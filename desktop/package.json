@@ -1,0 +1,86 @@
+{
+  "name": "navegador-ia-desktop",
+  "version": "1.0.0",
+  "description": "Desktop wrapper for AI Agent Browser",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.agentbrowser.app",
+    "productName": "Navegador IA",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build-resources/backend-server",
+        "to": "backend-server",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "build-resources/ms-playwright",
+        "to": "ms-playwright",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../frontend/dist",
+        "to": "frontend/dist",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.productivity"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Network"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "Navegador IA"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "charlessonamericantrading",
+      "repo": "navegador",
+      "releaseType": "release"
+    }
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
+  }
+}

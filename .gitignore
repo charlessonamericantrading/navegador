@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Build output / generated artifacts
+backend/dist/
+backend/build/
+backend/backend-server.spec
+/backend-server.spec
+frontend/dist/
+desktop/dist/
+desktop/build-resources/
+engine/target/
+*.exe
+
+# Local Claude Code runtime state (not shareable across machines/sessions)
+.claude/*.lock
+
+# Env / secrets
+.env
+.env.*
+*.pfx
+
+# Logs
+*.log
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/

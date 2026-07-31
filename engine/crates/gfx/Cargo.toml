@@ -1,0 +1,15 @@
+[package]
+name = "engine-gfx"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+engine-layout = { path = "../layout" }
+winit = "0.29"
+wgpu = "0.19"
+tiny-skia = "0.11"
+pollster = "0.3"

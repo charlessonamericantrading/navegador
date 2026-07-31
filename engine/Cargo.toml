@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/net",
+    "crates/dom",
+    "crates/css",
+    "crates/layout",
+    "crates/gfx",
+    "crates/js",
+    "crates/core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Navegador IA Engine Team"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1.38", features = ["full"] }
+rustls = { version = "0.23", features = ["ring"] }
+url = "2.5"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+bytes = "1.6"

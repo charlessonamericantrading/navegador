@@ -1,0 +1,17 @@
+[package]
+name = "engine-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+engine-net = { path = "../net" }
+engine-dom = { path = "../dom" }
+engine-css = { path = "../css" }
+engine-layout = { path = "../layout" }
+engine-gfx = { path = "../gfx" }
+engine-js = { path = "../js" }

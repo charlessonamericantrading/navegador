@@ -1,0 +1,13 @@
+[package]
+name = "engine-layout"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+engine-dom = { path = "../dom" }
+engine-css = { path = "../css" }
+rayon = "1.10"

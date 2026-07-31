@@ -1,0 +1,21 @@
+{
+  "name": "navegador-ia-root",
+  "version": "1.0.0",
+  "description": "Root workspace for AI Agent Browser Native Desktop",
+  "private": true,
+  "scripts": {
+    "install:frontend": "cd frontend && npm install",
+    "install:backend": "node scripts/install-backend.js",
+    "install:desktop": "cd desktop && npm install",
+    "install:all": "npm run install:frontend && npm run install:backend && npm run install:desktop",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:backend": "cd backend && .venv\\Scripts\\python app/core/main.py",
+    "dev:desktop": "cd desktop && npm start",
+    "start": "npx concurrently -k -n \"frontend,desktop\" -c \"blue,magenta\" \"npm run dev:frontend\" \"npm run dev:desktop\"",
+    "dev": "npx concurrently -k -n \"frontend,backend\" -c \"blue,green\" \"npm run dev:frontend\" \"npm run dev:backend\"",
+    "build:app": "node scripts/build-app.js"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

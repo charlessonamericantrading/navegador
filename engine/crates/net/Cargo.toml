@@ -1,0 +1,14 @@
+[package]
+name = "engine-net"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+rustls.workspace = true
+url.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
