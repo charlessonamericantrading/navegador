@@ -9,7 +9,11 @@ license.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 engine-layout = { path = "../layout" }
+engine-text = { path = "../text" }
 winit = "0.29"
 wgpu = "0.19"
 tiny-skia = "0.11"
 pollster = "0.3"
+# Copia el Pixmap de tiny-skia a la superficie real de la ventana. Sin esto
+# el pintado calcula pixeles que nunca llegan a pantalla.
+softbuffer = "0.4"

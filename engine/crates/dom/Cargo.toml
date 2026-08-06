@@ -9,3 +9,4 @@ license.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
+html5ever = "0.29"

@@ -1,7 +1,6 @@
 const { execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 
 const rootDir = path.join(__dirname, '..');
 const frontendDir = path.join(rootDir, 'frontend');
@@ -14,38 +13,6 @@ const isWin = process.platform === 'win32';
 function runCmd(cmd, cwd) {
   console.log(`\n>>> Ejecutando: ${cmd} (en ${cwd})`);
   execSync(cmd, { cwd, stdio: 'inherit' });
-}
-
-// Determina qué revisiones de Chromium usa realmente el Playwright instalado
-// en el venv del backend (backend/.venv/.../playwright/driver/package/browsers.json),
-// para poder excluir del paquete cualquier revisión vieja que haya quedado
-// acumulada en la caché local de Playwright (p. ej. tras una actualización de
-// versión). Sin este filtro, "npm run build:app" copia la carpeta ms-playwright
-// completa tal cual esté en la máquina de quien compila, arrastrando cientos de
-// MB de navegadores obsoletos a cada instalador generado.
-function getPinnedChromiumRevisions(backendDir) {
-  let browsersJsonPath = '';
-  if (isWin) {
-    browsersJsonPath = path.join(backendDir, '.venv', 'Lib', 'site-packages', 'playwright', 'driver', 'package', 'browsers.json');
-  } else {
-    const venvLibDir = path.join(backendDir, '.venv', 'lib');
-    const pyDir = fs.existsSync(venvLibDir) ? fs.readdirSync(venvLibDir).find(d => d.startsWith('python')) : null;
-    if (pyDir) {
-      browsersJsonPath = path.join(venvLibDir, pyDir, 'site-packages', 'playwright', 'driver', 'package', 'browsers.json');
-    }
-  }
-
-  if (!browsersJsonPath || !fs.existsSync(browsersJsonPath)) {
-    console.log('[ADVERTENCIA] No se encontró browsers.json de Playwright; se copiará ms-playwright sin filtrar revisiones.');
-    return null;
-  }
-
-  const browsersData = JSON.parse(fs.readFileSync(browsersJsonPath, 'utf-8'));
-  return new Set(
-    browsersData.browsers
-      .filter(b => b.name === 'chromium' || b.name === 'chromium-headless-shell')
-      .map(b => b.revision)
-  );
 }
 
 function prepareWinCodeSignCache() {
@@ -118,11 +85,15 @@ try {
   prepareWinCodeSignCache();
 
   // 1. Compilar Frontend
-  console.log('\n[Paso 1/5] Compilando Frontend (Vite + React)...');
+  console.log('\n[Paso 1/4] Compilando Frontend (Vite + React)...');
   runCmd('npm run build', frontendDir);
 
-  // 2. Compilar Backend a binario con PyInstaller
-  console.log('\n[Paso 2/5] Compilando Backend (PyInstaller)...');
+  // 2. Compilar el motor Rust nativo
+  console.log('\n[Paso 2/4] Compilando motor nativo Rust...');
+  runCmd('cargo build --manifest-path engine/Cargo.toml -p engine-core --bin engine_server --release', rootDir);
+
+  // 3. Compilar Backend a binario con PyInstaller
+  console.log('\n[Paso 3/4] Compilando Backend (PyInstaller)...');
   const pyinstallerPath = isWin
     ? path.join(backendDir, '.venv', 'Scripts', 'pyinstaller.exe')
     : path.join(backendDir, '.venv', 'bin', 'pyinstaller');
@@ -132,11 +103,11 @@ try {
   }
 
   // Ejecutamos pyinstaller con recopilación de todas las librerías dinámicas necesarias
-  const pyinstallerCmd = `"${pyinstallerPath}" --onedir --noconfirm --clean --name backend-server --distpath dist --workpath build --collect-all uvicorn --collect-all fastapi --collect-all playwright --collect-all websockets --collect-all google --collect-all pydantic app/core/main.py`;
+  const pyinstallerCmd = `"${pyinstallerPath}" --onedir --noconfirm --clean --name backend-server --distpath dist --workpath build --collect-all uvicorn --collect-all fastapi --collect-all websockets --collect-all google --collect-all pydantic app/core/main.py`;
   runCmd(pyinstallerCmd, backendDir);
 
-  // 3. Limpiar y recrear directorio de recursos temporales de Electron
-  console.log('\n[Paso 3/5] Preparando carpeta de recursos de compilación...');
+  // 4. Limpiar y recrear directorio de recursos temporales de Electron
+  console.log('\n[Paso 4/4] Preparando carpeta de recursos de compilación...');
   if (fs.existsSync(buildResourcesDir)) {
     console.log('Limpiando recursos antiguos...');
     fs.rmSync(buildResourcesDir, { recursive: true, force: true });
@@ -149,50 +120,18 @@ try {
   console.log(`Copiando servidor compilado desde ${compiledBackendSrc} a ${compiledBackendDest}...`);
   fs.cpSync(compiledBackendSrc, compiledBackendDest, { recursive: true });
 
-  // 4. Copiar carpeta de Chromium de Playwright
-  console.log('\n[Paso 4/5] Copiando carpeta local de navegadores Playwright...');
-  let playwrightBrowsersPath = '';
-  if (isWin) {
-    playwrightBrowsersPath = path.join(process.env.LOCALAPPDATA, 'ms-playwright');
-  } else if (process.platform === 'darwin') {
-    playwrightBrowsersPath = path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright');
-  } else {
-    playwrightBrowsersPath = path.join(os.homedir(), '.cache', 'ms-playwright');
+  // Copiar el proceso Rust que usa el backend como renderer nativo.
+  const nativeEngineName = isWin ? 'engine_server.exe' : 'engine_server';
+  const nativeEngineSrc = path.join(rootDir, 'engine', 'target', 'release', nativeEngineName);
+  const nativeEngineDestDir = path.join(buildResourcesDir, 'engine');
+  if (!fs.existsSync(nativeEngineSrc)) {
+    throw new Error(`No se encontró el binario Rust en: ${nativeEngineSrc}`);
   }
+  fs.mkdirSync(nativeEngineDestDir, { recursive: true });
+  fs.copyFileSync(nativeEngineSrc, path.join(nativeEngineDestDir, nativeEngineName));
 
-  const playwrightDest = path.join(buildResourcesDir, 'ms-playwright');
-  if (fs.existsSync(playwrightBrowsersPath)) {
-    console.log(`Copiando navegadores desde ${playwrightBrowsersPath} a ${playwrightDest}...`);
-    const pinnedRevisions = getPinnedChromiumRevisions(backendDir);
-    fs.cpSync(playwrightBrowsersPath, playwrightDest, {
-      recursive: true,
-      filter: (src) => {
-        const base = path.basename(src);
-        if (base === '.links') return false; // metadata local de la máquina, inútil en el paquete
-
-        // backend/app/domains/browser/browser.py siempre lanza
-        // chromium.launch(headless=True) sin "channel". Verificado empíricamente
-        // (2026-07-31): con esa combinación, Playwright 1.60 ejecuta
-        // chrome-headless-shell.exe (carpeta chromium_headless_shell-<rev>) y NUNCA
-        // el chrome.exe de la carpeta chromium-<rev> completa. Esa carpeta pesa
-        // ~413MB y viaja en el instalador sin que la app la use jamás, así que se
-        // excluye del todo. Si algún día se lanza con headless=False o con
-        // channel="chromium", quitar esta exclusión.
-        if (/^chromium-\d+$/.test(base)) return false;
-
-        const match = base.match(/^chromium(?:_headless_shell)?-(\d+)$/);
-        if (!match) return true; // no es una carpeta de revisión de chromium: copiar tal cual
-        if (!pinnedRevisions) return true; // no se pudo determinar qué se necesita: no filtrar por seguridad
-        return pinnedRevisions.has(match[1]);
-      }
-    });
-  } else {
-    console.log(`[ADVERTENCIA] No se encontró la carpeta de navegadores Playwright en ${playwrightBrowsersPath}.`);
-    console.log('Se intentará compilar de todas formas (puede que falten navegadores offline).');
-  }
-
-  // 5. Empaquetar con electron-builder
-  console.log('\n[Paso 5/5] Empaquetando instalador con electron-builder...');
+  // 4. Empaquetar con electron-builder
+  console.log('\n[Final] Empaquetando instalador con electron-builder...');
   runCmd('npx electron-builder', desktopDir);
 
   // Copiar el instalador generado a la raíz del proyecto para mayor accesibilidad

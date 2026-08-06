@@ -1,0 +1,61 @@
+<!--
+  Fixture escrita a mano en estilo testharness.js (test/assert_equals/
+  assert_true/assert_false), NO parte de la corpus real de Web Platform
+  Tests - ver el aviso en crates/core/src/bin/wpt_runner.rs. Ejercita
+  capacidad de mutacion/navegacion del DOM que el motor ya tiene de verdad:
+  setAttribute, appendChild, removeChild, insertBefore, replaceChild,
+  parentElement y children. Correr con:
+    cargo run -p engine-core --bin wpt_runner -- tests/wpt-style
+-->
+<html>
+<body>
+<div id="container"><span id="a"></span><span id="b"></span></div>
+<script>
+test(function() {
+  var el = document.getElementById('a');
+  el.setAttribute('data-x', 'hola');
+  assert_equals(el.getAttribute('data-x'), 'hola');
+}, 'setAttribute/getAttribute hacen roundtrip sobre el atributo real');
+
+test(function() {
+  var contenedor = document.getElementById('container');
+  var nuevo = document.createElement('p');
+  nuevo.setAttribute('id', 'nuevo');
+  contenedor.appendChild(nuevo);
+  assert_equals(document.getElementById('nuevo').parentElement.getAttribute('id'), 'container',
+    'parentElement deberia devolver el contenedor real, encontrado por una busqueda fresca');
+}, 'appendChild conecta de verdad al arbol y parentElement lo confirma');
+
+test(function() {
+  var contenedor = document.getElementById('container');
+  assert_equals(contenedor.children.length, 3, 'a, b, y el nuevo insertado por el test anterior');
+  assert_equals(contenedor.children.map(function(c) { return c.tagName; }).join('|'), 'SPAN|SPAN|P');
+}, 'children cuenta solo elementos reales, en orden de documento');
+
+test(function() {
+  var contenedor = document.getElementById('container');
+  var medio = document.createElement('em');
+  medio.setAttribute('id', 'medio');
+  contenedor.insertBefore(medio, document.getElementById('b'));
+  assert_equals(contenedor.children.map(function(c) { return c.tagName; }).join('|'), 'SPAN|EM|SPAN|P');
+}, 'insertBefore inserta justo antes de la referencia, no al final');
+
+test(function() {
+  var contenedor = document.getElementById('container');
+  var reemplazo = document.createElement('i');
+  var viejo = document.getElementById('medio');
+  var devuelto = contenedor.replaceChild(reemplazo, viejo);
+  assert_true(devuelto === viejo, 'replaceChild deberia devolver el nodo reemplazado');
+  assert_equals(contenedor.children.map(function(c) { return c.tagName; }).join('|'), 'SPAN|I|SPAN|P');
+}, 'replaceChild sustituye en la misma posicion y devuelve el nodo viejo');
+
+test(function() {
+  var contenedor = document.getElementById('container');
+  var b = document.getElementById('b');
+  contenedor.removeChild(b);
+  assert_false(document.getElementById('b') !== null, 'una busqueda fresca ya no deberia encontrar a b');
+  assert_equals(contenedor.children.length, 3);
+}, 'removeChild desconecta de verdad del arbol');
+</script>
+</body>
+</html>

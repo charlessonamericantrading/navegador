@@ -10,4 +10,4 @@ thiserror.workspace = true
 tracing.workspace = true
 engine-dom = { path = "../dom" }
 engine-css = { path = "../css" }
-rayon = "1.10"
+engine-text = { path = "../text" }

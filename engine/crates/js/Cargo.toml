@@ -12,3 +12,4 @@ boa_engine = "0.19"
 boa_gc = "0.19"
 boa_parser = "0.19"
 engine-dom = { path = "../dom" }
+engine-css = { path = "../css" }

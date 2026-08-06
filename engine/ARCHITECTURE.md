@@ -1,0 +1,829 @@
+# Arquitectura del motor — doctrina y estado real
+
+Este documento existe porque la version anterior de este codigo no lo tenia,
+y sin el, la tentacion de reescribir `rustls` a mano siempre vuelve. Tambien
+documenta el estado REAL del motor a fecha de este commit, sin adornos.
+
+## Estado real (no aspiracional)
+
+A fecha de esta limpieza, el motor:
+
+- **Descarga** paginas reales por HTTPS (`hyper` + `hyper-rustls`, TLS real
+  via `rustls`) — verificado en vivo contra `info.cern.ch`. Sin DNS propio
+  (usa el resolutor del SO via `hyper-util`); sin HTTP/2 todavia.
+- **Parsea HTML** con `html5ever`: el algoritmo de construccion de arbol del
+  spec real, con su recuperacion de errores para HTML mal formado. Verificado
+  en vivo y con el adaptador `TreeSink` propio (`html5ever_sink.rs`).
+  Simplificaciones documentadas ahi: namespaces foraneos (SVG/MathML) no
+  tienen namespace correcto, `<template>` no usa un DocumentFragment inerte
+  separado, doctype se ignora (sin representacion visual).
+- **Parsea CSS** con `cssparser` (el tokenizador real de Servo/Stylo): maneja
+  bloques anidados, `@media` y otras arroba-reglas (se saltan sin corromper
+  el resto de la hoja), strings con `{`/`}`/`;`/`:` dentro, y comentarios.
+- **Matchea selectores de verdad** con el crate `selectors` (el mismo motor
+  que usa Firefox/Stylo): combinadores (` `, `>`), selectores compuestos
+  (`div.foo`), selectores de atributo (`[href]`, `[type="text"]` con los 6
+  operadores del spec) y especificidad real ordenada como tripleta
+  (id, clase, tipo) — todo esto NO existia en el matcher anterior, que solo
+  comparaba un tag/`.clase`/`#id` suelto como cadena opaca. El adaptador
+  (`element.rs`, trait `Element` con sus ~26 metodos) vive sobre un newtype
+  `ElementRef` porque ni el trait ni `Arc<RwLock<Node>>` son locales al
+  crate `css` (regla de huerfanos de Rust). Pseudo-clases/pseudo-elementos
+  (`:hover`, `::before`) no estan soportados: el tipo que los representa es
+  un enum vacio, asi que el parser los rechaza como error de sintaxis en vez
+  de fingir que existen. Shadow DOM, partes y estados personalizados: `false`/
+  `None` honestos, no hay nada de eso implementado. Verificado con tests que
+  prueban exactamente lo que el matcher anterior no podia hacer.
+- **Extrae el CSS real de la pagina** (`core/pipeline.rs::build_page`): todos
+  los `<style>` del documento parseado se concatenan en orden (mismo patron
+  que `<script>` — `Node::find_all_by_tag` + `text_content`) y se parsean de
+  verdad — antes, `build_page` solo aplicaba el CSS que quien llamaba le
+  pasara aparte, y `main.rs` pasaba una hoja de ejemplo hardcodeada sin
+  ninguna relacion con lo que la pagina real descargada declarase; se quito
+  en cuanto hubo una fuente real, para no mezclar CSS inventado con CSS real
+  sin ninguna etiqueta que distinguiera cual era cual. El parametro `css` de
+  `build_page` sigue existiendo pero como CSS ADICIONAL (util para tests o
+  una futura hoja de usuario), no como sustituto — probado que ambas fuentes
+  se combinan y que varios `<style>` se concatenan en orden. `<link
+  rel="stylesheet">` (externo) sigue sin seguirse, mismo motivo que
+  `<script src>`: exigiria encolar otra peticion de red.
+- **Aplica la cascada CSS al layout**: `LayoutTreeBuilder::resolve_style`
+  filtra las reglas del stylesheet por `SelectorMatcher::matches`, ordena por
+  especificidad (`SelectorMatcher::calculate_specificity`) y fusiona
+  declaraciones — probado con tests de cascada (especificidad, no-match).
+  El atributo `style="..."` del propio elemento (si tiene uno) se fusiona
+  DESPUES de todas las reglas del stylesheet, sin importar su especificidad
+  — igual que el spec real, donde un estilo en linea gana incluso a un
+  selector de id (`!important` aparte, que no esta modelado) — parseado con
+  el mismo tokenizador `cssparser` que las hojas de estilo normales
+  (`CssParser::parse_inline_style`, en `css/src/parser.rs`), no un split
+  manual. Antes de esto el atributo `style` se ignoraba por completo: un
+  `<div style="color: red">` se pintaba igual que sin el atributo — probado
+  explicitamente, incluido que gana sobre una regla de id. `color` y
+  `font-size` (`INHERITABLE_PROPERTIES` en `tree.rs`) se propagan
+  de verdad a las cajas de texto descendientes, atravesando varios niveles y
+  respetando que un ancestro mas cercano pise a uno mas lejano — probado con
+  4 tests de herencia. El resto de propiedades heredables del spec
+  (`font-family`, `font-weight`, `line-height`...) no se propagan todavia.
+  Esto es solo el lado CSS/layout: el objeto JS `element.style`
+  (`.getPropertyValue`/`.setProperty`/`.cssText`) para MUTAR el atributo
+  desde un script es un paso deliberadamente separado (ver mas abajo,
+  ahora real).
+- **Calcula un layout de bloque real** (Fase 1, item 6 del plan): las cajas
+  se apilan verticalmente con ancho completo del contenedor, sin inline real,
+  floats, ni grid/flex todavia. Las cajas de texto SI miden con las metricas
+  reales de la fuente que de verdad se va a pintar (`engine_text::measure_text`,
+  misma fuente cargada una vez en `core/main.rs` y compartida con
+  `engine-gfx`): el alto de linea usa ascenso+descenso+salto de linea reales
+  de la fuente. El quiebre de linea YA rompe por palabra de verdad
+  (`engine_text::wrap_text`, sin hifenacion — una palabra sola mas ancha que
+  el contenedor se desborda en vez de partirse a mitad) — antes, `font-size`
+  se ignoraba por completo (constante fija de 22px de alto y 8px/caracter) y
+  el "envuelto" solo contaba cuantas lineas de ese ancho cabrian en total,
+  sin romper realmente el texto. `layout` y `engine-gfx` llaman a la misma
+  `wrap_text` con los mismos argumentos (mismo font_size, mismo ancho
+  disponible), asi que el numero de lineas reservado y el pintado coinciden
+  por construccion — probado con tests que comprueban que ninguna palabra se
+  parte, se pierde ni se reordena al envolver. Sin fuente de sistema
+  disponible, cae a la aproximacion anterior por caracteres — mismo tipo de
+  respaldo honesto que ya usaba `engine-gfx` al pintar. `flex`/`grid` NO
+  existen: habia un `flexbox.rs` con `FlexLayoutEngine` que nunca se llamaba
+  desde `LayoutTreeBuilder` (ningun stylesheet real podia activarlo) y cuya
+  logica interna tampoco implementaba el spec de verdad (`justify-content`
+  solo distinguia `Center` del resto, `align-items` no se usaba en fila,
+  altura fija de 40px, sin `flex-grow`/`shrink`/`basis`/`wrap`, sin recibir
+  siquiera el `computed_style` para poder leer CSS real) — exactamente el
+  patron de "codigo que miente" de la seccion de abajo, asi que se borro en
+  vez de dejarlo fingiendo. Flexbox real, conectado a `display: flex` y
+  probado contra casos concretos del spec, sigue pendiente (Fase 2).
+- **Pinta en una ventana nativa real** (`winit` + `tiny-skia` + `softbuffer`):
+  rectangulos solidos para cajas de bloque con `background-color`, y **texto
+  con glifos reales** via `engine-text` (`rustybuzz` para shaping +
+  `fontdb` para cargar una fuente sans-serif del sistema + `ttf_parser` para
+  extraer el contorno de cada glifo) — verificado con tests que comprueban
+  que los contornos tienen area no nula y que el avance entre glifos es
+  correcto (izquierda a derecha). El color y el tamaño de fuente del texto
+  ya vienen de la cascada heredada (negro/16px son solo el valor inicial
+  cuando nada los redefine, igual que en un navegador real); si no hay
+  ninguna fuente de sistema disponible, cae a un bloque de relleno en vez de
+  fingir que hay glifos. `font-size` ya entiende `em` y `%` (relativos al
+  font-size YA RESUELTO del padre inmediato — `resolve_font_size` en
+  `layout/src/tree.rs` — probado con resolucion de un nivel y encadenada a
+  traves de varios); el resultado se deja resuelto a `px` en `computed_style`
+  antes de que nada mas lo lea, asi que `parse_css_font_size` (aqui y en
+  `engine-gfx`) sigue sin necesitar saber de unidades relativas. `rem`
+  (relativo a la raiz del documento, no al padre inmediato) sigue sin
+  soportarse — exigiria rastrear el font-size de `<html>` por separado de lo
+  heredado nivel a nivel; cae al tamaño heredado del padre, no a un numero
+  inventado.
+- **Reflow real al redimensionar la ventana, nada mas todavia**: hasta hace
+  poco esto afirmaba (incorrectamente) que "el layout se recalcula en cada
+  frame" — no era cierto: `layout_root`/`display_list` se calculaban UNA
+  vez al arrancar y se reusaban sin cambios en cada `RedrawRequested`;
+  redimensionar la ventana solo estiraba el backbuffer de `softbuffer`
+  sobre las mismas cajas del tamaño original (contenido cortado o con
+  hueco vacio alrededor, sin fluir de verdad). Arreglado: `NativeEngineWindow::run`
+  recibe una closure `relayout(ancho, alto) -> LayoutBox` (construida en
+  `core/main.rs`, capturando clones de `dom_root`/`stylesheet`/`font` de
+  `PageResult`) que se llama de verdad en el handler de `Resized` para
+  recalcular el arbol completo al nuevo tamaño — probado que reconstruir
+  layout con el mismo `dom_root`+`stylesheet` a un ancho distinto produce
+  dimensiones distintas, no las originales congeladas. `gfx` sigue sin
+  depender de `engine-css`/`engine-dom`: la closure es la unica que conoce
+  esos tipos, `gfx` solo sabe pedir "un arbol de cajas para este tamaño".
+  El shaping de texto SI se recalculaba ya en cada redibujado (eso era
+  cierto) — sigue siendo un gasto conocido, aceptable por ahora; cache de
+  glifos es trabajo futuro si hace falta. El clic izquierdo SI recalcula
+  (relayout completo) ahora (ver mas abajo, "Clic real del SO cableado de
+  punta a punta"); el scroll de la rueda del raton YA repinta con un
+  nuevo desplazamiento vertical (sin relayout - el contenido no cambia de
+  forma, solo que porcion se ve, ver "Scroll real de la rueda del raton"
+  mas abajo); el teclado sigue sin ninguna fuente de eventos — sigue
+  siendo Fase 3.
+- **Ya NO quema ~100% de un nucleo de CPU en reposo**: medido en vivo antes
+  del arreglo, con la ventana abierta y SIN ninguna interaccion —
+  ~97% de un nucleo de forma continua (16.85s de CPU en 17.36s de reloj,
+  repetido dos veces). Causa real: `Event::AboutToWait` pedia un redraw sin
+  condicion alguna en cada vuelta del bucle, lo que encadenaba
+  `RedrawRequested -> AboutToWait -> RedrawRequested` para siempre — el
+  bucle nunca llegaba a esperar de verdad, aunque `ControlFlow::Wait` YA es
+  el valor por defecto de `winit` (el diagnostico inicial de "hace falta
+  poner Wait" era incorrecto; el problema no era el `ControlFlow`, era pedir
+  un redraw sin necesidad). Arreglado quitando ese redraw incondicional:
+  ahora solo se pide un redraw cuando algo cambia de verdad (una vez al
+  arrancar, y tras un `Resized` real) — medido en vivo despues del arreglo,
+  mismo experimento: 0.0s de CPU adicional en reposo, exactos, dos veces
+  seguidas. `ControlFlow::Wait` se fija explicito de todas formas, para que
+  quede documentado en vez de depender de un valor por defecto implicito.
+- **Ejecuta JavaScript real** sobre los `<script>` inline de la pagina
+  (`core/src/scripting.rs`): todos comparten el mismo `Context` de Boa, asi
+  que una variable declarada en un script sigue viva para el siguiente,
+  igual que en una pagina real — probado con 5 tests, incluyendo que un
+  error de sintaxis se reporta como tal en vez de fingir exito.
+  `<script src="...">` (externo) se detecta y se omite explicitamente: no
+  se descarga todavia. Los scripts corren todos seguidos tras parsear el
+  documento completo, no intercalados con el parseo como en un navegador
+  real (`document.write` no podria hacer nada de todas formas: ver mas
+  abajo por que). `queueMicrotask` (`event_loop.rs`) ya encola de verdad en
+  la cola de jobs que `Context` trae por defecto (`SimpleJobQueue` de
+  `boa_engine::job`) en vez de llamar al callback en el acto — antes,
+  `queueMicrotask(() => log('a')); log('b');` imprimia "a" y luego "b"
+  (orden invertido respecto a un navegador real); ahora imprime "b" y luego
+  "a", como debe ser. La cola se drena en `JsRuntime::eval` (`runtime.rs`)
+  justo despues de evaluar cada script — el punto mas parecido que hay
+  todavia a "termino la tarea actual", sin un event loop real (Fase 3).
+  Probado con 4 tests, incluyendo que un microtask que encola otro
+  microtask tambien drena en el mismo eval, y que un argumento no invocable
+  no revienta.
+- **Bindings DOM reales, pero minimos** (`js/src/dom_bindings.rs`):
+  `document.getElementById(id)`, `document.querySelector(selector)` y
+  `document.querySelectorAll(selector)` (los dos ultimos con matching real
+  via `SelectorMatcher::query_first`/`query_all` — combinadores incluidos,
+  no un lookup ingenuo por tag) devuelven un objeto JS por elemento
+  encontrado, con partes vivas y partes foto: `getAttribute`/`setAttribute`,
+  `textContent` (accessor real, con getter Y setter — via
+  `FunctionObjectBuilder`/`ObjectInitializer::accessor`), `appendChild` y
+  `removeChild` SI son vivos — leen y escriben de verdad sobre el
+  `Arc<RwLock<Node>>` del arbol real (`ElementCapture`), asi que mutar y
+  leer despues ve el cambio, incluso desde un objeto JS distinto obtenido
+  con otra llamada a `getElementById` sobre el mismo id — probado
+  explicitamente. Asignar `el.textContent = valor` reemplaza TODOS los
+  hijos existentes por un unico nodo de texto nuevo (semantica real, no un
+  append); `null` se trata como cadena vacia (`[LegacyNullToEmptyString]`
+  del spec real, no la cadena "null" que daria `ToString(null)` en
+  cualquier otra propiedad) — probado explicitamente, igual que la
+  coercion normal para otros valores (`42` -> `"42"`). `document.
+  createElement(tag)` crea un nodo nuevo y desconectado;
+  `padre.appendChild(hijo)`/`padre.removeChild(hijo)` lo conectan/
+  desconectan de verdad del arbol — probado explicitamente que un elemento
+  creado+mutado+añadido es alcanzable despues via una busqueda FRESCA por
+  id desde la raiz del documento (no solo que la variable local de JS lo
+  recuerde), y que tras `removeChild` esa misma busqueda ya no lo
+  encuentra. Ambos recuperan el nodo real de `hijo` via datos nativos
+  adjuntos al objeto JS (`JsObject::downcast_ref::<ElementCapture>()`,
+  `ObjectInitializer::with_native_data`) — si `hijo` no es un objeto
+  elemento nuestro (una cadena, un numero...) no hacen nada, en vez de
+  fingir que se añadio/quito algo; `removeChild` sobre un nodo que no es
+  hijo de verdad tambien es un no-op honesto (devuelve `null`, el DOM real
+  lanzaria `NotFoundError`) — todo esto probado. Solo `tagName` sigue
+  siendo foto (no observable: ningun binding cambia la etiqueta de un
+  elemento, y tampoco se puede en el DOM real). Como `scripting.rs`
+  ejecuta los `<script>` inline ANTES de construir el layout
+  (`core/pipeline.rs::build_page`), una mutacion real hecha durante la
+  ejecucion inicial de un script ya se refleja en el layout resultante,
+  sin necesitar recalculo tras interaccion (Fase 3, que sigue sin
+  existir). `querySelectorAll` devuelve un `Array` real de JS
+  (`boa_engine::object::builtins::JsArray`) — no un `NodeList` real, pero un
+  `Array` ya trae `.forEach`/`.map`/etc. que un `NodeList` no trae de
+  fabrica, asi que en la practica es mas capaz, no menos — la LISTA esta
+  congelada en el momento de la llamada (hay que volver a llamar para ver
+  elementos nuevos), no cada elemento dentro de ella. `el.classList` tambien
+  es real: `contains`/`add`/`remove`/`toggle` leen y escriben de verdad el
+  atributo `class` (cadena separada por espacios, partida/unida con
+  `split_whitespace`/`join`) — no una lista paralela que se desincroniza.
+  `toggle(nombre, force)` usa `ToBoolean` generico para `force` (igual que
+  el spec real: `0`, `""`, `undefined`... cuentan como false, no solo el
+  booleano literal). Una diferencia real con el DOM autentico, no
+  escondida: cada lectura de `el.classList` construye un objeto JS nuevo,
+  asi que `el.classList === el.classList` da `false` aqui y `true` en un
+  navegador real (alli `classList` es un `DOMTokenList` con identidad
+  estable) — no afecta a `contains`/`add`/`remove`/`toggle` en si, que
+  siempre operan sobre el `class` real del elemento, pero un script que
+  compare la identidad del objeto se comportaria distinto.
+  `.parentElement` (getter) sube por `Node::parent` (un `Weak`) y da `null`
+  si no hay padre o si el padre no es un `Element` — la raiz real del
+  arbol es un `NodeType::Document` (`html5ever_sink.rs`), no un elemento,
+  asi que `document.querySelector('html').parentElement` da `null` aqui
+  igual que en un navegador real. `.children` (getter) devuelve un `Array`
+  real solo con los hijos `Element` (los nodos de texto sueltos no
+  cuentan) — a diferencia de `querySelectorAll`, aqui SI es vivo: cada
+  lectura vuelve a mirar el arbol real, asi que ve altas/bajas de
+  `appendChild`/`removeChild` hechas justo antes, no una foto congelada.
+  `.style` (getter) devuelve un objeto con `getPropertyValue`/
+  `setProperty`/`removeProperty`/`cssText` reales sobre el atributo
+  `style` (parseado con `CssParser::parse_inline_style` — el mismo
+  tokenizador `cssparser` que una hoja de estilos normal, ver mas arriba)
+  — la MISMA fuente que la cascada real aplica al layout, asi que mutar
+  `el.style` es mutar de verdad lo que se pintaria en el siguiente
+  layout, no una copia paralela. `getPropertyValue` da `""` (nunca
+  `null`) si la propiedad no esta puesta; `setProperty(nombre, "")` QUITA
+  la propiedad en vez de guardarla vacia; `removeProperty` devuelve el
+  valor quitado — las tres, igual que el spec real. `cssText` (getter que
+  serializa TODAS las declaraciones, setter que REEMPLAZA el bloque
+  entero en vez de fusionarlo — probado explicitamente que una propiedad
+  vieja desaparece tras asignar `cssText`) y tres accessors por nombre
+  camelCase — `color`/`backgroundColor`/`fontSize` — tambien mutan de
+  verdad la misma fuente. Deliberadamente solo esas tres, no las cientos
+  del spec real: son las UNICAS que `layout`/`gfx` leen de verdad hoy
+  (verificado por grep contra `computed_style.get(...)`, no asumido) —
+  `el.style.margin` o `.display` no tienen accessor, se convierten en una
+  propiedad JS normal del objeto (sin tocar el atributo real), que es
+  exactamente el mismo comportamiento que un navegador real para una
+  propiedad `CSSStyleDeclaration` no reconocida. `padre.insertBefore(nuevo, referencia)` (`referencia` null o
+  ausente inserta al final, igual que appendChild) y
+  `padre.replaceChild(nuevo, viejo)` (devuelve `viejo`) completan las
+  cuatro mutaciones fundamentales de `Node` — ambos validan la posicion
+  ANTES de mutar nada (una referencia/viejo que no es hijo real deja todo
+  intacto, no a medio mover). Los tres metodos que pueden recibir un nodo
+  ya conectado (`appendChild`/`insertBefore`/`replaceChild`) lo desconectan
+  primero de su padre anterior si tenia uno — encontrado al construir
+  `insertBefore`: `appendChild` NO lo hacia, asi que mover un nodo ya
+  conectado antes lo dejaba fantasma en la lista de children de su padre
+  viejo ademas de en la del nuevo; arreglado a la vez para los tres.
+  `addEventListener(tipo, listener)`/`removeEventListener(tipo, listener)`/
+  `dispatchEvent(event)` son reales: un `EventRegistry` COMPARTIDO por
+  todo el documento (no por elemento ni por objeto JS envoltorio, que se
+  reconstruye nuevo en cada consulta) guarda los listeners indexados por
+  el puntero del NODO real, asi que registrar desde una consulta y
+  disparar desde otra consulta al mismo elemento se ven — probado
+  explicitamente, junto con que dos listeners del mismo tipo se llaman
+  ambos en orden, y que `removeEventListener` compara por identidad real
+  (`JsObject`/`Gc::ptr_eq`, no por contenido — dos funciones con el mismo
+  codigo fuente por separado no matchean). `new Event(tipo)` (constructor
+  global, solo `.type` al principio) necesito `.constructor(true)` de
+  verdad en Boa (`register_global_callable`, no
+  `register_global_builtin_callable` que usa `printEngineLog` — verificado
+  contra el codigo fuente de Boa, no asumido) para que `new` no lance "not
+  a constructor". Guardar los listeners (`JsObject`, con punteros `Gc<_>`
+  reales) en un `Mutex` invisible al trazador de Boa (`#[unsafe_ignore_trace]`)
+  sigue siendo seguro — verificado contra `boa_gc`: un objeto con mas
+  referencias (`ref_count`) de las que el trazado normal puede explicar
+  (`non_root_count`) se trata como RAIZ y sobrevive a cada recoleccion, en
+  vez de liberarse bajo los pies. Ya SI esta conectado al clic izquierdo
+  real del sistema operativo (ver mas abajo, "Clic real del SO cableado
+  de punta a punta"). La rueda del raton YA mueve el viewport de verdad
+  (ver "Scroll real de la rueda del raton" mas abajo) pero SOLO a nivel
+  de pintado/hit-testing en `gfx` — no dispara ningun evento `scroll`
+  hacia JS todavia (`addEventListener('scroll', ...)` no tiene ninguna
+  fuente que lo dispare); el teclado sigue sin ninguna fuente real en
+  absoluto.
+- **Bubbling real + `preventDefault`/`stopPropagation`/`event.target`**:
+  `dispatchEvent` ya no se queda en el nodo exacto — sube por los
+  ancestros (`dispatch_event_with_bubbling`) llamando a sus listeners
+  tambien, parando en cuanto algun listener llame a
+  `event.stopPropagation()` (comprobado despues de cada nodo, no solo al
+  final) — probado que un listener en un ANCESTRO se entera de un evento
+  disparado sobre un descendiente, y que `stopPropagation` corta la
+  subida antes de tiempo. Dentro de cada listener, `this` es el elemento
+  en el que ESE listener esta registrado (`currentTarget`, cambia por
+  nivel), mientras que `event.target` es siempre el nodo ORIGINAL, fijo
+  en todos los niveles — ambos probados por separado. `event.
+  preventDefault()`/`stopPropagation()` mutan el propio objeto evento
+  (`this` dentro del metodo, via `JsObject::set` — verificado su firma
+  exacta contra el codigo fuente de Boa antes de escribir nada:
+  `set<K,V>(key, value, throw, context) -> JsResult<bool>`), asi que
+  funcionan igual para un evento creado con `new Event(...)` en JS que
+  para el que construye `DomBindings::dispatch_event` internamente.
+  `dispatchEvent` ahora devuelve `false` si algun listener llamo a
+  `preventDefault()` (antes siempre devolvia `true`). **Bug real
+  encontrado por su propio test**: la primera version de bubbling
+  reconstruia un objeto JS nuevo hasta para el TARGET, rompiendo la
+  garantia ya probada de `this === el` dentro de un listener puesto en el
+  propio elemento (identidad, no solo contenido) — el test existente lo
+  detecto de inmediato; arreglado para que el target reuse la MISMA
+  referencia de `this` que ya tenia quien llamo a `dispatchEvent`, y solo
+  los ANCESTROS (sin ninguna referencia previa que reusar) construyan una
+  envoltura nueva.
+- **`Event.bubbles`/`.cancelable` reales**: antes todo evento burbujeaba
+  incondicionalmente y `preventDefault()` siempre funcionaba, sin
+  distincion `cancelable` — ya no. `new Event(tipo, opciones?)` lee
+  `opciones.bubbles`/`opciones.cancelable`, `false` por defecto en ambos
+  (igual que el spec real: un evento no burbujea ni es cancelable a menos
+  que se pida explicitamente) — probado. `dispatch_event_with_bubbling`
+  comprueba `.bubbles` antes de subir a los ancestros (`event_bubbles`,
+  hermana de `event_propagation_stopped`) — si es `false`, se queda en el
+  target y no toca ningun ancestro, probado explicitamente.
+  `preventDefault()` comprueba `.cancelable` antes de marcar
+  `defaultPrevented` — si es `false`, es un no-op honesto, tambien probado
+  junto con el caso contrario. `DomBindings::dispatch_event` (el camino
+  que usa el clic real del SO) fija ambos a `true` siempre: hoy el unico
+  evento real que pasa por ahi es "click", y un click real siempre
+  burbujea y es cancelable en el spec — parametrizable el dia que haga
+  falta otro tipo de evento con semantica distinta, no antes. Cuatro
+  tests de bubbling de la tarea anterior tuvieron que empezar a pedir
+  `{bubbles: true}` explicitamente (antes burbujeaban gratis, ahora hay
+  que pedirlo, como en un navegador real) — efecto secundario esperado de
+  hacer el flag real en vez de asumido. Probado con 92 tests en total
+  (`cargo test -p engine-js`, crate completo).
+- **Fase de captura real en `addEventListener`/`removeEventListener`/
+  `dispatchEvent`**: las tres fases del spec, en orden - CAPTURA (raiz del
+  documento -> padre inmediato del target, solo listeners registrados con
+  `{capture: true}` o el legado `useCapture=true`), TARGET (el target
+  mismo, TODOS sus listeners sin importar captura, en orden de registro)
+  y BURBUJEO (padre inmediato del target -> raiz, solo listeners SIN
+  captura, y solo si `.bubbles` es `true`) — probado que un listener de
+  captura en un ancestro se llama ANTES que el del propio target (orden
+  capturado en un log, no solo "ambos se llamaron"), y que la fase de
+  captura pasa AUNQUE el evento no burbujee (punto del spec facil de
+  pasar por alto: solo la fase de burbujeo depende de `.bubbles`, la de
+  captura no). `EventRegistry` paso de `Vec<(String, JsObject)>` a
+  `Vec<(String, JsObject, bool)>` (tipo, listener, `use_capture`);
+  `dispatch_event_to_listeners` gano un filtro `phase_capture:
+  Option<bool>` (`Some(true)`/`Some(false)`/`None` para captura/burbujeo/
+  target respectivamente) para no duplicar la logica de busqueda entre
+  las tres fases. `removeEventListener` ahora exige que `capture`
+  coincida ademas de tipo e identidad — el MISMO listener registrado una
+  vez con captura y otra sin ella son dos entradas DISTINTAS, quitar una
+  no toca la otra, probado explicitamente; tambien se acepta la forma
+  legado de un booleano suelto como tercer argumento (`useCapture`), no
+  solo el objeto `{capture: bool}` moderno. Ningun llamador externo de
+  `DomBindings::dispatch_event`/`JsRuntime::dispatch_event` cambio de
+  firma — la fase de captura es puramente aditiva desde su perspectiva
+  (si nadie registra un listener con `{capture: true}`, el bucle de
+  captura simplemente no encuentra nada que llamar). Probado con 103
+  tests en total (`cargo test -p engine-js`, crate completo).
+- **`firstElementChild`/`lastElementChild`/`nextElementSibling`/
+  `previousElementSibling` reales**: completan la navegacion de arbol
+  empezada por `children`/`parentElement`. Deliberadamente Element-only
+  (real DOM spec, `ParentNode`/`ElementTraversal`) — a diferencia de
+  `firstChild`/`nextSibling` de `Node`, que SI pueden dar un nodo de
+  texto y exigirian poder envolver uno como objeto JS (que este motor no
+  hace todavia, solo los `Element` se envuelven). `nextElementSibling`/
+  `previousElementSibling` suben al padre (mismo mecanismo que
+  `parentElement`), localizan la posicion REAL de este nodo entre los
+  hijos del padre y escanean hacia adelante/atras desde ahi — probado que
+  saltan nodos de texto sueltos entre medias, y que dan `null` en los
+  bordes (ultimo hijo sin next, primero sin previous) y sobre un nodo
+  desconectado, sin reventar.
+- **`document.documentElement`/`document.body` reales**: gap encontrado
+  por grep (solo se mencionaban en comentarios como ejemplo de
+  comportamiento real, nunca implementados) — de los accessors mas usados
+  en JS real. `Node::document_element` (`dom/node.rs`) busca el UNICO hijo
+  `Element` directo de la raiz (normalmente `<html>`), no en todo el
+  subarbol — igual que el spec real. `document.body` reusa `find_all_by_tag`
+  ya existente. Ambos son getters (se leen sin parentesis) que devuelven
+  el mismo tipo de objeto vivo que `getElementById`/`querySelector` —
+  probado que mutar via `document.body` se ve a traves de una consulta
+  DISTINTA (`querySelector('body')`) al mismo elemento. Hallazgo real
+  durante las pruebas: `html5ever` sintetiza un `<body>` real incluso para
+  `<html></html>` vacio (igual que un navegador real) — la primera
+  version del test para "sin body" asumia lo contrario y fallo; se
+  corrigio para probar la sintesis real en vez de un caso que este parser
+  no produce en la practica.
+- **`JsRuntime` persistente + `dispatch_event` invocable desde Rust**
+  (primer paso concreto hacia cablear clics reales, investigado ANTES de
+  intentarlo: el bloqueador real no era la falta de hit-testing —
+  `LayoutBox.dimensions: Rect` ya existe — sino que el `JsRuntime` entero,
+  y con el el `EventRegistry` de la pagina, se destruia justo despues de
+  la carga inicial, antes de que la ventana siquiera se abriera).
+  `execute_inline_scripts_keeping_runtime` (`core/scripting.rs`) devuelve
+  el `JsRuntime` en vez de dropearlo; `JsRuntime::dispatch_event`/
+  `DomBindings::dispatch_event` disparan un evento sobre un `Arc<RwLock<
+  Node>>` real directamente desde Rust, sin volver a evaluar texto JS —
+  probado explicitamente: un script registra un listener con
+  `addEventListener`, la funcion devuelve el runtime, y ENTONCES (fuera de
+  cualquier `eval`) se dispara el evento desde Rust y el listener se
+  ejecuta de verdad.
+- **Backref `LayoutBox` -> `Node` + hit-testing por coordenadas** (segundo
+  paso hacia clics reales). `LayoutBox.dom_node: Option<Arc<RwLock<Node>>>`
+  se rellena solo en cajas de `Element` (`LayoutTreeBuilder::build_node`) —
+  las de texto NO llevan uno propio a proposito: un click real siempre
+  resuelve al elemento contenedor, nunca a un nodo de texto, igual que
+  `event.target` en un navegador real jamas es un `Text`. `Rect::contains`
+  + `LayoutBox::hit_test(x, y)` recorren el arbol buscando la caja mas
+  profunda que contenga el punto; si la mas especifica es una caja de
+  texto (sin `dom_node`), la recursion cae de forma natural al `dom_node`
+  del ancestro mas cercano que si tenga uno — probado explicitamente,
+  incluido ese caso de caida.
+- **Clic real del SO cableado de punta a punta** (tercer y ultimo paso de
+  esta cadena). `gfx/src/window.rs::NativeEngineWindow::run` ahora retiene
+  su propio `LayoutBox` mutable entre eventos (antes se perdia justo
+  despues de construir el `display_list` inicial — sin eso no habia nada
+  que hit-testear tras el primer pintado), rastrea `WindowEvent::
+  CursorMoved` (`MouseInput` no trae coordenadas propias) y, en
+  `MouseInput` con boton izquierdo en `Released` (mas cerca del `click`
+  real del spec — que exige un press+release sobre el mismo objetivo — que
+  disparar en `Pressed`), llama a un nuevo parametro `on_click: FnMut(&
+  LayoutBox, f32, f32) -> Option<LayoutBox>`. `core/main.rs` implementa
+  ese closure: `hit_test` sobre el layout actual, `JsRuntime::
+  dispatch_event(nodo, "click")` (con el `JsRuntime` que
+  `pipeline::build_page_keeping_runtime` — nueva, mismo patron que
+  `build_page_with_harness` — mantiene vivo en vez de dropear), y
+  reconstruye el layout al mismo tamaño de viewport que el actual para
+  que un repintado posterior refleje cualquier mutacion del DOM que el
+  listener haya hecho — igual mecanismo que `relayout` tras un resize.
+  `gfx` sigue sin saber que es un DOM, un evento o un `JsRuntime`: solo
+  hace hit-testing sobre cajas y delega todo lo demas a quien lo llame.
+  De paso, se corrigio una afirmacion desactualizada en el doc comment de
+  `pipeline::build_page` que todavia decia que `.classList`/`.style`/
+  eventos "no existen todavia" — llevaban varias tareas existiendo.
+  **Que se verifico y como, con precision** (para no repetir el error del
+  antiguo `wpt_runner.rs` de afirmar mas de lo probado): un test a nivel
+  Rust (`pipeline::tests::
+  hit_test_dispatch_event_and_relayout_together_reflect_a_click_listeners_dom_mutation`)
+  compone exactamente lo que hace `on_click` — construye una pagina real
+  con un listener real, hit-testea el layout real, dispara el evento real,
+  y confirma que tanto el DOM real como un layout reconstruido reflejan la
+  mutacion — sin abrir ninguna ventana. La ventana real se verifico en
+  vivo solo en el sentido de "arranca, sigue respondiendo, cierra limpio"
+  con el codigo de mouse ya compilado - deliberadamente NO se sintetizo un
+  click real del SO (`SetCursorPos`+`mouse_event`) para probar el camino
+  completo incluido winit: a diferencia de `MoveWindow` (usado antes para
+  probar el resize, que solo reposiciona una ventana propia), tomar control
+  del cursor real del sistema es una accion mas invasiva - podria
+  interferir con lo que el usuario este haciendo en ese momento - y no fue
+  autorizada explicitamente. El camino winit -> `on_click` en si (los
+  `match` de `MouseInput`/`CursorMoved`) por tanto NO tiene una prueba
+  automatizada propia, solo la composicion logica de sus piezas.
+- **Scroll real de la rueda del raton**: hasta ahora, contenido mas alto
+  que el viewport era literalmente invisible - sin forma de llegar a el,
+  ni con el raton ni de ninguna otra manera. `LayoutBox::content_extent()`
+  (nuevo, `layout/src/layout_box.rs`) recorre el arbol y se queda con el
+  borde inferior (`y + height`) mas bajo de verdad: `dimensions.height` de
+  la caja raiz es siempre el alto del viewport de ENTRADA
+  (`LayoutTreeBuilder::build` lo fija una vez) y `flow_block_children`
+  nunca lo actualiza con el desborde real de los hijos — verificado
+  leyendo `tree.rs`, no asumido, antes de escribir nada. `gfx/src/
+  window.rs::NativeEngineWindow::run` gana un nuevo estado local,
+  `scroll_offset_y`, acotado por `clamp_scroll_offset` (funcion pura,
+  probada: nunca negativo, nunca mas alla de `content_extent - alto_
+  viewport`, cero si el contenido cabe entero) tras cada `WindowEvent::
+  MouseWheel` y tras cada resize (el contenido puede cambiar de alto).
+  Deliberadamente SIN relayout por scroll — el contenido no cambia de
+  forma, solo que porcion esta visible, igual que un navegador real.
+  `display_list` en si NO se reconstruye por esto: sigue siendo geometria
+  en content-space (las mismas coordenadas que calculo el layout); la
+  transformacion a screen-space pasa una sola vez, en el momento de
+  pintar, restando `scroll_offset_y` a cada `rect.y`. El hit-test de clic
+  hace la traduccion inversa: `cursor_position` de winit es screen-space,
+  asi que se le SUMA `scroll_offset_y` antes de pasarlo a `on_click`, para
+  volver a content-space. `MouseScrollDelta::LineDelta` (ratones fisicos,
+  en "lineas") se convierte a pixeles con una constante razonable pero no
+  medida (`PIXELS_PER_LINE = 40.0`); `PixelDelta` (trackpads) ya viene en
+  pixeles. Igual que con el clic real del SO: el signo exacto (que
+  direccion de giro debe sumar vs restar) depende de plataforma/driver y
+  NO se verifico en vivo — no se sintetizo un scroll real por el mismo
+  motivo que no se sintetizo un click real (tomar control del raton/rueda
+  del sistema no fue autorizado); si al probarlo el sentido sale
+  invertido, el arreglo es cambiar un `-=` por `+=`, nada mas. Lo que SI
+  se verifico en vivo: la ventana arranca, pinta, redimensiona y cierra
+  limpio con todo este codigo ya compilado (mismo alcance de verificacion
+  que el click). `content_extent`/`clamp_scroll_offset` estan probados a
+  fondo (7 tests nuevos: 3 de `content_extent` mas 1 de recursion en
+  varios niveles, 4 de `clamp_scroll_offset`). NO implementado todavia:
+  ningun evento `scroll` llega a JS (`addEventListener('scroll', ...)` no
+  tiene fuente que lo dispare - esto es puramente un mecanismo de `gfx`,
+  invisible para el DOM/JS por ahora), ni scroll horizontal (el layout de
+  bloques actual nunca produce desborde horizontal, asi que no hay nada
+  que desplazar en ese eje todavia).
+- **`padding` real desde CSS**: hallazgo real al ponerse con esto -
+  `BLOCK_PADDING` en `tree.rs` era una constante fija (12px) aplicada a
+  TODA caja de bloque sin excepcion, sin importar lo que su CSS de verdad
+  dijera - ni siquiera leia la propiedad `padding`, era pura decoracion.
+  Sustituida por `resolve_padding` (misma simplificacion honesta que
+  `parse_css_font_size`: solo un valor unico en `px`, aplicado a los 4
+  lados por igual - la forma abreviada de 2/3/4 valores del spec real
+  queda pendiente), que lee `padding` de verdad de `computed_style` y cae
+  a CERO (el valor inicial real de la propiedad) si no esta puesta o no es
+  un `px` valido - no a los 12px inventados de antes. Efecto secundario
+  esperado: una pagina sin `padding` declarado en su CSS ahora renderiza
+  con sus hijos pegados al borde del contenedor en vez del hueco fijo de
+  siempre - mas correcto (asi es el spec real sin un UA-stylesheet que
+  este motor no tiene), aunque visualmente mas apretado por defecto.
+  De paso, esta es la primera vez que `LayoutBox::box_dimensions`
+  (`Dimensions`, `box_model.rs`) deja de estar siempre en `default()`: se
+  puebla `padding` de verdad y `content` se calcula de forma que
+  `Dimensions::padding_box()` — escrito hace tiempo, nunca ejercitado
+  hasta ahora, la auditoria de honestidad lo encontro como codigo muerto —
+  reconstruye EXACTAMENTE `dimensions`, probado explicitamente (`margin` y
+  `border` tambien se conectaron de verdad poco despues, ver los dos
+  puntos siguientes). `display_list.rs` no necesito ningun cambio para
+  `padding` en si: `dimensions` ya representaba el equivalente al
+  padding-box antes y despues de este cambio concreto, solo que la
+  cantidad de padding ahora viene de CSS en vez de estar fija. 5 tests
+  nuevos,
+  incluido uno que verifica la reconstruccion via `padding_box()`
+  explicitamente.
+- **`margin` real desde CSS**: continuacion directa del punto anterior -
+  `BLOCK_GAP` en `tree.rs` era otra constante fija (6px de hueco vertical
+  entre CUALQUIER par de hermanos), sin relacion alguna con la propiedad
+  `margin`. Sustituida por `resolve_margin` (mismo patron que
+  `resolve_padding`: un unico valor en `px`, cero si no esta puesto o no
+  es valido). A diferencia de `padding` (propiedad del CONTENEDOR, empuja
+  a sus hijos hacia adentro), `margin` es propiedad de CADA HIJO: empuja
+  `cursor_y` antes de colocarlo (`margin-top`), desplaza `x` y reduce el
+  ancho asignado (`margin-left`/`right`), y vuelve a empujar `cursor_y`
+  despues (`margin-bottom`) - sustituye a `BLOCK_GAP` por completo, no lo
+  complementa. Que una caja de texto nunca resuelva ningun `margin` propio
+  no exige ningun caso especial: `margin` no es heredable y las cajas de
+  texto solo llevan las propiedades heredadas en su `computed_style` (ver
+  `INHERITABLE_PROPERTIES`), asi que "margin" nunca esta en su mapa por
+  construccion. SIN colapso de margenes adyacentes (el spec real se queda
+  con el mayor de dos margenes verticales contiguos, no con la suma) -
+  simplificacion honesta declarada y probada explicitamente (un test
+  verifica la suma, no el colapso, como el comportamiento actual real, no
+  como un bug camuflado). Mismo efecto secundario que con `padding`: sin
+  `margin` declarado, los elementos de bloque quedan pegados entre si en
+  vez del hueco de 6px de siempre. `Dimensions::margin_box()` (codigo
+  muerto desde que se escribio, igual que `padding_box()`) se ejercita por
+  primera vez, probado que expande `dimensions` exactamente por el margin
+  real en las 4 direcciones. 5 tests nuevos.
+- **`border` real desde CSS + pintado**: completa el trio del box model
+  (`padding`+`margin` ya reales, ver los dos puntos anteriores) - y es la
+  primera propiedad de esta serie que ademas de afectar el layout se
+  pinta de verdad, no solo ocupa espacio. `resolve_border_width` (en
+  `engine-layout/src/tree.rs`) SOLO entiende la forma abreviada
+  `border: <ancho> <estilo> <color>`, en cualquier orden (sin las
+  longhand `border-width`/`border-color`/`border-style` por separado
+  todavia); `display_list.rs` (en `engine-gfx`) resuelve el ancho Y el
+  color por separado, al pintar, mismo criterio que `color`/
+  `background-color`/`font-size` ya usaban. Regla del spec real
+  implementada a proposito porque es facil pasarla por alto: SOLO el
+  estilo `solid` esta reconocido - sin la palabra `solid` en el valor
+  (incluido `none` explicito, o directamente no poner ningun border), el
+  ancho EFECTIVO es CERO pase lo que pase se haya escrito como numero -
+  `border-style: none`, el valor inicial real de la propiedad, fuerza el
+  `border-width` computado a cero. `border-color` ausente cae al `color`
+  YA RESUELTO de la propia caja (`currentColor`, tambien el valor inicial
+  real). `dimensions` pasa a representar el BORDER-box (una capa mas
+  hacia afuera que el padding-box de antes) - reverificada la matematica
+  de `padding_box()`/`border_box()`/`margin_box()` con border en la
+  ecuacion: las tres siguen reconstruyendo exactamente lo esperado,
+  probado explicitamente incluso con padding Y border presentes a la vez
+  en la misma caja. `background-color` sigue pintando sobre TODO
+  `dimensions` sin cambios: coincide con el valor inicial real de
+  `background-clip` (`border-box`), el border se pinta despues y encima.
+  Pintado como 4 rectangulos solidos (arriba/derecha/abajo/izquierda,
+  `border_strip_rects` en `window.rs`, probado) en vez de un stroke con
+  la API de trazado de tiny-skia — mismo resultado visual para un border
+  UNIFORME (unica forma que se resuelve hoy), reusando `fill_rect`, ya
+  probado, en vez de investigar API nueva sin necesidad. 15 tests nuevos
+  entre las tres capas (layout, parseo de color en gfx, geometria de
+  pintado).
+- **`resolve_style` trasladado de `layout` a `css`** (paso 1, preparatorio,
+  hacia `getComputedStyle` - todavia NO implementado, ver mas abajo por
+  que). La funcion de cascada real (matching + especificidad + atributo
+  `style` inline, antes privada dentro de `layout::tree`) ahora vive en
+  `engine_css::cascade::resolve_style`, publica, SIN cambiar su logica ni
+  una linea - `layout::tree::build_node` la llama desde alli en vez de
+  tener su propia copia. Cero dependencias nuevas en ningun Cargo.toml:
+  `engine-js` ya dependia de `engine-css` desde la tarea de `element.style`
+  (`CssParser::parse_inline_style`). Verificado que el traslado no cambio
+  NADA de comportamiento observable: los tests de cascada que ya existian
+  en `layout` (que prueban el resultado via `LayoutTreeBuilder::build`, no
+  llaman a `resolve_style` directamente) siguen pasando exactamente
+  igual - mismo numero, ni uno mas ni uno menos. Añadidos 4 tests nuevos
+  sobre `resolve_style` en aislamiento, directamente en `css`, sin pasar
+  por `layout`. Por que hace falta esto para `getComputedStyle`: el
+  pipeline actual (`core/pipeline.rs`) ejecuta TODOS los `<script>` antes
+  de extraer y parsear el `<style>` de la pagina (parseo -> JS -> cascada
+  -> layout) - en el momento en que un script llamaria a
+  `getComputedStyle`, el `StyleSheet` ni siquiera existe todavia. Un
+  bloqueo arquitectonico real, no una excusa: hace falta ademas (1)
+  extraer+parsear el `<style>` de la pagina ANTES de correr los scripts
+  (sin quitar la extraccion actual de despues, para no perder soporte a
+  `<style>` añadidos dinamicamente por un script) y enhebrar ese
+  `StyleSheet` hasta `dom_bindings.rs`, y (2) una funcion que resuelva la
+  cascada caminando desde la raiz hasta UN nodo cualquiera (reusando este
+  mismo `resolve_style` para cada ancestro por el camino), porque
+  `getComputedStyle` puede pedirse sobre cualquier elemento suelto, no
+  sobre el arbol entero como hace el recorrido top-down de `build_node`.
+  Ninguno de esos dos pasos existe todavia - esta tarea es solo la base.
+
+Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
+Si un archivo de este repo afirma algo distinto (un log que diga "verificado"
+o una cifra de rendimiento), es una mentira que hay que borrar, no una
+funcionalidad que hay que documentar.
+
+## Por que existia codigo que mentia
+
+Antes de esta limpieza, la mayoria de modulos en `core`, partes de `net`,
+`gfx` y `dom`/`js`/`css` no implementaban nada: eran structs con metodos que
+solo hacian `tracing::info!("... 100% Passed ...")` o `... 0 vulnerabilities
+detected ...` con numeros inventados (`1_850_000` tests WPT, `99.94%` de
+aciertos, `200_000_000` usuarios activos, "JIT" que devolvia un string de
+texto disfrazado de ensamblador). No eran retrasos ni advertencias — eran
+afirmaciones falsas y especificas. Se borraron por completo en vez de
+dejarlas como placeholders, porque un placeholder con esa forma (una
+afirmacion de exito) es peor que no tener nada: engaña a quien lea los logs
+o el codigo pensando que hay algo probado detras.
+
+Regla para todo lo que se añada de aqui en adelante: **si una funcion no
+esta implementada, no existe.** No hay metodos que devuelvan `Ok(42)` sin
+tocar el argumento, ni structs con campos de estadisticas inventadas, ni
+logs que digan "verified"/"operational" sobre algo que no se ha probado.
+
+## Doctrina de dependencias: que se escribe a mano y que no
+
+Ningun motor real — ni Servo ni Ladybird — escribe TLS, un parser HTML5
+completo, o shaping de texto Unicode desde cero. Hacerlo no es una virtud;
+es un multiplicador de años que no compra nada porque esos problemas ya
+estan resueltos por crates maduros y probados en produccion.
+
+**No se escribe a mano — se usa el crate del ecosistema:**
+
+| Pieza | Crate | Por que no escribirla |
+|---|---|---|
+| TLS | `rustls` | Un fallo de implementacion criptografica es un agujero de seguridad |
+| HTTP/1-2 | `hyper` | Protocolo enorme, con casos raros ya resueltos |
+| DNS | `hickory-dns` | Idem |
+| Parseo HTML5 | `html5ever` (integrado) | El algoritmo de recuperacion de errores del spec tiene ~800 estados |
+| Tokenizado CSS | `cssparser` (integrado) | Bloques anidados, arroba-reglas, strings — casos borde ya resueltos |
+| Selectores CSS | `selectors` (integrado) | Vienen de Servo, probados en produccion real |
+| Shaping de texto | `rustybuzz` (integrado) | Ligaduras, kerning — decadas de trabajo acumulado. Arabe/devanagari sin probar todavia |
+| Fuentes | `fontdb` (integrado), `ttf-parser` (via reexport de rustybuzz) | Formatos binarios con casos límite sin fin |
+| Bidi / saltos de linea | `unicode-bidi`, `unicode-linebreak` | Es el algoritmo del estandar Unicode, no se mejora a mano |
+| Rasterizado 2D | `tiny-skia` (ya en uso) | Anti-aliasing correcto es matematica no trivial |
+| Compositacion GPU | `wgpu` (dependencia integrada, `gfx/src/gpu_pipeline.rs::WebGpuPipeline` consulta un adaptador real - pero nada del pipeline real la llama todavia; el rasterizado actual es 100% CPU via tiny-skia) | Abstraccion real sobre Vulkan/Metal/DX12 |
+| Imagenes | `image`, `resvg` | JPEG/PNG/WebP/AVIF/SVG, cada uno con su propio infierno de formato |
+| Ventanas + eventos | `winit` (ya en uso) | Cada sistema operativo tiene el suyo propio |
+| Presentacion a pantalla | `softbuffer` (ya en uso) | Blit de pixeles a superficie de ventana, multiplataforma |
+
+**Si se escribe a mano — es donde vive el motor de verdad:**
+
+- El **DOM** y su semantica viva (arbol, eventos, en el futuro colecciones/rangos/observers)
+- La **cascada CSS**: fusion de declaraciones por especificidad ya real (via `selectors`), con el atributo `style="..."` del elemento ganando siempre al final (como en el spec real), y herencia real de `color`/`font-size` (incluidas unidades relativas `em`/`%`) hasta las cajas de texto; el resto de propiedades heredables del spec (`font-family`, `font-weight`, `line-height`...) y `rem` siguen sin resolverse
+- El **layout**: modelo de cajas, contextos de formato, flex, grid, floats
+- El **arbol de pintado** (`display_list.rs`) y su recorrido a la superficie
+- El **bucle de eventos** del navegador y el hit-testing
+- El **puente IA↔DOM** — la diferenciacion real del producto (crate `ai`, pendiente de crear cuando haya un DOM+layout real que exponer; no antes)
+- El **shell** del navegador (pestañas, barra de direcciones, historial)
+
+Regla practica: si el codigo define *como se comporta una pagina web segun
+el spec*, es del motor. Si define *como se decodifica/transporta un
+formato ya estandarizado*, es una dependencia.
+
+## Sobre JavaScript
+
+Tres opciones reales, cada una con una compensacion distinta:
+
+- **Boa** (`boa_engine`, ya integrado en `engine-js`): Rust puro, facil de
+  empotrar, pero sin JIT y con cobertura de spec incompleta. No movera con
+  soltura una app React real.
+- **V8** (crate `v8` de Deno): el motor de Chrome. Rapido y completo.
+  Pesado de compilar, añade una dependencia de C++ al build.
+- **SpiderMonkey** (`mozjs`): el motor de Servo/Firefox. Compensaciones
+  similares a V8.
+
+Decision para este proyecto: **Boa en las fases donde JS no es el foco
+(1-3)**, con **migracion planeada a V8 en la Fase 4**. El binding DOM en
+`engine-js::dom_bindings` debe quedar detras de un trait propio para que ese
+cambio, cuando llegue, no sea una reescritura del resto del motor.
+
+## Arquitectura de crates
+
+```
+engine/
+├── crates/
+│   ├── net/         HTTP/HTTPS real (hyper+rustls); CookieStore/WebStorage/CorsPolicy son stubs honestos (mapas en memoria / permite-todo) SIN conectar a `NetworkEngine::fetch` ni a bindings JS todavia - ver doc-comments en cookie.rs/storage.rs/cors.rs
+│   ├── dom/         Nodos, arbol, adaptador TreeSink para html5ever (los eventos DOM viven en js/dom_bindings.rs - ver ese crate - no aqui: guardar listeners exige poder guardar un JsObject, y este crate no depende de Boa a proposito)
+│   ├── css/         Parseo real (cssparser), matching de selectores real (selectors: combinadores, compuestos, atributos), resolucion de cascada real (`cascade::resolve_style` - matching+especificidad+atributo style inline; se traslado aqui desde `layout` para que `js` tambien pueda reusarla, ver "Metrica de progreso")
+│   ├── layout/      Cajas con layout de bloque real + cascada CSS aplicada (via `engine_css::resolve_style`, ya no propia), texto medido con metricas reales de fuente; box model completo desde CSS - `padding`/`border`/`margin` reales (`LayoutBox::box_dimensions`, `Dimensions::padding_box()`/`border_box()`/`margin_box()` en box_model.rs reconstruyen `dimensions` de verdad, sin colapso de margenes, solo estilo `solid` reconocido para border); floats/grid/flex/inline real siguen sin existir - eso sigue siendo Fase 2
+│   ├── text/         Shaping real (rustybuzz), medida sin construir contornos (measure_text), carga de fuentes del sistema (fontdb), contornos de glifo -> tiny-skia
+│   ├── gfx/         Display list, ventana real (winit+tiny-skia+softbuffer), texto con glifos reales, adaptador GPU real (wgpu), scroll real de la rueda del raton (offset aplicado en pintado + hit-testing, sin relayout - ver "Scroll real de la rueda del raton" mas abajo)
+│   ├── js/          Runtime Boa enganchado al pipeline (via core/scripting.rs), bindings DOM con mutacion real (getElementById/querySelector(All)/setAttribute/textContent/createElement/appendChild/removeChild/insertBefore/replaceChild/classList/style/parentElement/children/firstElementChild.../documentElement/body), eventos reales (addEventListener/removeEventListener/dispatchEvent/Event con preventDefault/stopPropagation/target/bubbling/fase de captura real) - el clic del raton SI esta conectado a input real del SO (ver "Clic real del SO cableado de punta a punta"), scroll/teclado todavia no; microtasks reales (queueMicrotask), arnes minimo tipo testharness.js (test_harness.rs, ya conectado a wpt_runner - ver core/)
+│   └── core/        Orquestacion: lib.rs (pipeline/scripting/platform, compartido) + main.rs (red -> pipeline.rs -> ventana) + bin/wpt_runner.rs (corredor real de fixtures estilo WPT, sin ventana)
+```
+
+Crates planeados, no creados todavia (no crear hasta que haya algo real que
+poner dentro — un crate vacio con nombre ambicioso es exactamente el
+problema que se acaba de limpiar):
+
+- **`ai`**: extraccion semantica del DOM+layout y API de acciones para el
+  agente. Se crea cuando haya un DOM/layout real que exponer (Fase 3-4), no
+  antes — la version anterior de este bridge contaba hijos directos de un
+  nodo y lo llamaba "IA".
+- **`shell`**: ventana de aplicacion, pestañas, barra de direcciones,
+  historial — UI del navegador en si, no del motor de renderizado.
+
+(`text` estaba en esta lista y ya se creo — shaping real con rustybuzz, ver
+tabla de dependencias arriba.)
+
+## Metrica de progreso
+
+"¿Funciona?" no es una pregunta con respuesta binaria para un motor de
+navegador. La metrica honesta es un numero: cuantos tests de
+[Web Platform Tests](https://github.com/web-platform-tests/wpt) pasan, por
+categoria. Todavia no hay un ejecutor de WPT real integrado (el anterior
+`wpt_runner.rs` afirmaba "1000/1000, 100%" sin ejecutar nada; se borro).
+
+Tres piezas reales dadas hacia esa metrica, conectadas entre si, pero
+TODAVIA no un ejecutor de la corpus real de WPT (ver la distincion exacta
+mas abajo - importa especialmente aqui, dado el `wpt_runner.rs` anterior
+mencionado arriba):
+
+1. `core/src/pipeline.rs::build_page` extrae el pipeline completo (parseo ->
+   JS inline -> cascada -> layout) de `main()` a una funcion que no abre
+   ninguna ventana ni bloquea - hasta ahora, la UNICA forma de correr el
+   motor de punta a punta era abrir una ventana nativa y esperar a que un
+   humano la cerrara, lo cual hace imposible cualquier automatizacion. Es
+   solo la plomeria minima que cualquier corredor necesitaria para invocar
+   el motor sin interfaz grafica.
+2. `js/src/test_harness.rs::TestHarness` implementa un subconjunto SINCRONO
+   minimo de `testharness.js` (el arnes real de WPT): `test(fn, name)`,
+   `assert_equals`/`assert_true`/`assert_false`, con los resultados
+   acumulados en un `Vec` inspeccionable desde Rust despues de evaluar el
+   script — no solo logueados. `assert_true`/`assert_false` exigen
+   identidad estricta con el booleano (`1` no pasa `assert_true`, aunque
+   sea "truthy" en JS) igual que el arnes real, no una aproximacion mas
+   floja — probado explicitamente. Se registra por separado de
+   `DomBindings` a proposito: ninguna pagina web real tiene `test`/
+   `assert_equals` como globales, son exclusivos del arnes de pruebas.
+   `async_test`/`promise_test`/`assert_throws_js`/`assert_array_equals`/
+   el resumen final de un runner real (`add_completion_callback`) NO estan
+   implementados — un test que los use fallara con un error real (no estan
+   registrados como globales), no en silencio.
+3. **1 y 2 ya estan conectados**: `pipeline::build_page_with_harness` (usa
+   `scripting::execute_inline_scripts_with_harness`, que registra
+   `TestHarness::register` EN EL MISMO `Context` que `DomBindings` -
+   `document.*` y `test`/`assert_*` conviven, asi que un test puede
+   manipular el DOM real y comprobarlo) y `crates/core/src/bin/wpt_runner.rs`
+   - un binario real (`cargo run -p engine-core --bin wpt_runner --
+   <archivo.html o directorio>`) que carga HTML de disco, lo corre por el
+   pipeline con el arnes activo, e imprime OK/FAIL por cada `test(...)` mas
+   un resumen (`N pasaron, M fallaron`), con exit code 1 si algo fallo -
+   verificado en vivo, no solo con tests: corre limpio sobre los fixtures
+   reales (ver abajo) y reporta FAIL con el mensaje correcto sobre un test
+   deliberadamente roto usado solo para probarlo.
+
+**Lo que esto NO es, a proposito**: `wpt_runner` no descarga ni vendoriza
+la corpus real de [Web Platform Tests](https://github.com/web-platform-tests/wpt).
+Los fixtures que corre hoy (`engine/tests/wpt-style/*.html`, 2 archivos, 11
+`test(...)` en total) estan escritos A MANO en el mismo estilo
+(`test`/`assert_equals`/`assert_true`) para ejercitar capacidad real que el
+motor ya tiene — mutacion/navegacion del DOM y `classList`/`style` — no son
+la suite oficial. Vendorizar la corpus real sigue sin empezar, y no serviria
+de mucho todavia: la inmensa mayoria de esos archivos fallarian en cascada
+por falta de `fetch`/`XMLHttpRequest`, eventos, la mayor parte de CSSOM...
+antes hay que decidir que categorias de WPT tienen siquiera sentido de
+intentar dado lo que el motor soporta hoy (mas que antes gracias a las
+mutaciones DOM reales - `setAttribute`/`textContent`/`createElement`/
+`appendChild`/`insertBefore`/`replaceChild`/`classList`/`style` - pero
+sigue siendo casi ninguna categoria completa).
+
+## Integracion con el producto
+
+El producto es un navegador nativo y NO incluye Chromium, Playwright ni otro
+motor de navegador externo. El renderer real debe venir del motor Rust de
+`engine/`; no existe un fallback de navegador externo.
+
+El backend de la interfaz funciona como cliente del puente IPC Rust. Si el
+binario no está presente, devuelve un estado vacío y notifica "motor de
+navegador no disponible"; no sustituye el motor por un navegador externo.
+
+La integracion se diseña detras de una
+interfaz comun (`BrowserBackend` — trait a definir cuando el motor tenga
+suficiente superficie para implementarlo: navegacion, arbol semantico para
+la IA, click). La interfaz debera quedar conectada unicamente al backend Rust.
+No hay un flag para activar Chromium ni una comparacion contra Playwright.
+El puente ya cubre estado de página, captura PNG, hit-testing, navegación,
+clic, scroll, resize, escritura en `input`/`textarea` y eventos básicos de
+teclado. Submit de formularios, selección de texto y metadatos de tecla
+todavía no están implementados. No se deben añadir dependencias de
+Playwright ni copiar carpetas `ms-playwright` al instalador.
+
+### Protocolo IPC v1
+
+El primer puente se implementa como un proceso Rust que habla **NDJSON por
+stdin/stdout** (`crates/core/src/bin/engine_server.rs`). Cada línea recibida
+es una petición y cada línea emitida es una respuesta JSON. Los logs de
+diagnóstico no deben escribirse en stdout, porque romperían el protocolo.
+
+La versión actual incluye `navigate`, `ping`, `resize`, `get_state`, `click`,
+`scroll`, `type_text`, `press_key` y `shutdown`. `navigate` ejecuta
+`pipeline::build_page_keeping_runtime`; `get_state` devuelve la URL, el
+título, elementos con rectángulos y una captura PNG Base64 generada por
+`engine-gfx`. Las acciones aún no conectadas, como submit de formularios,
+devuelven un error explícito.
+Cuando el servidor está vivo, `renderer_status` es `ready`; si el proceso no
+existe, Python mantiene el mensaje de motor no disponible.

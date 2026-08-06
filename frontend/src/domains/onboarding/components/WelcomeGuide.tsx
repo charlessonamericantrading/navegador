@@ -100,10 +100,6 @@ export const WelcomeGuide: React.FC<WelcomeGuideProps> = ({ onFinish }) => {
               habitual, ni tus contraseñas o pestañas) y deja que un agente de IA navegue por
               internet siguiendo instrucciones que tú escribes en español sencillo.
             </p>
-            <p style={{ color: 'var(--text-dim)', lineHeight: 1.5, fontSize: '0.85rem' }}>
-              Puedes ver en todo momento lo que el agente está pensando y haciendo, y detenerlo
-              cuando quieras con el botón "Detener Agente".
-            </p>
           </>
         )}
 
@@ -123,8 +119,7 @@ export const WelcomeGuide: React.FC<WelcomeGuideProps> = ({ onFinish }) => {
                 <strong style={{ fontSize: '0.9rem' }}>✨ Modo IA real (Gemini)</strong>
                 <p style={{ color: 'var(--text-dim)', fontSize: '0.82rem', marginTop: '4px', lineHeight: 1.5 }}>
                   Razona de verdad con IA de Google. Es opcional y requiere tu propia clave gratuita
-                  de Google AI Studio, que se guarda solo en tu ordenador. Puedes activarlo más
-                  tarde en "Ajustes".
+                  de Google AI Studio, que se guarda solo en tu ordenador.
                 </p>
               </div>
             </div>
@@ -140,8 +135,8 @@ export const WelcomeGuide: React.FC<WelcomeGuideProps> = ({ onFinish }) => {
             <div style={{ fontSize: '2rem' }}>🚀</div>
             <h2 style={{ fontSize: '1.3rem', fontWeight: 700 }}>Prueba tu primer ejemplo</h2>
             <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', lineHeight: 1.5 }}>
-              Elige uno para empezar ahora mismo, o cierra esta guía y escribe tu propia instrucción
-              en la consola de la derecha.
+              Así son las instrucciones que puedes darle al agente. Cierra esta guía cuando quieras
+              para volver al navegador.
             </p>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
               {EXAMPLE_GOALS.map(ex => (

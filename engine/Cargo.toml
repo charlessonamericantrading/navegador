@@ -6,6 +6,7 @@ members = [
     "crates/css",
     "crates/layout",
     "crates/gfx",
+    "crates/text",
     "crates/js",
     "crates/core",
 ]
@@ -24,3 +25,6 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 bytes = "1.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"

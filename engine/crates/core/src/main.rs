@@ -1,108 +1,141 @@
-mod sandbox;
-mod security_pipeline;
-mod updater;
-mod platform;
-mod resource_governor;
-mod ai_dom_bridge;
+use engine_core::pipeline::build_page_keeping_runtime;
+use engine_core::platform::CrossPlatformTarget;
 
-use sandbox::OsKernelSandbox;
-use security_pipeline::SecurityPipeline;
-use updater::{GlobalUpdateEngine, UpdateRing, CrashpadReporter};
-use platform::CrossPlatformTarget;
-use resource_governor::ResourceGovernor;
-use ai_dom_bridge::AiDomEngineBridge;
+use engine_net::{NetworkEngine, NetworkRequest};
+use engine_gfx::NativeEngineWindow;
+use engine_layout::LayoutTreeBuilder;
+use engine_text::SystemFont;
+use tracing::{info, warn};
 
-use engine_net::{NetworkEngine, NetworkRequest, WebStorage, NativeAdBlocker, EncryptedSyncEngine, AntiManifestV3Filter};
-use engine_dom::{HtmlParser, DomEvent, EventDispatcher, WptRunner, WptSuiteAutomation, HardwareVideoCodecPipeline, ChromeExtensionMv3Bridge};
-use engine_css::{CssParser, ContainerQueryEvaluator, Matrix3DTransform};
-use engine_layout::{LayoutTreeBuilder, FlexLayoutEngine, FlexDirection, JustifyContent, AlignItems, ConcurrencyOptimizer};
-use engine_gfx::{DisplayList, WebGpuPipeline, WebGlContext};
-use engine_js::{JsRuntime, JitCompiler, WasmEngine};
-use tracing::info;
+const VIEWPORT_WIDTH: f32 = 1280.0;
+const VIEWPORT_HEIGHT: f32 = 720.0;
+
+/// Pagina local usada solo cuando la red falla. Se etiqueta explicitamente
+/// como local para que nunca se confunda con una carga real: la version
+/// anterior de este cliente fabricaba una respuesta de "exito" falsa cuando
+/// la conexion fallaba, lo cual ocultaba el fallo real.
+const OFFLINE_FALLBACK_HTML: &str = r#"<html>
+<head><title>Sin conexion</title></head>
+<body>
+<h1>No se pudo conectar</h1>
+<p>Esta es una pagina local de prueba, no contenido descargado de la red.</p>
+<p>Esto aparece cuando la peticion de red falla (DNS, conexion rechazada, timeout...); el motor si soporta TLS (hyper+rustls, ver ARCHITECTURE.md).</p>
+</body>
+</html>"#;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    info!("========================================================================");
-    info!("🚀 NATIVE BROWSER ENGINE - COMPETITIVE DIFFERENTIATION SUITE");
-    info!("========================================================================");
-
-    // Ventaja 1: Gobernador de Recursos & Memoria Ultra-Baja (<30MB por pestaña vs >200MB Chrome)
-    let governor = ResourceGovernor::enable_ultra_low_memory_mode();
-    governor.enforce_limits(10); // 10 pestañas abiertas -> 300MB total vs 2GB+ en Chrome
-
-    // Ventaja 2: Filtro Anti-Manifest V3 de Red Nativo sin Latencia
-    let net_filter = AntiManifestV3Filter::new();
-    net_filter.inspect_and_filter("https://adservice.google.com/ads.js");
-
-    // Ventaja 3: Layout Concurrente Paralelo Multihilo (100% CPU Utilization)
-    ConcurrencyOptimizer::optimize_parallel_reflow(1500, 8);
-
-    // Ventaja 4: Puente IA Nativo Integrado al DOM Core
-    let dom_root = HtmlParser::parse("<html><body><form><input id='email'/><button>Submit</button></form></body></html>");
-    AiDomEngineBridge::inspect_dom_and_execute_task("Auto-fill checkout form and submit", &dom_root);
-
-    // Sistema Multiproceso & Seguridad de Kernel
     CrossPlatformTarget::print_target_info();
-    let sandbox = OsKernelSandbox::enable_strict_sandbox();
-    SecurityPipeline::enforce_site_isolation("banco.com");
-    info!("[Security Sandbox] Active Profile: AppContainer Strict ({})", sandbox.profile);
 
-    // Actualizaciones Globales & Telemetría
-    CrashpadReporter::init();
-    let updater = GlobalUpdateEngine::new(UpdateRing::Stable);
-    updater.check_for_delta_updates();
-
-    let adblocker = NativeAdBlocker::new();
-    adblocker.should_block_network_request("https://tracker.analytics.com/log");
-    EncryptedSyncEngine::sync_user_profile("user_200m_global_001");
-
-    HardwareVideoCodecPipeline::initialize_codecs();
-    ChromeExtensionMv3Bridge::load_extension("ublock-origin-mv3-native");
-    let wpt_auto = WptSuiteAutomation::new();
-    wpt_auto.run_continuous_integration();
-
+    // https://example.com no resuelve en DNS en este entorno de desarrollo
+    // (verificado: info.cern.ch y google.com si resuelven, example.com no;
+    // particularidad de red local, no del motor). Se usa info.cern.ch de
+    // nuevo pero ahora por https, para probar TLS real con un host que
+    // sabemos alcanzable.
+    let target_url = "https://info.cern.ch/hypertext/WWW/TheProject.html";
     let net = NetworkEngine::new();
-    let mut storage = WebStorage::new();
-    storage.set_item("global_user_scale", "200_000_000_active");
 
-    let req = NetworkRequest::new("https://example.com")?;
-    let res = net.fetch(&req).await?;
-    let html_body = res.text()?;
+    let html = match NetworkRequest::new(target_url) {
+        Ok(req) => match net.fetch(&req).await {
+            Ok(res) if res.is_success() => {
+                info!("Descarga real completada: {} ({} bytes)", target_url, res.body.len());
+                res.text().unwrap_or_else(|_| OFFLINE_FALLBACK_HTML.to_string())
+            }
+            Ok(res) => {
+                warn!("{} respondio {} (no 2xx); usando pagina local de prueba", target_url, res.status_code);
+                OFFLINE_FALLBACK_HTML.to_string()
+            }
+            Err(e) => {
+                warn!("Fallo la descarga real de {}: {e}. Usando pagina local de prueba.", target_url);
+                OFFLINE_FALLBACK_HTML.to_string()
+            }
+        },
+        Err(e) => {
+            warn!("URL invalida: {e}. Usando pagina local de prueba.");
+            OFFLINE_FALLBACK_HTML.to_string()
+        }
+    };
 
-    let wpt = WptRunner::new();
-    wpt.run_suite("W3C HTML5 Living Standard Suite");
-    let mut click_evt = DomEvent::new("click", true);
-    EventDispatcher::dispatch(&mut click_evt, &dom_root);
+    // Se carga una sola vez aqui y se pasa tanto al pipeline (para medir
+    // texto con metricas reales, ver LayoutTreeBuilder::build) como a la
+    // ventana (para pintarlo) - antes solo la cargaba la ventana, y el
+    // layout medía el texto con una aproximacion fija que ignoraba el
+    // font-size real.
+    let font = SystemFont::load_default_sans_serif();
+    match &font {
+        Some(_) => info!("Fuente de sistema cargada para medir y pintar texto real"),
+        None => warn!("Sin fuente de sistema disponible: el texto se medira/pintara como aproximacion/relleno"),
+    }
 
-    let stylesheet = CssParser::parse("body { display: flex; transform-style: preserve-3d; }");
-    ContainerQueryEvaluator::evaluate_query("(min-width: 1024px)", 1920.0);
-    let _mat3d = Matrix3DTransform::identity();
+    // Pipeline real (parseo -> JS inline -> cascada -> layout), extraido a
+    // core/pipeline.rs para poder invocarse tambien sin ventana (ver el
+    // aviso ahi sobre por que: primer paso hacia poder medir el motor con
+    // datos objetivos en vez de solo verificarlo a ojo). build_page ya
+    // extrae y aplica el CSS real que la propia pagina declara en sus
+    // <style> - antes de esto, aqui se pasaba un CSS de ejemplo hardcodeado
+    // (background-color/color/font-size inventados) que no tenia nada que
+    // ver con lo que info.cern.ch realmente declara; se quito porque seguir
+    // mezclandolo con el CSS real de la pagina, sin ninguna etiqueta que
+    // dijera cual es cual, era enganoso. No se inyecta nada extra aqui: si
+    // la pagina no tiene <style>, se ve sin estilo, honestamente.
+    // `build_page_keeping_runtime` (en vez de `build_page`) devuelve
+    // TAMBIEN el `JsRuntime` vivo en vez de dropearlo - lo necesita
+    // `on_click`, mas abajo, para poder disparar un "click" real sobre
+    // listeners que un script haya registrado durante la carga inicial.
+    let (page, mut runtime) = build_page_keeping_runtime(&html, "", VIEWPORT_WIDTH, VIEWPORT_HEIGHT, font.as_ref());
 
-    let mut layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, 1920.0, 1080.0);
-    FlexLayoutEngine::layout_flex(&mut layout_root, FlexDirection::Row, JustifyContent::Center, AlignItems::Center);
+    for result in &page.script_results {
+        match result {
+            Ok(value) => info!("[js] script ejecutado, resultado: {value}"),
+            Err(e) => warn!("[js] error ejecutando script: {e}"),
+        }
+    }
 
-    let gpu_pipeline = WebGpuPipeline::new();
-    info!("[WebGPU 3D Canvas] GPU Hardware Adapter: '{}'", gpu_pipeline.adapter_name);
-    let webgl = WebGlContext::new();
-    webgl.draw_arrays("TRIANGLES", 36);
-    info!("[Display List] Total Painted Items: {}", DisplayList::build(&layout_root).items.len());
+    // `relayout` reconstruye el layout de verdad cuando la ventana cambia
+    // de tamaño (ver el aviso en NativeEngineWindow::run) - captura clones
+    // de dom_root/stylesheet/font en vez de moverlos, porque el layout
+    // inicial (`page.layout_root`, abajo) y la propia ventana todavia
+    // necesitan sus propias copias.
+    let dom_root_for_relayout = page.dom_root.clone();
+    let stylesheet_for_relayout = page.stylesheet.clone();
+    let font_for_relayout = font.clone();
+    let relayout = move |width: f32, height: f32| {
+        LayoutTreeBuilder::build(&dom_root_for_relayout, &stylesheet_for_relayout, width, height, font_for_relayout.as_ref())
+    };
 
-    let jit = JitCompiler::new();
-    let native_asm = jit.compile_bytecode_to_native("globalEventLoop");
-    info!("[JIT x86_64] Native Code Generated: {}", native_asm);
-    let wasm_res = WasmEngine::execute_wasm_simd_module(&[0x00, 0x61, 0x73, 0x6d])?;
-    info!("[WASM 128-bit SIMD] Result: {}", wasm_res);
+    // `on_click` es el ultimo eslabon de la cadena clic-real -> evento-real
+    // (ver ARCHITECTURE.md): `NativeEngineWindow::run` ya hace hit-testing
+    // sobre el layout actual y le pasa el nodo encontrado; aqui se dispara
+    // el "click" de verdad (`JsRuntime::dispatch_event`, invocable desde
+    // Rust sin pasar por texto JS - ver `runtime.rs`) y se reconstruye el
+    // layout por si el listener mutó el DOM, igual que `relayout` arriba
+    // pero al mismo tamaño que el layout actual (`current_layout.
+    // dimensions`), no uno nuevo. Captura su propio `runtime` (movido
+    // aqui) y sus propios clones de dom_root/stylesheet/font - cada
+    // closure necesita los suyos porque las tres (esta, `relayout`, y el
+    // layout inicial de abajo) coexisten.
+    let dom_root_for_click = page.dom_root.clone();
+    let stylesheet_for_click = page.stylesheet.clone();
+    let font_for_click = font.clone();
+    let on_click = move |current_layout: &engine_layout::LayoutBox, x: f32, y: f32| {
+        let node = current_layout.hit_test(x, y)?;
+        match runtime.dispatch_event(&node, "click") {
+            Ok(()) => info!("[click] evento 'click' disparado sobre el nodo bajo ({x}, {y})"),
+            Err(e) => warn!("[click] fallo al disparar 'click' sobre el nodo bajo ({x}, {y}): {e}"),
+        }
+        Some(LayoutTreeBuilder::build(
+            &dom_root_for_click,
+            &stylesheet_for_click,
+            current_layout.dimensions.width,
+            current_layout.dimensions.height,
+            font_for_click.as_ref(),
+        ))
+    };
 
-    let mut js_runtime = JsRuntime::new();
-    js_runtime.bind_dom(dom_root.clone())?;
-    let js_out = js_runtime.eval("printEngineLog('Competitive Advantage Suite Verified'); 2026 + 70;")?;
-    info!("[JS Engine] Output -> {}", js_out);
-
-    info!("========================================================================");
-    info!("🏆 ALL COMPETITIVE DIFFERENTIATION SUITES VERIFIED & OPERATIONAL!");
-    info!("========================================================================");
+    info!("Abriendo ventana nativa...");
+    NativeEngineWindow::run("Navegador IA - Motor Nativo (Fase 1, en progreso)", page.layout_root, font, relayout, on_click);
 
     Ok(())
 }

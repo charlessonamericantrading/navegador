@@ -32,8 +32,8 @@ def friendly_error(exc: Exception) -> str:
         return "No se ha podido conectar a esa dirección. Comprueba tu conexión a internet o que la URL sea correcta."
     if "invalid url" in text or "err_invalid" in text:
         return "Esa dirección no parece válida. Revisa que esté bien escrita."
-    if "target closed" in text or "browser has been closed" in text or "connection closed" in text:
-        return "El navegador de pruebas se cerró inesperadamente. Vamos a reabrirlo."
+    if "motor de navegador no disponible" in text:
+        return "El navegador no tiene ningún motor de renderizado conectado todavía."
     return "Ha ocurrido un problema inesperado al interactuar con la página. Puedes intentarlo de nuevo."
 
 
@@ -53,26 +53,22 @@ browser_manager = BrowserManager()
 
 async def send_browser_state(websocket: WebSocket):
     """Obtiene la captura y elementos del navegador y los envía por el WebSocket."""
-    screenshot = await browser_manager.get_screenshot()
-    url = await browser_manager.get_url()
-    elements = await browser_manager.get_elements()
+    state = await browser_manager.get_state()
     
     await websocket.send_json({
         "type": "browser_state",
-        "screenshot": screenshot,
-        "url": url,
-        "elements": elements
+        "screenshot": state.get("screenshot", ""),
+        "url": state.get("url", ""),
+        "elements": state.get("elements", [])
     })
 
 @app.on_event("startup")
 async def startup_event():
-    print("Iniciando navegador Playwright en segundo plano...")
     await browser_manager.start()
-    print("Navegador listo.")
+    print("Backend listo (motor nativo Rust pendiente de conexión; no se usará Chromium).")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    print("Cerrando navegador...")
     await browser_manager.close()
     print("Servidor detenido.")
 
@@ -196,7 +192,24 @@ async def websocket_endpoint(websocket: WebSocket):
                     await browser_manager.press_key(key)
                     await send_browser_state(websocket)
 
+                elif msg_type == "scroll":
+                    # Sin status_msg: el scroll se dispara muchas veces seguidas
+                    # y llenaría la consola sin aportar nada al usuario.
+                    dx = int(message.get("dx", 0))
+                    dy = int(message.get("dy", 0))
+                    await browser_manager.scroll(dx, dy)
+                    await send_browser_state(websocket)
+
                 elif msg_type == "refresh_browser":
+                    await send_browser_state(websocket)
+
+                elif msg_type == "resize":
+                    # El frontend informa del tamaño real de su contenedor - sin
+                    # motor de renderizado conectado, BrowserManager.resize() solo
+                    # guarda las medidas, no hay ningún viewport que ajustar todavía.
+                    width = max(200, min(int(message.get("width")), 4000))
+                    height = max(200, min(int(message.get("height")), 4000))
+                    await browser_manager.resize(width, height)
                     await send_browser_state(websocket)
             except Exception as action_error:
                 print(f"Error ejecutando acción '{msg_type}': {action_error}")

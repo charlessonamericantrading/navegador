@@ -1,0 +1,236 @@
+//! Conecta `engine-js` (el wrapper de Boa, hasta ahora aislado) con el
+//! pipeline principal: encuentra los `<script>` inline de la pagina cargada
+//! y los ejecuta de verdad.
+//!
+//! Simplificaciones honestas:
+//! - `<script src="...">` (externo) se detecta y se omite explicitamente en
+//!   vez de intentar descargarlo - eso exige encolar otra peticion de red en
+//!   el orden correcto respecto al parseo, tarea aparte.
+//! - Los scripts se ejecutan todos seguidos, de una vez, despues de parsear
+//!   el documento completo - un navegador real intercala parseo y ejecucion
+//!   (un `<script>` puede hacer `document.write` y modificar lo que queda
+//!   por parsear). Aqui el parseo ya termino del todo para cuando el primer
+//!   script corre, asi que esa interaccion no puede pasar estructuralmente,
+//!   sin relacion con cuantos bindings DOM haya (`dom_bindings.rs` expone
+//!   bastante mas que `printEngineLog` a estas alturas: getElementById/
+//!   querySelector(All), setAttribute/textContent, createElement/
+//!   appendChild/removeChild/insertBefore/replaceChild, classList/style,
+//!   addEventListener/dispatchEvent - `document.write` en si mismo no esta
+//!   entre ellos).
+//! - Sin `async`/eventos: cada script corre hasta el final de forma
+//!   sincrona con el mismo `JsRuntime` (mismo `Context` de Boa) que los
+//!   anteriores, para que variables/funciones declaradas en un script
+//!   esten disponibles en el siguiente, como en una pagina real.
+
+use engine_dom::{Node, NodeType};
+use engine_js::{JsRuntime, TestHarness, TestResult};
+use std::sync::{Arc, RwLock};
+
+pub fn execute_inline_scripts(dom_root: &Arc<RwLock<Node>>) -> Vec<Result<String, String>> {
+    let scripts = Node::find_all_by_tag(dom_root, "script");
+    if scripts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut runtime = JsRuntime::new();
+    if let Err(e) = runtime.bind_dom(dom_root.clone()) {
+        tracing::warn!("[js] no se pudo enlazar el DOM al runtime: {e}");
+    }
+
+    run_scripts(&mut runtime, &scripts)
+}
+
+/// Igual que `execute_inline_scripts`, pero TAMBIEN registra
+/// `TestHarness::register` en el mismo `Context` - `document.*` y
+/// `test`/`assert_*` conviven sin conflicto (nombres de globales distintos),
+/// asi que un script de test puede usar ambos a la vez, igual que un test
+/// real de WPT que manipula el DOM. Ninguna pagina real usa esto - solo el
+/// runner de tests (`bin/wpt_runner.rs`) - por eso es una funcion aparte y
+/// no un flag en `execute_inline_scripts`.
+pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>) -> (Vec<Result<String, String>>, Vec<TestResult>) {
+    let scripts = Node::find_all_by_tag(dom_root, "script");
+    if scripts.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut runtime = JsRuntime::new();
+    if let Err(e) = runtime.bind_dom(dom_root.clone()) {
+        tracing::warn!("[js] no se pudo enlazar el DOM al runtime: {e}");
+    }
+    let test_results = match TestHarness::register(&mut runtime.context) {
+        Ok(results) => results,
+        Err(e) => {
+            tracing::warn!("[js] no se pudo registrar el arnes de tests: {e}");
+            return (run_scripts(&mut runtime, &scripts), Vec::new());
+        }
+    };
+
+    let script_results = run_scripts(&mut runtime, &scripts);
+    let test_results = test_results.lock().unwrap().clone();
+    (script_results, test_results)
+}
+
+/// Igual que `execute_inline_scripts`, pero DEVUELVE el `JsRuntime` en vez
+/// de dropearlo al terminar - necesario para poder disparar eventos MAS
+/// TARDE (`JsRuntime::dispatch_event`) sobre los listeners que un script
+/// registro con `addEventListener` durante la carga inicial; sin esto, el
+/// `EventRegistry` entero (y con el, cualquier listener) se destruye antes
+/// de que la ventana siquiera se abra. A diferencia de
+/// `execute_inline_scripts`/`execute_inline_scripts_with_harness` (que se
+/// saltan crear el runtime si no hay ningun `<script>`, porque no habria
+/// nada que evaluar), esta SIEMPRE crea y enlaza uno, incluso sin scripts -
+/// quien llama quiere un runtime vivo pase lo que pase, no solo cuando hubo
+/// algo que ejecutar al principio.
+pub fn execute_inline_scripts_keeping_runtime(dom_root: &Arc<RwLock<Node>>) -> (Vec<Result<String, String>>, JsRuntime) {
+    let scripts = Node::find_all_by_tag(dom_root, "script");
+
+    let mut runtime = JsRuntime::new();
+    if let Err(e) = runtime.bind_dom(dom_root.clone()) {
+        tracing::warn!("[js] no se pudo enlazar el DOM al runtime: {e}");
+    }
+
+    let script_results = run_scripts(&mut runtime, &scripts);
+    (script_results, runtime)
+}
+
+fn run_scripts(runtime: &mut JsRuntime, scripts: &[Arc<RwLock<Node>>]) -> Vec<Result<String, String>> {
+    let mut results = Vec::new();
+    for script_node in scripts {
+        let is_external = matches!(
+            &script_node.read().unwrap().node_type,
+            NodeType::Element { attributes, .. } if attributes.contains_key("src")
+        );
+        if is_external {
+            tracing::info!("[js] <script src> externo - descarga de scripts remotos fuera de alcance todavia, se omite");
+            continue;
+        }
+
+        let code = Node::text_content(script_node);
+        if code.trim().is_empty() {
+            continue;
+        }
+
+        results.push(runtime.eval(&code).map_err(|e| e.to_string()));
+    }
+    results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine_dom::HtmlParser;
+
+    #[test]
+    fn executes_inline_script_and_returns_its_result() {
+        let dom = HtmlParser::parse("<html><body><script>1 + 2</script></body></html>");
+        let results = execute_inline_scripts(&dom);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_deref(), Ok("3"));
+    }
+
+    /// Ambos scripts corren en el mismo Context de Boa - una variable
+    /// declarada en el primero deberia seguir viva para el segundo, igual
+    /// que en una pagina real donde varios <script> comparten el mismo
+    /// entorno global.
+    #[test]
+    fn scripts_share_state_across_the_same_document() {
+        let dom = HtmlParser::parse("<html><body><script>var contador = 10;</script><script>contador + 5</script></body></html>");
+        let results = execute_inline_scripts(&dom);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].as_deref(), Ok("15"), "el segundo script deberia ver la variable del primero");
+    }
+
+    #[test]
+    fn reports_script_errors_instead_of_silently_swallowing_them() {
+        let dom = HtmlParser::parse("<html><body><script>esto no es JS valido (((</script></body></html>");
+        let results = execute_inline_scripts(&dom);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_err(), "un error de sintaxis JS deberia reportarse, no fingir exito");
+    }
+
+    #[test]
+    fn external_scripts_with_src_are_skipped_not_fetched() {
+        let dom = HtmlParser::parse(r#"<html><body><script src="https://example.com/app.js"></script></body></html>"#);
+        let results = execute_inline_scripts(&dom);
+        assert!(results.is_empty(), "un <script src> no deberia intentar ejecutarse (no se descarga todavia)");
+    }
+
+    #[test]
+    fn document_with_no_scripts_produces_no_results() {
+        let dom = HtmlParser::parse("<html><body><p>sin scripts</p></body></html>");
+        assert!(execute_inline_scripts(&dom).is_empty());
+    }
+
+    #[test]
+    fn execute_inline_scripts_with_harness_records_a_passing_test() {
+        let dom = HtmlParser::parse("<html><body><script>test(function() { assert_equals(1 + 1, 2); }, 'suma');</script></body></html>");
+        let (_, test_results) = execute_inline_scripts_with_harness(&dom);
+        assert_eq!(test_results.len(), 1);
+        assert!(test_results[0].passed);
+        assert_eq!(test_results[0].name, "suma");
+    }
+
+    /// Un test que falla se reporta como fallido, con su mensaje - no se
+    /// silencia ni se cuenta como exito por accidente.
+    #[test]
+    fn execute_inline_scripts_with_harness_reports_a_failing_test_instead_of_silencing_it() {
+        let dom = HtmlParser::parse("<html><body><script>test(function() { assert_equals(1, 2, 'no deberian ser iguales'); }, 'resta rota');</script></body></html>");
+        let (_, test_results) = execute_inline_scripts_with_harness(&dom);
+        assert_eq!(test_results.len(), 1);
+        assert!(!test_results[0].passed);
+        let message = test_results[0].failure_message.as_ref().expect("deberia haber mensaje de fallo");
+        assert!(message.contains("no deberian ser iguales"));
+    }
+
+    /// El punto real de esta funcion: `document.*` Y `test`/`assert_*`
+    /// disponibles A LA VEZ en el mismo script, para poder escribir tests
+    /// estilo WPT que manipulan el DOM real y lo comprueban con el arnes.
+    #[test]
+    fn execute_inline_scripts_with_harness_has_real_dom_bindings_available_too() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="target">hola</div><script>
+                test(function() {
+                    assert_equals(document.getElementById('target').textContent, 'hola');
+                }, 'dom real dentro de un test');
+            </script></body></html>"#,
+        );
+        let (_, test_results) = execute_inline_scripts_with_harness(&dom);
+        assert_eq!(test_results.len(), 1);
+        assert!(test_results[0].passed, "el test deberia poder leer el DOM real: {:?}", test_results[0].failure_message);
+    }
+
+    /// El punto real de esta funcion, probado a traves del punto de
+    /// entrada de verdad que usaria `main.rs`: el runtime que devuelve
+    /// sigue vivo y usable DESPUES de que esta funcion retorne - un
+    /// listener registrado durante la carga inicial se dispara mas tarde
+    /// desde Rust puro, sin volver a evaluar texto JS.
+    #[test]
+    fn execute_inline_scripts_keeping_runtime_returns_a_runtime_that_still_works_after_the_call() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="target"></div><div id="output"></div><script>
+                document.getElementById('target').addEventListener('click', function() {
+                    document.getElementById('output').textContent = 'disparado';
+                });
+            </script></body></html>"#,
+        );
+        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom);
+        assert_eq!(script_results.len(), 1, "el <script> que registra el listener deberia haberse ejecutado");
+
+        let target = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        runtime.dispatch_event(&target, "click").expect("dispatch_event no deberia fallar");
+
+        let result = runtime.eval("document.getElementById('output').textContent").expect("leer el resultado deberia ser JS valido");
+        assert_eq!(result, "\"disparado\"");
+    }
+
+    #[test]
+    fn execute_inline_scripts_keeping_runtime_returns_a_bound_runtime_even_with_no_scripts() {
+        let dom = HtmlParser::parse("<html><body><p>sin scripts</p></body></html>");
+        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom);
+        assert!(script_results.is_empty());
+        // Sin scripts no hay forma de que se haya registrado ningun
+        // listener, pero el runtime en si deberia seguir siendo usable
+        // (bind_dom se llamo) - probarlo con un eval trivial.
+        assert_eq!(runtime.eval("1 + 1").expect("deberia poder evaluar JS"), "2");
+    }
+}

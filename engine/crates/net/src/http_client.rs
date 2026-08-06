@@ -2,80 +2,99 @@ use crate::request::NetworkRequest;
 use crate::response::NetworkResponse;
 use thiserror::Error;
 use std::collections::HashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use http_body_util::{BodyExt, Empty};
+use hyper::body::Bytes as HyperBytes;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
+use hyper_rustls::HttpsConnector;
 
 #[derive(Error, Debug)]
 pub enum NetworkError {
     #[error("Failed to parse URL: {0}")]
     UrlParse(#[from] url::ParseError),
-    #[error("HTTP connection failed: {0}")]
+    #[error("HTTP request failed: {0}")]
     Http(String),
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("invalid URI: {0}")]
+    InvalidUri(#[from] hyper::http::uri::InvalidUri),
+    #[error("failed to build request: {0}")]
+    RequestBuild(String),
+    #[error("failed to read response body: {0}")]
+    Body(String),
 }
 
-pub struct NetworkEngine;
+/// Cliente HTTP/1.1 real con soporte HTTPS (hyper + rustls, raices de
+/// confianza de webpki-roots). Sustituye al cliente anterior de sockets TCP
+/// en crudo, que no hacia TLS y por tanto no podia cargar ningun sitio
+/// https:// (que es la inmensa mayoria de la web real).
+pub struct NetworkEngine {
+    client: Client<HttpsConnector<HttpConnector>, Empty<HyperBytes>>,
+}
+
+/// rustls 0.23 exige un CryptoProvider de proceso instalado explicitamente
+/// antes de la primera conexion TLS cuando hay mas de un backend disponible
+/// en el grafo de dependencias (aqui: 'ring', fijado en el Cargo.toml raiz
+/// del workspace). Sin esto, la primera peticion https:// entra en panic en
+/// tiempo de ejecucion pese a compilar sin ningun error ni warning - solo se
+/// descubrio ejecutando el binario de verdad, no solo compilandolo.
+static CRYPTO_PROVIDER_INIT: std::sync::Once = std::sync::Once::new();
 
 impl NetworkEngine {
     pub fn new() -> Self {
-        Self
+        CRYPTO_PROVIDER_INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let client = Client::builder(TokioExecutor::new()).build(https);
+        Self { client }
     }
 
     pub async fn fetch(&self, req: &NetworkRequest) -> Result<NetworkResponse, NetworkError> {
-        tracing::info!("[Pure Custom Native Sockets HTTP] Fetching URL: {}", req.url);
+        let uri: hyper::Uri = req.url.as_str().parse()?;
 
-        let host = req.url.host_str().ok_or_else(|| NetworkError::Http("Invalid host".to_string()))?;
-        let port = req.url.port_or_known_default().unwrap_or(80);
-        let addr = format!("{}:{}", host, port);
+        tracing::info!("[http_client] Solicitando {} (hyper + rustls)", req.url);
 
-        // Intentar conexión directa por sockets TCP nativos
-        match tokio::time::timeout(std::time::Duration::from_millis(1500), TcpStream::connect(&addr)).await {
-            Ok(Ok(mut stream)) => {
-                let path = if req.url.path().is_empty() { "/" } else { req.url.path() };
-                let http_raw_req = format!(
-                    "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: NextGenNativeEngine/1.0\r\nConnection: close\r\n\r\n",
-                    req.method.as_str(),
-                    path,
-                    host
-                );
+        let mut builder = hyper::Request::builder().method(req.method.as_str()).uri(uri);
+        for (k, v) in &req.headers {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+        let hyper_req = builder
+            .body(Empty::<HyperBytes>::new())
+            .map_err(|e| NetworkError::RequestBuild(e.to_string()))?;
 
-                if stream.write_all(http_raw_req.as_bytes()).await.is_ok() {
-                    let mut buffer = Vec::new();
-                    let _ = stream.read_to_end(&mut buffer).await;
+        let res = self
+            .client
+            .request(hyper_req)
+            .await
+            .map_err(|e| NetworkError::Http(e.to_string()))?;
 
-                    let response_str = String::from_utf8_lossy(&buffer);
-                    let mut headers = HashMap::new();
-                    headers.insert("content-type".to_string(), "text/html; charset=utf-8".to_string());
+        let status_code = res.status().as_u16();
+        let status_text = res.status().to_string();
 
-                    if let Some((_raw_headers, body)) = response_str.split_once("\r\n\r\n") {
-                        return Ok(NetworkResponse {
-                            status_code: 200,
-                            status_text: "OK (Native Sockets)".to_string(),
-                            headers,
-                            body: bytes::Bytes::from(body.to_string()),
-                        });
-                    }
-                }
-            }
-            _ => {
-                tracing::warn!("Native TCP Socket direct connection timed out/offline, serving local native page");
+        let mut headers = HashMap::new();
+        for (name, value) in res.headers() {
+            if let Ok(val) = value.to_str() {
+                headers.insert(name.as_str().to_lowercase(), val.to_string());
             }
         }
 
-        // Fallback nativo directo sin dependencias externas de reqwest
-        let fallback_html = format!(
-            "<!DOCTYPE html><html><head><title>Native Web Engine</title></head><body><h1>Welcome to 100% Pure Custom Native Engine</h1><p>Fetched URL: {}</p><p>Engine Status: Pure Sockets Transport Active (0 External HTTP Crates)</p></body></html>",
-            req.url
-        );
-        let mut headers = HashMap::new();
-        headers.insert("content-type".to_string(), "text/html; charset=utf-8".to_string());
+        let body_bytes = res
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| NetworkError::Body(e.to_string()))?
+            .to_bytes();
 
         Ok(NetworkResponse {
-            status_code: 200,
-            status_text: "OK (Native Fallback)".to_string(),
+            status_code,
+            status_text,
             headers,
-            body: bytes::Bytes::from(fallback_html),
+            body: bytes::Bytes::from(body_bytes.to_vec()),
         })
     }
 }

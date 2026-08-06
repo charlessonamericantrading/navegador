@@ -1,8 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import SettingsPanel from '../domains/settings/components/SettingsPanel';
 import BrowserViewport from '../domains/browser/components/BrowserViewport';
-import AgentConsole from '../domains/agent/components/AgentConsole';
-import DOMViewer from '../domains/browser/components/DOMViewer';
 import WelcomeGuide from '../domains/onboarding/components/WelcomeGuide';
 import './App.css';
 
@@ -30,44 +27,37 @@ interface InteractiveElement {
   };
 }
 
-interface AgentStep {
-  thought: string;
-  action: string;
-  url: string;
-  title: string;
-  finished: boolean;
-  answer?: string;
-}
-
 function App() {
-  // Ajustes persistidos
-  const [apiKey, setApiKeyState] = useState(() => localStorage.getItem('gemini_api_key') || '');
-  const [agentMode, setAgentModeState] = useState(() => localStorage.getItem('agent_mode') || 'simulation');
-  const [agentSpeed, setAgentSpeedState] = useState(() => Number(localStorage.getItem('agent_speed')) || 2);
-
   // Estados del navegador
   const [screenshot, setScreenshot] = useState('');
   const [browserUrl, setBrowserUrl] = useState('');
   const [elements, setElements] = useState<InteractiveElement[]>([]);
   const [loading, setLoading] = useState(false);
 
-  // Estados del agente de IA
-  const [agentStatus, setAgentStatus] = useState<'idle' | 'running' | 'thinking' | 'finished' | 'error'>('idle');
-  const [agentMessage, setAgentMessage] = useState('');
-  const [steps, setSteps] = useState<AgentStep[]>([]);
-
   // Interactividad UI
-  const [hoveredElementId, setHoveredElementId] = useState<number | null>(null);
-  const [activeTab, setActiveTab] = useState<'console' | 'dom'>('console');
-  const [wsConnected, setWsConnected] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(
     () => localStorage.getItem('onboarding_completed') !== 'true'
   );
-  const [pendingGoal, setPendingGoal] = useState<string | undefined>(undefined);
   const [toast, setToast] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const toastTimeoutRef = useRef<number | undefined>(undefined);
+  // Último tamaño de contenedor conocido, informado por BrowserViewport. Se
+  // guarda aquí (y no solo se envía) porque el contenedor puede medirse antes
+  // de que el WebSocket llegue a abrirse; al abrir, se reenvía este valor para
+  // que el primer screenshot ya llegue con el tamaño correcto.
+  const lastSizeRef = useRef<{ width: number; height: number } | null>(null);
+  // Estado del scroll. Cada rueda provoca una captura completa en el backend,
+  // así que no se envía un mensaje por evento: mientras hay uno en vuelo se
+  // acumula el desplazamiento y se manda de golpe al recibir la respuesta.
+  const scrollBusyRef = useRef(false);
+  const scrollPendingRef = useRef(0);
+  const scrollTimeoutRef = useRef<number | undefined>(undefined);
+  // Red de seguridad para clic/escritura/navegación: si por lo que sea la
+  // respuesta nunca llega (mensaje perdido, backend reiniciado a medio
+  // camino...), antes `loading` se quedaba en true para siempre y la app
+  // dejaba de reaccionar a NINGÚN clic hasta reiniciarla entera.
+  const loadingTimeoutRef = useRef<number | undefined>(undefined);
 
   const showToast = (message: string) => {
     setToast(message);
@@ -75,20 +65,43 @@ function App() {
     toastTimeoutRef.current = window.setTimeout(() => setToast(null), 6000);
   };
 
-  // Guardar configuraciones en localStorage al cambiar
-  const setApiKey = (val: string) => {
-    setApiKeyState(val);
-    localStorage.setItem('gemini_api_key', val);
+  const beginLoading = () => {
+    setLoading(true);
+    window.clearTimeout(loadingTimeoutRef.current);
+    loadingTimeoutRef.current = window.setTimeout(() => {
+      setLoading(false);
+      showToast('La página está tardando demasiado en responder. Puedes intentarlo de nuevo.');
+      // La respuesta puede no haber llegado porque la conexión en sí está
+      // muerta sin que el navegador lo haya notado todavía: se fuerza un
+      // ciclo de reconexión en vez de esperar a que WebSocket lo detecte.
+      wsRef.current?.close();
+    }, 12000);
   };
 
-  const setAgentMode = (val: string) => {
-    setAgentModeState(val);
-    localStorage.setItem('agent_mode', val);
+  const endLoading = () => {
+    setLoading(false);
+    window.clearTimeout(loadingTimeoutRef.current);
   };
 
-  const setAgentSpeed = (val: number) => {
-    setAgentSpeedState(val);
-    localStorage.setItem('agent_speed', val.toString());
+  // Solo toca refs, nunca estado, así que puede llamarse desde el onmessage del
+  // WebSocket (que capturó el primer render) sin quedarse obsoleta.
+  const flushScroll = () => {
+    if (scrollBusyRef.current) return;
+    const dy = scrollPendingRef.current;
+    if (!dy) return;
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+
+    scrollPendingRef.current = 0;
+    scrollBusyRef.current = true;
+    wsRef.current.send(JSON.stringify({ type: 'scroll', dx: 0, dy }));
+
+    // Red de seguridad: si el backend no llega a contestar (acción fallida,
+    // reinicio del proceso), sin esto el scroll quedaría bloqueado para siempre.
+    window.clearTimeout(scrollTimeoutRef.current);
+    scrollTimeoutRef.current = window.setTimeout(() => {
+      scrollBusyRef.current = false;
+      flushScroll();
+    }, 3000);
   };
 
   // Escuchar reinicios/fallos del proceso backend (solo existe en la app de escritorio Electron)
@@ -137,12 +150,13 @@ function App() {
 
       socket.onopen = () => {
         console.log('WebSocket conectado con éxito.');
-        setWsConnected(true);
+        if (lastSizeRef.current) {
+          socket.send(JSON.stringify({ type: 'resize', ...lastSizeRef.current }));
+        }
       };
 
       socket.onclose = () => {
         console.log('WebSocket cerrado. Intentando reconectar en 3s...');
-        setWsConnected(false);
         if (!cancelled) {
           reconnectTimeout = window.setTimeout(connectWS, 3000);
         }
@@ -167,32 +181,22 @@ function App() {
             setScreenshot(data.screenshot);
             setBrowserUrl(data.url);
             setElements(data.elements || []);
-            // Los IDs de elemento se reasignan desde cero en cada captura del DOM
-            // (ver backend/app/domains/browser/parser.py), así que un ID resaltado
-            // de la instantánea anterior puede ahora apuntar a un elemento distinto.
-            // Se limpia aquí para no resaltar algo que el usuario no está señalando.
-            setHoveredElementId(null);
-            setLoading(false);
+            endLoading();
+            window.clearTimeout(scrollTimeoutRef.current);
+            scrollBusyRef.current = false;
+            flushScroll();
             break;
 
           case 'agent_status':
-            setAgentStatus(data.status);
-            if (data.message) {
-              setAgentMessage(data.message);
-            }
             if (data.status === 'thinking') {
-              setLoading(true);
+              beginLoading();
             } else if (data.status === 'idle' || data.status === 'error' || data.status === 'finished') {
               // El backend puede llegar a estos estados (agente cancelado o con
               // error) sin enviar antes un browser_state/error_msg, que son los
               // otros dos únicos sitios donde loading se desactiva: sin esto el
               // spinner de la barra de direcciones se queda girando para siempre.
-              setLoading(false);
+              endLoading();
             }
-            break;
-
-          case 'agent_step':
-            setSteps(prev => [...prev, data.step]);
             break;
 
           case 'status_msg':
@@ -200,7 +204,10 @@ function App() {
             break;
 
           case 'error_msg':
-            setLoading(false);
+            endLoading();
+            window.clearTimeout(scrollTimeoutRef.current);
+            scrollBusyRef.current = false;
+            scrollPendingRef.current = 0;
             showToast(data.message);
             break;
 
@@ -229,7 +236,7 @@ function App() {
   const handleManualNavigate = (url: string) => {
     if (loading) return;
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      setLoading(true);
+      beginLoading();
       wsRef.current.send(JSON.stringify({ type: 'navigate', url }));
     }
   };
@@ -237,7 +244,7 @@ function App() {
   const handleManualClick = (x: number, y: number) => {
     if (loading) return;
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      setLoading(true);
+      beginLoading();
       wsRef.current.send(JSON.stringify({ type: 'click', x, y }));
     }
   };
@@ -245,177 +252,40 @@ function App() {
   const handleManualType = (x: number, y: number, text: string) => {
     if (loading) return;
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      setLoading(true);
+      beginLoading();
       wsRef.current.send(JSON.stringify({ type: 'type', x, y, text }));
     }
   };
 
-  // Eventos de control del Agente de IA
-  const handleStartAgent = (goal: string) => {
+  // No se bloquea por `loading`: redimensionar el viewport no es una acción
+  // sobre la página (no hay resultado que pueda quedar encolado sobre un
+  // estado obsoleto), y el usuario puede redimensionar la ventana mientras
+  // el agente está trabajando.
+  // Tampoco se bloquea por `loading`: en un navegador real puedes seguir
+  // desplazándote mientras la página trabaja.
+  const handleManualScroll = (dy: number) => {
+    scrollPendingRef.current += dy;
+    flushScroll();
+  };
+
+  const handleManualResize = (width: number, height: number) => {
+    lastSizeRef.current = { width, height };
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      setSteps([]);
-      setAgentStatus('running');
-      setAgentMessage('Iniciando agente...');
-      wsRef.current.send(JSON.stringify({
-        type: 'agent_start',
-        goal,
-        mode: agentMode,
-        api_key: apiKey
-      }));
-    }
-  };
-
-  const handleStopAgent = () => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'agent_stop' }));
-    }
-  };
-
-  // Resalta un elemento al seleccionarlo en la lista lateral
-  const handleElementSelect = (el: InteractiveElement) => {
-    // Si el usuario clica el elemento en el árbol DOM, podemos simular un clic manual automáticamente
-    const cx = el.rect.x + el.rect.width / 2;
-    const cy = el.rect.y + el.rect.height / 2;
-    handleManualClick(cx, cy);
-  };
-
-  // Genera un informe de diagnóstico y lo deja listo para que el propio usuario
-  // decida enviarlo por correo. Nunca se transmite nada automáticamente ni sin
-  // su intervención, y deliberadamente NUNCA se incluye la clave de API.
-  const handleSendReport = () => {
-    const lastSteps = steps.slice(-3).map((s, i) =>
-      `  ${i + 1}. Pensamiento: ${s.thought || '(sin registrar)'} | Acción: ${s.action || '(sin registrar)'}`
-    ).join('\n');
-
-    const report = [
-      `Fecha: ${new Date().toISOString()}`,
-      `Plataforma: ${window.electronAPI?.platform || navigator.platform}`,
-      `Modo del agente: ${agentMode}`,
-      `Estado del agente: ${agentStatus}`,
-      `Último mensaje: ${agentMessage || '(ninguno)'}`,
-      `URL del navegador de pruebas: ${browserUrl || '(ninguna)'}`,
-      `Últimos pasos:\n${lastSteps || '  (ninguno)'}`
-    ].join('\n');
-
-    const mailBody = encodeURIComponent(
-      'He copiado los detalles técnicos al portapapeles. Pégalos aquí debajo:\n\n(pega aquí)\n\nDescribe brevemente qué esperabas que pasara:\n'
-    );
-    const mailtoUrl = `mailto:?subject=${encodeURIComponent('Informe de Navegador IA')}&body=${mailBody}`;
-
-    navigator.clipboard.writeText(report).then(
-      () => showToast('Informe copiado al portapapeles. Se abrirá tu programa de correo para que lo pegues y lo envíes si quieres.'),
-      () => showToast('No se pudo copiar el informe automáticamente. Puedes describir el problema directamente en el correo.')
-    );
-
-    if (window.electronAPI?.openExternal) {
-      window.electronAPI.openExternal(mailtoUrl);
-    } else {
-      window.location.href = mailtoUrl;
+      wsRef.current.send(JSON.stringify({ type: 'resize', width, height }));
     }
   };
 
   return (
     <div className="app-container">
-      {/* Cabecera */}
-      <header className="app-header">
-        <div className="logo-section">
-          <div className="logo-icon">AI</div>
-          <span className="logo-text">Navegador IA</span>
-          <div className="native-engine-pill">
-            <span className="native-engine-dot"></span>
-            Motor: Chromium (Playwright)
-          </div>
-        </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <button
-            onClick={() => setShowOnboarding(true)}
-            className="btn"
-            title="Ver la guía de bienvenida otra vez"
-            style={{
-              background: 'rgba(255,255,255,0.04)',
-              border: '1px solid var(--border-light)',
-              color: 'var(--text-muted)',
-              padding: '6px 12px',
-              fontSize: '0.8rem'
-            }}
-          >
-            ¿Cómo funciona?
-          </button>
-
-          <button
-            onClick={handleSendReport}
-            className="btn"
-            title="Copia un informe técnico y abre tu correo para que lo envíes si quieres"
-            style={{
-              background: 'rgba(255,255,255,0.04)',
-              border: '1px solid var(--border-light)',
-              color: 'var(--text-muted)',
-              padding: '6px 12px',
-              fontSize: '0.8rem'
-            }}
-          >
-            Reportar un problema
-          </button>
-
-          <div className="status-badge">
-            <div className={`status-dot ${wsConnected ? (agentStatus === 'thinking' ? 'thinking' : 'active') : ''}`} />
-            <span>
-              {backendIssue?.status === 'failed'
-                ? 'No se pudo iniciar el motor del agente'
-                : backendIssue?.status === 'restarting'
-                ? `Reiniciando el motor del agente (intento ${backendIssue.attempt})...`
-                : wsConnected
-                ? (agentStatus === 'thinking' ? 'Agente pensando' : 'Listo para usarse')
-                : 'Preparando el motor del agente...'}
-            </span>
-          </div>
-        </div>
-      </header>
-
       {backendIssue?.status === 'failed' && (
-        <div
-          role="alert"
-          style={{
-            position: 'fixed',
-            top: '64px',
-            left: 0,
-            right: 0,
-            zIndex: 150,
-            background: 'hsl(355, 40%, 16%)',
-            borderBottom: '1px solid var(--error)',
-            color: 'var(--text-main)',
-            padding: '10px 24px',
-            fontSize: '0.85rem',
-            textAlign: 'center'
-          }}
-        >
+        <div role="alert" className="alert-banner error">
           No se ha podido iniciar el motor del agente tras varios intentos. Cierra y vuelve a abrir
           la aplicación; si el problema continúa, reinstálala desde el instalador oficial.
         </div>
       )}
 
       {updateReady && (
-        <div
-          role="status"
-          style={{
-            position: 'fixed',
-            top: '64px',
-            left: 0,
-            right: 0,
-            zIndex: 150,
-            background: 'hsl(150, 30%, 14%)',
-            borderBottom: '1px solid var(--success)',
-            color: 'var(--text-main)',
-            padding: '10px 24px',
-            fontSize: '0.85rem',
-            textAlign: 'center',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            gap: '14px'
-          }}
-        >
+        <div role="status" className="alert-banner success">
           <span>✨ Hay una nueva versión lista para instalarse.</span>
           <button
             onClick={() => window.electronAPI?.installUpdate()}
@@ -429,38 +299,15 @@ function App() {
 
       {showOnboarding && (
         <WelcomeGuide
-          onFinish={(chosenGoal) => {
+          onFinish={() => {
             localStorage.setItem('onboarding_completed', 'true');
             setShowOnboarding(false);
-            if (chosenGoal) {
-              setPendingGoal(chosenGoal);
-            }
           }}
         />
       )}
 
       {toast && (
-        <div
-          role="alert"
-          style={{
-            position: 'fixed',
-            bottom: '24px',
-            left: '50%',
-            transform: 'translateX(-50%)',
-            zIndex: 200,
-            background: 'hsl(355, 30%, 14%)',
-            border: '1px solid var(--error)',
-            color: 'var(--text-main)',
-            borderRadius: '10px',
-            padding: '12px 18px',
-            display: 'flex',
-            alignItems: 'center',
-            gap: '12px',
-            maxWidth: '480px',
-            boxShadow: '0 8px 30px rgba(0, 0, 0, 0.4)',
-            fontSize: '0.85rem'
-          }}
-        >
+        <div role="alert" className="toast">
           <span aria-hidden="true">⚠️</span>
           <span style={{ lineHeight: 1.4 }}>{toast}</span>
           <button
@@ -474,16 +321,6 @@ function App() {
         </div>
       )}
 
-      {/* Sidebar Izquierdo: Configuración */}
-      <SettingsPanel
-        apiKey={apiKey}
-        setApiKey={setApiKey}
-        agentMode={agentMode}
-        setAgentMode={setAgentMode}
-        agentSpeed={agentSpeed}
-        setAgentSpeed={setAgentSpeed}
-      />
-
       {/* Área Principal: Viewport del Navegador */}
       <main className="main-viewport">
         <BrowserViewport
@@ -493,50 +330,11 @@ function App() {
           onManualNavigate={handleManualNavigate}
           onManualClick={handleManualClick}
           onManualType={handleManualType}
-          hoveredElementId={hoveredElementId}
-          setHoveredElementId={setHoveredElementId}
+          onManualResize={handleManualResize}
+          onManualScroll={handleManualScroll}
           loading={loading}
         />
       </main>
-
-      {/* Sidebar Derecho: Consola y DOM */}
-      <aside className="right-panel">
-        <div className="panel-tabs">
-          <div
-            className={`panel-tab ${activeTab === 'console' ? 'active' : ''}`}
-            onClick={() => setActiveTab('console')}
-          >
-            Consola del Agente
-          </div>
-          <div
-            className={`panel-tab ${activeTab === 'dom' ? 'active' : ''}`}
-            onClick={() => setActiveTab('dom')}
-          >
-            Lo que ve el agente ({elements.length})
-          </div>
-        </div>
-
-        <div className="panel-content">
-          {activeTab === 'console' ? (
-            <AgentConsole
-              onStartAgent={handleStartAgent}
-              onStopAgent={handleStopAgent}
-              agentStatus={agentStatus}
-              agentMessage={agentMessage}
-              steps={steps}
-              presetGoal={pendingGoal}
-              onPresetConsumed={() => setPendingGoal(undefined)}
-            />
-          ) : (
-            <DOMViewer
-              elements={elements}
-              hoveredElementId={hoveredElementId}
-              setHoveredElementId={setHoveredElementId}
-              onElementSelect={handleElementSelect}
-            />
-          )}
-        </div>
-      </aside>
     </div>
   );
 }

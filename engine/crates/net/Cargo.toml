@@ -12,3 +12,7 @@ url.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "webpki-roots", "tls12", "ring"] }
+http-body-util = "0.1"

@@ -33,15 +33,15 @@
         ]
       },
       {
-        "from": "build-resources/ms-playwright",
-        "to": "ms-playwright",
+        "from": "../frontend/dist",
+        "to": "frontend/dist",
         "filter": [
           "**/*"
         ]
       },
       {
-        "from": "../frontend/dist",
-        "to": "frontend/dist",
+        "from": "build-resources/engine",
+        "to": "engine",
         "filter": [
           "**/*"
         ]

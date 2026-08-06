@@ -4,14 +4,24 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+# Sin esto, `cargo run -p engine-core` (sin --bin) quedaria ambiguo en
+# cuanto src/bin/wpt_runner.rs existe junto a main.rs - Cargo no sabe cual
+# es "el" binario del paquete con dos candidatos. Mantiene el comando de
+# siempre (abre la ventana) como el default; wpt_runner sigue accesible
+# explicito via `cargo run -p engine-core --bin wpt_runner -- <args>`.
+default-run = "engine-core"
 
 [dependencies]
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
 engine-net = { path = "../net" }
 engine-dom = { path = "../dom" }
 engine-css = { path = "../css" }
 engine-layout = { path = "../layout" }
 engine-gfx = { path = "../gfx" }
 engine-js = { path = "../js" }
+engine-text = { path = "../text" }

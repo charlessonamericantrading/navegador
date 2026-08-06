@@ -1,0 +1,17 @@
+[package]
+name = "engine-text"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing.workspace = true
+# ttf-parser NO se añade como dependencia directa: rustybuzz::Face hace Deref
+# a ttf_parser::Face y reexporta el crate entero (rustybuzz::ttf_parser). Usar
+# ese reexport en vez de una dependencia propia garantiza que es exactamente
+# la misma version que usa rustybuzz por dentro - dos versiones distintas del
+# mismo crate en el grafo de dependencias no unificarian los tipos.
+rustybuzz = "0.20"
+fontdb = "0.24"
+tiny-skia = "0.11"

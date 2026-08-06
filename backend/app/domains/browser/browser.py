@@ -1,151 +1,252 @@
 # -*- coding: utf-8 -*-
+"""Cliente del motor Rust nativo, sin Chromium ni Playwright.
+
+El proceso Rust habla NDJSON por stdin/stdout. La ruta del ejecutable se debe
+proporcionar explícitamente mediante ``NATIVE_ENGINE_PATH``; no se descarga,
+busca ni sustituye por otro motor. Mientras esa variable no apunte a un
+binario válido, el backend permanece disponible y expone un estado vacío.
+"""
+
 import asyncio
-import base64
-from playwright.async_api import async_playwright
-from app.domains.browser.parser import DOM_PARSER_JS
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
 
-class BrowserManager:
-    def __init__(self, width=1280, height=720):
-        self.width = width
-        self.height = height
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
 
-    async def start(self):
-        """Inicia el navegador Chromium de Playwright."""
-        if not self.playwright:
-            self.playwright = await async_playwright().start()
-            
-        # Lanzamos de forma headless por defecto. 
-        # Añadimos argumentos para evitar detección básica de automatización.
-        self.browser = await self.playwright.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage"
-            ]
-        )
-        
-        self.context = await self.browser.new_context(
-            viewport={"width": self.width, "height": self.height},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            device_scale_factor=1
-        )
-        
-        self.page = await self.context.new_page()
-        # Inyectar script para ocultar el objeto navigator.webdriver
-        await self.page.add_init_script(
-            "const newProto = navigator.__proto__; delete newProto.webdriver; navigator.__proto__ = newProto;"
-        )
-        
-        # Abrir página inicial en blanco o por defecto (Google)
-        await self.page.goto("https://www.google.com")
-        await asyncio.sleep(1)
+class NativeEngineUnavailableError(RuntimeError):
+    """El motor Rust todavía no está conectado al backend."""
 
-    async def navigate(self, url: str):
-        """Navega a la URL especificada."""
-        if not self.page:
-            await self.start()
-            
-        if not (url.startswith("http://") or url.startswith("https://")):
-            url = "https://" + url
-            
+    def __init__(self):
+        super().__init__("motor de navegador no disponible")
+
+
+class NativeEngineClient:
+    """Transporte NDJSON mínimo para el proceso ``engine_server``."""
+
+    protocol_version = 1
+
+    def __init__(self, executable_path: Optional[str] = None):
+        configured_path = executable_path or os.environ.get("NATIVE_ENGINE_PATH")
+        self.executable_path = Path(configured_path) if configured_path else None
+        self.process: Optional[asyncio.subprocess.Process] = None
+        self._lock = asyncio.Lock()
+        self._stderr_task: Optional[asyncio.Task] = None
+        self.renderer_ready = False
+        self._request_number = 0
+
+    @property
+    def connected(self) -> bool:
+        return self.process is not None and self.process.returncode is None
+
+    async def start(self, width: int, height: int) -> bool:
+        if self.connected:
+            return self.renderer_ready
+        if self.executable_path is None or not self.executable_path.is_file():
+            return False
+
         try:
-            # Esperar a que se dispare domcontentloaded
-            await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(1.5)  # Tiempo adicional para que el JS renderice la página
-        except Exception as e:
-            print(f"Error navegando a {url}: {e}")
-            raise e
+            self.process = await asyncio.create_subprocess_exec(
+                str(self.executable_path),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            self._stderr_task = asyncio.create_task(self._drain_stderr())
+            ready = await asyncio.wait_for(self._read_response(), timeout=10)
+            if (
+                ready.get("type") != "ready"
+                or ready.get("protocol_version") != self.protocol_version
+                or ready.get("renderer") != "rust-native"
+            ):
+                raise RuntimeError("handshake NDJSON inválido")
 
-    async def click(self, x: int, y: int):
-        """Realiza un clic físico en las coordenadas del viewport."""
-        if not self.page:
+            response = await self.request({
+                "type": "resize",
+                "id": "backend-start",
+                "width": width,
+                "height": height,
+            })
+            if response.get("type") == "error":
+                raise RuntimeError(response.get("message", "error de resize"))
+            self.renderer_ready = response.get("renderer_status") == "ready"
+            return self.renderer_ready
+        except (OSError, asyncio.TimeoutError, RuntimeError, ValueError) as error:
+            print(f"[NativeEngineClient] No se pudo conectar con Rust: {error}")
+            await self.close()
+            return False
+
+    async def request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.connected or self.process is None or self.process.stdin is None:
+            raise NativeEngineUnavailableError()
+
+        async with self._lock:
+            self._request_number += 1
+            request_payload = dict(payload)
+            request_payload["id"] = f"python-{self._request_number}"
+            try:
+                self.process.stdin.write(
+                    (json.dumps(request_payload, separators=(",", ":")) + "\n").encode()
+                )
+                await self.process.stdin.drain()
+                return await asyncio.wait_for(self._read_response(), timeout=30)
+            except (BrokenPipeError, ConnectionError, asyncio.TimeoutError, RuntimeError, ValueError):
+                await self.close()
+                raise
+
+    async def _read_response(self) -> Dict[str, Any]:
+        if self.process is None or self.process.stdout is None:
+            raise NativeEngineUnavailableError()
+        line = await self.process.stdout.readline()
+        if not line:
+            raise RuntimeError("el proceso Rust cerró stdout")
+        response = json.loads(line.decode("utf-8"))
+        if not isinstance(response, dict):
+            raise ValueError("la respuesta NDJSON no es un objeto")
+        return response
+
+    async def _drain_stderr(self):
+        if self.process is None or self.process.stderr is None:
             return
-        # Simula mover el ratón y hacer clic de forma natural
-        await self.page.mouse.move(x, y)
-        await asyncio.sleep(0.1)
-        await self.page.mouse.click(x, y)
-        # Esperar un breve instante para ver cambios de UI inmediatos
-        await asyncio.sleep(1.0)
-
-    async def type_text(self, x: int, y: int, text: str, press_enter: bool = False):
-        """Hace clic en unas coordenadas para enfocar y escribe texto."""
-        if not self.page:
-            return
-        # Clic para enfocar el elemento
-        await self.click(x, y)
-        # Seleccionar todo el texto existente y borrarlo
-        await self.page.keyboard.press("Control+A")
-        await asyncio.sleep(0.05)
-        await self.page.keyboard.press("Backspace")
-        await asyncio.sleep(0.05)
-        # Escribir el nuevo texto letra a letra (simulando retraso humano)
-        for char in text:
-            await self.page.keyboard.type(char)
-            await asyncio.sleep(0.02)
-            
-        if press_enter:
-            await asyncio.sleep(0.1)
-            await self.page.keyboard.press("Enter")
-            
-        await asyncio.sleep(1.5)  # Esperar que reaccione la página
-
-    async def press_key(self, key: str):
-        """Presiona una tecla en el navegador (ej: Enter, Escape, Backspace)."""
-        if not self.page:
-            return
-        await self.page.keyboard.press(key)
-        await asyncio.sleep(1.0)
-
-    async def get_screenshot(self) -> str:
-        """Toma un screenshot JPEG en base64 para envío rápido."""
-        if not self.page:
-            return ""
-        try:
-            screenshot_bytes = await self.page.screenshot(type="jpeg", quality=80)
-            return base64.b64encode(screenshot_bytes).decode('utf-8')
-        except Exception as e:
-            print(f"Error tomando captura: {e}")
-            return ""
-
-    async def get_elements(self):
-        """Extrae la lista de elementos interactivos de la página activa."""
-        if not self.page:
-            return []
-        try:
-            elements = await self.page.evaluate(DOM_PARSER_JS)
-            return elements
-        except Exception as e:
-            print(f"Error analizando DOM: {e}")
-            return []
-
-    async def get_url(self) -> str:
-        """Devuelve la URL actual."""
-        if self.page:
-            return self.page.url
-        return ""
-
-    async def get_title(self) -> str:
-        """Devuelve el título de la página actual."""
-        if self.page:
-            return await self.page.title()
-        return ""
+        while await self.process.stderr.readline():
+            pass
 
     async def close(self):
-        """Cierra todos los recursos del navegador."""
-        if self.page:
-            await self.page.close()
-        if self.context:
-            await self.context.close()
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
-        self.page = None
-        self.context = None
-        self.browser = None
-        self.playwright = None
+        process = self.process
+        self.process = None
+        self.renderer_ready = False
+        if process is None:
+            return
+
+        if process.returncode is None and process.stdin is not None:
+            try:
+                process.stdin.write(b'{"type":"shutdown","id":"backend-close"}\n')
+                await process.stdin.drain()
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except (BrokenPipeError, ConnectionError, asyncio.TimeoutError):
+                process.kill()
+                await process.wait()
+
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            self._stderr_task = None
+
+
+class BrowserManager:
+    """Fachada del renderer Rust; nunca tiene fallback a un navegador externo."""
+
+    def __init__(self, width: int = 1280, height: int = 720):
+        self.width = width
+        self.height = height
+        self._client = NativeEngineClient()
+        self._native_engine_connected = False
+        self._notice_printed = False
+
+    async def start(self):
+        self._native_engine_connected = await self._client.start(self.width, self.height)
+        if not self._native_engine_connected and not self._notice_printed:
+            print("[BrowserManager] Motor nativo Rust no conectado todavía; no se usará Chromium.")
+            self._notice_printed = True
+
+    async def _require_native_engine(self):
+        await self.start()
+        if not self._native_engine_connected:
+            raise NativeEngineUnavailableError()
+
+    async def resize(self, width: int, height: int):
+        self.width = width
+        self.height = height
+        await self.start()
+        if self._native_engine_connected:
+            response = await self._client.request({
+                "type": "resize",
+                "id": "backend-resize",
+                "width": width,
+                "height": height,
+            })
+            if response.get("type") == "error":
+                raise RuntimeError(response.get("message", "error de resize"))
+
+    async def navigate(self, url: str):
+        await self._require_native_engine()
+        response = await self._client.request({
+            "type": "navigate",
+            "id": "backend-navigate",
+            "url": url,
+        })
+        if response.get("type") == "error":
+            raise RuntimeError(response.get("message", "error de navegación"))
+
+    async def click(self, x: int, y: int):
+        await self._require_native_engine()
+        response = await self._client.request({
+            "type": "click",
+            "id": "backend-click",
+            "x": x,
+            "y": y,
+        })
+        if response.get("type") == "error":
+            raise RuntimeError(response.get("message", "error de clic"))
+
+    async def scroll(self, dx: int, dy: int):
+        await self._require_native_engine()
+        response = await self._client.request({
+            "type": "scroll",
+            "id": "backend-scroll",
+            "dx": dx,
+            "dy": dy,
+        })
+        if response.get("type") == "error":
+            raise RuntimeError(response.get("message", "error de scroll"))
+
+    async def type_text(self, x: int, y: int, text: str, press_enter: bool = False):
+        await self._require_native_engine()
+        response = await self._client.request({
+            "type": "type_text",
+            "id": "backend-type",
+            "x": x,
+            "y": y,
+            "text": text,
+            "press_enter": press_enter,
+        })
+        if response.get("type") == "error":
+            raise RuntimeError(response.get("message", "error de entrada de texto"))
+
+    async def press_key(self, key: str):
+        await self._require_native_engine()
+        response = await self._client.request({
+            "type": "press_key",
+            "id": "backend-key",
+            "key": key,
+        })
+        if response.get("type") == "error":
+            raise RuntimeError(response.get("message", "error de teclado"))
+
+    async def _get_state(self) -> Dict[str, Any]:
+        await self.start()
+        if not self._native_engine_connected:
+            return {"screenshot": "", "url": "", "title": "", "elements": []}
+        response = await self._client.request({"type": "get_state", "id": "backend-state"})
+        if response.get("type") == "error":
+            raise RuntimeError(response.get("message", "error leyendo estado"))
+        return response
+
+    async def get_state(self) -> Dict[str, Any]:
+        """Obtiene una sola instantánea para la actualización del frontend."""
+        return await self._get_state()
+
+    async def get_screenshot(self) -> str:
+        return str((await self._get_state()).get("screenshot", ""))
+
+    async def get_elements(self):
+        return (await self._get_state()).get("elements", [])
+
+    async def get_url(self) -> str:
+        return str((await self._get_state()).get("url", ""))
+
+    async def get_title(self) -> str:
+        return str((await self._get_state()).get("title", ""))
+
+    async def close(self):
+        await self._client.close()
+        self._native_engine_connected = False

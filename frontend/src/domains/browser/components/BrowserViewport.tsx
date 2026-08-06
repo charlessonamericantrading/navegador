@@ -31,8 +31,8 @@ interface BrowserViewportProps {
   onManualNavigate: (url: string) => void;
   onManualClick: (x: number, y: number) => void;
   onManualType: (x: number, y: number, text: string) => void;
-  hoveredElementId: number | null;
-  setHoveredElementId: (id: number | null) => void;
+  onManualResize: (width: number, height: number) => void;
+  onManualScroll: (dy: number) => void;
   loading: boolean;
 }
 
@@ -43,8 +43,8 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   onManualNavigate,
   onManualClick,
   onManualType,
-  hoveredElementId,
-  setHoveredElementId,
+  onManualResize,
+  onManualScroll,
   loading
 }) => {
   const [addressInput, setAddressInput] = useState(url || 'https://www.google.com');
@@ -67,6 +67,47 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   // arriba/abajo. Las insignias/resaltados deben posicionarse relativas a
   // ESTE rectángulo, no al 100%/100% del contenedor (ver bug de desalineación).
   const [imgRect, setImgRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+
+  // Informa al backend del tamaño real del contenedor (ver BrowserManager.resize
+  // en el backend) - pensado para que, cuando haya un motor de renderizado
+  // conectado, la captura llene el espacio disponible en vez de quedar con
+  // proporción fija 1280:720 y franjas vacías a los lados.
+  const lastSentSizeRef = useRef<{ width: number; height: number } | null>(null);
+  const resizeDebounceRef = useRef<number | undefined>(undefined);
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    const measureAndSend = () => {
+      if (!containerRef.current) return;
+      const { width, height } = containerRef.current.getBoundingClientRect();
+      const w = Math.round(width);
+      const h = Math.round(height);
+      if (w <= 0 || h <= 0) return;
+      if (lastSentSizeRef.current?.width === w && lastSentSizeRef.current?.height === h) return;
+      lastSentSizeRef.current = { width: w, height: h };
+      onManualResize(w, h);
+    };
+
+    const resizeObserver = new ResizeObserver(() => {
+      // La primera medición (montaje) se envía sin demora para minimizar el
+      // parpadeo inicial a 1280x720; los cambios posteriores (arrastrar el
+      // borde de la ventana) se debouncean para no saturar al backend, que
+      // en cada resize relanza un screenshot completo.
+      if (lastSentSizeRef.current === null) {
+        measureAndSend();
+        return;
+      }
+      window.clearTimeout(resizeDebounceRef.current);
+      resizeDebounceRef.current = window.setTimeout(measureAndSend, 250);
+    });
+    resizeObserver.observe(containerRef.current);
+
+    return () => {
+      resizeObserver.disconnect();
+      window.clearTimeout(resizeDebounceRef.current);
+    };
+  }, [onManualResize]);
 
   useEffect(() => {
     const updateImgRect = () => {
@@ -99,13 +140,16 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
     };
   }, [screenshot]);
 
-  // Convierte una coordenada del modelo (espacio 1280x720 del backend) a
-  // píxeles dentro del "stage", usando el rectángulo real de la imagen.
+  // Convierte una coordenada del modelo (espacio de píxeles real de la
+  // captura recibida, no un tamaño fijo) a píxeles dentro del "stage",
+  // usando el rectángulo real de la imagen.
   const toStagePx = (mx: number, my: number) => {
-    if (!imgRect) return { left: 0, top: 0 };
+    if (!imgRect || !imgRef.current) return { left: 0, top: 0 };
+    const naturalWidth = imgRef.current.naturalWidth || imgRect.width;
+    const naturalHeight = imgRef.current.naturalHeight || imgRect.height;
     return {
-      left: imgRect.left + (mx / 1280) * imgRect.width,
-      top: imgRect.top + (my / 720) * imgRect.height
+      left: imgRect.left + (mx / naturalWidth) * imgRect.width,
+      top: imgRect.top + (my / naturalHeight) * imgRect.height
     };
   };
 
@@ -148,8 +192,10 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
     const clickX = e.clientX - rect.left;
     const clickY = e.clientY - rect.top;
 
-    const scaleX = 1280 / rect.width;
-    const scaleY = 720 / rect.height;
+    const naturalWidth = e.currentTarget.naturalWidth || rect.width;
+    const naturalHeight = e.currentTarget.naturalHeight || rect.height;
+    const scaleX = naturalWidth / rect.width;
+    const scaleY = naturalHeight / rect.height;
     const mappedX = Math.round(clickX * scaleX);
     const mappedY = Math.round(clickY * scaleY);
 
@@ -176,6 +222,25 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
     }
   };
 
+  const handleWheel = (e: React.WheelEvent) => {
+    // El popup de escritura se posiciona sobre unas coordenadas de la página
+    // que dejan de ser válidas en cuanto ésta se desplaza.
+    if (inputTextPopup) {
+      setInputTextPopup(null);
+    }
+
+    // deltaMode indica la unidad de deltaY: 0 = píxeles, 1 = líneas, 2 = páginas.
+    // El backend siempre espera píxeles.
+    let dy = e.deltaY;
+    if (e.deltaMode === 1) {
+      dy *= 16;
+    } else if (e.deltaMode === 2) {
+      dy *= containerRef.current?.clientHeight ?? 800;
+    }
+
+    onManualScroll(Math.round(dy));
+  };
+
   const handlePopupSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (inputTextPopup) {
@@ -183,8 +248,6 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
       setInputTextPopup(null);
     }
   };
-
-  const hoveredElement = elements.find(el => el.id === hoveredElementId);
 
   const quickLinks = [
     { name: 'Google', url: 'https://www.google.com', icon: '🔍' },
@@ -194,23 +257,14 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   ];
 
   return (
-    <div className="browser-frame" style={{ display: 'flex', flexDirection: 'column', height: '100%', background: '#f8fafc' }}>
+    <div className="browser-frame">
       {/* Barra de Navegación del Navegador (Nivel Superior Prominente) */}
-      <div className="browser-bar" style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: '12px',
-        padding: '10px 16px',
-        background: '#ffffff',
-        borderBottom: '1px solid #e2e8f0',
-        boxShadow: '0 2px 8px rgba(0,0,0,0.04)'
-      }}>
+      <div className="browser-bar">
         {/* Botones de control de navegación */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
           <button
             onClick={() => onManualNavigate(url || 'https://www.google.com')}
-            className="btn"
-            style={{ padding: '6px 10px', background: '#f1f5f9', border: '1px solid #cbd5e1', color: '#334155' }}
+            className="btn icon-btn"
             title="Recargar página"
           >
             ↻
@@ -218,53 +272,26 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
         </div>
 
         {/* Input de dirección URL Prominente */}
-        <form onSubmit={handleNavigateSubmit} style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <div style={{
-            flex: 1,
-            display: 'flex',
-            alignItems: 'center',
-            gap: '8px',
-            background: '#f8fafc',
-            border: '1.5px solid #cbd5e1',
-            borderRadius: '10px',
-            padding: '6px 14px',
-            boxShadow: 'inset 0 1px 2px rgba(0,0,0,0.03)'
-          }}>
-            <span style={{ fontSize: '0.85rem', color: '#64748b' }}>🔒</span>
+        <form onSubmit={handleNavigateSubmit} className="address-form">
+          <div className="address-pill">
+            <span className="address-lock">🔒</span>
             <input
               type="text"
+              className="address-input"
               value={addressInput}
               onChange={(e) => setAddressInput(e.target.value)}
               placeholder="Introduce cualquier dirección web (ej: wikipedia.org o google.com)..."
-              style={{
-                width: '100%',
-                background: 'transparent',
-                border: 'none',
-                color: '#0f172a',
-                fontSize: '0.9rem',
-                fontWeight: 500,
-                outline: 'none'
-              }}
             />
-            {loading && (
-              <div style={{
-                width: '16px',
-                height: '16px',
-                border: '2px solid #cbd5e1',
-                borderTopColor: '#6d28d9',
-                borderRadius: '50%',
-                animation: 'spin 0.8s linear infinite'
-              }} />
-            )}
+            {loading && <div className="address-spinner" />}
           </div>
-          <button type="submit" className="btn btn-primary" style={{ padding: '8px 18px', fontWeight: 600 }}>
+          <button type="submit" className="btn btn-primary">
             Navegar
           </button>
         </form>
       </div>
 
       {/* Área Principal de Renderizado / Inicio */}
-      <div className="viewport-container" ref={containerRef} style={{ flex: 1, position: 'relative', overflow: 'hidden', background: '#f1f5f9', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+      <div className="viewport-container" ref={containerRef} onWheel={screenshot ? handleWheel : undefined}>
         {screenshot ? (
           <div ref={stageRef} style={{ position: 'relative', width: '100%', height: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
             <img
@@ -285,89 +312,15 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
                   });
                 }
               }}
-              style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', cursor: 'crosshair', borderRadius: '8px', boxShadow: '0 8px 30px rgba(0,0,0,0.1)' }}
             />
-
-            {imgRect && elements.map(el => {
-              const cx = el.rect.x + el.rect.width / 2;
-              const cy = el.rect.y + el.rect.height / 2;
-              const { left, top } = toStagePx(cx, cy);
-
-              return (
-                <div
-                  key={el.id}
-                  className="overlay-badge"
-                  style={{
-                    position: 'absolute',
-                    left: `${left}px`,
-                    top: `${top}px`,
-                    border: hoveredElementId === el.id ? '2px solid #6d28d9' : '1.5px solid white',
-                    transform: hoveredElementId === el.id ? 'translate(-50%, -50%) scale(1.25)' : 'translate(-50%, -50%)',
-                    background: '#6d28d9',
-                    color: 'white',
-                    padding: '2px 6px',
-                    borderRadius: '4px',
-                    fontSize: '0.7rem',
-                    fontWeight: 700,
-                    cursor: 'pointer',
-                    boxShadow: '0 2px 6px rgba(0,0,0,0.3)'
-                  }}
-                  onMouseEnter={() => setHoveredElementId(el.id)}
-                  onMouseLeave={() => setHoveredElementId(null)}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (loading) return;
-                    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
-                      setInputTextPopup({
-                        mx: cx,
-                        my: cy,
-                        text: '',
-                        placeholder: el.attributes.placeholder || 'Escribe texto...'
-                      });
-                    } else {
-                      onManualClick(cx, cy);
-                    }
-                  }}
-                >
-                  {el.id}
-                </div>
-              );
-            })}
-
-            {hoveredElement && imgRect && (
-              <div
-                style={{
-                  position: 'absolute',
-                  left: `${imgRect.left + (hoveredElement.rect.x / 1280) * imgRect.width}px`,
-                  top: `${imgRect.top + (hoveredElement.rect.y / 720) * imgRect.height}px`,
-                  width: `${(hoveredElement.rect.width / 1280) * imgRect.width}px`,
-                  height: `${(hoveredElement.rect.height / 720) * imgRect.height}px`,
-                  border: '2px dashed #6d28d9',
-                  pointerEvents: 'none'
-                }}
-              />
-            )}
 
             {inputTextPopup && (() => {
               const { left, top } = toStagePx(inputTextPopup.mx, inputTextPopup.my);
               return (
               <form
                 onSubmit={handlePopupSubmit}
-                style={{
-                  position: 'absolute',
-                  left: `${left}px`,
-                  top: `${top}px`,
-                  transform: 'translate(-50%, -120%)',
-                  background: '#ffffff',
-                  border: '1px solid #cbd5e1',
-                  borderRadius: '10px',
-                  padding: '10px',
-                  display: 'flex',
-                  gap: '8px',
-                  zIndex: 20,
-                  boxShadow: '0 10px 25px rgba(0,0,0,0.15)',
-                  minWidth: '260px'
-                }}
+                className="inline-type-popup"
+                style={{ left: `${left}px`, top: `${top}px` }}
                 onClick={(e) => e.stopPropagation()}
               >
                 <input
@@ -376,7 +329,6 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
                   placeholder={inputTextPopup.placeholder}
                   value={inputTextPopup.text}
                   onChange={(e) => setInputTextPopup({ ...inputTextPopup, text: e.target.value })}
-                  style={{ flex: 1, padding: '8px 12px', borderRadius: '6px', border: '1px solid #cbd5e1' }}
                 />
                 <button type="submit" className="btn btn-primary" style={{ padding: '8px 14px' }}>
                   Enviar
@@ -387,57 +339,23 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
           </div>
         ) : (
           /* PÁGINA DE INICIO / NUEVA PESTAÑA NATIVA (NTP) */
-          <div style={{
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '40px',
-            maxWidth: '640px',
-            width: '100%',
-            textAlign: 'center',
-            gap: '24px'
-          }}>
-            <div style={{
-              width: '64px',
-              height: '64px',
-              background: 'linear-gradient(135deg, #6d28d9, #0284c7)',
-              borderRadius: '18px',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              fontSize: '1.8rem',
-              color: 'white',
-              fontWeight: 800,
-              boxShadow: '0 10px 25px rgba(109,40,217,0.3)'
-            }}>
-              AI
-            </div>
+          <div className="ntp">
+            <div className="ntp-mark">AI</div>
 
             <div>
-              <h2 style={{ fontSize: '1.75rem', fontWeight: 800, color: '#0f172a', marginBottom: '8px' }}>
-                ¿A dónde deseas navegar?
-              </h2>
-              <p style={{ color: '#64748b', fontSize: '0.95rem' }}>
+              <h2 className="ntp-title">¿A dónde deseas navegar?</h2>
+              <p className="ntp-subtitle">
                 Introduce una URL en la barra superior o elige uno de los accesos rápidos a continuación:
               </p>
             </div>
 
             {/* Buscador Central de Inicio */}
-            <form onSubmit={handleNavigateSubmit} style={{ width: '100%', display: 'flex', gap: '8px' }}>
+            <form onSubmit={handleNavigateSubmit} className="ntp-search">
               <input
                 type="text"
                 value={addressInput}
                 onChange={(e) => setAddressInput(e.target.value)}
                 placeholder="Escribe una web (ej: wikipedia.org o google.com)..."
-                style={{
-                  flex: 1,
-                  padding: '14px 18px',
-                  borderRadius: '12px',
-                  border: '1.5px solid #cbd5e1',
-                  fontSize: '1rem',
-                  boxShadow: '0 4px 12px rgba(0,0,0,0.04)'
-                }}
               />
               <button type="submit" className="btn btn-primary" style={{ padding: '14px 24px', fontSize: '1rem' }}>
                 Ir a la Web
@@ -445,30 +363,18 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
             </form>
 
             {/* Enlaces de acceso rápido */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px', width: '100%', marginTop: '12px' }}>
+            <div className="quick-links">
               {quickLinks.map((link) => (
                 <button
                   key={link.name}
+                  className="quick-link-card"
                   onClick={() => {
                     setAddressInput(link.url);
                     onManualNavigate(link.url);
                   }}
-                  style={{
-                    display: 'flex',
-                    flexDirection: 'column',
-                    alignItems: 'center',
-                    gap: '8px',
-                    padding: '16px',
-                    background: '#ffffff',
-                    border: '1px solid #e2e8f0',
-                    borderRadius: '12px',
-                    cursor: 'pointer',
-                    transition: 'all 0.2s ease',
-                    boxShadow: '0 2px 6px rgba(0,0,0,0.03)'
-                  }}
                 >
-                  <span style={{ fontSize: '1.5rem' }}>{link.icon}</span>
-                  <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#334155' }}>{link.name}</span>
+                  <span className="quick-link-icon">{link.icon}</span>
+                  <span className="quick-link-label">{link.name}</span>
                 </button>
               ))}
             </div>

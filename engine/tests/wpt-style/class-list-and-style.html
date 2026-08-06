@@ -1,0 +1,51 @@
+<!--
+  Fixture escrita a mano en estilo testharness.js, NO parte de la corpus
+  real de WPT - ver el aviso en crates/core/src/bin/wpt_runner.rs. Ejercita
+  classList (add/remove/contains/toggle) y element.style
+  (getPropertyValue/setProperty/removeProperty), ambos respaldados por los
+  atributos reales `class`/`style` del elemento.
+-->
+<html>
+<body>
+<div id="target" class="a"></div>
+<script>
+test(function() {
+  var el = document.getElementById('target');
+  el.classList.add('activo');
+  assert_true(el.classList.contains('activo'));
+  assert_equals(el.getAttribute('class'), 'a activo', 'add deberia escribir de verdad el atributo class');
+}, 'classList.add anade una clase al atributo real');
+
+test(function() {
+  var el = document.getElementById('target');
+  el.classList.remove('activo');
+  assert_false(el.classList.contains('activo'));
+  assert_equals(el.getAttribute('class'), 'a');
+}, 'classList.remove quita solo la clase indicada');
+
+test(function() {
+  var el = document.getElementById('target');
+  var quedoPresente = el.classList.toggle('activo');
+  assert_true(quedoPresente);
+  assert_true(el.classList.contains('activo'));
+  el.classList.toggle('activo');
+  assert_false(el.classList.contains('activo'), 'un segundo toggle deberia quitarla de nuevo');
+}, 'classList.toggle alterna presencia y devuelve el estado final');
+
+test(function() {
+  var el = document.getElementById('target');
+  assert_equals(el.style.getPropertyValue('color'), '', 'sin atributo style, getPropertyValue da cadena vacia, no null');
+  el.style.setProperty('color', 'red');
+  assert_equals(el.style.getPropertyValue('color'), 'red');
+  assert_equals(el.getAttribute('style'), 'color: red;', 'setProperty deberia escribir de verdad el atributo style');
+}, 'element.style.setProperty escribe el atributo style real');
+
+test(function() {
+  var el = document.getElementById('target');
+  var quitado = el.style.removeProperty('color');
+  assert_equals(quitado, 'red', 'removeProperty deberia devolver el valor quitado');
+  assert_equals(el.style.getPropertyValue('color'), '');
+}, 'element.style.removeProperty quita la declaracion y devuelve su valor viejo');
+</script>
+</body>
+</html>

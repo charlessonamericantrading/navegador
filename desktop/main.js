@@ -1,5 +1,6 @@
 const { app, BrowserWindow, shell, ipcMain, protocol, net } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const child_process = require('child_process');
 const { autoUpdater } = require('electron-updater');
 
@@ -44,6 +45,10 @@ function notifyBackendStatus(status, extra = {}) {
 function startPythonBackend() {
   const isWin = process.platform === 'win32';
   const isDev = !app.isPackaged;
+  const nativeEngineName = isWin ? 'engine_server.exe' : 'engine_server';
+  const nativeEnginePath = isDev
+    ? path.join(__dirname, '..', 'engine', 'target', 'debug', nativeEngineName)
+    : path.join(process.resourcesPath, 'engine', nativeEngineName);
   
   // Rutas al entorno virtual según el sistema operativo (Desarrollo)
   const venvPython = isWin
@@ -65,16 +70,24 @@ function startPythonBackend() {
     cwd = path.join(process.resourcesPath, 'backend-server');
     args = [];
     
-    // Apuntar a la carpeta interna de navegadores de Playwright empaquetada
-    process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(process.resourcesPath, 'ms-playwright');
     console.log(`Producción: Ejecutando servidor binario en ${exePath}`);
-    console.log(`Producción: Directorio de navegadores Playwright en ${process.env.PLAYWRIGHT_BROWSERS_PATH}`);
   } else {
     // Modo desarrollo
     exePath = venvPython;
     args = [scriptPath];
     cwd = backendDir;
     console.log(`Desarrollo: Ejecutando script con python en ${exePath}`);
+  }
+
+  const backendEnv = {
+    ...process.env,
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUNBUFFERED: '1',
+    NATIVE_ENGINE_PATH: nativeEnginePath
+  };
+
+  if (!fs.existsSync(nativeEnginePath)) {
+    console.warn(`Motor Rust no encontrado todavía en ${nativeEnginePath}`);
   }
 
   // Iniciar el subproceso FastAPI. windowsHide oculta la ventana negra en Windows.
@@ -88,7 +101,7 @@ function startPythonBackend() {
     // búfer de Python cuando su salida no es una terminal (como aquí): sin esto,
     // si el proceso muere de forma abrupta se pueden perder los últimos mensajes
     // que explicarían por qué, justo cuando más falta hacen para depurar.
-    env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' }
+    env: backendEnv
   });
 
   pythonProcess.stdout.on('data', (data) => {
@@ -149,13 +162,15 @@ function startPythonBackend() {
   });
 }
 
-// El backend (backend-server.exe / python) lanza a su vez el driver de Node de
-// Playwright, que a su vez lanza el propio proceso de Chromium. child.kill() solo
-// mata ese PID directo: los procesos nietos (driver + Chromium) quedaban huérfanos
-// y seguían corriendo en segundo plano tras cerrar la app. En Windows no existen
-// grupos de procesos POSIX, así que se usa "taskkill /t" para matar el árbol
-// completo; en el resto de plataformas se aprovecha el grupo de procesos creado
-// por "detached: true" en el spawn, matando el PID negativo (todo el grupo).
+// El backend (backend-server.exe / python) puede lanzar procesos hijos propios,
+// que a su vez lancen los suyos. child.kill() solo mata ese PID directo: los
+// nietos quedaban huérfanos y seguían corriendo en segundo plano tras cerrar
+// la app - problema real encontrado con una dependencia previa de este
+// proyecto que hacía justo eso, pero el mismo riesgo aplica a cualquier
+// proceso que el backend lance en el futuro. En Windows no existen grupos de
+// procesos POSIX, así que se usa "taskkill /t" para matar el árbol completo;
+// en el resto de plataformas se aprovecha el grupo de procesos creado por
+// "detached: true" en el spawn, matando el PID negativo (todo el grupo).
 function killProcessTree(proc) {
   if (!proc || proc.pid == null) return;
   if (process.platform === 'win32') {
@@ -323,7 +338,7 @@ app.on('window-all-closed', () => {
 app.on('will-quit', () => {
   isQuitting = true;
   if (pythonProcess) {
-    console.log("Cerrando el árbol de procesos del backend (incluye Playwright/Chromium)...");
+    console.log("Cerrando el árbol de procesos del backend...");
     killProcessTree(pythonProcess);
     pythonProcess = null;
   }
