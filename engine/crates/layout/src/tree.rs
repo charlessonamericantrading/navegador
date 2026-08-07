@@ -98,6 +98,69 @@ fn resolve_border_width(computed_style: &HashMap<String, String>) -> EdgeSizes {
     EdgeSizes { top: px, right: px, bottom: px, left: px }
 }
 
+/// Colapsa cualquier RACHA de espacios en blanco (incluidos saltos de
+/// linea/tabulaciones de la indentacion del HTML fuente) a un unico espacio
+/// - el comportamiento real de `white-space: normal` (el valor inicial real
+/// de esa propiedad), NO un simple recorte de bordes (`str::trim`): un
+/// espacio inicial/final SIGNIFICATIVO (el que separa palabras de un
+/// elemento vecino) se conserva como UN espacio, no se elimina por
+/// completo. Un texto puramente en blanco colapsa a `" "` (no vacio) -
+/// quien llama decide si eso cuenta como "sin contenido" con su propio
+/// `.trim().is_empty()`.
+fn collapse_whitespace(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut last_was_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space {
+                result.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            result.push(ch);
+            last_was_space = false;
+        }
+    }
+    result
+}
+
+/// Resuelve el ancho BORDER-BOX final de una caja de bloque, a partir de
+/// `width`/`max-width`/`min-width` (si estan puestas en la cascada) mas el
+/// ancho que tendria por defecto (`auto_width` - "llenar el espacio
+/// disponible", el unico comportamiento que existia antes de esta tarea).
+///
+/// `width`/`max-width`/`min-width` son CONTENT-box en el spec real (el
+/// valor inicial de `box-sizing`), asi que se convierten a border-box
+/// sumando el propio padding+border del elemento antes de aplicarlas - sin
+/// esta conversion, un `width: 200px` con padding habria dado un
+/// border-box MAS ESTRECHO que 200px, al reves de lo que hace cualquier
+/// navegador real por defecto. `box-sizing: border-box` (donde `width` ya
+/// seria border-box directamente) no esta soportado.
+///
+/// `max-width` se aplica ANTES que `min-width` - si ambas entran en
+/// conflicto (un `max-width` menor que `min-width`), `min-width` gana,
+/// igual que exige el spec real (`clamp(min, tentative, max)`, no al
+/// reves).
+fn resolve_block_width(computed_style: &HashMap<String, String>, auto_width: f32) -> f32 {
+    let padding = resolve_padding(computed_style);
+    let border = resolve_border_width(computed_style);
+    let box_model_extra = padding.left + padding.right + border.left + border.right;
+
+    let mut width = computed_style
+        .get("width")
+        .and_then(|v| parse_css_length(v))
+        .map(|content_width| content_width + box_model_extra)
+        .unwrap_or(auto_width);
+
+    if let Some(max_content_width) = computed_style.get("max-width").and_then(|v| parse_css_length(v)) {
+        width = width.min(max_content_width + box_model_extra);
+    }
+    if let Some(min_content_width) = computed_style.get("min-width").and_then(|v| parse_css_length(v)) {
+        width = width.max(min_content_width + box_model_extra);
+    }
+    width.max(0.0)
+}
+
 /// Resuelve el valor CRUDO de `font-size` de un elemento (puede venir en
 /// `px`, `em` o `%`) a un tamaño absoluto en pixeles, usando el font-size ya
 /// resuelto del padre como referencia para las unidades relativas - la
@@ -220,9 +283,21 @@ impl LayoutTreeBuilder {
                 parent_layout_box.children.push(current_box);
             }
             NodeType::Text(content) => {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    let mut text_box = LayoutBox::new(BoxType::Text(trimmed.to_string()));
+                // `collapse_whitespace`, NO `content.trim()` a secas (como
+                // era antes de esta tarea): un `.trim()` completo tambien
+                // quita un espacio SIGNIFICATIVO al final de este nodo si
+                // separaba palabras de un hermano siguiente - invisible
+                // mientras cada nodo de texto/inline tenia su propia linea
+                // (antes de la Fase 2.3), pero un bug real ahora que el
+                // flujo inline los junta en la misma linea ("Text " antes
+                // de un `<b>bold</b>` se quedaba en "Text", pegandose a
+                // "bold" sin espacio: "Textbold"). `white-space: normal`
+                // (el valor inicial real de esa propiedad) colapsa
+                // cualquier RACHA de espacios en blanco a uno solo, sin
+                // quitar los bordes por completo.
+                let collapsed = collapse_whitespace(content);
+                if !collapsed.trim().is_empty() {
+                    let mut text_box = LayoutBox::new(BoxType::Text(collapsed));
                     text_box.computed_style = inherited.clone();
                     parent_layout_box.children.push(text_box);
                 }
@@ -247,7 +322,19 @@ impl LayoutTreeBuilder {
     /// ancho asignado (margin-left/right), y vuelve a empujar `cursor_y`
     /// despues (margin-bottom) - sin colapso entre margenes adyacentes, ver
     /// `resolve_margin`.
-    fn flow_block_children(container: &mut LayoutBox, font: Option<&SystemFont>) {
+    /// Devuelve el alto de CONTENIDO real que este contenedor termino
+    /// ocupando (`cursor_y` final menos su propio content-top) - quien
+    /// llama (el mismo `flow_block_children`, para SU padre) lo usa
+    /// directamente en vez de volver a sumar alturas de hijos por su
+    /// cuenta. Esto es lo que hace que el calculo sea correcto tanto para
+    /// hijos de BLOQUE (que nunca se solapan verticalmente, `cursor_y`
+    /// avanza monotono) como para RACHAS INLINE (donde varios hermanos SI
+    /// comparten la misma linea/`y` - ver `flow_inline_run`): sumar
+    /// `dimensions.height` por hijo, como se hacia antes, contaria la misma
+    /// linea varias veces si dos fragmentos inline la comparten. Devolver
+    /// el `cursor_y` final ya resuelve eso por construccion, sin necesitar
+    /// un caso aparte para "hijos que se solapan".
+    fn flow_block_children(container: &mut LayoutBox, font: Option<&SystemFont>) -> f32 {
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
         let padding = resolve_padding(&container.computed_style);
@@ -261,9 +348,26 @@ impl LayoutTreeBuilder {
 
         let origin_x = container.dimensions.x + inset_left;
         let inner_width = (container.dimensions.width - inset_left - inset_right).max(0.0);
-        let mut cursor_y = container.dimensions.y + inset_top;
+        let content_top = container.dimensions.y + inset_top;
+        let mut cursor_y = content_top;
 
-        for child in &mut container.children {
+        let mut i = 0;
+        while i < container.children.len() {
+            if Self::is_inline_level(&container.children[i]) {
+                // Racha de hijos inline-level (texto y/o span/a/b/i)
+                // consecutivos: fluyen juntos en la(s) misma(s) linea(s) en
+                // vez de apilarse uno por uno - ver `flow_inline_run`.
+                let run_end = container.children[i..]
+                    .iter()
+                    .position(|c| !Self::is_inline_level(c))
+                    .map(|rel| i + rel)
+                    .unwrap_or(container.children.len());
+                cursor_y = Self::flow_inline_run(&mut container.children[i..run_end], origin_x, inner_width, cursor_y, font);
+                i = run_end;
+                continue;
+            }
+
+            let child = &mut container.children[i];
             // `margin` no es heredable y las cajas de texto solo llevan
             // propiedades heredadas en su `computed_style` (ver
             // `build_node`) - por construccion, una caja de texto nunca
@@ -275,67 +379,211 @@ impl LayoutTreeBuilder {
             cursor_y += margin.top;
             child.dimensions.x = origin_x + margin.left;
             child.dimensions.y = cursor_y;
-            child.dimensions.width = (inner_width - margin.left - margin.right).max(0.0);
+            // `width`/`max-width`/`min-width` (si estan puestas) sustituyen
+            // o acotan el ancho "llenar el espacio disponible" que era el
+            // unico comportamiento antes de esta tarea - ver
+            // `resolve_block_width`.
+            let auto_width = (inner_width - margin.left - margin.right).max(0.0);
+            child.dimensions.width = resolve_block_width(&child.computed_style, auto_width);
             let child_width = child.dimensions.width;
 
-            match &child.box_type {
-                BoxType::Text(content) => {
-                    let font_size = child
-                        .computed_style
-                        .get("font-size")
-                        .and_then(|v| parse_css_font_size(v))
-                        .unwrap_or(INITIAL_FONT_SIZE);
-
-                    child.dimensions.height = match font {
-                        Some(font) => {
-                            // Quiebre de linea real por palabra (wrap_text,
-                            // engine-text) - la misma funcion que usa
-                            // engine-gfx para pintar cada linea, con los
-                            // mismos argumentos (mismo font_size, mismo
-                            // child_width), asi que el numero de lineas
-                            // que aqui se reserva de alto y el que alli se
-                            // pinta coinciden siempre por construccion.
-                            let lines = engine_text::wrap_text(font, content, font_size, child_width);
-                            let line_height = engine_text::measure_text(font, "", font_size).line_height;
-                            lines.len().max(1) as f32 * line_height
-                        }
-                        None => {
-                            // Sin fuente de sistema disponible (ver
-                            // engine-gfx/window.rs, mismo caso): aproximacion
-                            // por caracteres, no shaping real.
-                            let approx_chars_per_line = (child_width / 8.0).max(1.0);
-                            let lines = (content.len() as f32 / approx_chars_per_line).ceil().max(1.0);
-                            lines * LINE_HEIGHT_FALLBACK
-                        }
-                    };
-                }
-                _ => {
-                    Self::flow_block_children(child, font);
-                    // `flow_block_children(child, ...)`, arriba, ya dejo
-                    // `child.box_dimensions.padding`/`.border` resueltos
-                    // (child pasa a ser el "container" de esa llamada) - se
-                    // reusan en vez de volver a leer la cascada dos veces.
-                    let child_padding = child.box_dimensions.padding;
-                    let child_border = child.box_dimensions.border;
-                    let content_height: f32 = child.children.iter().map(|c| c.dimensions.height).sum();
-                    child.dimensions.height = (content_height
-                        + child_padding.top + child_padding.bottom
-                        + child_border.top + child_border.bottom)
-                        .max(LINE_HEIGHT_FALLBACK);
-                    // El area de contenido real (sin padding NI border, los
-                    // dos ya sumados arriba) - poblar esto es lo que hace
-                    // que `Dimensions::padding_box()`/`border_box()`
-                    // reconstruyan exactamente `child.dimensions`.
-                    child.box_dimensions.content = Rect {
-                        x: child.dimensions.x + child_border.left + child_padding.left,
-                        y: child.dimensions.y + child_border.top + child_padding.top,
-                        width: child_width - child_border.left - child_border.right - child_padding.left - child_padding.right,
-                        height: content_height,
-                    };
-                }
-            }
+            let content_height = Self::flow_block_children(child, font);
+            // `flow_block_children(child, ...)`, arriba, ya dejo
+            // `child.box_dimensions.padding`/`.border` resueltos (child
+            // pasa a ser el "container" de esa llamada) - se reusan en vez
+            // de volver a leer la cascada dos veces.
+            let child_padding = child.box_dimensions.padding;
+            let child_border = child.box_dimensions.border;
+            // `height` (si esta puesta) sustituye la altura AUTO (la que
+            // acaba de devolver la recursion) por el valor explicito del
+            // autor - a diferencia del ancho auto, aqui NO se aplica el
+            // minimo `LINE_HEIGHT_FALLBACK`: ese minimo es un heuristico
+            // propio del motor para no colapsar una caja vacia a cero, no
+            // una regla real del spec, y no deberia pisar un `height` que
+            // el autor puso a proposito (aunque sea mas pequeño que el
+            // contenido - el contenido simplemente desborda, sin recorte:
+            // `overflow` no esta implementado todavia). Sin
+            // `max-height`/`min-height` todavia (fuera del alcance de esta
+            // tarea).
+            let explicit_content_height = child.computed_style.get("height").and_then(|v| parse_css_length(v));
+            let resolved_content_height = explicit_content_height.unwrap_or(content_height);
+            child.dimensions.height = match explicit_content_height {
+                Some(h) => h + child_padding.top + child_padding.bottom + child_border.top + child_border.bottom,
+                None => (content_height + child_padding.top + child_padding.bottom + child_border.top + child_border.bottom).max(LINE_HEIGHT_FALLBACK),
+            };
+            // El area de contenido real (sin padding NI border, los dos ya
+            // sumados arriba) - poblar esto es lo que hace que
+            // `Dimensions::padding_box()`/`border_box()` reconstruyan
+            // exactamente `child.dimensions`. Usa `resolved_content_height`
+            // (no `content_height` a secas) para seguir siendo consistente
+            // cuando `height` esta puesta explicitamente.
+            child.box_dimensions.content = Rect {
+                x: child.dimensions.x + child_border.left + child_padding.left,
+                y: child.dimensions.y + child_border.top + child_padding.top,
+                width: child_width - child_border.left - child_border.right - child_padding.left - child_padding.right,
+                height: resolved_content_height,
+            };
 
             cursor_y += child.dimensions.height + margin.bottom;
+            i += 1;
+        }
+
+        (cursor_y - content_top).max(0.0)
+    }
+
+    fn is_inline_level(b: &LayoutBox) -> bool {
+        matches!(b.box_type, BoxType::Text(_) | BoxType::Inline)
+    }
+
+    /// Coloca una RACHA de hijos inline-level (`BoxType::Text`/
+    /// `BoxType::Inline` consecutivos, ya sea texto suelto o elementos como
+    /// `span`/`a`/`b`/`i`) fluyendo horizontalmente en lineas reales, en vez
+    /// de apilarlos verticalmente uno por uno como hacia este motor antes
+    /// de esta tarea (la razon real del bug "cada `<b>`/`<a>` en su propia
+    /// linea").
+    ///
+    /// Granularidad ATOMICA por hoja de texto, no palabra a palabra entre
+    /// hermanos: cada hoja de texto se coloca ENTERA en la linea actual si
+    /// cabe (una sola medicion via `measure_text`); si no cabe pero la
+    /// linea actual ya tiene contenido, salta a una linea nueva; si ni
+    /// siquiera cabe sola en una linea vacia, esa hoja consume el ANCHO
+    /// COMPLETO del contenedor y envuelve internamente con el mismo
+    /// `wrap_text` de siempre (igual que cualquier caja de texto de
+    /// bloque) - el siguiente hermano SIEMPRE empieza en una linea nueva
+    /// despues de eso, nunca continua a media linea (simplificacion
+    /// declarada: el spec real permitiria que el siguiente inline
+    /// continuara en la ultima linea parcial de un vecino que envolvio
+    /// varias lineas; aqui no - caso raro en paginas reales).
+    ///
+    /// `line_height` se calcula UNA vez para TODA la racha (con el
+    /// font-size de su primera hoja de texto) y se usa para todas sus
+    /// lineas - el spec real usaria el maximo real de cada linea cuando el
+    /// font-size varia dentro de ella; esta simplificacion asume tamaño
+    /// uniforme, cierto para la inmensa mayoria de parrafos reales.
+    ///
+    /// Devuelve el `cursor_y` final (el tope de una linea nueva lista para
+    /// lo que venga despues de la racha).
+    fn flow_inline_run(nodes: &mut [LayoutBox], origin_x: f32, inner_width: f32, start_y: f32, font: Option<&SystemFont>) -> f32 {
+        const LINE_HEIGHT_FALLBACK: f32 = 22.0;
+
+        let line_height = match font {
+            Some(f) => {
+                let font_size = Self::first_leaf_font_size(nodes).unwrap_or(INITIAL_FONT_SIZE);
+                engine_text::measure_text(f, "", font_size).line_height
+            }
+            None => LINE_HEIGHT_FALLBACK,
+        };
+
+        let mut cursor_x = origin_x;
+        let mut cursor_y = start_y;
+        for node in nodes.iter_mut() {
+            Self::place_inline_node(node, origin_x, inner_width, line_height, &mut cursor_x, &mut cursor_y, font);
+        }
+        cursor_y + line_height
+    }
+
+    /// Busca el `font-size` de la primera hoja de TEXTO de la racha,
+    /// atravesando elementos inline anidados (`<b>`, `<i>`...) - la base
+    /// para el `line_height` COMPARTIDO de toda la racha (ver
+    /// `flow_inline_run`). `None` si la racha no tiene ninguna hoja de
+    /// texto real (p.ej. un `<span></span>` vacio suelto).
+    fn first_leaf_font_size(nodes: &[LayoutBox]) -> Option<f32> {
+        for node in nodes {
+            match &node.box_type {
+                BoxType::Text(_) => {
+                    return Some(
+                        node.computed_style
+                            .get("font-size")
+                            .and_then(|v| parse_css_font_size(v))
+                            .unwrap_or(INITIAL_FONT_SIZE),
+                    );
+                }
+                BoxType::Inline => {
+                    if let Some(fs) = Self::first_leaf_font_size(&node.children) {
+                        return Some(fs);
+                    }
+                }
+                BoxType::Block => {}
+            }
+        }
+        None
+    }
+
+    /// Coloca UN nodo inline-level (hoja de texto, o elemento inline cuyos
+    /// hijos se recorren recursivamente con el MISMO cursor compartido) -
+    /// ver `flow_inline_run` para la logica de ajuste de linea.
+    fn place_inline_node(node: &mut LayoutBox, origin_x: f32, inner_width: f32, line_height: f32, cursor_x: &mut f32, cursor_y: &mut f32, font: Option<&SystemFont>) {
+        match &node.box_type {
+            BoxType::Text(content) => {
+                let font_size = node
+                    .computed_style
+                    .get("font-size")
+                    .and_then(|v| parse_css_font_size(v))
+                    .unwrap_or(INITIAL_FONT_SIZE);
+
+                let natural_width = match font {
+                    Some(f) => engine_text::measure_text(f, content, font_size).width,
+                    // Sin fuente de sistema (ver engine-gfx/window.rs, mismo
+                    // caso): misma aproximacion por caracteres que el resto
+                    // del motor sin fuente real.
+                    None => content.len() as f32 * 8.0,
+                };
+
+                let mut remaining = origin_x + inner_width - *cursor_x;
+                if natural_width > remaining && *cursor_x > origin_x {
+                    // No cabe en lo que queda de la linea actual, pero la
+                    // linea ya tiene contenido de un hermano anterior: salta
+                    // a una linea nueva antes de decidir nada mas.
+                    *cursor_y += line_height;
+                    *cursor_x = origin_x;
+                    remaining = inner_width;
+                }
+
+                if natural_width <= remaining {
+                    node.dimensions = Rect { x: *cursor_x, y: *cursor_y, width: natural_width, height: line_height };
+                    *cursor_x += natural_width;
+                } else {
+                    // Ni siquiera cabe sola en una linea vacia (cursor_x ==
+                    // origin_x aqui siempre, por el salto de arriba):
+                    // consume el ancho completo y envuelve internamente,
+                    // igual que una caja de texto de bloque de siempre.
+                    let lines = match font {
+                        Some(f) => engine_text::wrap_text(f, content, font_size, inner_width),
+                        None => vec![content.clone()],
+                    };
+                    let consumed_lines = lines.len().max(1) as f32;
+                    node.dimensions = Rect { x: origin_x, y: *cursor_y, width: inner_width, height: consumed_lines * line_height };
+                    *cursor_y += consumed_lines * line_height;
+                    *cursor_x = origin_x;
+                }
+            }
+            BoxType::Inline => {
+                // `margin`/`padding`/`border` de elementos inline no se
+                // resuelven todavia (fuera de alcance de esta tarea) - el
+                // spec real solo les aplica margen/padding HORIZONTAL de
+                // todas formas (el vertical no afecta el alto de linea), y
+                // es un caso raro en paginas reales para span/a/b/i.
+                let start_x = *cursor_x;
+                let start_y = *cursor_y;
+                for child in &mut node.children {
+                    Self::place_inline_node(child, origin_x, inner_width, line_height, cursor_x, cursor_y, font);
+                }
+                // Rectangulo delimitador de todo lo que contuvo - honesto
+                // solo para el caso comun (contenido que cabe en una sola
+                // linea); si sus hijos terminaron repartidos en mas de una
+                // linea, esto NO es geometricamente preciso (un elemento
+                // inline partido en dos lineas es, en el spec real, DOS
+                // fragmentos rectangulares, no uno) - simplificacion
+                // declarada, suficiente para pintar/hit-testear el caso
+                // comun.
+                node.dimensions = Rect {
+                    x: start_x,
+                    y: start_y,
+                    width: (*cursor_x - start_x).max(0.0),
+                    height: (*cursor_y - start_y) + line_height,
+                };
+            }
+            BoxType::Block => unreachable!("is_inline_level ya filtro los bloques antes de llegar aqui"),
         }
     }
 }
@@ -632,12 +880,15 @@ mod tests {
 
     #[test]
     fn padding_from_css_insets_children_instead_of_the_old_fixed_twelve_pixels() {
-        let dom = HtmlParser::parse(r#"<html><body><div style="padding: 20px"><p>hola</p></div></body></html>"#);
+        // `<div>` hijo, no `<p>`: `<p>` tiene su propio `margin` real desde
+        // la hoja de agente de usuario, lo que desplazaria al hijo por una
+        // razon ajena a lo que este test comprueba (el padding del padre).
+        let dom = HtmlParser::parse(r#"<html><body><div style="padding: 20px"><div>hola</div></div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
         let div_box = find_box_with_style(&root, "padding").expect("el div deberia tener padding en su computed_style");
-        let child_box = div_box.children.first().expect("el div deberia tener un hijo (el <p>)");
+        let child_box = div_box.children.first().expect("el div deberia tener un hijo");
 
         assert_eq!(child_box.dimensions.x, div_box.dimensions.x + 20.0, "el hijo deberia empezar 20px a la derecha del borde del div, no 12px");
         assert_eq!(child_box.dimensions.y, div_box.dimensions.y + 20.0, "el hijo deberia empezar 20px por debajo del borde del div, no 12px");
@@ -645,13 +896,16 @@ mod tests {
 
     #[test]
     fn missing_padding_resolves_to_zero_not_the_old_fixed_default() {
-        let dom = HtmlParser::parse(r#"<html><body><div id="container"><p>hola</p></div></body></html>"#);
+        // `<div>` hijo, no `<p>`: `<p>` ya tiene margin real por la hoja de
+        // agente de usuario, lo que desplazaria al hijo aunque el padding
+        // siga en cero - el test quiere aislar solo el padding.
+        let dom = HtmlParser::parse(r#"<html><body><div id="container"><div>hola</div></div></body></html>"#);
         let stylesheet = CssParser::parse(""); // sin padding en ningun sitio
 
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
         let container_node = Node::find_by_id(&dom, "container").expect("container deberia existir en el DOM");
         let container_box = find_box_for_dom_node(&root, &container_node).expect("container deberia tener una caja de layout");
-        let child_box = container_box.children.first().expect("container deberia tener un hijo (el <p>)");
+        let child_box = container_box.children.first().expect("container deberia tener un hijo");
 
         assert_eq!(child_box.dimensions.x, container_box.dimensions.x, "sin padding declarado, el hijo deberia quedar pegado al borde de su contenedor (offset cero), no a los 12px fijos de antes");
         assert_eq!(child_box.dimensions.y, container_box.dimensions.y, "sin padding declarado, el hijo deberia quedar pegado al borde de su contenedor (offset cero), no a los 12px fijos de antes");
@@ -722,7 +976,10 @@ mod tests {
 
     #[test]
     fn missing_margin_resolves_to_zero_not_the_old_fixed_gap() {
-        let dom = HtmlParser::parse(r#"<html><body><div id="container"><p>uno</p><p>dos</p></div></body></html>"#);
+        // `<div>` hijos, no `<p>`: `<p>` ya tiene margin real por la hoja de
+        // agente de usuario, que introduciria justo el hueco que este test
+        // quiere comprobar que NO existe sin margin declarado.
+        let dom = HtmlParser::parse(r#"<html><body><div id="container"><div>uno</div><div>dos</div></div></body></html>"#);
         let stylesheet = CssParser::parse(""); // sin margin en ningun sitio
 
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
@@ -763,11 +1020,17 @@ mod tests {
 
     #[test]
     fn box_dimensions_margin_is_populated_from_the_real_css_value() {
-        let dom = HtmlParser::parse(r#"<html><body><div style="margin: 12px">contenido</div></body></html>"#);
+        // Busqueda por id, no `find_box_with_style(&root, "margin")`: desde
+        // la hoja de agente de usuario, `<body>` (un ANCESTRO del div en
+        // todo este arbol) tambien tiene su propio `margin` real - la
+        // primera caja con esa clave ya no seria necesariamente el div que
+        // este test quiere comprobar.
+        let dom = HtmlParser::parse(r#"<html><body><div id="target" style="margin: 12px">contenido</div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
-        let div_box = find_box_with_style(&root, "margin").expect("el div deberia tener margin en su computed_style");
+        let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        let div_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja de layout");
 
         assert_eq!(div_box.box_dimensions.margin.top, 12.0);
         assert_eq!(div_box.box_dimensions.margin.right, 12.0);
@@ -802,13 +1065,15 @@ mod tests {
 
     #[test]
     fn border_from_css_insets_children_same_as_padding_would() {
-        let dom = HtmlParser::parse(r#"<html><body><div id="container" style="border: 5px solid #000000"><p>hola</p></div></body></html>"#);
+        // `<div>` hijo, no `<p>`: `<p>` ya tiene margin real por la hoja de
+        // agente de usuario, que desplazaria al hijo ademas del border.
+        let dom = HtmlParser::parse(r#"<html><body><div id="container" style="border: 5px solid #000000"><div>hola</div></div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
         let container_node = Node::find_by_id(&dom, "container").expect("container deberia existir en el DOM");
         let container_box = find_box_for_dom_node(&root, &container_node).expect("container deberia tener una caja de layout");
-        let child_box = container_box.children.first().expect("container deberia tener un hijo (el <p>)");
+        let child_box = container_box.children.first().expect("container deberia tener un hijo");
 
         assert_eq!(child_box.dimensions.x, container_box.dimensions.x + 5.0, "border-width deberia desplazar el hijo hacia adentro, igual que padding");
         assert_eq!(child_box.dimensions.y, container_box.dimensions.y + 5.0, "border-width deberia desplazar el hijo hacia adentro, igual que padding");
@@ -820,13 +1085,14 @@ mod tests {
     /// #000000` sin la palabra `solid` no deberia pintar ni ocupar espacio.
     #[test]
     fn border_without_solid_style_has_zero_effective_width() {
-        let dom = HtmlParser::parse(r#"<html><body><div id="container" style="border: 5px #000000"><p>hola</p></div></body></html>"#);
+        // `<div>` hijo, no `<p>`: mismo motivo que el test anterior.
+        let dom = HtmlParser::parse(r#"<html><body><div id="container" style="border: 5px #000000"><div>hola</div></div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
         let container_node = Node::find_by_id(&dom, "container").expect("container deberia existir en el DOM");
         let container_box = find_box_for_dom_node(&root, &container_node).expect("container deberia tener una caja de layout");
-        let child_box = container_box.children.first().expect("container deberia tener un hijo (el <p>)");
+        let child_box = container_box.children.first().expect("container deberia tener un hijo");
 
         assert_eq!(child_box.dimensions.x, container_box.dimensions.x, "sin 'solid', el ancho efectivo del border deberia ser cero - border-style:none es el valor inicial real");
         assert_eq!(container_box.box_dimensions.border.top, 0.0);
@@ -908,5 +1174,246 @@ mod tests {
 
         let hit = root.hit_test(point_x, point_y).expect("deberia resolver al elemento contenedor, no a None");
         assert!(Arc::ptr_eq(&hit, &target_node));
+    }
+
+    /// Regresion real, encontrada al añadir la hoja de agente de usuario
+    /// (`<body>` gana `margin: 8px` por defecto): el calculo de altura de
+    /// un contenedor sumaba solo `dimensions.height` de cada hijo, sin su
+    /// margin-top/margin-bottom - un contenedor con un hijo marginado se
+    /// quedaba mas bajo de lo que su contenido realmente ocupaba, y el hijo
+    /// se salia por debajo del propio contenedor sin que este lo supiera.
+    /// Prueba directamente el sintoma: la caja de `<html>` debe crecer lo
+    /// bastante para seguir conteniendo a `<body>` una vez desplazado por
+    /// su propio margin, no solo por la altura "interna" de `<body>`.
+    #[test]
+    fn container_height_accounts_for_a_childs_own_margin_not_just_its_box() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="child" style="margin: 40px">hola</div></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+
+        let html_box = root.children.first().expect("root deberia tener un hijo (<html>)");
+        let body_box = html_box.children.first().expect("html deberia tener un hijo (<body>)");
+        let child_node = Node::find_by_id(&dom, "child").expect("child deberia existir");
+        let child_box = find_box_for_dom_node(&root, &child_node).expect("child deberia tener caja");
+
+        let child_bottom = child_box.dimensions.y + child_box.dimensions.height + child_box.box_dimensions.margin.bottom;
+        let body_bottom = body_box.dimensions.y + body_box.dimensions.height;
+        assert!(body_bottom >= child_bottom, "body (hasta {body_bottom}) deberia seguir conteniendo a su hijo marginado (hasta {child_bottom}), no quedarse corto");
+
+        let html_bottom = html_box.dimensions.y + html_box.dimensions.height;
+        assert!(html_bottom >= body_bottom, "html (hasta {html_bottom}) deberia seguir conteniendo a body (hasta {body_bottom})");
+    }
+
+    #[test]
+    fn explicit_width_sets_the_border_box_including_padding_and_border() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="target" style="width: 200px; padding: 10px; border: 5px solid #000000">hola</div></body></html>"#);
+        let stylesheet = CssParser::parse("");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
+
+        // width:200px es CONTENT-box (comportamiento por defecto real de
+        // box-sizing) - el border-box final suma el padding y el border a
+        // los dos lados: 200 + 10*2 + 5*2 = 230.
+        assert_eq!(target_box.dimensions.width, 230.0, "el border-box deberia incluir el width de contenido mas padding y border a ambos lados");
+    }
+
+    #[test]
+    fn without_an_explicit_width_the_box_still_fills_the_available_space() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="target">hola</div></body></html>"#);
+        let stylesheet = CssParser::parse("");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
+
+        // 800 (viewport) - 16 (margin: 8px a cada lado de <body>, hoja de
+        // agente de usuario) = 784, no 800 - el div llena el espacio
+        // disponible DENTRO de body, no el viewport completo.
+        assert_eq!(target_box.dimensions.width, 784.0, "sin width declarado, el comportamiento auto de siempre (llenar el ancho disponible del padre) deberia seguir intacto");
+    }
+
+    #[test]
+    fn max_width_clamps_a_wider_explicit_width() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="target" style="width: 500px; max-width: 300px">hola</div></body></html>"#);
+        let stylesheet = CssParser::parse("");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
+
+        assert_eq!(target_box.dimensions.width, 300.0, "max-width deberia acotar un width explicito mayor");
+    }
+
+    #[test]
+    fn max_width_clamps_the_auto_width_too() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="target" style="max-width: 250px">hola</div></body></html>"#);
+        let stylesheet = CssParser::parse("");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
+
+        assert_eq!(target_box.dimensions.width, 250.0, "max-width deberia acotar tambien el ancho automatico (llenar 800px), no solo un width explicito");
+    }
+
+    #[test]
+    fn min_width_wins_over_a_smaller_max_width() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="target" style="width: 50px; max-width: 100px; min-width: 400px">hola</div></body></html>"#);
+        let stylesheet = CssParser::parse("");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
+
+        assert_eq!(target_box.dimensions.width, 400.0, "min-width deberia ganar sobre max-width si entran en conflicto, igual que el spec real (clamp(min, tentative, max))");
+    }
+
+    #[test]
+    fn explicit_width_shrinks_the_space_available_to_its_own_children() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="parent" style="width: 300px"><div id="child">hola</div></div></body></html>"#);
+        let stylesheet = CssParser::parse("");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let child_node = Node::find_by_id(&dom, "child").expect("child deberia existir");
+        let child_box = find_box_for_dom_node(&root, &child_node).expect("child deberia tener caja");
+
+        assert_eq!(child_box.dimensions.width, 300.0, "el hijo deberia llenar el ancho del padre YA acotado por su width, no el ancho del viewport completo");
+    }
+
+    #[test]
+    fn explicit_height_overrides_the_auto_computed_content_height() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="target" style="height: 400px">hola</div></body></html>"#);
+        let stylesheet = CssParser::parse("");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
+
+        assert_eq!(target_box.dimensions.height, 400.0, "height explicito deberia ganar al alto auto-calculado del contenido");
+    }
+
+    #[test]
+    fn explicit_height_includes_padding_and_border_in_the_border_box() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="target" style="height: 100px; padding: 10px; border: 5px solid #000000">hola</div></body></html>"#);
+        let stylesheet = CssParser::parse("");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
+
+        // height:100px es CONTENT-box, igual que width: 100 + 10*2 + 5*2 = 130.
+        assert_eq!(target_box.dimensions.height, 130.0, "el border-box final deberia incluir el height de contenido mas padding y border arriba y abajo");
+    }
+
+    #[test]
+    fn explicit_height_reconstructs_exactly_via_padding_box() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="target" style="height: 50px; padding: 8px">hola</div></body></html>"#);
+        let stylesheet = CssParser::parse("");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
+
+        let reconstructed = target_box.box_dimensions.padding_box();
+        assert_eq!(reconstructed.height, target_box.dimensions.height, "box_dimensions.content.height debe seguir siendo consistente con dimensions.height cuando height es explicito, no solo en el caso auto");
+    }
+
+    /// El punto real de la Fase 2.3: un `<span>` (u otro elemento inline)
+    /// deberia continuar en la MISMA linea que el texto anterior, no
+    /// saltar a su propia linea como pasaba antes de esta tarea (cada
+    /// hijo, fuera Text o Inline, avanzaba `cursor_y` por su cuenta).
+    #[test]
+    fn text_and_inline_element_share_the_same_line_and_continue_horizontally() {
+        let dom = HtmlParser::parse(r#"<html><body><p>Text <span id="target">bold</span></p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+
+        let text_box = find_text_box(&root, "Text ").expect("deberia existir una caja de texto 'Text '");
+        let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
+
+        assert_eq!(text_box.dimensions.y, target_box.dimensions.y, "el <span> deberia compartir la misma linea que el texto anterior, no saltar a la suya propia");
+        assert_eq!(target_box.dimensions.x, text_box.dimensions.x + text_box.dimensions.width, "el <span> deberia continuar justo donde termina el texto anterior");
+    }
+
+    /// Varios elementos inline consecutivos (no solo texto+inline) tambien
+    /// deberian compartir linea entre si.
+    #[test]
+    fn multiple_inline_elements_in_a_row_share_the_same_line() {
+        let dom = HtmlParser::parse(r#"<html><body><p><b id="first">uno</b><i id="second">dos</i></p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+
+        let first_node = Node::find_by_id(&dom, "first").expect("first deberia existir");
+        let second_node = Node::find_by_id(&dom, "second").expect("second deberia existir");
+        let first_box = find_box_for_dom_node(&root, &first_node).expect("first deberia tener caja");
+        let second_box = find_box_for_dom_node(&root, &second_node).expect("second deberia tener caja");
+
+        assert_eq!(first_box.dimensions.y, second_box.dimensions.y, "<b> e <i> consecutivos deberian compartir linea");
+        assert_eq!(second_box.dimensions.x, first_box.dimensions.x + first_box.dimensions.width, "<i> deberia continuar justo donde termina <b>");
+    }
+
+    /// Cuando el contenido inline no cabe en lo que queda de la linea
+    /// actual, debe saltar a una linea nueva - no desbordar horizontalmente
+    /// mas alla del contenedor.
+    #[test]
+    fn inline_content_wraps_to_a_new_line_when_it_doesnt_fit() {
+        // Sin fuente real (font: None), el ancho es determinista: 8px por
+        // caracter (misma aproximacion que usa el resto del motor sin
+        // fuente). "primera_palabra" (15 caracteres) = 120px, "segunda" (7
+        // caracteres) = 56px - un contenedor de 150px de ancho deja sitio
+        // de sobra para la primera pero no para las dos en la misma linea
+        // (120+56=176 > 150).
+        let dom = HtmlParser::parse(r#"<html><body><div id="container" style="width: 150px"><b id="first">primera_palabra</b><i id="second">segunda</i></div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+
+        let first_text = find_text_box(&root, "primera_palabra").expect("deberia existir la caja de texto 'primera_palabra'");
+        let second_text = find_text_box(&root, "segunda").expect("deberia existir la caja de texto 'segunda'");
+
+        assert!(second_text.dimensions.y > first_text.dimensions.y, "el segundo elemento deberia saltar a una linea nueva al no caber junto al primero");
+        assert_eq!(second_text.dimensions.x, first_text.dimensions.x, "tras saltar de linea, deberia volver al borde izquierdo del contenedor, no seguir desplazado");
+    }
+
+    /// Un hijo de BLOQUE despues de una racha inline no deberia compartir
+    /// linea con ella - el limite de la racha se detecta correctamente al
+    /// encontrar el primer hijo que ya no es inline-level.
+    #[test]
+    fn a_block_sibling_after_an_inline_run_starts_below_it_not_on_the_same_line() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="container"><span id="inline_child">texto</span><div id="block_child">bloque</div></div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+
+        let inline_node = Node::find_by_id(&dom, "inline_child").expect("inline_child deberia existir");
+        let block_node = Node::find_by_id(&dom, "block_child").expect("block_child deberia existir");
+        let inline_box = find_box_for_dom_node(&root, &inline_node).expect("inline_child deberia tener caja");
+        let block_box = find_box_for_dom_node(&root, &block_node).expect("block_child deberia tener caja");
+
+        assert!(block_box.dimensions.y >= inline_box.dimensions.y + inline_box.dimensions.height, "el hijo de bloque deberia empezar despues de que termine la racha inline, no compartir su linea");
+    }
+
+    /// La razon real del cambio de `flow_block_children` de sumar alturas a
+    /// devolver el `cursor_y` final: varios fragmentos inline en la MISMA
+    /// linea no deberian multiplicar la altura del contenedor - si se
+    /// sumaran sus `dimensions.height` (todas iguales, una linea) por
+    /// separado, un parrafo con 3 palabras cortas en una sola linea
+    /// pareceria 3 lineas de alto.
+    #[test]
+    fn sibling_fragments_on_the_same_line_dont_inflate_the_containers_height() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="container"><b id="one">a</b><i id="two">b</i><span id="three">c</span></div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+
+        let container_node = Node::find_by_id(&dom, "container").expect("container deberia existir");
+        let container_box = find_box_for_dom_node(&root, &container_node).expect("container deberia tener caja");
+
+        let one_node = Node::find_by_id(&dom, "one").expect("one deberia existir");
+        let one_box = find_box_for_dom_node(&root, &one_node).expect("one deberia tener caja");
+
+        // Los 3 fragmentos comparten linea (caben de sobra), asi que el
+        // contenedor deberia medir UNA sola linea de alto, no tres.
+        assert_eq!(container_box.dimensions.height, one_box.dimensions.height, "3 fragmentos en la misma linea no deberian multiplicar la altura del contenedor");
     }
 }

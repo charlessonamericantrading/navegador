@@ -16,10 +16,11 @@
 //! workspace.
 
 use engine_css::{CssParser, StyleSheet};
-use engine_dom::{HtmlParser, Node};
+use engine_dom::{HtmlParser, Node, NodeType};
 use engine_js::{JsRuntime, TestResult};
 use engine_layout::{LayoutBox, LayoutTreeBuilder};
 use engine_text::SystemFont;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::scripting;
@@ -54,12 +55,32 @@ pub struct PageResult {
 /// Los `<style>` del documento se concatenan primero, en orden de
 /// documento, y `css` se añade despues; a igualdad de especificidad, lo que
 /// venga despues en la cascada gana, asi que `css` puede pisar reglas de la
-/// pagina si hace falta para un test. `<link rel="stylesheet">` (externo)
-/// queda fuera de alcance, mismo motivo que `<script src>`: exigiria
-/// encolar otra peticion de red en el orden correcto.
-pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font: Option<&SystemFont>) -> PageResult {
+/// pagina si hace falta para un test.
+///
+/// `<link rel="stylesheet">` (externo) sigue sin descargarse AQUI - esta
+/// funcion sigue sin tocar la red a proposito (ver el doc-comment del
+/// modulo). Quien SI puede tocar la red (`core/server.rs::navigate`)
+/// descubre esos `<link>` con `find_external_stylesheet_hrefs`, descarga
+/// cada hoja, y las concatena dentro del propio parametro `css` antes de
+/// llamar aqui - por eso ese parametro ya bastaba para conectar el caso
+/// real sin cambiar esta firma.
+///
+/// `<script src="...">` (externo) SI necesita un parametro nuevo -
+/// `external_scripts` - en vez de reusar `css`: a diferencia de una hoja de
+/// estilos (donde solo importa el conjunto final de declaraciones, no el
+/// orden relativo a nada mas), un script comparte estado real con los
+/// scripts inline vecinos (`var x` declarada en uno debe verse en el
+/// siguiente), asi que su ORDEN DE DOCUMENTO relativo a los `<script>`
+/// inline importa. `external_scripts` mapea el `src` CRUDO tal como
+/// aparece en el HTML (sin resolver) a su contenido ya descargado -
+/// `find_external_script_srcs` descubre que `src` hacen falta, quien llama
+/// los descarga y resuelve, y `scripting::run_scripts` los sustituye en su
+/// sitio exacto en la lista de `<script>` del documento, sin alterar el
+/// orden. Un `src` ausente del mapa (no se pudo descargar, o quien llama no
+/// tiene red - como los tests de este archivo) se omite, igual que antes.
+pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font: Option<&SystemFont>, external_scripts: &HashMap<String, String>) -> PageResult {
     let dom_root = HtmlParser::parse(html);
-    let script_results = scripting::execute_inline_scripts(&dom_root);
+    let script_results = scripting::execute_inline_scripts(&dom_root, external_scripts);
 
     let mut combined_css = String::new();
     for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
@@ -82,9 +103,9 @@ pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f
 /// `bin/wpt_runner.rs`, el unico llamador real de esto - `build_page`
 /// normal se queda intacta a proposito: ninguna pagina real deberia ver
 /// `test`/`assert_equals` como globales.
-pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font: Option<&SystemFont>) -> (PageResult, Vec<TestResult>) {
+pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font: Option<&SystemFont>, external_scripts: &HashMap<String, String>) -> (PageResult, Vec<TestResult>) {
     let dom_root = HtmlParser::parse(html);
-    let (script_results, test_results) = scripting::execute_inline_scripts_with_harness(&dom_root);
+    let (script_results, test_results) = scripting::execute_inline_scripts_with_harness(&dom_root, external_scripts);
 
     let mut combined_css = String::new();
     for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
@@ -108,9 +129,9 @@ pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewp
 /// normal (sin runtime) sigue siendo la opcion correcta para cualquier uso
 /// headless que no necesite interactividad despues de la carga inicial
 /// (`wpt_runner`, los tests de este mismo archivo).
-pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font: Option<&SystemFont>) -> (PageResult, JsRuntime) {
+pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font: Option<&SystemFont>, external_scripts: &HashMap<String, String>) -> (PageResult, JsRuntime) {
     let dom_root = HtmlParser::parse(html);
-    let (script_results, runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root);
+    let (script_results, runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts);
 
     let mut combined_css = String::new();
     for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
@@ -125,6 +146,59 @@ pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, vi
     (PageResult { dom_root, stylesheet, layout_root, script_results }, runtime)
 }
 
+/// Devuelve el valor CRUDO (sin resolver contra ninguna URL base) del
+/// atributo `href` de cada `<link rel="stylesheet" href="...">` del
+/// documento, en orden de documento. `rel` puede traer varios valores
+/// separados por espacios (`rel="preload stylesheet"` es valido) - basta
+/// con que "stylesheet" sea uno de ellos, comparado sin distinguir
+/// mayusculas/minusculas como exige el spec de atributos con lista de
+/// tokens.
+///
+/// Deliberadamente pura y sin red: resolver cada href relativo contra la
+/// URL de la pagina y descargarlo es responsabilidad de quien llama
+/// (`core/server.rs::navigate`), que es quien tiene tanto la URL base como
+/// acceso a `NetworkEngine` - `pipeline.rs` no depende del crate `url` ni
+/// de `engine-net` y no deberia empezar a hacerlo solo por esto.
+pub fn find_external_stylesheet_hrefs(dom_root: &Arc<RwLock<Node>>) -> Vec<String> {
+    Node::find_all_by_tag(dom_root, "link")
+        .iter()
+        .filter_map(|link_node| {
+            let node = link_node.read().unwrap();
+            let NodeType::Element { attributes, .. } = &node.node_type else {
+                return None;
+            };
+            let is_stylesheet = attributes
+                .get("rel")
+                .is_some_and(|rel| rel.split_whitespace().any(|token| token.eq_ignore_ascii_case("stylesheet")));
+            if !is_stylesheet {
+                return None;
+            }
+            attributes.get("href").cloned()
+        })
+        .collect()
+}
+
+/// Devuelve el valor CRUDO del atributo `src` de cada `<script src="...">`
+/// del documento, en orden de documento - el mismo orden en el que
+/// `scripting::run_scripts` recorre `<script>` (inline o externo, sin
+/// distincion) para ejecutarlos. Deliberadamente pura y sin red, mismo
+/// motivo que `find_external_stylesheet_hrefs`. Un `<script>` SIN `src`
+/// (inline) no aparece aqui - eso lo sigue resolviendo `run_scripts` leyendo
+/// `text_content` directamente, esta funcion solo existe para que quien
+/// llama sepa que URLs descargar de antemano.
+pub fn find_external_script_srcs(dom_root: &Arc<RwLock<Node>>) -> Vec<String> {
+    Node::find_all_by_tag(dom_root, "script")
+        .iter()
+        .filter_map(|script_node| {
+            let node = script_node.read().unwrap();
+            let NodeType::Element { attributes, .. } = &node.node_type else {
+                return None;
+            };
+            attributes.get("src").cloned()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +211,7 @@ mod tests {
             800.0,
             600.0,
             None,
+            &HashMap::new(),
         );
 
         assert_eq!(Node::find_all_by_tag(&page.dom_root, "h1").len(), 1);
@@ -146,7 +221,7 @@ mod tests {
 
     #[test]
     fn build_page_executes_inline_scripts_and_reports_their_results() {
-        let page = build_page("<html><body><script>1 + 2</script></body></html>", "", 800.0, 600.0, None);
+        let page = build_page("<html><body><script>1 + 2</script></body></html>", "", 800.0, 600.0, None, &HashMap::new());
         assert_eq!(page.script_results.len(), 1);
         assert_eq!(page.script_results[0].as_deref(), Ok("3"));
     }
@@ -164,6 +239,7 @@ mod tests {
             800.0,
             600.0,
             None,
+            &HashMap::new(),
         );
 
         assert_eq!(page.script_results.len(), 1);
@@ -191,6 +267,7 @@ mod tests {
             800.0,
             600.0,
             None,
+            &HashMap::new(),
         );
         let styled = find_box_with_style(&page.layout_root, "background-color")
             .expect("el <style> de la pagina deberia haber aplicado background-color");
@@ -205,6 +282,7 @@ mod tests {
             800.0,
             600.0,
             None,
+            &HashMap::new(),
         );
         assert!(find_box_with_style(&page.layout_root, "background-color").is_some(), "la regla del <style> de la pagina deberia seguir aplicando");
         assert!(find_box_with_style(&page.layout_root, "color").is_some(), "la regla inyectada por el parametro css tambien deberia aplicar");
@@ -221,6 +299,7 @@ mod tests {
             800.0,
             600.0,
             None,
+            &HashMap::new(),
         );
         assert!(find_box_with_style(&page.layout_root, "background-color").is_some(), "la regla del primer <style> deberia aplicar");
         assert!(find_box_with_style(&page.layout_root, "color").is_some(), "la regla del segundo <style> tambien deberia aplicar");
@@ -234,7 +313,7 @@ mod tests {
     /// produce un arbol con ese ancho, no el original congelado.
     #[test]
     fn dom_root_and_stylesheet_from_a_page_result_can_rebuild_layout_at_a_new_viewport_size() {
-        let page = build_page("<html><body><p>hola</p></body></html>", "", 800.0, 600.0, None);
+        let page = build_page("<html><body><p>hola</p></body></html>", "", 800.0, 600.0, None, &HashMap::new());
         assert_eq!(page.layout_root.dimensions.width, 800.0);
 
         let relaid_out = LayoutTreeBuilder::build(&page.dom_root, &page.stylesheet, 400.0, 300.0, None);
@@ -249,6 +328,7 @@ mod tests {
             800.0,
             600.0,
             None,
+            &HashMap::new(),
         );
         assert_eq!(test_results.len(), 1);
         assert!(test_results[0].passed);
@@ -264,7 +344,7 @@ mod tests {
     /// deberia fallar con un ReferenceError real, no en silencio.
     #[test]
     fn build_page_normal_does_not_register_the_test_harness_globals() {
-        let page = build_page("<html><body><script>typeof test === 'undefined'</script></body></html>", "", 800.0, 600.0, None);
+        let page = build_page("<html><body><script>typeof test === 'undefined'</script></body></html>", "", 800.0, 600.0, None, &HashMap::new());
         assert_eq!(page.script_results[0].as_deref(), Ok("true"), "test no deberia existir como global fuera del arnes");
     }
 
@@ -302,6 +382,7 @@ mod tests {
             800.0,
             600.0,
             None,
+            &HashMap::new(),
         );
 
         let target_node = Node::find_by_id(&page.dom_root, "target").expect("target deberia existir");
@@ -324,5 +405,119 @@ mod tests {
         let new_output_box = find_box_for_dom_node(&new_layout, &output_node).expect("output deberia seguir teniendo caja tras reconstruir el layout");
         let shows_updated_text = new_output_box.children.iter().any(|c| matches!(&c.box_type, engine_layout::BoxType::Text(text) if text == "disparado"));
         assert!(shows_updated_text, "el layout reconstruido deberia pintar el texto ya mutado, no el 'antes' original");
+    }
+
+    #[test]
+    fn finds_the_href_of_a_stylesheet_link() {
+        let dom = HtmlParser::parse(r#"<html><head><link rel="stylesheet" href="/estilos.css"></head><body></body></html>"#);
+        assert_eq!(find_external_stylesheet_hrefs(&dom), vec!["/estilos.css".to_string()]);
+    }
+
+    #[test]
+    fn ignores_link_tags_with_a_different_rel() {
+        let dom = HtmlParser::parse(r#"<html><head><link rel="icon" href="/favicon.ico"></head><body></body></html>"#);
+        assert!(find_external_stylesheet_hrefs(&dom).is_empty(), "un <link rel=icon> no es una hoja de estilos");
+    }
+
+    #[test]
+    fn finds_multiple_stylesheets_in_document_order() {
+        let dom = HtmlParser::parse(
+            r#"<html><head>
+                <link rel="stylesheet" href="/a.css">
+                <link rel="stylesheet" href="/b.css">
+               </head><body></body></html>"#,
+        );
+        assert_eq!(find_external_stylesheet_hrefs(&dom), vec!["/a.css".to_string(), "/b.css".to_string()]);
+    }
+
+    #[test]
+    fn matches_stylesheet_as_one_of_several_space_separated_rel_tokens() {
+        let dom = HtmlParser::parse(r#"<html><head><link rel="preload stylesheet" href="/c.css"></head><body></body></html>"#);
+        assert_eq!(find_external_stylesheet_hrefs(&dom), vec!["/c.css".to_string()]);
+    }
+
+    #[test]
+    fn link_without_href_is_skipped_instead_of_producing_an_empty_string() {
+        let dom = HtmlParser::parse(r#"<html><head><link rel="stylesheet"></head><body></body></html>"#);
+        assert!(find_external_stylesheet_hrefs(&dom).is_empty());
+    }
+
+    #[test]
+    fn finds_the_src_of_an_external_script() {
+        let dom = HtmlParser::parse(r#"<html><body><script src="/app.js"></script></body></html>"#);
+        assert_eq!(find_external_script_srcs(&dom), vec!["/app.js".to_string()]);
+    }
+
+    #[test]
+    fn inline_scripts_are_not_returned_by_find_external_script_srcs() {
+        let dom = HtmlParser::parse("<html><body><script>1 + 1</script></body></html>");
+        assert!(find_external_script_srcs(&dom).is_empty(), "un <script> inline no tiene src, no deberia aparecer aqui");
+    }
+
+    #[test]
+    fn finds_multiple_script_srcs_in_document_order() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><script src="/a.js"></script><script src="/b.js"></script></body></html>"#,
+        );
+        assert_eq!(find_external_script_srcs(&dom), vec!["/a.js".to_string(), "/b.js".to_string()]);
+    }
+
+    /// El punto real de `external_scripts`: un `<script src>` cuyo contenido
+    /// ya fue descargado por quien llama se ejecuta como si fuera inline -
+    /// mismo `JsRuntime`, mismo orden de documento.
+    #[test]
+    fn build_page_executes_a_prefetched_external_script() {
+        let mut external = HashMap::new();
+        external.insert("/app.js".to_string(), "1 + 41".to_string());
+        let page = build_page(
+            r#"<html><body><script src="/app.js"></script></body></html>"#,
+            "",
+            800.0,
+            600.0,
+            None,
+            &external,
+        );
+        assert_eq!(page.script_results.len(), 1);
+        assert_eq!(page.script_results[0].as_deref(), Ok("42"));
+    }
+
+    /// Un `src` que no esta en el mapa (no se pudo descargar, o quien llama
+    /// no tiene red) se omite en silencio - igual que el comportamiento
+    /// anterior a esta tarea, no un panic ni un error fabricado.
+    #[test]
+    fn build_page_skips_an_external_script_missing_from_the_map() {
+        let page = build_page(
+            r#"<html><body><script src="/no-descargado.js"></script></body></html>"#,
+            "",
+            800.0,
+            600.0,
+            None,
+            &HashMap::new(),
+        );
+        assert!(page.script_results.is_empty(), "un src sin contenido pre-descargado deberia omitirse, no fallar");
+    }
+
+    /// La razon real de que esto necesite un parametro nuevo en vez de
+    /// reusar `css`: un script externo comparte ESTADO con los inline
+    /// vecinos, en su posicion exacta del documento - no solo su resultado
+    /// final importa, sino que una variable que declare debe seguir viva
+    /// para el siguiente `<script>`, sea inline o externo.
+    #[test]
+    fn external_and_inline_scripts_share_state_in_document_order() {
+        let mut external = HashMap::new();
+        external.insert("/contador.js".to_string(), "var contador = 10;".to_string());
+        let page = build_page(
+            r#"<html><body>
+                <script src="/contador.js"></script>
+                <script>contador + 5</script>
+            </body></html>"#,
+            "",
+            800.0,
+            600.0,
+            None,
+            &external,
+        );
+        assert_eq!(page.script_results.len(), 2);
+        assert_eq!(page.script_results[1].as_deref(), Ok("15"), "el script inline deberia ver la variable declarada por el script externo anterior");
     }
 }

@@ -1,11 +1,15 @@
 //! Conecta `engine-js` (el wrapper de Boa, hasta ahora aislado) con el
-//! pipeline principal: encuentra los `<script>` inline de la pagina cargada
-//! y los ejecuta de verdad.
+//! pipeline principal: encuentra los `<script>` (inline o externo) de la
+//! pagina cargada y los ejecuta de verdad, en orden de documento.
 //!
 //! Simplificaciones honestas:
-//! - `<script src="...">` (externo) se detecta y se omite explicitamente en
-//!   vez de intentar descargarlo - eso exige encolar otra peticion de red en
-//!   el orden correcto respecto al parseo, tarea aparte.
+//! - `<script src="...">` (externo) NO se descarga aqui - este modulo sigue
+//!   sin tocar la red a proposito, igual que `pipeline.rs`. `run_scripts`
+//!   recibe `external_scripts: &HashMap<String, String>` (src crudo ->
+//!   contenido ya descargado) desde quien SI tiene acceso a red
+//!   (`core/server.rs`, via `pipeline::find_external_script_srcs` +
+//!   `NetworkEngine`); un `src` ausente del mapa se omite, igual que antes
+//!   de que este soporte existiera.
 //! - Los scripts se ejecutan todos seguidos, de una vez, despues de parsear
 //!   el documento completo - un navegador real intercala parseo y ejecucion
 //!   (un `<script>` puede hacer `document.write` y modificar lo que queda
@@ -19,14 +23,16 @@
 //!   entre ellos).
 //! - Sin `async`/eventos: cada script corre hasta el final de forma
 //!   sincrona con el mismo `JsRuntime` (mismo `Context` de Boa) que los
-//!   anteriores, para que variables/funciones declaradas en un script
-//!   esten disponibles en el siguiente, como en una pagina real.
+//!   anteriores, para que variables/funciones declaradas en un script -
+//!   inline o externo, sin distincion - esten disponibles en el siguiente,
+//!   como en una pagina real.
 
 use engine_dom::{Node, NodeType};
 use engine_js::{JsRuntime, TestHarness, TestResult};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-pub fn execute_inline_scripts(dom_root: &Arc<RwLock<Node>>) -> Vec<Result<String, String>> {
+pub fn execute_inline_scripts(dom_root: &Arc<RwLock<Node>>, external_scripts: &HashMap<String, String>) -> Vec<Result<String, String>> {
     let scripts = Node::find_all_by_tag(dom_root, "script");
     if scripts.is_empty() {
         return Vec::new();
@@ -37,7 +43,7 @@ pub fn execute_inline_scripts(dom_root: &Arc<RwLock<Node>>) -> Vec<Result<String
         tracing::warn!("[js] no se pudo enlazar el DOM al runtime: {e}");
     }
 
-    run_scripts(&mut runtime, &scripts)
+    run_scripts(&mut runtime, &scripts, external_scripts)
 }
 
 /// Igual que `execute_inline_scripts`, pero TAMBIEN registra
@@ -47,7 +53,7 @@ pub fn execute_inline_scripts(dom_root: &Arc<RwLock<Node>>) -> Vec<Result<String
 /// real de WPT que manipula el DOM. Ninguna pagina real usa esto - solo el
 /// runner de tests (`bin/wpt_runner.rs`) - por eso es una funcion aparte y
 /// no un flag en `execute_inline_scripts`.
-pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>) -> (Vec<Result<String, String>>, Vec<TestResult>) {
+pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, external_scripts: &HashMap<String, String>) -> (Vec<Result<String, String>>, Vec<TestResult>) {
     let scripts = Node::find_all_by_tag(dom_root, "script");
     if scripts.is_empty() {
         return (Vec::new(), Vec::new());
@@ -61,11 +67,11 @@ pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>) -> (Vec
         Ok(results) => results,
         Err(e) => {
             tracing::warn!("[js] no se pudo registrar el arnes de tests: {e}");
-            return (run_scripts(&mut runtime, &scripts), Vec::new());
+            return (run_scripts(&mut runtime, &scripts, external_scripts), Vec::new());
         }
     };
 
-    let script_results = run_scripts(&mut runtime, &scripts);
+    let script_results = run_scripts(&mut runtime, &scripts, external_scripts);
     let test_results = test_results.lock().unwrap().clone();
     (script_results, test_results)
 }
@@ -81,7 +87,7 @@ pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>) -> (Vec
 /// nada que evaluar), esta SIEMPRE crea y enlaza uno, incluso sin scripts -
 /// quien llama quiere un runtime vivo pase lo que pase, no solo cuando hubo
 /// algo que ejecutar al principio.
-pub fn execute_inline_scripts_keeping_runtime(dom_root: &Arc<RwLock<Node>>) -> (Vec<Result<String, String>>, JsRuntime) {
+pub fn execute_inline_scripts_keeping_runtime(dom_root: &Arc<RwLock<Node>>, external_scripts: &HashMap<String, String>) -> (Vec<Result<String, String>>, JsRuntime) {
     let scripts = Node::find_all_by_tag(dom_root, "script");
 
     let mut runtime = JsRuntime::new();
@@ -89,26 +95,40 @@ pub fn execute_inline_scripts_keeping_runtime(dom_root: &Arc<RwLock<Node>>) -> (
         tracing::warn!("[js] no se pudo enlazar el DOM al runtime: {e}");
     }
 
-    let script_results = run_scripts(&mut runtime, &scripts);
+    let script_results = run_scripts(&mut runtime, &scripts, external_scripts);
     (script_results, runtime)
 }
 
-fn run_scripts(runtime: &mut JsRuntime, scripts: &[Arc<RwLock<Node>>]) -> Vec<Result<String, String>> {
+/// `external_scripts` mapea el `src` CRUDO (tal como aparece en el atributo,
+/// sin resolver contra ninguna URL base) al contenido JS ya descargado por
+/// quien llama - ver el doc-comment del modulo. Un `<script src>` cuyo
+/// valor no esta en el mapa se omite con un aviso, en vez de fallar: puede
+/// que la descarga fallara, o que quien llama (los tests de este archivo,
+/// `wpt_runner`) no tenga red en absoluto.
+fn run_scripts(runtime: &mut JsRuntime, scripts: &[Arc<RwLock<Node>>], external_scripts: &HashMap<String, String>) -> Vec<Result<String, String>> {
     let mut results = Vec::new();
     for script_node in scripts {
-        let is_external = matches!(
-            &script_node.read().unwrap().node_type,
-            NodeType::Element { attributes, .. } if attributes.contains_key("src")
-        );
-        if is_external {
-            tracing::info!("[js] <script src> externo - descarga de scripts remotos fuera de alcance todavia, se omite");
-            continue;
-        }
+        let src = match &script_node.read().unwrap().node_type {
+            NodeType::Element { attributes, .. } => attributes.get("src").cloned(),
+            _ => None,
+        };
 
-        let code = Node::text_content(script_node);
-        if code.trim().is_empty() {
-            continue;
-        }
+        let code = match src {
+            Some(src) => match external_scripts.get(&src) {
+                Some(fetched) => fetched.clone(),
+                None => {
+                    tracing::info!("[js] <script src=\"{src}\"> sin contenido pre-descargado, se omite");
+                    continue;
+                }
+            },
+            None => {
+                let code = Node::text_content(script_node);
+                if code.trim().is_empty() {
+                    continue;
+                }
+                code
+            }
+        };
 
         results.push(runtime.eval(&code).map_err(|e| e.to_string()));
     }
@@ -123,7 +143,7 @@ mod tests {
     #[test]
     fn executes_inline_script_and_returns_its_result() {
         let dom = HtmlParser::parse("<html><body><script>1 + 2</script></body></html>");
-        let results = execute_inline_scripts(&dom);
+        let results = execute_inline_scripts(&dom, &HashMap::new());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].as_deref(), Ok("3"));
     }
@@ -135,7 +155,7 @@ mod tests {
     #[test]
     fn scripts_share_state_across_the_same_document() {
         let dom = HtmlParser::parse("<html><body><script>var contador = 10;</script><script>contador + 5</script></body></html>");
-        let results = execute_inline_scripts(&dom);
+        let results = execute_inline_scripts(&dom, &HashMap::new());
         assert_eq!(results.len(), 2);
         assert_eq!(results[1].as_deref(), Ok("15"), "el segundo script deberia ver la variable del primero");
     }
@@ -143,28 +163,41 @@ mod tests {
     #[test]
     fn reports_script_errors_instead_of_silently_swallowing_them() {
         let dom = HtmlParser::parse("<html><body><script>esto no es JS valido (((</script></body></html>");
-        let results = execute_inline_scripts(&dom);
+        let results = execute_inline_scripts(&dom, &HashMap::new());
         assert_eq!(results.len(), 1);
         assert!(results[0].is_err(), "un error de sintaxis JS deberia reportarse, no fingir exito");
     }
 
     #[test]
-    fn external_scripts_with_src_are_skipped_not_fetched() {
+    fn external_script_missing_from_the_map_is_skipped_not_fetched() {
         let dom = HtmlParser::parse(r#"<html><body><script src="https://example.com/app.js"></script></body></html>"#);
-        let results = execute_inline_scripts(&dom);
-        assert!(results.is_empty(), "un <script src> no deberia intentar ejecutarse (no se descarga todavia)");
+        let results = execute_inline_scripts(&dom, &HashMap::new());
+        assert!(results.is_empty(), "un <script src> sin contenido pre-descargado no deberia intentar ejecutarse (este modulo no toca la red)");
+    }
+
+    /// El punto real de `external_scripts`: si quien llama YA descargo el
+    /// contenido (ver `core/server.rs::fetch_external_scripts`), un
+    /// `<script src>` se ejecuta igual que uno inline.
+    #[test]
+    fn external_script_present_in_the_map_is_executed() {
+        let dom = HtmlParser::parse(r#"<html><body><script src="/app.js"></script></body></html>"#);
+        let mut external = HashMap::new();
+        external.insert("/app.js".to_string(), "10 * 4".to_string());
+        let results = execute_inline_scripts(&dom, &external);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_deref(), Ok("40"));
     }
 
     #[test]
     fn document_with_no_scripts_produces_no_results() {
         let dom = HtmlParser::parse("<html><body><p>sin scripts</p></body></html>");
-        assert!(execute_inline_scripts(&dom).is_empty());
+        assert!(execute_inline_scripts(&dom, &HashMap::new()).is_empty());
     }
 
     #[test]
     fn execute_inline_scripts_with_harness_records_a_passing_test() {
         let dom = HtmlParser::parse("<html><body><script>test(function() { assert_equals(1 + 1, 2); }, 'suma');</script></body></html>");
-        let (_, test_results) = execute_inline_scripts_with_harness(&dom);
+        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new());
         assert_eq!(test_results.len(), 1);
         assert!(test_results[0].passed);
         assert_eq!(test_results[0].name, "suma");
@@ -175,7 +208,7 @@ mod tests {
     #[test]
     fn execute_inline_scripts_with_harness_reports_a_failing_test_instead_of_silencing_it() {
         let dom = HtmlParser::parse("<html><body><script>test(function() { assert_equals(1, 2, 'no deberian ser iguales'); }, 'resta rota');</script></body></html>");
-        let (_, test_results) = execute_inline_scripts_with_harness(&dom);
+        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new());
         assert_eq!(test_results.len(), 1);
         assert!(!test_results[0].passed);
         let message = test_results[0].failure_message.as_ref().expect("deberia haber mensaje de fallo");
@@ -194,7 +227,7 @@ mod tests {
                 }, 'dom real dentro de un test');
             </script></body></html>"#,
         );
-        let (_, test_results) = execute_inline_scripts_with_harness(&dom);
+        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new());
         assert_eq!(test_results.len(), 1);
         assert!(test_results[0].passed, "el test deberia poder leer el DOM real: {:?}", test_results[0].failure_message);
     }
@@ -213,7 +246,7 @@ mod tests {
                 });
             </script></body></html>"#,
         );
-        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom);
+        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new());
         assert_eq!(script_results.len(), 1, "el <script> que registra el listener deberia haberse ejecutado");
 
         let target = Node::find_by_id(&dom, "target").expect("target deberia existir");
@@ -226,7 +259,7 @@ mod tests {
     #[test]
     fn execute_inline_scripts_keeping_runtime_returns_a_bound_runtime_even_with_no_scripts() {
         let dom = HtmlParser::parse("<html><body><p>sin scripts</p></body></html>");
-        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom);
+        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new());
         assert!(script_results.is_empty());
         // Sin scripts no hay forma de que se haya registrado ningun
         // listener, pero el runtime en si deberia seguir siendo usable

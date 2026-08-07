@@ -84,7 +84,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TAMBIEN el `JsRuntime` vivo en vez de dropearlo - lo necesita
     // `on_click`, mas abajo, para poder disparar un "click" real sobre
     // listeners que un script haya registrado durante la carga inicial.
-    let (page, mut runtime) = build_page_keeping_runtime(&html, "", VIEWPORT_WIDTH, VIEWPORT_HEIGHT, font.as_ref());
+    // Sin `<link>`/`<script src>` externos aqui a proposito: este binario
+    // es el arnes manual de pruebas contra una ventana nativa (ver
+    // ARCHITECTURE.md), no el camino real del producto - `server.rs` (el
+    // proceso NDJSON que si habla con el backend) es quien descarga
+    // recursos externos de verdad.
+    let (page, mut runtime) = build_page_keeping_runtime(&html, "", VIEWPORT_WIDTH, VIEWPORT_HEIGHT, font.as_ref(), &std::collections::HashMap::new());
 
     for result in &page.script_results {
         match result {

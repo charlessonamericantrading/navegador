@@ -44,6 +44,7 @@ impl NetworkRequest {
         );
         headers.insert("Accept".to_string(), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".to_string());
         headers.insert("Accept-Language".to_string(), "en-US,en;q=0.9,es;q=0.8".to_string());
+        headers.insert("Accept-Encoding".to_string(), "gzip, deflate, br".to_string());
 
         Ok(Self {
             url,

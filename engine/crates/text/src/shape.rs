@@ -113,6 +113,16 @@ pub fn measure_text(font: &SystemFont, text: &str, font_size: f32) -> TextMetric
 /// lineas que uno calcula y el otro pinta sea siempre el mismo por
 /// construccion, no por coincidencia.
 ///
+/// Preserva un espacio inicial/final SIGNIFICATIVO de `text` (uno solo,
+/// tras `collapse_whitespace` en `engine-layout`) en la primera/ultima
+/// linea devuelta - `split_whitespace()` por si solo los descartaria
+/// (produce tokens de PALABRA, sin bordes), lo cual era invisible mientras
+/// nada llegaba aqui con espacios de borde (el motor recortaba todo el
+/// texto por completo antes de la Fase 2.3), pero es un bug real ahora que
+/// el flujo inline junta varias cajas de texto en la misma linea: un
+/// espacio de borde perdido aqui pega visualmente dos fragmentos vecinos
+/// sin el hueco que deberian tener entre si.
+///
 /// Nota de coste: mide la linea completa que se va formando en cada palabra
 /// (via `measure_text`, que vuelve a shapear desde cero) en vez de sumar
 /// anchos de palabras sueltas - mas simple y exacto (el kerning entre
@@ -128,6 +138,9 @@ pub fn wrap_text(font: &SystemFont, text: &str, font_size: f32, max_width: f32) 
     if max_width <= 0.0 {
         return vec![text.to_string()];
     }
+
+    let leading_space = text.starts_with(char::is_whitespace);
+    let trailing_space = text.ends_with(char::is_whitespace);
 
     let mut lines = Vec::new();
     let mut current_line = String::new();
@@ -149,6 +162,18 @@ pub fn wrap_text(font: &SystemFont, text: &str, font_size: f32, max_width: f32) 
     if !current_line.is_empty() {
         lines.push(current_line);
     }
+
+    if leading_space {
+        if let Some(first) = lines.first_mut() {
+            first.insert(0, ' ');
+        }
+    }
+    if trailing_space {
+        if let Some(last) = lines.last_mut() {
+            last.push(' ');
+        }
+    }
+
     lines
 }
 
@@ -354,5 +379,41 @@ mod tests {
         };
         assert!(wrap_text(&font, "", 16.0, 500.0).is_empty());
         assert!(wrap_text(&font, "   ", 16.0, 500.0).is_empty());
+    }
+
+    /// Regresion real, encontrada al renderizar contenido inline (Fase 2.3
+    /// del motor de layout): `split_whitespace()` produce tokens de
+    /// PALABRA sin bordes, asi que reconstruir lineas uniendo palabras con
+    /// `format!("{a} {b}")` perdia el espacio inicial/final del texto
+    /// original - invisible mientras nada le pasaba a esta funcion un
+    /// texto con espacios de borde (el motor recortaba todo con
+    /// `.trim()`), pero un bug real ahora que varios fragmentos de texto
+    /// comparten linea: el espacio que separa "cursiva" de "y" en
+    /// "cursiva" + " y un " + "enlace" desaparecia al pintar, pegando las
+    /// palabras ("cursivay").
+    #[test]
+    fn wrap_text_preserves_a_significant_leading_and_trailing_space() {
+        let Some(font) = SystemFont::load_default_sans_serif() else {
+            eprintln!("sin fuentes de sistema en este entorno, test omitido");
+            return;
+        };
+        let lines = wrap_text(&font, " y un ", 16.0, 2000.0);
+        assert_eq!(lines, vec![" y un ".to_string()], "el espacio inicial y final del texto original no deberian perderse en una linea unica");
+    }
+
+    /// Mismo punto que el test anterior, pero cuando el texto SI se parte
+    /// en varias lineas: el espacio de borde solo deberia sobrevivir en el
+    /// extremo que le corresponde (inicio de la primera linea, fin de la
+    /// ultima), no en los saltos de linea intermedios.
+    #[test]
+    fn wrap_text_preserves_edge_spaces_only_on_the_first_and_last_line() {
+        let Some(font) = SystemFont::load_default_sans_serif() else {
+            eprintln!("sin fuentes de sistema en este entorno, test omitido");
+            return;
+        };
+        let lines = wrap_text(&font, " uno dos tres ", 16.0, 60.0);
+        assert!(lines.len() > 1, "un ancho estrecho deberia forzar varias lineas para este texto");
+        assert!(lines.first().unwrap().starts_with(' '), "la PRIMERA linea deberia conservar el espacio inicial del texto original");
+        assert!(lines.last().unwrap().ends_with(' '), "la ULTIMA linea deberia conservar el espacio final del texto original");
     }
 }

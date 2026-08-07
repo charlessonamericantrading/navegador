@@ -11,6 +11,36 @@ A fecha de esta limpieza, el motor:
 - **Descarga** paginas reales por HTTPS (`hyper` + `hyper-rustls`, TLS real
   via `rustls`) — verificado en vivo contra `info.cern.ch`. Sin DNS propio
   (usa el resolutor del SO via `hyper-util`); sin HTTP/2 todavia.
+- **Sigue redirecciones** 301/302/303/307/308 de verdad (`NetworkEngine::
+  fetch` en `net/src/http_client.rs`), hasta 20 saltos (limite del fetch
+  spec de WHATWG) antes de rendirse con `NetworkError::TooManyRedirects`.
+  301/302/303 con un metodo distinto de GET/HEAD degradan a GET sin cuerpo
+  antes de repetir la peticion (comportamiento de facto de los navegadores,
+  no el RFC original); 307/308 preservan metodo y cuerpo exactos, que es su
+  unica razon de existir frente a 301/302. `NetworkResponse::url` expone la
+  URL que efectivamente respondio (la final, no la pedida originalmente) -
+  `core/server.rs::navigate` ya la usa para que la barra de direcciones
+  muestre la pagina real en la que se aterrizo, y las Fases 1.3/1.4
+  (recursos externos) la necesitaran para resolver rutas relativas contra
+  la pagina correcta. Verificado en vivo con un servidor local que
+  encadena 302 → 307 → 200. NO implementado: reintento automatico con
+  cache de redirecciones, ni deteccion de bucles mas alla del limite fijo
+  de 20 saltos (si A→B→A, se cuenta como 2 saltos "gastados" como
+  cualquier otro, no se detecta el ciclo antes de tiempo).
+- **Descomprime** el cuerpo de la respuesta segun `Content-Encoding`
+  (`decompress_body` en `net/src/http_client.rs`): gzip y deflate/zlib con
+  `flate2` (backend `miniz_oxide`, Rust puro, sin dependencia de C),
+  brotli con el crate `brotli` (tambien Rust puro). Cada peticion manda
+  `Accept-Encoding: gzip, deflate, br` por defecto. `identity` o cualquier
+  codificacion no reconocida devuelve el cuerpo tal cual (no es un error,
+  es "sin comprimir", igual que un navegador real con una codificacion que
+  no soporta); un cuerpo que dice ser gzip/deflate/br y no lo es SI es un
+  error real (`NetworkError::Decompress`), no se pasa en silencio. "deflate"
+  se interpreta como zlib (RFC 1950, cabecera de 2 bytes), que es lo que
+  mandan los servidores reales pese al nombre - no como deflate crudo (RFC
+  1951). Verificado en vivo contra un servidor local que sirve HTML
+  gzipeado de verdad. NO implementado: zstd (aun no es un `Content-Encoding`
+  de uso generalizado en la web).
 - **Parsea HTML** con `html5ever`: el algoritmo de construccion de arbol del
   spec real, con su recuperacion de errores para HTML mal formado. Verificado
   en vivo y con el adaptador `TreeSink` propio (`html5ever_sink.rs`).
@@ -20,6 +50,22 @@ A fecha de esta limpieza, el motor:
 - **Parsea CSS** con `cssparser` (el tokenizador real de Servo/Stylo): maneja
   bloques anidados, `@media` y otras arroba-reglas (se saltan sin corromper
   el resto de la hoja), strings con `{`/`}`/`;`/`:` dentro, y comentarios.
+- **Descarga `<link rel="stylesheet">`** (externo), no solo `<style>`
+  inline: `core/server.rs::fetch_external_stylesheets` descubre cada
+  `<link>` con `pipeline::find_external_stylesheet_hrefs` (pura, sin red -
+  solo mira `rel`/`href`, tolera `rel="preload stylesheet"` con varios
+  tokens), resuelve su `href` contra la URL final de la pagina (tras
+  redirecciones) y descarga cada hoja con el mismo `NetworkEngine` que la
+  pagina - por tanto con los mismos redirects/gzip/brotli que cualquier
+  otra peticion. Las hojas descargadas se concatenan, en orden de
+  documento, DESPUES de los `<style>` inline (mismo criterio de "lo que
+  viene despues gana a igual especificidad" que ya regia entre `<style>` y
+  el parametro `css` de test). Una hoja que falla (404, red caida, texto
+  invalido) se omite con un aviso, sin abortar la carga de la pagina entera
+  - igual que un navegador real. Verificado en vivo contra un servidor
+  local que sirve HTML y CSS en rutas separadas. NO implementado: cache de
+  hojas repetidas entre navegaciones, `@import` dentro de una hoja externa,
+  precarga especulativa antes de que el HTML termine de parsear.
 - **Matchea selectores de verdad** con el crate `selectors` (el mismo motor
   que usa Firefox/Stylo): combinadores (` `, `>`), selectores compuestos
   (`div.foo`), selectores de atributo (`[href]`, `[type="text"]` con los 6
@@ -45,8 +91,10 @@ A fecha de esta limpieza, el motor:
   `build_page` sigue existiendo pero como CSS ADICIONAL (util para tests o
   una futura hoja de usuario), no como sustituto — probado que ambas fuentes
   se combinan y que varios `<style>` se concatenan en orden. `<link
-  rel="stylesheet">` (externo) sigue sin seguirse, mismo motivo que
-  `<script src>`: exigiria encolar otra peticion de red.
+  rel="stylesheet">` (externo) SI se descarga ahora - ver mas abajo, "Sigue
+  redirecciones"/"Descomprime"/"Descarga `<link rel=stylesheet>`" - lo que
+  sigue sin ocurrir es que se busque durante el PARSEO en si (se descubre
+  parseando el documento una vez completo, no en streaming).
 - **Aplica la cascada CSS al layout**: `LayoutTreeBuilder::resolve_style`
   filtra las reglas del stylesheet por `SelectorMatcher::matches`, ordena por
   especificidad (`SelectorMatcher::calculate_specificity`) y fusiona
@@ -59,8 +107,50 @@ A fecha de esta limpieza, el motor:
   (`CssParser::parse_inline_style`, en `css/src/parser.rs`), no un split
   manual. Antes de esto el atributo `style` se ignoraba por completo: un
   `<div style="color: red">` se pintaba igual que sin el atributo — probado
-  explicitamente, incluido que gana sobre una regla de id. `color` y
-  `font-size` (`INHERITABLE_PROPERTIES` en `tree.rs`) se propagan
+  explicitamente, incluido que gana sobre una regla de id.
+- **Hoja de estilos de agente de usuario** (`css/src/user_agent_stylesheet.rs`):
+  margenes reales de `body`/`h1`-`h6`/`p`/`ul`/`ol`, tamaños de fuente de
+  titulares, color+subrayado de `a`, negrita de `b`/`strong`, cursiva de
+  `i`/`em` - los valores por defecto que cualquier navegador real aplica
+  ANTES del CSS del autor. Sin esto, una pagina sin su propio CSS se veia
+  como texto plano de 16px sin estructura alguna (verificado en vivo antes
+  y despues del cambio: el mismo HTML sin CSS pasa de texto plano a tener
+  titular grande, margenes reales entre parrafos y enlaces azules). Se
+  resuelve como un ORIGEN aparte en `resolve_style`
+  (`apply_matching_rules` se llama dos veces: agente de usuario primero,
+  autor despues) - una regla de autor SIEMPRE gana a una de agente de
+  usuario para la misma propiedad, sin comparar especificidad entre ambas,
+  igual que el orden de origenes real del cascade spec; la especificidad
+  solo desempata DENTRO de cada origen. Probado explicitamente que un
+  autor con la MISMA especificidad nominal que la regla de agente de
+  usuario (ambas un simple selector de tag) sigue ganando - si se hubieran
+  mezclado ambos origenes en una sola lista ordenada por especificidad, el
+  resultado habria dependido del orden de insercion en vez de ser siempre
+  "autor gana". La hoja se parsea una sola vez (`OnceLock`), no en cada
+  `resolve_style` (que corre por cada nodo del DOM). Simplificaciones
+  honestas: `margin` de estos elementos solo tiene el valor VERTICAL real
+  en el spec (arriba/abajo, horizontal en cero) pero aqui el motor de
+  layout solo soporta un unico valor a los 4 lados (`resolve_margin`), asi
+  que tambien empuja los lados; `font-weight`/`font-style`/
+  `text-decoration` quedan en el `computed_style` (cascada correcta) pero
+  `engine-gfx` todavia no los lee al pintar (negrita/cursiva/subrayado no
+  se ven todavia - Fase 2.4); sin viñetas ni sangria de listas.
+  - **Bug real encontrado al añadir esto, no solo teorico**: dar a `<body>`
+    un `margin` real por primera vez expuso que `flow_block_children`
+    calculaba la altura de un contenedor sumando solo `dimensions.height`
+    de cada hijo, SIN su margin-top/margin-bottom - un contenedor con un
+    hijo marginado quedaba mas bajo de lo que su contenido realmente
+    ocupaba, y `<html>` dejaba de contener a `<body>` una vez desplazado
+    por su propio margin. Sintoma real: el hit-test sobre un `<p>` fallaba
+    porque un ancestro (`<html>`) ya no envolvia geometricamente al punto
+    pedido. Arreglado sumando tambien el margin de cada nieto al calcular
+    `content_height` - probado con un test de regresion dedicado
+    (`container_height_accounts_for_a_childs_own_margin_not_just_its_box`).
+    Este bug era preexistente desde que `margin` se hizo real (tarea
+    anterior); simplemente ningun test previo tenia un contenedor cuyo
+    hijo marginado desbordara la altura calculada del contenedor lo
+    suficiente como para romper una comprobacion geometrica de un ancestro.
+  `color` y `font-size` (`INHERITABLE_PROPERTIES` en `tree.rs`) se propagan
   de verdad a las cajas de texto descendientes, atravesando varios niveles y
   respetando que un ancestro mas cercano pise a uno mas lejano — probado con
   4 tests de herencia. El resto de propiedades heredables del spec
@@ -70,8 +160,30 @@ A fecha de esta limpieza, el motor:
   desde un script es un paso deliberadamente separado (ver mas abajo,
   ahora real).
 - **Calcula un layout de bloque real** (Fase 1, item 6 del plan): las cajas
-  se apilan verticalmente con ancho completo del contenedor, sin inline real,
-  floats, ni grid/flex todavia. Las cajas de texto SI miden con las metricas
+  se apilan verticalmente, con `width`/`height`/`max-width`/`min-width`
+  reales (`resolve_block_width` en `tree.rs`) — antes, TODA caja de bloque
+  llenaba el ancho disponible sin importar que dijera su CSS; ahora un
+  `width: 300px` (o `max-width`/`min-width`) se respeta de verdad, y sin
+  ninguna de las tres se sigue llenando el espacio disponible (mismo
+  comportamiento auto de siempre). `width`/`max-width`/`min-width` son
+  CONTENT-box (el valor inicial real de `box-sizing`): se convierten a
+  border-box sumando el propio padding+border antes de aplicarse, asi que
+  un `width: 200px` con padding da un border-box MAS ANCHO que 200px, no
+  mas estrecho — `box-sizing: border-box` no esta soportado. `max-width` se
+  aplica antes que `min-width` (si entran en conflicto, `min-width` gana,
+  igual que `clamp(min, tentative, max)` del spec real) — probado
+  explicitamente. `height` (si esta puesta) sustituye el alto
+  auto-calculado del contenido por el valor del autor, SIN el minimo
+  heuristico que si aplica al alto auto (`LINE_HEIGHT_FALLBACK`, un
+  invento propio del motor, no una regla real) — un `height` pequeño se
+  respeta aunque el contenido desborde visualmente (sin recorte:
+  `overflow` no esta implementado). Sin `max-height`/`min-height`
+  todavia. Verificado en vivo: dos cajas con `background-color` distinto,
+  una con `width: 300px; padding: 10px` midiendo 320px reales, otra con
+  `width: 500px; max-width: 200px` quedando en 200px — ambas visiblemente
+  mas estrechas que el viewport de 800px, donde antes las dos lo habrian
+  llenado por completo sin importar su CSS. Sin floats ni grid/flex
+  todavia. Las cajas de texto SI miden con las metricas
   reales de la fuente que de verdad se va a pintar (`engine_text::measure_text`,
   misma fuente cargada una vez en `core/main.rs` y compartida con
   `engine-gfx`): el alto de linea usa ascenso+descenso+salto de linea reales
@@ -86,7 +198,59 @@ A fecha de esta limpieza, el motor:
   por construccion — probado con tests que comprueban que ninguna palabra se
   parte, se pierde ni se reordena al envolver. Sin fuente de sistema
   disponible, cae a la aproximacion anterior por caracteres — mismo tipo de
-  respaldo honesto que ya usaba `engine-gfx` al pintar. `flex`/`grid` NO
+  respaldo honesto que ya usaba `engine-gfx` al pintar.
+- **Layout INLINE real** (Fase 2.3): `<b>`/`<i>`/`<a>`/`<span>` y texto
+  suelto fluyen horizontalmente en lineas reales, en vez de que cada uno
+  cayera en su propia linea vertical (el bug mas visible detectado en el
+  analisis honesto que motivo el plan de 5 fases). `flow_block_children`
+  (`tree.rs`) agrupa cada racha de hijos consecutivos `BoxType::Text`/
+  `BoxType::Inline` y la delega a `flow_inline_run`, que coloca cada hoja
+  de texto ENTERA (granularidad atomica por nodo, no palabra a palabra
+  entre hermanos) en la linea actual si cabe, salta de linea si no, y
+  envuelve internamente con el mismo `wrap_text` de siempre si ni siquiera
+  cabe sola en una linea vacia — el siguiente hermano entonces empieza en
+  linea nueva (simplificacion declarada: el spec real permitiria
+  continuar en la ultima linea parcial de un vecino que envolvio varias
+  lineas). Un elemento inline anidado (`<b>` con hijos propios) se
+  recorre recursivamente con el MISMO cursor compartido; su propia caja
+  se dimensiona como el rectangulo delimitador de lo que contuvo —
+  impreciso si sus hijos terminan repartidos en mas de una linea (un
+  inline partido en dos lineas es, en el spec real, dos fragmentos, no
+  uno), simplificacion declarada suficiente para pintar/hit-testear el
+  caso comun. `flow_block_children` cambio de sumar `dimensions.height`
+  de cada hijo a devolver el `cursor_y` final (menos su propio
+  content-top): con hijos de bloque nunca se solapan verticalmente y da
+  el mismo resultado exacto que antes (verificado matematicamente y con
+  tests), pero con una racha inline VARIOS hermanos comparten la misma
+  `y` — sumar sus alturas por separado, como se hacia antes, habria
+  multiplicado la altura del contenedor por cada fragmento en la misma
+  linea.
+  - **Dos bugs reales encontrados al construir esto, no solo teoricos**:
+    (1) `build_node` recortaba cada nodo de texto con `.trim()` completo,
+    incluido un espacio SIGNIFICATIVO al final que separaba palabras de
+    un hermano siguiente ("Text " antes de un `<b>bold</b>` se quedaba en
+    "Text", pegandose a "bold": "Textbold") — invisible mientras cada
+    nodo tenia su propia linea, real ahora que el flujo los junta.
+    Arreglado con `collapse_whitespace` (colapsa CUALQUIER racha de
+    espacios en blanco a uno solo, el comportamiento real de
+    `white-space: normal`, sin recortar los bordes por completo). (2)
+    `engine_text::wrap_text` reconstruye lineas via `split_whitespace()` +
+    union de palabras, lo que descarta ESTRUCTURALMENTE cualquier espacio
+    inicial/final del texto original (los tokens de palabra no llevan
+    bordes) — mismo sintoma, un fragmento de texto perdia su espacio de
+    separacion al PINTARSE (gfx re-deriva las lineas llamando a
+    `wrap_text` de nuevo). Arreglado detectando si el texto original
+    empezaba/terminaba en espacio y reinsertandolo en la primera/ultima
+    linea del resultado. Ambos verificados en vivo (un parrafo con texto
+    + `<b>`/`<i>`/`<a>` mezclados, antes y despues: de palabras pegadas
+    entre si a espaciado correcto) y con tests dedicados en
+    `engine-text`/`engine-layout` (`wrap_text` no tenia NINGUN test
+    directo hasta ahora, pese a ser central para layout y pintado).
+  NO implementado: `text-align`, `vertical-align`, alineacion por
+  baseline real (todo el texto de una racha usa el mismo `line_height`,
+  calculado una vez con el font-size de su primera hoja — el spec real
+  usaria el maximo por linea cuando el tamaño varia dentro de ella).
+  `flex`/`grid` NO
   existen: habia un `flexbox.rs` con `FlexLayoutEngine` que nunca se llamaba
   desde `LayoutTreeBuilder` (ningun stylesheet real podia activarlo) y cuya
   logica interna tampoco implementaba el spec de verdad (`justify-content`
@@ -155,13 +319,21 @@ A fecha de esta limpieza, el motor:
   mismo experimento: 0.0s de CPU adicional en reposo, exactos, dos veces
   seguidas. `ControlFlow::Wait` se fija explicito de todas formas, para que
   quede documentado en vez de depender de un valor por defecto implicito.
-- **Ejecuta JavaScript real** sobre los `<script>` inline de la pagina
-  (`core/src/scripting.rs`): todos comparten el mismo `Context` de Boa, asi
-  que una variable declarada en un script sigue viva para el siguiente,
-  igual que en una pagina real — probado con 5 tests, incluyendo que un
-  error de sintaxis se reporta como tal en vez de fingir exito.
-  `<script src="...">` (externo) se detecta y se omite explicitamente: no
-  se descarga todavia. Los scripts corren todos seguidos tras parsear el
+- **Ejecuta JavaScript real** sobre los `<script>` de la pagina, inline O
+  externo (`core/src/scripting.rs`): todos comparten el mismo `Context` de
+  Boa, asi que una variable declarada en un script sigue viva para el
+  siguiente - inline o externo, sin distincion - igual que en una pagina
+  real. `<script src="...">` SI se descarga ahora:
+  `core/server.rs::fetch_external_scripts` descubre cada `src` con
+  `pipeline::find_external_script_srcs` (pura, sin red), lo descarga con el
+  mismo `NetworkEngine` de la pagina (mismos redirects/gzip/brotli), y
+  `scripting::run_scripts` lo ejecuta EN SU POSICION EXACTA del documento -
+  no al final ni por separado - para que el orden relativo a los `<script>`
+  inline (y por tanto el estado compartido entre ellos) sea el correcto.
+  Verificado en vivo con un servidor local: un script externo declara una
+  variable, un `<script>` inline justo despues la lee y la usa. Un `src`
+  que falla al descargarse se omite con un aviso, no aborta la pagina.
+  Los scripts corren todos seguidos tras parsear el
   documento completo, no intercalados con el parseo como en un navegador
   real (`document.write` no podria hacer nada de todas formas: ver mas
   abajo por que). `queueMicrotask` (`event_loop.rs`) ya encola de verdad en

@@ -5,7 +5,7 @@
 //! el layout con tiny-skia y devuelve la captura PNG en Base64. La salida
 //! estándar contiene exclusivamente JSON; los logs van a stderr.
 
-use crate::pipeline::{build_page_keeping_runtime, PageResult};
+use crate::pipeline::{build_page_keeping_runtime, find_external_script_srcs, find_external_stylesheet_hrefs, PageResult};
 use crate::protocol::{
     ElementAttributes, ElementRect, EngineRequest, EngineResponse, InteractiveElement,
     PROTOCOL_VERSION,
@@ -17,6 +17,7 @@ use engine_js::JsRuntime;
 use engine_layout::LayoutTreeBuilder;
 use engine_net::{NetworkEngine, NetworkRequest};
 use engine_text::SystemFont;
+use std::collections::HashMap;
 use std::io;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -141,17 +142,41 @@ impl EngineServer {
             );
         }
 
+        // `response.url` es la URL que realmente respondio 200, tras seguir
+        // las redirecciones que hiciera falta (ver `NetworkEngine::fetch`) -
+        // no el parametro `url` que llego en la peticion, que puede ser una
+        // URL intermedia que ya no existe. Tambien es la base correcta para
+        // resolver rutas relativas de `<link href>` (si `/viejo` redirigio a
+        // `/nuevo/`, un href="foo.css" es `/nuevo/foo.css`, no `/foo.css`).
+        let page_url = response.url.clone();
+        let final_url = page_url.to_string();
         let html = match response.text() {
             Ok(html) => html,
             Err(error) => return Self::error(id, format!("invalid_html_encoding: {error}")),
         };
+
+        // Se parsea UNA vez aqui solo para descubrir que recursos externos
+        // hacen falta (`<link rel=stylesheet>`, `<script src>`) - un DOM de
+        // usar y tirar, distinto del DOM real que construye
+        // `build_page_keeping_runtime` mas abajo. Duplica el parseo (barato,
+        // microsegundos para una pagina normal) a cambio de que
+        // `pipeline.rs` siga sin depender de `url`/`engine-net` para nada -
+        // ver el doc-comment de `find_external_stylesheet_hrefs`.
+        let discovery_dom = engine_dom::HtmlParser::parse(&html);
+        let stylesheet_hrefs = find_external_stylesheet_hrefs(&discovery_dom);
+        let script_srcs = find_external_script_srcs(&discovery_dom);
+
+        let external_css = self.fetch_external_stylesheets(stylesheet_hrefs, &page_url).await;
+        let external_scripts = self.fetch_external_scripts(script_srcs, &page_url).await;
+
         let font = SystemFont::load_default_sans_serif();
         let (page, runtime) = build_page_keeping_runtime(
             &html,
-            "",
+            &external_css,
             self.width as f32,
             self.height as f32,
             font.as_ref(),
+            &external_scripts,
         );
         let title = Node::find_all_by_tag(&page.dom_root, "title")
             .first()
@@ -159,7 +184,7 @@ impl EngineServer {
             .unwrap_or_default();
 
         self.current_page = Some(LoadedPage {
-            url,
+            url: final_url,
             title,
             page,
             runtime,
@@ -168,6 +193,95 @@ impl EngineServer {
         });
         self.scroll_offset_y = 0.0;
         self.state_response(id)
+    }
+
+    /// Descarga cada href de `<link rel="stylesheet">` ya descubierto por
+    /// `find_external_stylesheet_hrefs` y concatena su contenido, en orden
+    /// de documento - la inmensa mayoria de la web real no lleva su CSS en
+    /// `<style>` inline, asi que sin esto casi ninguna pagina real llegaba
+    /// a verse estilada.
+    ///
+    /// Cada href se resuelve contra `page_url` (la URL final tras
+    /// redirecciones, no la pedida originalmente). Una hoja que falla al
+    /// descargarse (404, red caida, URL invalida) se omite con un aviso en
+    /// vez de abortar la carga entera de la pagina - igual que un
+    /// navegador real, que sigue mostrando la pagina con el resto de sus
+    /// estilos aunque una hoja concreta no cargue.
+    async fn fetch_external_stylesheets(&self, hrefs: Vec<String>, page_url: &url::Url) -> String {
+        let mut combined = String::new();
+        for href in hrefs {
+            let Ok(sheet_url) = page_url.join(&href) else {
+                tracing::warn!("[server] href de <link rel=stylesheet> invalido, se omite: {href}");
+                continue;
+            };
+            let request = match NetworkRequest::new(sheet_url.as_str()) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!("[server] no se pudo construir la peticion para {sheet_url}: {error}");
+                    continue;
+                }
+            };
+            match self.network.fetch(&request).await {
+                Ok(response) if response.is_success() => match response.text() {
+                    Ok(css) => {
+                        combined.push_str(&css);
+                        combined.push('\n');
+                    }
+                    Err(error) => tracing::warn!("[server] {sheet_url} no es texto valido, se omite: {error}"),
+                },
+                Ok(response) => tracing::warn!(
+                    "[server] {sheet_url} respondio {} {}, se omite",
+                    response.status_code,
+                    response.status_text
+                ),
+                Err(error) => tracing::warn!("[server] no se pudo descargar {sheet_url}: {error}"),
+            }
+        }
+        combined
+    }
+
+    /// Descarga cada src de `<script src>` ya descubierto por
+    /// `find_external_script_srcs` y devuelve un mapa `src crudo ->
+    /// contenido`, que `scripting::run_scripts` usa para ejecutar cada
+    /// script externo en su posicion exacta de documento (ver el
+    /// doc-comment de `scripting.rs` sobre por que el orden importa aqui y
+    /// no importaba para las hojas de estilo). La clave es el `src` SIN
+    /// resolver (tal como aparece en el HTML), porque es lo unico que
+    /// `run_scripts` ve al recorrer el DOM - resolverlo pasa AQUI, antes de
+    /// insertarlo en el mapa.
+    ///
+    /// Mismo criterio que las hojas de estilo: un script que falla al
+    /// descargarse se omite con un aviso, no aborta la pagina entera.
+    async fn fetch_external_scripts(&self, srcs: Vec<String>, page_url: &url::Url) -> HashMap<String, String> {
+        let mut fetched = HashMap::new();
+        for src in srcs {
+            let Ok(script_url) = page_url.join(&src) else {
+                tracing::warn!("[server] src de <script> invalido, se omite: {src}");
+                continue;
+            };
+            let request = match NetworkRequest::new(script_url.as_str()) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!("[server] no se pudo construir la peticion para {script_url}: {error}");
+                    continue;
+                }
+            };
+            match self.network.fetch(&request).await {
+                Ok(response) if response.is_success() => match response.text() {
+                    Ok(js) => {
+                        fetched.insert(src, js);
+                    }
+                    Err(error) => tracing::warn!("[server] {script_url} no es texto valido, se omite: {error}"),
+                },
+                Ok(response) => tracing::warn!(
+                    "[server] {script_url} respondio {} {}, se omite",
+                    response.status_code,
+                    response.status_text
+                ),
+                Err(error) => tracing::warn!("[server] no se pudo descargar {script_url}: {error}"),
+            }
+        }
+        fetched
     }
 
     fn click(&mut self, id: Option<String>, x: f32, y: f32) -> EngineResponse {
