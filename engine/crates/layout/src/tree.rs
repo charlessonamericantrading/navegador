@@ -326,6 +326,150 @@ fn resolve_image_dimensions(explicit_width: Option<f32>, explicit_height: Option
     }
 }
 
+/// Traduce las propiedades CSS de un CONTENEDOR flex (`flex-direction`,
+/// `justify-content`, `align-items`) al `taffy::Style` que taffy necesita -
+/// puente honesto: cada valor de la cascada ya resuelto que el motor
+/// entiende hoy se traduce 1-a-1; un valor no reconocido o ausente cae al
+/// mismo valor inicial real del spec que usaria taffy por su cuenta
+/// (`Style::default()` ya trae `flex_direction: Row`, y `justify_content`/
+/// `align_items` en `None` significan "sin alinear", que taffy resuelve
+/// como `Start` - el valor inicial real de ambas propiedades). Sin
+/// `flex-wrap`, `align-content`, `row-gap`/`column-gap` todavia
+/// (simplificaciones declaradas, ver el doc-comment de `flow_flex_children`).
+fn flex_container_style(computed_style: &HashMap<String, String>) -> taffy::Style {
+    let flex_direction = match computed_style.get("flex-direction").map(String::as_str) {
+        Some("column") => taffy::FlexDirection::Column,
+        Some("column-reverse") => taffy::FlexDirection::ColumnReverse,
+        Some("row-reverse") => taffy::FlexDirection::RowReverse,
+        _ => taffy::FlexDirection::Row,
+    };
+    let justify_content = match computed_style.get("justify-content").map(String::as_str) {
+        Some("center") => Some(taffy::JustifyContent::CENTER),
+        Some("flex-end") | Some("end") => Some(taffy::JustifyContent::FLEX_END),
+        Some("space-between") => Some(taffy::JustifyContent::SPACE_BETWEEN),
+        Some("space-around") => Some(taffy::JustifyContent::SPACE_AROUND),
+        Some("space-evenly") => Some(taffy::JustifyContent::SPACE_EVENLY),
+        Some("flex-start") | Some("start") => Some(taffy::JustifyContent::FLEX_START),
+        _ => None,
+    };
+    let align_items = match computed_style.get("align-items").map(String::as_str) {
+        Some("center") => Some(taffy::AlignItems::CENTER),
+        Some("flex-end") | Some("end") => Some(taffy::AlignItems::FLEX_END),
+        Some("flex-start") | Some("start") => Some(taffy::AlignItems::FLEX_START),
+        Some("baseline") => Some(taffy::AlignItems::BASELINE),
+        Some("stretch") => Some(taffy::AlignItems::STRETCH),
+        _ => None,
+    };
+    taffy::Style {
+        display: taffy::Display::Flex,
+        flex_direction,
+        justify_content,
+        align_items,
+        ..Default::default()
+    }
+}
+
+/// Traduce las propiedades CSS de un ITEM flex (`flex-grow`/`flex-shrink`/
+/// `flex-basis`, mas `width`/`height` si estan puestas) al `taffy::Style`
+/// del nodo hoja correspondiente. Valores iniciales reales del spec cuando
+/// la propiedad no esta puesta: `flex-grow: 0`, `flex-shrink: 1`,
+/// `flex-basis: auto`.
+fn flex_item_style(computed_style: &HashMap<String, String>) -> taffy::Style {
+    let flex_grow = computed_style.get("flex-grow").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.0);
+    let flex_shrink = computed_style.get("flex-shrink").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0);
+    let flex_basis: taffy::Dimension = computed_style
+        .get("flex-basis")
+        .and_then(|v| parse_css_length(v))
+        .map(taffy::style_helpers::length)
+        .unwrap_or_else(taffy::style_helpers::auto);
+    let width: taffy::Dimension =
+        computed_style.get("width").and_then(|v| parse_css_length(v)).map(taffy::style_helpers::length).unwrap_or_else(taffy::style_helpers::auto);
+    let height: taffy::Dimension =
+        computed_style.get("height").and_then(|v| parse_css_length(v)).map(taffy::style_helpers::length).unwrap_or_else(taffy::style_helpers::auto);
+    taffy::Style {
+        flex_grow,
+        flex_shrink,
+        flex_basis,
+        size: taffy::geometry::Size { width, height },
+        ..Default::default()
+    }
+}
+
+/// Funcion de medida que `taffy` llama para saber cuanto espacio necesita
+/// UN item flex - taffy puede llamarla varias veces con distintos
+/// `known_dimensions`/`available_space` mientras resuelve el layout final
+/// (pasadas ESPECULATIVAS, no la definitiva - esa es
+/// `finalize_flex_item_children`, despues). Reusa el motor de medida real
+/// que ya existe (`flow_block_children` para bloque/inline,
+/// `resolve_image_dimensions` para `<img>`) en vez de que taffy tenga que
+/// inventar su propio medidor de texto/imagenes - exactamente el patron
+/// que `compute_layout_with_measure` espera.
+fn measure_flex_item(
+    child: &mut LayoutBox,
+    known_dimensions: taffy::geometry::Size<Option<f32>>,
+    available_space: taffy::geometry::Size<taffy::AvailableSpace>,
+    font_set: Option<&FontSet>,
+    images: &ImageMap,
+) -> taffy::geometry::Size<f32> {
+    if let BoxType::Image(src) = &child.box_type {
+        let natural = images.get(src).map(|img| (img.width as f32, img.height as f32));
+        let explicit_width = child.computed_style.get("width").and_then(|v| parse_css_length(v));
+        let explicit_height = child.computed_style.get("height").and_then(|v| parse_css_length(v));
+        let (width, height) = resolve_image_dimensions(explicit_width, explicit_height, natural);
+        return taffy::geometry::Size {
+            width: known_dimensions.width.unwrap_or(width),
+            height: known_dimensions.height.unwrap_or(height),
+        };
+    }
+
+    let width = known_dimensions.width.unwrap_or(match available_space.width {
+        taffy::AvailableSpace::Definite(w) => w,
+        // Sin ancho conocido ni disponible definido (min-content/max-content
+        // especulativos): el motor no mide min/max-content real todavia
+        // (ver el doc-comment de `flow_flex_children`) - cero es honesto
+        // (mejor que fingir un ancho arbitrario) y taffy vuelve a preguntar
+        // con un ancho definido antes del layout final de todas formas.
+        _ => 0.0,
+    });
+
+    child.dimensions.x = 0.0;
+    child.dimensions.y = 0.0;
+    child.dimensions.width = width;
+    let content_height = LayoutTreeBuilder::flow_block_children(child, font_set, images);
+    let child_padding = child.box_dimensions.padding;
+    let child_border = child.box_dimensions.border;
+    let explicit_height = child.computed_style.get("height").and_then(|v| parse_css_length(v));
+    let height = known_dimensions.height.unwrap_or_else(|| {
+        let content_or_explicit = explicit_height.unwrap_or(content_height);
+        content_or_explicit + child_padding.top + child_padding.bottom + child_border.top + child_border.bottom
+    });
+
+    taffy::geometry::Size { width, height }
+}
+
+/// Pasada FINAL y autoritativa: `child.dimensions` (x/y/width/height) ya
+/// vienen resueltos por `taffy` (ver `flow_flex_children`) - aqui solo se
+/// posicionan los NIETOS (hijos de este item flex) dentro de esa caja ya
+/// fijada, reusando `flow_block_children` de siempre. El alto que esa
+/// llamada devuelve se descarta a proposito: el alto de ESTE item ya lo
+/// decidio taffy (puede ser distinto del contenido natural por
+/// `align-items: stretch` o `flex-grow` en el eje transversal), no se
+/// recalcula aqui.
+fn finalize_flex_item_children(child: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) {
+    if matches!(child.box_type, BoxType::Image(_)) {
+        return;
+    }
+    LayoutTreeBuilder::flow_block_children(child, font_set, images);
+    let child_padding = child.box_dimensions.padding;
+    let child_border = child.box_dimensions.border;
+    child.box_dimensions.content = Rect {
+        x: child.dimensions.x + child_border.left + child_padding.left,
+        y: child.dimensions.y + child_border.top + child_padding.top,
+        width: (child.dimensions.width - child_border.left - child_border.right - child_padding.left - child_padding.right).max(0.0),
+        height: (child.dimensions.height - child_border.top - child_border.bottom - child_padding.top - child_padding.bottom).max(0.0),
+    };
+}
+
 pub struct LayoutTreeBuilder;
 
 impl LayoutTreeBuilder {
@@ -494,6 +638,16 @@ impl LayoutTreeBuilder {
     /// el `cursor_y` final ya resuelve eso por construccion, sin necesitar
     /// un caso aparte para "hijos que se solapan".
     fn flow_block_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+        // `display: flex` desvia el contenedor entero a `flow_flex_children`
+        // (Fase 3.2, via el crate `taffy` - ver ARCHITECTURE.md "Doctrina de
+        // dependencias") ANTES de tocar nada del flujo de bloque normal: un
+        // contenedor flex no apila a sus hijos verticalmente ni los agrupa
+        // en rachas inline, taffy decide su posicion en los ejes principal/
+        // cruzado.
+        if container.computed_style.get("display").map(String::as_str) == Some("flex") {
+            return Self::flow_flex_children(container, font_set, images);
+        }
+
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
         let padding = resolve_padding(&container.computed_style);
@@ -588,6 +742,126 @@ impl LayoutTreeBuilder {
         }
 
         (cursor_y - content_top).max(0.0)
+    }
+
+    /// Layout real de `display: flex` (Fase 3.2) - EL ALGORITMO en si (como
+    /// se reparte el espacio en los ejes principal/cruzado, `flex-grow`/
+    /// `shrink`/`basis`, alineacion) lo resuelve `taffy`, no codigo propio -
+    /// ver "Doctrina de dependencias" en ARCHITECTURE.md, entrada "Layout
+    /// flex/grid", para la razon exacta. Lo que SI es codigo propio: el
+    /// puente completo hacia/desde `taffy` en las 3 funciones de abajo
+    /// (`flex_container_style`/`flex_item_style` traducen CSS ya resuelto a
+    /// `taffy::Style`; `measure_flex_item` conecta el motor de texto/imagen
+    /// YA existente como funcion de medida de `taffy` en vez de que taffy
+    /// necesite inventar su propio medidor de contenido; el bucle final
+    /// vuelca `taffy::Layout` de vuelta en `LayoutBox::dimensions`).
+    ///
+    /// Cada hijo DIRECTO del contenedor es un item flex (sin distincion de
+    /// `BoxType` - un `<img>` o un `<div>` son items igual de validos); sus
+    /// propios hijos (nietos de `container`) se posicionan aparte, DESPUES
+    /// de que `taffy` decida el tamaño/posicion final de cada item, via
+    /// `finalize_flex_item_children` - reutilizando el mismo
+    /// `flow_block_children` de siempre, no una copia.
+    ///
+    /// Simplificaciones declaradas: sin `flex-wrap` (una sola linea
+    /// siempre), sin contenido inline/texto suelto como item flex directo
+    /// (el caso raro de texto suelto como hijo directo de un contenedor
+    /// flex no se envuelve en un item anonimo, como exigiria el spec real -
+    /// en la practica set ignora, no aparece), sin medicion real de
+    /// min-content/max-content (un item sin ancho explicito mide su
+    /// contenido al ancho DISPONIBLE completo, no al ancho minimo que
+    /// evitaria partir palabras - aproximacion razonable para la mayoria de
+    /// paginas reales, exacta cuando el item tiene su propio `width`).
+    fn flow_flex_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+        let padding = resolve_padding(&container.computed_style);
+        let border = resolve_border_width(&container.computed_style);
+        container.box_dimensions.padding = padding;
+        container.box_dimensions.border = border;
+
+        let inset_left = border.left + padding.left;
+        let inset_right = border.right + padding.right;
+        let inset_top = border.top + padding.top;
+
+        let origin_x = container.dimensions.x + inset_left;
+        let origin_y = container.dimensions.y + inset_top;
+        let inner_width = (container.dimensions.width - inset_left - inset_right).max(0.0);
+
+        if container.children.is_empty() {
+            return 0.0;
+        }
+
+        let mut taffy_tree: taffy::TaffyTree<usize> = taffy::TaffyTree::new();
+        let mut child_node_ids = Vec::with_capacity(container.children.len());
+        for (index, child) in container.children.iter().enumerate() {
+            let style = flex_item_style(&child.computed_style);
+            let node_id = taffy_tree
+                .new_leaf_with_context(style, index)
+                .expect("crear un nodo hoja de taffy no deberia fallar (sin limite de nodos alcanzado)");
+            child_node_ids.push(node_id);
+        }
+        // El PROPIO tamaño del contenedor va en su `Style.size`, no solo en
+        // el `available_space` de `compute_layout_with_measure` (que taffy
+        // trata como un techo para sizing intrinseco/shrink-to-fit, no como
+        // el ancho ya resuelto) - `resolve_block_width` (fuera de esta
+        // funcion, en `flow_block_children`) YA dejo el ancho border-box
+        // definitivo en `container.dimensions.width` antes de llegar aqui,
+        // asi que se pasa tal cual en vez de dejar que taffy lo redescubra
+        // encogiendo el contenedor al contenido (bug real encontrado en
+        // vivo: sin esto, un `<div style="display:flex; width:500px">`
+        // con un item `flex-grow:1` sin ancho propio se encogia a 100px en
+        // vez de 500 - taffy sumaba solo el flex-basis de los items,
+        // ignorando el ancho real del contenedor, porque nunca se le dijo).
+        let explicit_container_height = container.computed_style.get("height").and_then(|v| parse_css_length(v));
+        let mut root_style = flex_container_style(&container.computed_style);
+        root_style.size.width = taffy::style_helpers::length(inner_width);
+        if let Some(h) = explicit_container_height {
+            root_style.size.height = taffy::style_helpers::length(h);
+        }
+        let root_id = taffy_tree
+            .new_with_children(root_style, &child_node_ids)
+            .expect("crear el nodo contenedor de taffy no deberia fallar");
+
+        // Alto explicito del CONTENEDOR (si lo hay): un contenedor flex sin
+        // `height` propia crece para envolver su contenido (MaxContent);
+        // uno con `height` fija le da a taffy un alto DEFINIDO, necesario
+        // para que `align-items: stretch` (el valor inicial real de la
+        // propiedad) tenga contra que estirar a sus items en flex-direction
+        // row.
+        let available_height = match explicit_container_height {
+            Some(h) => taffy::AvailableSpace::Definite(h),
+            None => taffy::AvailableSpace::MaxContent,
+        };
+
+        let children = &mut container.children;
+        taffy_tree
+            .compute_layout_with_measure(
+                root_id,
+                taffy::geometry::Size { width: taffy::AvailableSpace::Definite(inner_width), height: available_height },
+                |known_dimensions, available_space, _node_id, node_context, _style| match node_context {
+                    Some(&mut index) => measure_flex_item(&mut children[index], known_dimensions, available_space, font_set, images),
+                    None => taffy::geometry::Size::ZERO,
+                },
+            )
+            .expect("compute_layout_with_measure no deberia fallar con un arbol bien formado (sin ciclos, todos los nodos creados arriba)");
+
+        // Con el layout ya resuelto por taffy, se copia cada item de vuelta
+        // a `LayoutBox::dimensions` (coordenadas ABSOLUTAS, `origin_x`/
+        // `origin_y` mas la posicion RELATIVA al contenedor que devuelve
+        // taffy) y se posicionan sus propios hijos (los nietos de
+        // `container`) en una pasada final autoritativa.
+        let mut max_bottom = origin_y;
+        for (index, node_id) in child_node_ids.iter().enumerate() {
+            let layout = *taffy_tree.layout(*node_id).expect("layout deberia existir tras compute_layout_with_measure");
+            let child = &mut container.children[index];
+            child.dimensions.x = origin_x + layout.location.x;
+            child.dimensions.y = origin_y + layout.location.y;
+            child.dimensions.width = layout.size.width;
+            child.dimensions.height = layout.size.height;
+            finalize_flex_item_children(child, font_set, images);
+            max_bottom = max_bottom.max(child.dimensions.y + child.dimensions.height);
+        }
+
+        (max_bottom - origin_y).max(0.0)
     }
 
     fn is_inline_level(b: &LayoutBox) -> bool {
@@ -835,6 +1109,108 @@ mod tests {
             }
         }
         root.children.iter().find_map(|c| find_box_for_dom_node(c, target))
+    }
+
+    /// El punto real de la Fase 3.2: tres items de ancho fijo en un
+    /// contenedor `display: flex` (row, el eje principal por defecto) se
+    /// colocan uno al lado del otro, no apilados verticalmente como haria
+    /// el flujo de bloque normal.
+    #[test]
+    fn flex_row_places_children_side_by_side() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="c" style="display: flex;"><div id="a" style="width: 50px;">a</div><div id="b" style="width: 60px;">b</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } #c div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let a_node = Node::find_by_id(&dom, "a").expect("a deberia existir");
+        let b_node = Node::find_by_id(&dom, "b").expect("b deberia existir");
+        let a_box = find_box_for_dom_node(&root, &a_node).expect("a deberia tener caja");
+        let b_box = find_box_for_dom_node(&root, &b_node).expect("b deberia tener caja");
+
+        assert_eq!(a_box.dimensions.x, 0.0);
+        assert_eq!(a_box.dimensions.width, 50.0);
+        assert_eq!(b_box.dimensions.x, 50.0, "b deberia empezar justo donde termina a (eje principal), no en su propia linea");
+        assert_eq!(a_box.dimensions.y, b_box.dimensions.y, "ambos items deberian compartir la misma coordenada y (una sola fila)");
+    }
+
+    /// `flex-direction: column` cambia el eje principal a vertical - los
+    /// items se apilan en Y en vez de en X.
+    #[test]
+    fn flex_column_stacks_children_vertically() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="display: flex; flex-direction: column;"><div id="a" style="height: 30px;">a</div><div id="b" style="height: 40px;">b</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let a_node = Node::find_by_id(&dom, "a").expect("a deberia existir");
+        let b_node = Node::find_by_id(&dom, "b").expect("b deberia existir");
+        let a_box = find_box_for_dom_node(&root, &a_node).expect("a deberia tener caja");
+        let b_box = find_box_for_dom_node(&root, &b_node).expect("b deberia tener caja");
+
+        assert_eq!(a_box.dimensions.y, 0.0);
+        assert_eq!(a_box.dimensions.height, 30.0);
+        assert_eq!(b_box.dimensions.y, 30.0, "b deberia empezar justo debajo de a (eje principal vertical)");
+        assert_eq!(a_box.dimensions.x, b_box.dimensions.x, "ambos items deberian compartir la misma columna");
+    }
+
+    /// El punto real de `flex-grow`: reparte el espacio SOBRANTE del
+    /// contenedor entre los items proporcionalmente a su valor - un item
+    /// con `flex-grow: 1` y otro sin `flex-grow` (0 por defecto) se lleva
+    /// TODO el espacio libre, no una parte fija.
+    #[test]
+    fn flex_grow_distributes_the_remaining_space() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="display: flex; width: 500px;"><div id="fixed" style="width: 100px;">fijo</div><div id="grow" style="flex-grow: 1;">crece</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let fixed_node = Node::find_by_id(&dom, "fixed").expect("fixed deberia existir");
+        let grow_node = Node::find_by_id(&dom, "grow").expect("grow deberia existir");
+        let fixed_box = find_box_for_dom_node(&root, &fixed_node).expect("fixed deberia tener caja");
+        let grow_box = find_box_for_dom_node(&root, &grow_node).expect("grow deberia tener caja");
+
+        assert_eq!(fixed_box.dimensions.width, 100.0, "el item sin flex-grow deberia quedarse en su ancho fijo");
+        assert_eq!(grow_box.dimensions.width, 400.0, "el item con flex-grow: 1 deberia llevarse todo el espacio sobrante (500 - 100)");
+    }
+
+    /// `justify-content: center` centra los items en el eje principal
+    /// cuando sobra espacio, en vez de dejarlos pegados al borde inicial
+    /// (comportamiento por defecto, `flex-start`).
+    #[test]
+    fn justify_content_center_centers_items_on_the_main_axis() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="display: flex; justify-content: center; width: 400px;"><div id="item" style="width: 100px;">x</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let item_node = Node::find_by_id(&dom, "item").expect("item deberia existir");
+        let item_box = find_box_for_dom_node(&root, &item_node).expect("item deberia tener caja");
+
+        assert_eq!(item_box.dimensions.x, 150.0, "(400 - 100) / 2 = 150, el item deberia quedar centrado en el eje principal");
+    }
+
+    /// Un `<img>` como item flex (sin distincion de BoxType, ver el
+    /// doc-comment de `flow_flex_children`) deberia medir su tamaño real -
+    /// prueba que `measure_flex_item` conecta de verdad
+    /// `resolve_image_dimensions`, no solo las cajas de bloque/texto.
+    #[test]
+    fn an_image_as_a_flex_item_measures_its_real_natural_size() {
+        let dom = HtmlParser::parse(r#"<html><body><div style="display: flex;"><img id="photo" src="foto.png"></div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let mut images = ImageMap::new();
+        images.insert("foto.png".to_string(), Arc::new(engine_image::DecodedImage { width: 80, height: 40, rgba: vec![0u8; 80 * 40 * 4] }));
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &images);
+
+        let photo_node = Node::find_by_id(&dom, "photo").expect("photo deberia existir");
+        let photo_box = find_box_for_dom_node(&root, &photo_node).expect("photo deberia tener caja");
+
+        assert_eq!(photo_box.dimensions.width, 80.0);
+        assert_eq!(photo_box.dimensions.height, 40.0);
     }
 
     #[test]

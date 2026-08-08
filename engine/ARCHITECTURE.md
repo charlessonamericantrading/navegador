@@ -260,6 +260,79 @@ A fecha de esta limpieza, el motor:
   patron de "codigo que miente" de la seccion de abajo, asi que se borro en
   vez de dejarlo fingiendo. Flexbox real, conectado a `display: flex` y
   probado contra casos concretos del spec, sigue pendiente (Fase 2).
+- **Flexbox real via `taffy`** (Fase 3.2): la tarea original pedia evaluar
+  `taffy` antes de escribir flexbox a mano, dado el `FlexLayoutEngine`
+  fingido que se borro arriba (que ni el propio `LayoutTreeBuilder` llamaba
+  nunca). Verificado que `taffy` (v0.13, resuelto contra crates.io en este
+  mismo entorno) es real y madura: implementa Flexbox Y CSS Grid completos,
+  la usan proyectos en produccion real (Bevy, Dioxus), y expone
+  `TaffyTree::compute_layout_with_measure` con funciones de medida propias -
+  exactamente el patron que hace falta para reusar el `flow_block_children`/
+  `measure_text`/`resolve_image_dimensions` YA existentes en vez de que
+  taffy tenga que reinventar su propio medidor de texto/imagenes.
+  - **Decision, con la razon exacta**: SI usar `taffy` para el ALGORITMO de
+    reparto de espacio de flex (eje principal/cruzado, `flex-grow`/`shrink`/
+    `basis`, alineacion) - es del mismo orden de complejidad que el arbol
+    de HTML5 (~800 estados, ya justifica `html5ever` en esta misma tabla) y
+    ya esta resuelto por un crate maduro. Esto es una EXCEPCION explicita a
+    la entrada "layout: ..., flex, grid, ..." de la lista "se escribe a
+    mano" de mas abajo - un cambio real de la doctrina previa, no una
+    entrada mas (aprobado explicitamente antes de integrar). El puente SI
+    se escribe a mano - eso sigue siendo "como se comporta la pagina" real.
+  - **La integracion real, no solo la evaluacion**: nuevo modulo dentro de
+    `engine-layout::tree` con 3 piezas. (1) `flex_container_style`/
+    `flex_item_style` traducen `computed_style` ya resuelto (`display: flex`
+    detectado en `flow_block_children`, que desvia el contenedor entero a
+    `flow_flex_children`) a `taffy::Style`: `flex-direction`/
+    `justify-content`/`align-items` para el contenedor, `flex-grow`/
+    `flex-shrink`/`flex-basis`/`width`/`height` para cada item - CADA hijo
+    DIRECTO es un item flex, sin distincion de `BoxType` (un `<img>` es un
+    item tan valido como un `<div>`). (2) `measure_flex_item`, la funcion de
+    medida que `taffy` invoca (varias veces, con distintos `available_space`
+    especulativos) para saber cuanto necesita cada item: para imagenes
+    llama a `resolve_image_dimensions`, para bloque/inline ejecuta
+    `flow_block_children` en una pasada especulativa a un ancho candidato.
+    (3) Tras `compute_layout_with_measure`, `finalize_flex_item_children`
+    hace la pasada FINAL y autoritativa: copia `taffy::Layout` (x/y/ancho/
+    alto ya resueltos) a `LayoutBox::dimensions` y posiciona a los NIETOS
+    (hijos de cada item) con el mismo `flow_block_children` de siempre, a
+    su ancho/alto YA definitivos. El pintado (`display_list.rs`) no
+    necesito ningun cambio: solo lee `LayoutBox::dimensions`, sin saber ni
+    importarle si vinieron del flujo de bloque o de `taffy`.
+  - **Bug real encontrado y arreglado al verificar en vivo, no teorico**:
+    el PROPIO tamaño del contenedor flex nunca se paso a `taffy::Style.size`
+    - solo se pasaba como `available_space` a `compute_layout_with_measure`,
+    que taffy trata como un TECHO para sizing intrinseco/shrink-to-fit, NO
+    como el ancho ya resuelto. Resultado: un contenedor `display: flex;
+    width: 500px` con un item `flex-grow: 1` sin ancho propio se encogia a
+    la suma de los flex-basis de sus items (100px) en vez de ocupar los
+    500px reales - `flex-grow` no tenia espacio sobrante que repartir
+    porque el contenedor nunca llego a medir 500px. Diagnosticado leyendo
+    el propio codigo fuente de `taffy` (`determine_container_main_size` en
+    `compute/flexbox.rs`: sin `Style.size` propio, un contenedor de una
+    sola linea usa `longest_line_length` -shrink-to-fit-, ignorando
+    `available_space` como techo real solo cuando hay mas de una linea).
+    Arreglado pasando el `inner_width`/alto explicito YA resueltos por
+    `resolve_block_width` (via el flujo de bloque normal, ANTES de llegar
+    aqui) directamente en `Style.size` del nodo raiz. Verificado con test
+    dedicado (`flex_grow_distributes_the_remaining_space`) y en vivo (fila
+    con 3 items reales, `flex-grow`/`justify-content: space-between`/
+    `align-items: center`, mas una columna separada con `flex-direction:
+    column` - captura de pantalla con colores solidos, screenshot revisado).
+  - Tests reales: layout fila/columna, `flex-grow` repartiendo espacio
+    sobrante, `justify-content: center`, una `<img>` como item flex midiendo
+    su tamaño natural real via `measure_flex_item`.
+  - NO implementado: `flex-wrap` (una sola linea siempre), medicion real de
+    min-content/max-content (un item sin ancho explicito mide su contenido
+    al ancho DISPONIBLE completo al pedir el tamaño de contenido, no al
+    ancho minimo que evitaria partir palabras - declarado en el propio
+    `measure_flex_item`), `align-content`, `align-self` por item,
+    `row-gap`/`column-gap`, `order`, texto suelto como item flex anonimo
+    (el spec real lo envolveria; aqui simplemente no se maneja - caso raro).
+    CSS Grid NO esta conectado (la feature `grid` de `taffy` esta
+    deliberadamente desactivada en `Cargo.toml` - esta tarea era solo
+    flexbox); reactivarla cuando llegue esa fase es sumar la feature y un
+    puente equivalente, `taffy` ya la trae.
 - **Negrita/cursiva reales** (Fase 2.4): `<b>`/`<strong>`/`font-weight: bold`
   y `<i>`/`<em>`/`font-style: italic` ya se PINTAN con una cara de fuente de
   verdad, no solo se resuelven en la cascada sin efecto visible (que era el
@@ -966,6 +1039,7 @@ estan resueltos por crates maduros y probados en produccion.
 | Compositacion GPU | `wgpu` (dependencia integrada, `gfx/src/gpu_pipeline.rs::WebGpuPipeline` consulta un adaptador real - pero nada del pipeline real la llama todavia; el rasterizado actual es 100% CPU via tiny-skia) | Abstraccion real sobre Vulkan/Metal/DX12 |
 | Imagenes de trama | `image` (integrado - `engine-image`, Fase 3.1: PNG/JPEG/GIF/BMP/WebP/TIFF/ICO) | Cada formato tiene su propio infierno de casos borde |
 | Imagenes vectoriales | `resvg` (pendiente de integrar) | SVG es su propio motor de render, no un simple decode-a-RGBA |
+| Layout flex (grid pendiente) | `taffy` (integrado - `flow_flex_children`/`measure_flex_item` en `engine-layout::tree`, Fase 3.2: flexbox real; feature `grid` desactivada a proposito, todavia sin puente propio) | El algoritmo de Flexible Box Layout completo (ejes principal/cruzado, `flex-grow`/`shrink`/`basis`, wrap, min/max-content, alineacion) es del mismo orden de complejidad que el arbol de HTML5 - "resuelto ya", no una virtud reescribirlo |
 | Ventanas + eventos | `winit` (ya en uso) | Cada sistema operativo tiene el suyo propio |
 | Presentacion a pantalla | `softbuffer` (ya en uso) | Blit de pixeles a superficie de ventana, multiplataforma |
 
@@ -973,7 +1047,7 @@ estan resueltos por crates maduros y probados en produccion.
 
 - El **DOM** y su semantica viva (arbol, eventos, en el futuro colecciones/rangos/observers)
 - La **cascada CSS**: fusion de declaraciones por especificidad ya real (via `selectors`), con el atributo `style="..."` del elemento ganando siempre al final (como en el spec real), y herencia real de 20 propiedades (`color`/`font-size` con unidades relativas `em`/`%`, `font-weight`/`font-style` ya pintados como negrita/cursiva real, mas `font-family`/`line-height`/`text-align`/... - ver Fases 2.4/2.5 en "Estado real" - todavia sin efecto visual); `rem` (relativo a `<html>`, no al padre inmediato) sigue sin resolverse
-- El **layout**: modelo de cajas, contextos de formato, flex, grid, floats
+- El **layout de bloque e inline** (`BoxType::Block`/`Inline`/`Text`/`Image`, contextos de formato de bloque/inline reales - `flow_block_children`/`flow_inline_run` en `tree.rs`) y el **puente hacia `taffy`** para flex/grid (ver la fila de la tabla de arriba): el ALGORITMO de Flexible Box Layout/Grid en si NO se reescribe a mano (razon en la tabla), pero SI se escribe a mano todo el puente real - mapear `computed_style` a `taffy::Style`, medir contenido de texto/imagenes via el callback `MeasureFunction` de `taffy` reusando `flow_block_children`/`measure_text` YA existentes, y volcar el resultado de vuelta en `LayoutBox::dimensions` - eso sigue siendo "como se comporta la pagina", solo que el ALGORITMO interno de reparto de espacio en el eje principal/cruzado no se reinventa
 - El **arbol de pintado** (`display_list.rs`) y su recorrido a la superficie
 - El **bucle de eventos** del navegador y el hit-testing
 - El **puente IA↔DOM** — la diferenciacion real del producto (crate `ai`, pendiente de crear cuando haya un DOM+layout real que exponer; no antes)
@@ -1008,7 +1082,7 @@ engine/
 │   ├── net/         HTTP/HTTPS real (hyper+rustls); CookieStore/WebStorage/CorsPolicy son stubs honestos (mapas en memoria / permite-todo) SIN conectar a `NetworkEngine::fetch` ni a bindings JS todavia - ver doc-comments en cookie.rs/storage.rs/cors.rs
 │   ├── dom/         Nodos, arbol, adaptador TreeSink para html5ever (los eventos DOM viven en js/dom_bindings.rs - ver ese crate - no aqui: guardar listeners exige poder guardar un JsObject, y este crate no depende de Boa a proposito)
 │   ├── css/         Parseo real (cssparser), matching de selectores real (selectors: combinadores, compuestos, atributos), resolucion de cascada real (`cascade::resolve_style` - matching+especificidad+atributo style inline; se traslado aqui desde `layout` para que `js` tambien pueda reusarla, ver "Metrica de progreso")
-│   ├── layout/      Cajas con layout de bloque Y inline real (`BoxType::Block`/`Inline`/`Text`/`Image`) + cascada CSS aplicada (via `engine_css::resolve_style`), texto medido con metricas reales de fuente (negrita/cursiva incluidas, via `FontSet`); box model completo desde CSS - `padding`/`border`/`margin` reales (`LayoutBox::box_dimensions`, `Dimensions::padding_box()`/`border_box()`/`margin_box()` en box_model.rs); floats/grid/flex/position siguen sin existir - eso es Fase 3
+│   ├── layout/      Cajas con layout de bloque, inline Y flex real (`BoxType::Block`/`Inline`/`Text`/`Image`; `display: flex` via `taffy`, ver `flow_flex_children`) + cascada CSS aplicada (via `engine_css::resolve_style`), texto medido con metricas reales de fuente (negrita/cursiva incluidas, via `FontSet`); box model completo desde CSS - `padding`/`border`/`margin` reales (`LayoutBox::box_dimensions`, `Dimensions::padding_box()`/`border_box()`/`margin_box()` en box_model.rs); floats/grid/position siguen sin existir
 │   ├── image/       Decodificacion real de imagenes de trama (`image`: PNG/JPEG/GIF/BMP/WebP/TIFF/ICO) a RGBA8 - crate propio y minimo porque tanto `layout` (dimensiones) como `gfx` (pixeles) lo necesitan sin que `layout` dependa de `gfx`
 │   ├── text/         Shaping real (rustybuzz), medida sin construir contornos (measure_text), carga de fuentes del sistema en 4 variantes peso/estilo (`FontSet`, fontdb), contornos de glifo -> tiny-skia
 │   ├── gfx/         Display list (incluye `DisplayItem::Image`, pintado real via `image_paint.rs`), ventana real (winit+tiny-skia+softbuffer), texto con glifos reales, adaptador GPU real (wgpu), scroll real de la rueda del raton (offset aplicado en pintado + hit-testing, sin relayout - ver "Scroll real de la rueda del raton" mas abajo)
