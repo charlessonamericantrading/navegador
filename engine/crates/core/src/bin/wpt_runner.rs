@@ -56,7 +56,7 @@ fn main() {
         // Sin scripts/hojas externos aqui a proposito: los fixtures de
         // `engine/tests/wpt-style/` son autocontenidos (inline), y este
         // runner no tiene acceso a red - ver el doc-comment de este archivo.
-        let (_, test_results) = build_page_with_harness(&html, "", 800.0, 600.0, None, &std::collections::HashMap::new());
+        let (_, test_results) = build_page_with_harness(&html, "", 800.0, 600.0, None, &std::collections::HashMap::new(), &engine_layout::ImageMap::new());
         println!("\n{}", file.display());
         for result in &test_results {
             if result.passed {

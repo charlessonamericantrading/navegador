@@ -18,7 +18,7 @@
 use engine_css::{CssParser, StyleSheet};
 use engine_dom::{HtmlParser, Node, NodeType};
 use engine_js::{JsRuntime, TestResult};
-use engine_layout::{LayoutBox, LayoutTreeBuilder};
+use engine_layout::{ImageMap, LayoutBox, LayoutTreeBuilder};
 use engine_text::FontSet;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -78,7 +78,7 @@ pub struct PageResult {
 /// sitio exacto en la lista de `<script>` del documento, sin alterar el
 /// orden. Un `src` ausente del mapa (no se pudo descargar, o quien llama no
 /// tiene red - como los tests de este archivo) se omite, igual que antes.
-pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>) -> PageResult {
+pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap) -> PageResult {
     let dom_root = HtmlParser::parse(html);
     let script_results = scripting::execute_inline_scripts(&dom_root, external_scripts);
 
@@ -90,7 +90,7 @@ pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f
     combined_css.push_str(css);
 
     let stylesheet = CssParser::parse(&combined_css);
-    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set);
+    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
 
     PageResult { dom_root, stylesheet, layout_root, script_results }
 }
@@ -103,7 +103,7 @@ pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f
 /// `bin/wpt_runner.rs`, el unico llamador real de esto - `build_page`
 /// normal se queda intacta a proposito: ninguna pagina real deberia ver
 /// `test`/`assert_equals` como globales.
-pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>) -> (PageResult, Vec<TestResult>) {
+pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap) -> (PageResult, Vec<TestResult>) {
     let dom_root = HtmlParser::parse(html);
     let (script_results, test_results) = scripting::execute_inline_scripts_with_harness(&dom_root, external_scripts);
 
@@ -115,7 +115,7 @@ pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewp
     combined_css.push_str(css);
 
     let stylesheet = CssParser::parse(&combined_css);
-    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set);
+    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
 
     (PageResult { dom_root, stylesheet, layout_root, script_results }, test_results)
 }
@@ -129,7 +129,7 @@ pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewp
 /// normal (sin runtime) sigue siendo la opcion correcta para cualquier uso
 /// headless que no necesite interactividad despues de la carga inicial
 /// (`wpt_runner`, los tests de este mismo archivo).
-pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>) -> (PageResult, JsRuntime) {
+pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap) -> (PageResult, JsRuntime) {
     let dom_root = HtmlParser::parse(html);
     let (script_results, runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts);
 
@@ -141,7 +141,7 @@ pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, vi
     combined_css.push_str(css);
 
     let stylesheet = CssParser::parse(&combined_css);
-    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set);
+    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
 
     (PageResult { dom_root, stylesheet, layout_root, script_results }, runtime)
 }
@@ -199,6 +199,30 @@ pub fn find_external_script_srcs(dom_root: &Arc<RwLock<Node>>) -> Vec<String> {
         .collect()
 }
 
+/// Devuelve el valor CRUDO del atributo `src` de cada `<img src="...">` del
+/// documento, en orden de documento - mismo patron exacto que
+/// `find_external_script_srcs`/`find_external_stylesheet_hrefs`: pura, sin
+/// red, quien llama (`core/server.rs::navigate`) resuelve cada `src`
+/// contra la URL de la pagina, lo descarga y lo decodifica
+/// (`engine_image::decode_image`) antes de construir el `ImageMap` que
+/// `build_page*`/`LayoutTreeBuilder::build` necesitan. Un `<img>` sin `src`
+/// no aparece aqui - `LayoutTreeBuilder` ya lo deja en una caja `src: ""`
+/// que simplemente no encontrara nada en el mapa (ver
+/// `apply_image_size_attributes`/`BoxType::Image` en `engine-layout::tree`).
+pub fn find_image_srcs(dom_root: &Arc<RwLock<Node>>) -> Vec<String> {
+    Node::find_all_by_tag(dom_root, "img")
+        .iter()
+        .filter_map(|img_node| {
+            let node = img_node.read().unwrap();
+            let NodeType::Element { attributes, .. } = &node.node_type else {
+                return None;
+            };
+            attributes.get("src").cloned()
+        })
+        .filter(|src| !src.is_empty())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +236,7 @@ mod tests {
             600.0,
             None,
             &HashMap::new(),
+            &ImageMap::new(),
         );
 
         assert_eq!(Node::find_all_by_tag(&page.dom_root, "h1").len(), 1);
@@ -221,7 +246,7 @@ mod tests {
 
     #[test]
     fn build_page_executes_inline_scripts_and_reports_their_results() {
-        let page = build_page("<html><body><script>1 + 2</script></body></html>", "", 800.0, 600.0, None, &HashMap::new());
+        let page = build_page("<html><body><script>1 + 2</script></body></html>", "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new());
         assert_eq!(page.script_results.len(), 1);
         assert_eq!(page.script_results[0].as_deref(), Ok("3"));
     }
@@ -240,6 +265,7 @@ mod tests {
             600.0,
             None,
             &HashMap::new(),
+            &ImageMap::new(),
         );
 
         assert_eq!(page.script_results.len(), 1);
@@ -268,6 +294,7 @@ mod tests {
             600.0,
             None,
             &HashMap::new(),
+            &ImageMap::new(),
         );
         let styled = find_box_with_style(&page.layout_root, "background-color")
             .expect("el <style> de la pagina deberia haber aplicado background-color");
@@ -283,6 +310,7 @@ mod tests {
             600.0,
             None,
             &HashMap::new(),
+            &ImageMap::new(),
         );
         assert!(find_box_with_style(&page.layout_root, "background-color").is_some(), "la regla del <style> de la pagina deberia seguir aplicando");
         assert!(find_box_with_style(&page.layout_root, "color").is_some(), "la regla inyectada por el parametro css tambien deberia aplicar");
@@ -300,6 +328,7 @@ mod tests {
             600.0,
             None,
             &HashMap::new(),
+            &ImageMap::new(),
         );
         assert!(find_box_with_style(&page.layout_root, "background-color").is_some(), "la regla del primer <style> deberia aplicar");
         assert!(find_box_with_style(&page.layout_root, "color").is_some(), "la regla del segundo <style> tambien deberia aplicar");
@@ -313,10 +342,10 @@ mod tests {
     /// produce un arbol con ese ancho, no el original congelado.
     #[test]
     fn dom_root_and_stylesheet_from_a_page_result_can_rebuild_layout_at_a_new_viewport_size() {
-        let page = build_page("<html><body><p>hola</p></body></html>", "", 800.0, 600.0, None, &HashMap::new());
+        let page = build_page("<html><body><p>hola</p></body></html>", "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new());
         assert_eq!(page.layout_root.dimensions.width, 800.0);
 
-        let relaid_out = LayoutTreeBuilder::build(&page.dom_root, &page.stylesheet, 400.0, 300.0, None);
+        let relaid_out = LayoutTreeBuilder::build(&page.dom_root, &page.stylesheet, 400.0, 300.0, None, &ImageMap::new());
         assert_eq!(relaid_out.dimensions.width, 400.0, "el layout reconstruido deberia reflejar el nuevo ancho, no seguir en 800");
     }
 
@@ -329,6 +358,7 @@ mod tests {
             600.0,
             None,
             &HashMap::new(),
+            &ImageMap::new(),
         );
         assert_eq!(test_results.len(), 1);
         assert!(test_results[0].passed);
@@ -344,7 +374,7 @@ mod tests {
     /// deberia fallar con un ReferenceError real, no en silencio.
     #[test]
     fn build_page_normal_does_not_register_the_test_harness_globals() {
-        let page = build_page("<html><body><script>typeof test === 'undefined'</script></body></html>", "", 800.0, 600.0, None, &HashMap::new());
+        let page = build_page("<html><body><script>typeof test === 'undefined'</script></body></html>", "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new());
         assert_eq!(page.script_results[0].as_deref(), Ok("true"), "test no deberia existir como global fuera del arnes");
     }
 
@@ -383,6 +413,7 @@ mod tests {
             600.0,
             None,
             &HashMap::new(),
+            &ImageMap::new(),
         );
 
         let target_node = Node::find_by_id(&page.dom_root, "target").expect("target deberia existir");
@@ -401,7 +432,7 @@ mod tests {
         // El punto extra sobre solo comprobar el DOM: la MISMA mutacion
         // debe verse en un layout reconstruido con el DOM ya mutado - es
         // literalmente lo que on_click hace antes de pedir un repintado.
-        let new_layout = LayoutTreeBuilder::build(&page.dom_root, &page.stylesheet, 800.0, 600.0, None);
+        let new_layout = LayoutTreeBuilder::build(&page.dom_root, &page.stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let new_output_box = find_box_for_dom_node(&new_layout, &output_node).expect("output deberia seguir teniendo caja tras reconstruir el layout");
         let shows_updated_text = new_output_box.children.iter().any(|c| matches!(&c.box_type, engine_layout::BoxType::Text(text) if text == "disparado"));
         assert!(shows_updated_text, "el layout reconstruido deberia pintar el texto ya mutado, no el 'antes' original");
@@ -476,6 +507,7 @@ mod tests {
             600.0,
             None,
             &external,
+            &ImageMap::new(),
         );
         assert_eq!(page.script_results.len(), 1);
         assert_eq!(page.script_results[0].as_deref(), Ok("42"));
@@ -493,6 +525,7 @@ mod tests {
             600.0,
             None,
             &HashMap::new(),
+            &ImageMap::new(),
         );
         assert!(page.script_results.is_empty(), "un src sin contenido pre-descargado deberia omitirse, no fallar");
     }
@@ -516,6 +549,7 @@ mod tests {
             600.0,
             None,
             &external,
+            &ImageMap::new(),
         );
         assert_eq!(page.script_results.len(), 2);
         assert_eq!(page.script_results[1].as_deref(), Ok("15"), "el script inline deberia ver la variable declarada por el script externo anterior");

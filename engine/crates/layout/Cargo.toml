@@ -11,3 +11,4 @@ tracing.workspace = true
 engine-dom = { path = "../dom" }
 engine-css = { path = "../css" }
 engine-text = { path = "../text" }
+engine-image = { path = "../image" }

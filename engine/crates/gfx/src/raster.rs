@@ -5,13 +5,15 @@
 //! memoria frente a softbuffer) de las operaciones de pintado.
 
 use crate::display_list::{DisplayItem, DisplayList};
-use engine_layout::{LayoutBox, Rect};
+use crate::image_paint::paint_image;
+use engine_layout::{ImageMap, LayoutBox, Rect};
 use engine_text::{measure_text, shape_text, wrap_text, FontSet};
 use tiny_skia::{Color, FillRule, Paint, Pixmap, Rect as SkiaRect, Transform};
 
 pub fn render_layout_to_png(
     layout_root: &LayoutBox,
     font_set: Option<&FontSet>,
+    images: &ImageMap,
     width: u32,
     height: u32,
     scroll_offset_y: f32,
@@ -20,7 +22,7 @@ pub fn render_layout_to_png(
         .ok_or_else(|| format!("no se pudo crear la superficie de rasterizado {width}x{height}"))?;
     pixmap.fill(Color::from_rgba8(245, 245, 245, 255));
 
-    for item in DisplayList::build(layout_root).items {
+    for item in DisplayList::build(layout_root, images).items {
         match item {
             DisplayItem::SolidRect { rect, color } => {
                 fill_rect(&mut pixmap, &rect, color, scroll_offset_y);
@@ -59,6 +61,9 @@ pub fn render_layout_to_png(
                 for strip in border_strip_rects(&rect, width) {
                     fill_rect_with_paint(&mut pixmap, &strip, &mut paint, scroll_offset_y);
                 }
+            }
+            DisplayItem::Image { rect, image } => {
+                paint_image(&mut pixmap, &rect, &image, scroll_offset_y);
             }
         }
     }
@@ -131,7 +136,7 @@ mod tests {
         let mut root = LayoutBox::new(BoxType::Block);
         root.dimensions.width = 120.0;
         root.dimensions.height = 80.0;
-        let png = render_layout_to_png(&root, None, 120, 80, 0.0).expect("PNG should encode");
+        let png = render_layout_to_png(&root, None, &engine_layout::ImageMap::new(), 120, 80, 0.0).expect("PNG should encode");
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 }

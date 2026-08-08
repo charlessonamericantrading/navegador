@@ -4,9 +4,10 @@ use winit::{
     window::WindowBuilder,
 };
 use tiny_skia::{Pixmap, Paint, Rect, Transform, Color, FillRule};
-use engine_layout::LayoutBox;
+use engine_layout::{ImageMap, LayoutBox};
 use engine_text::FontSet;
 use crate::display_list::{DisplayList, DisplayItem};
+use crate::image_paint::paint_image;
 use std::rc::Rc;
 use std::num::NonZeroU32;
 
@@ -58,6 +59,7 @@ impl NativeEngineWindow {
         title: &str,
         layout_root: LayoutBox,
         font_set: Option<FontSet>,
+        images: ImageMap,
         relayout: impl Fn(f32, f32) -> LayoutBox + 'static,
         mut on_click: impl FnMut(&LayoutBox, f32, f32) -> Option<LayoutBox> + 'static,
     ) {
@@ -85,7 +87,7 @@ impl NativeEngineWindow {
         // guarda como estado mutable del bucle de eventos, igual que
         // `display_list`.
         let mut current_layout_root = layout_root;
-        let mut display_list = DisplayList::build(&current_layout_root);
+        let mut display_list = DisplayList::build(&current_layout_root, &images);
         let mut cursor_position: (f32, f32) = (0.0, 0.0);
         // Desplazamiento vertical actual, en content-space (mismas unidades
         // que `LayoutBox::dimensions`) - NUNCA se rehace `display_list` por
@@ -123,7 +125,7 @@ impl NativeEngineWindow {
                     // nuevo tamaño (no solo se estira el backbuffer sobre
                     // las mismas cajas de antes) - ver el aviso de `run`.
                     current_layout_root = relayout(size.width as f32, size.height as f32);
-                    display_list = DisplayList::build(&current_layout_root);
+                    display_list = DisplayList::build(&current_layout_root, &images);
                     // El contenido puede haber cambiado de alto (un ancho
                     // distinto envuelve el texto en mas o menos lineas) -
                     // re-acotar aqui evita quedarse "scrolleado" mas alla
@@ -189,7 +191,7 @@ impl NativeEngineWindow {
                     let content_y = cursor_position.1 + scroll_offset_y;
                     if let Some(new_layout_root) = on_click(&current_layout_root, cursor_position.0, content_y) {
                         current_layout_root = new_layout_root;
-                        display_list = DisplayList::build(&current_layout_root);
+                        display_list = DisplayList::build(&current_layout_root, &images);
                         window.request_redraw();
                     }
                 }
@@ -258,6 +260,9 @@ impl NativeEngineWindow {
                                         pixmap.fill_rect(sk_rect, &paint, Transform::identity(), None);
                                     }
                                 }
+                            }
+                            DisplayItem::Image { rect, image } => {
+                                paint_image(&mut pixmap, rect, image, scroll_offset_y);
                             }
                         }
                     }

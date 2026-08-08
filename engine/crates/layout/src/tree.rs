@@ -2,9 +2,20 @@ use crate::box_model::EdgeSizes;
 use crate::layout_box::{LayoutBox, BoxType, Rect};
 use engine_dom::{Node, NodeType};
 use engine_css::StyleSheet;
+use engine_image::DecodedImage;
 use engine_text::FontSet;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+
+/// `src` CRUDO (tal como aparece en `<img src="...">`, sin resolver contra
+/// la URL de la pagina) -> imagen ya decodificada - mismo criterio que
+/// `external_scripts: &HashMap<String, String>` en `core/pipeline.rs` para
+/// `<script src>`: quien orquesta la red (`core/server.rs`) descubre los
+/// `src`, los descarga y decodifica, y este mapa ya resuelto es lo unico
+/// que `LayoutTreeBuilder` necesita - sin saber nada de red. Una imagen
+/// ausente del mapa (`src` vacio, descarga fallida, formato no soportado)
+/// simplemente no aporta dimension natural - ver `resolve_image_dimensions`.
+pub type ImageMap = HashMap<String, Arc<DecodedImage>>;
 
 /// Propiedades que SI se propagan de un elemento a sus descendientes cuando
 /// estos no las redefinen (herencia CSS real). Ampliada en la Fase 2.5 a la
@@ -267,6 +278,54 @@ fn resolve_font_style_is_italic(computed_style: &HashMap<String, String>) -> boo
     trimmed.eq_ignore_ascii_case("italic") || trimmed.eq_ignore_ascii_case("oblique")
 }
 
+/// Los atributos HTML `width`/`height` de un `<img>` (numeros sin unidad,
+/// pixeles - `<img width="200" height="100">`, con mucho el caso mas comun
+/// en la web real, mas comun que `style="width: ..."`) SI participan en el
+/// tamaño final, pero con MENOR prioridad que CSS - son un "hint" de
+/// presentacion, no una regla de la cascada (asi es el spec real: son el
+/// equivalente a una regla de agente de usuario de la especificidad mas
+/// baja posible). Por eso solo se insertan en `computed_style` si CSS
+/// (`resolve_style`, ya aplicado antes de llamar aqui) no puso `width`/
+/// `height` por su cuenta - insertar sin mirar pisaria un
+/// `style="width: 300px"` real con el atributo, al reves de como debe ser.
+/// Un atributo ausente, vacio o que no parsea como numero simplemente no
+/// aporta nada (sin fallback inventado).
+fn apply_image_size_attributes(computed_style: &mut HashMap<String, String>, attributes: &HashMap<String, String>) {
+    for (attr, prop) in [("width", "width"), ("height", "height")] {
+        if computed_style.contains_key(prop) {
+            continue;
+        }
+        if let Some(px) = attributes.get(attr).and_then(|v| v.trim().parse::<f32>().ok()).filter(|n| *n > 0.0) {
+            computed_style.insert(prop.to_string(), format!("{px}px"));
+        }
+    }
+}
+
+/// Tamaño final de un `<img>`: si el autor puso AMBOS `width`/`height`
+/// (CSS o el atributo HTML, ya fusionados en `computed_style` por
+/// `apply_image_size_attributes`), se usan tal cual. Si solo puso UNO de
+/// los dos y la imagen decodifico con exito, el otro se escala para
+/// mantener la proporcion real de la imagen (igual que el spec real - un
+/// `<img width="200">` de una foto 800x400 deberia medir 200x100, no
+/// 200x400). Sin dimension natural (imagen sin decodificar - `src` vacio,
+/// descarga fallida, formato no soportado), el resultado es SIEMPRE 0x0 sin
+/// importar lo que diga `width`/`height`: sin icono de "imagen rota" ni el
+/// tamaño de respaldo 300x150 que el spec real exige para un reemplazado
+/// sin tamaño intrinseco - simplificacion declarada (Fase 3.1), ninguna
+/// caja visible en vez de fingir un tamaño para contenido que no existe.
+fn resolve_image_dimensions(explicit_width: Option<f32>, explicit_height: Option<f32>, natural: Option<(f32, f32)>) -> (f32, f32) {
+    let Some((natural_width, natural_height)) = natural else { return (0.0, 0.0) };
+    if natural_width <= 0.0 || natural_height <= 0.0 {
+        return (0.0, 0.0);
+    }
+    match (explicit_width, explicit_height) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, w * natural_height / natural_width),
+        (None, Some(h)) => (h * natural_width / natural_height, h),
+        (None, None) => (natural_width, natural_height),
+    }
+}
+
 pub struct LayoutTreeBuilder;
 
 impl LayoutTreeBuilder {
@@ -288,7 +347,11 @@ impl LayoutTreeBuilder {
     /// aproximacion anterior por caracteres (ver `flow_block_children`),
     /// igual que `engine-gfx` cae a un bloque de relleno cuando pinta sin
     /// fuente.
-    pub fn build(dom_root: &Arc<RwLock<Node>>, stylesheet: &StyleSheet, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>) -> LayoutBox {
+    /// `images`: mapa de `src` crudo -> imagen ya decodificada (ver
+    /// `ImageMap` arriba) - `&ImageMap::new()`/`&HashMap::new()` si no hay
+    /// ninguna disponible (por ejemplo, `core/main.rs`, que no descarga
+    /// recursos externos - ver su doc-comment).
+    pub fn build(dom_root: &Arc<RwLock<Node>>, stylesheet: &StyleSheet, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, images: &ImageMap) -> LayoutBox {
         let mut root_box = LayoutBox::new(BoxType::Block);
         root_box.dimensions = Rect {
             x: 0.0,
@@ -298,7 +361,7 @@ impl LayoutTreeBuilder {
         };
 
         Self::build_node(dom_root, &mut root_box, stylesheet, &HashMap::new());
-        Self::flow_block_children(&mut root_box, font_set);
+        Self::flow_block_children(&mut root_box, font_set, images);
         root_box
     }
 
@@ -314,7 +377,7 @@ impl LayoutTreeBuilder {
                     Self::build_node(child, parent_layout_box, stylesheet, inherited);
                 }
             }
-            NodeType::Element { tag_name, .. } => {
+            NodeType::Element { tag_name, attributes } => {
                 // "head", "script" y "style" no tienen representacion visual;
                 // sin esto, su contenido de texto se pintaria como si fuera
                 // parrafo visible.
@@ -335,8 +398,13 @@ impl LayoutTreeBuilder {
                 // mezclaba `<strong>` con texto vecino, caso que ningun
                 // test anterior de layout inline (Fase 2.3) cubria porque
                 // todos usaban `<b>`/`<i>`, no `<strong>`/`<em>`.
+                // `<img>` es "inline replaced element" en el spec real - se
+                // resuelve aparte porque, a diferencia de span/a/b/i/strong/
+                // em (que envuelven MAS marcado), un `<img>` es una hoja sin
+                // hijos cuyo `BoxType` lleva su propio `src` (Fase 3.1).
                 let box_type = match tag_name.as_str() {
                     "span" | "a" | "b" | "i" | "strong" | "em" => BoxType::Inline,
+                    "img" => BoxType::Image(attributes.get("src").cloned().unwrap_or_default()),
                     _ => BoxType::Block,
                 };
                 let mut current_box = LayoutBox::new(box_type);
@@ -348,6 +416,9 @@ impl LayoutTreeBuilder {
                 // reusarla sin depender de `layout` solo para esto. Misma
                 // logica exacta, cero cambio de comportamiento.
                 current_box.computed_style = engine_css::resolve_style(dom_node, stylesheet);
+                if tag_name == "img" {
+                    apply_image_size_attributes(&mut current_box.computed_style, attributes);
+                }
 
                 let mut child_inherited = inherited.clone();
                 for prop in INHERITABLE_PROPERTIES {
@@ -422,7 +493,7 @@ impl LayoutTreeBuilder {
     /// linea varias veces si dos fragmentos inline la comparten. Devolver
     /// el `cursor_y` final ya resuelve eso por construccion, sin necesitar
     /// un caso aparte para "hijos que se solapan".
-    fn flow_block_children(container: &mut LayoutBox, font_set: Option<&FontSet>) -> f32 {
+    fn flow_block_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
         let padding = resolve_padding(&container.computed_style);
@@ -450,7 +521,7 @@ impl LayoutTreeBuilder {
                     .position(|c| !Self::is_inline_level(c))
                     .map(|rel| i + rel)
                     .unwrap_or(container.children.len());
-                cursor_y = Self::flow_inline_run(&mut container.children[i..run_end], origin_x, inner_width, cursor_y, font_set);
+                cursor_y = Self::flow_inline_run(&mut container.children[i..run_end], origin_x, inner_width, cursor_y, font_set, images);
                 i = run_end;
                 continue;
             }
@@ -475,7 +546,7 @@ impl LayoutTreeBuilder {
             child.dimensions.width = resolve_block_width(&child.computed_style, auto_width);
             let child_width = child.dimensions.width;
 
-            let content_height = Self::flow_block_children(child, font_set);
+            let content_height = Self::flow_block_children(child, font_set, images);
             // `flow_block_children(child, ...)`, arriba, ya dejo
             // `child.box_dimensions.padding`/`.border` resueltos (child
             // pasa a ser el "container" de esa llamada) - se reusan en vez
@@ -520,7 +591,7 @@ impl LayoutTreeBuilder {
     }
 
     fn is_inline_level(b: &LayoutBox) -> bool {
-        matches!(b.box_type, BoxType::Text(_) | BoxType::Inline)
+        matches!(b.box_type, BoxType::Text(_) | BoxType::Inline | BoxType::Image(_))
     }
 
     /// Coloca una RACHA de hijos inline-level (`BoxType::Text`/
@@ -543,18 +614,24 @@ impl LayoutTreeBuilder {
     /// continuara en la ultima linea parcial de un vecino que envolvio
     /// varias lineas; aqui no - caso raro en paginas reales).
     ///
-    /// `line_height` se calcula UNA vez para TODA la racha (con el
-    /// font-size de su primera hoja de texto) y se usa para todas sus
-    /// lineas - el spec real usaria el maximo real de cada linea cuando el
-    /// font-size varia dentro de ella; esta simplificacion asume tamaño
-    /// uniforme, cierto para la inmensa mayoria de parrafos reales.
+    /// `text_line_height` se calcula UNA vez para TODA la racha (con el
+    /// font-size de su primera hoja de texto) y es el alto que recibe cada
+    /// caja de TEXTO, sea cual sea la linea en la que caiga - el spec real
+    /// usaria el maximo real de cada linea cuando el font-size varia DENTRO
+    /// del texto; esta simplificacion asume tamaño uniforme, cierto para la
+    /// inmensa mayoria de parrafos reales. Lo que SI varia por linea es
+    /// `line_extent` (ver mas abajo): una imagen (`BoxType::Image`) mas alta
+    /// que `text_line_height` SI hace crecer el avance vertical de SU
+    /// propia linea, para no solapar el contenido siguiente - sin esto, un
+    /// `<img>` alto junto a texto pisaba la linea de abajo (encontrado en
+    /// vivo al verificar la Fase 3.1 con una imagen real).
     ///
     /// Devuelve el `cursor_y` final (el tope de una linea nueva lista para
     /// lo que venga despues de la racha).
-    fn flow_inline_run(nodes: &mut [LayoutBox], origin_x: f32, inner_width: f32, start_y: f32, font_set: Option<&FontSet>) -> f32 {
+    fn flow_inline_run(nodes: &mut [LayoutBox], origin_x: f32, inner_width: f32, start_y: f32, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
-        let line_height = match font_set {
+        let text_line_height = match font_set {
             Some(set) => {
                 let (font_size, bold, italic) = Self::first_leaf_font_info(nodes).unwrap_or((INITIAL_FONT_SIZE, false, false));
                 match set.pick(bold, italic) {
@@ -567,10 +644,16 @@ impl LayoutTreeBuilder {
 
         let mut cursor_x = origin_x;
         let mut cursor_y = start_y;
+        // Alto real de la linea EN CURSO - arranca en `text_line_height`
+        // (una linea de solo texto) y crece si algo mas alto se coloca en
+        // ella (una imagen); se usa para avanzar `cursor_y` de verdad al
+        // saltar de linea o al terminar la racha, en vez de siempre
+        // `text_line_height`.
+        let mut line_extent = text_line_height;
         for node in nodes.iter_mut() {
-            Self::place_inline_node(node, origin_x, inner_width, line_height, &mut cursor_x, &mut cursor_y, font_set);
+            Self::place_inline_node(node, origin_x, inner_width, text_line_height, &mut line_extent, &mut cursor_x, &mut cursor_y, font_set, images);
         }
-        cursor_y + line_height
+        cursor_y + line_extent
     }
 
     /// Busca `font-size`/`font-weight`/`font-style` de la primera hoja de
@@ -596,7 +679,7 @@ impl LayoutTreeBuilder {
                         return Some(info);
                     }
                 }
-                BoxType::Block => {}
+                BoxType::Block | BoxType::Image(_) => {}
             }
         }
         None
@@ -605,7 +688,7 @@ impl LayoutTreeBuilder {
     /// Coloca UN nodo inline-level (hoja de texto, o elemento inline cuyos
     /// hijos se recorren recursivamente con el MISMO cursor compartido) -
     /// ver `flow_inline_run` para la logica de ajuste de linea.
-    fn place_inline_node(node: &mut LayoutBox, origin_x: f32, inner_width: f32, line_height: f32, cursor_x: &mut f32, cursor_y: &mut f32, font_set: Option<&FontSet>) {
+    fn place_inline_node(node: &mut LayoutBox, origin_x: f32, inner_width: f32, text_line_height: f32, line_extent: &mut f32, cursor_x: &mut f32, cursor_y: &mut f32, font_set: Option<&FontSet>, images: &ImageMap) {
         match &node.box_type {
             BoxType::Text(content) => {
                 let font_size = node
@@ -637,14 +720,19 @@ impl LayoutTreeBuilder {
                 if natural_width > remaining && *cursor_x > origin_x {
                     // No cabe en lo que queda de la linea actual, pero la
                     // linea ya tiene contenido de un hermano anterior: salta
-                    // a una linea nueva antes de decidir nada mas.
-                    *cursor_y += line_height;
+                    // a una linea nueva antes de decidir nada mas. Avanza
+                    // por `line_extent` (el alto REAL de la linea que se
+                    // deja atras, ya sea texto solo o con una imagen mas
+                    // alta - ver `flow_inline_run`), no por
+                    // `text_line_height` a secas.
+                    *cursor_y += *line_extent;
                     *cursor_x = origin_x;
+                    *line_extent = text_line_height;
                     remaining = inner_width;
                 }
 
                 if natural_width <= remaining {
-                    node.dimensions = Rect { x: *cursor_x, y: *cursor_y, width: natural_width, height: line_height };
+                    node.dimensions = Rect { x: *cursor_x, y: *cursor_y, width: natural_width, height: text_line_height };
                     *cursor_x += natural_width;
                 } else {
                     // Ni siquiera cabe sola en una linea vacia (cursor_x ==
@@ -656,9 +744,10 @@ impl LayoutTreeBuilder {
                         None => vec![content.clone()],
                     };
                     let consumed_lines = lines.len().max(1) as f32;
-                    node.dimensions = Rect { x: origin_x, y: *cursor_y, width: inner_width, height: consumed_lines * line_height };
-                    *cursor_y += consumed_lines * line_height;
+                    node.dimensions = Rect { x: origin_x, y: *cursor_y, width: inner_width, height: consumed_lines * text_line_height };
+                    *cursor_y += consumed_lines * text_line_height;
                     *cursor_x = origin_x;
+                    *line_extent = text_line_height;
                 }
             }
             BoxType::Inline => {
@@ -670,7 +759,7 @@ impl LayoutTreeBuilder {
                 let start_x = *cursor_x;
                 let start_y = *cursor_y;
                 for child in &mut node.children {
-                    Self::place_inline_node(child, origin_x, inner_width, line_height, cursor_x, cursor_y, font_set);
+                    Self::place_inline_node(child, origin_x, inner_width, text_line_height, line_extent, cursor_x, cursor_y, font_set, images);
                 }
                 // Rectangulo delimitador de todo lo que contuvo - honesto
                 // solo para el caso comun (contenido que cabe en una sola
@@ -684,8 +773,38 @@ impl LayoutTreeBuilder {
                     x: start_x,
                     y: start_y,
                     width: (*cursor_x - start_x).max(0.0),
-                    height: (*cursor_y - start_y) + line_height,
+                    height: (*cursor_y - start_y) + *line_extent,
                 };
+            }
+            BoxType::Image(src) => {
+                // Mismo criterio de salto de linea que `BoxType::Text`
+                // arriba (no cabe en lo que queda de la linea actual, pero
+                // la linea ya tiene contenido de un hermano) - sin el
+                // "envuelve internamente" de texto, porque una imagen es
+                // atomica, no se puede partir en trozos mas pequeños: si
+                // ni siquiera cabe sola en una linea vacia, se coloca de
+                // todas formas y desborda el contenedor (igual que un
+                // navegador real con una imagen mas ancha que su
+                // contenedor y sin `max-width`).
+                let natural = images.get(src).map(|img| (img.width as f32, img.height as f32));
+                let explicit_width = node.computed_style.get("width").and_then(|v| parse_css_length(v));
+                let explicit_height = node.computed_style.get("height").and_then(|v| parse_css_length(v));
+                let (width, height) = resolve_image_dimensions(explicit_width, explicit_height, natural);
+
+                let remaining = origin_x + inner_width - *cursor_x;
+                if width > remaining && *cursor_x > origin_x {
+                    *cursor_y += *line_extent;
+                    *cursor_x = origin_x;
+                    *line_extent = text_line_height;
+                }
+
+                node.dimensions = Rect { x: *cursor_x, y: *cursor_y, width, height };
+                *cursor_x += width;
+                // Una imagen mas alta que el resto de la linea hace crecer
+                // el avance vertical de ESTA linea (ver el doc-comment de
+                // `flow_inline_run`) - sin esto, el texto/contenido
+                // siguiente se solapaba con la parte de abajo de la imagen.
+                *line_extent = line_extent.max(height);
             }
             BoxType::Block => unreachable!("is_inline_level ya filtro los bloques antes de llegar aqui"),
         }
@@ -723,7 +842,7 @@ mod tests {
         let dom = HtmlParser::parse("<html><body><p>hola</p></body></html>");
         let stylesheet = CssParser::parse("body { background-color: #dbe9f4; }");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let styled_box = find_box_with_style(&root, "background-color")
             .expect("alguna caja deberia tener background-color tras la cascada");
 
@@ -738,7 +857,7 @@ mod tests {
         let dom = HtmlParser::parse("<html><body><p>hola</p></body></html>");
         let stylesheet = CssParser::parse("h1 { background-color: #ff0000; }");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         assert!(
             find_box_with_style(&root, "background-color").is_none(),
@@ -753,7 +872,7 @@ mod tests {
         // pese a aparecer antes en la hoja de estilos.
         let stylesheet = CssParser::parse("#main { background-color: #00ff00; } body { background-color: #ff0000; }");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let styled_box = find_box_with_style(&root, "background-color").expect("body deberia tener estilo");
 
         assert_eq!(
@@ -768,7 +887,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div style="color: red">hola</div></body></html>"#);
         let stylesheet = CssParser::parse(""); // sin ninguna regla: solo el atributo style deberia aportar algo
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let styled_box = find_box_with_style(&root, "color").expect("el atributo style inline deberia aplicarse");
 
         assert_eq!(styled_box.computed_style.get("color").map(String::as_str), Some("red"));
@@ -784,7 +903,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body id="main" style="background-color: #0000ff"><p>hola</p></body></html>"#);
         let stylesheet = CssParser::parse("#main { background-color: #00ff00; }");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let styled_box = find_box_with_style(&root, "background-color").expect("body deberia tener estilo");
 
         assert_eq!(
@@ -808,7 +927,7 @@ mod tests {
         let dom = HtmlParser::parse("<html><body><h1>titulo</h1></body></html>");
         let stylesheet = CssParser::parse("h1 { color: #ff0000; font-size: 32px; }");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let text_box = find_text_box(&root, "titulo").expect("deberia existir una caja de texto 'titulo'");
 
         assert_eq!(text_box.computed_style.get("color").map(String::as_str), Some("#ff0000"));
@@ -826,7 +945,7 @@ mod tests {
         let dom = HtmlParser::parse("<html><body><b><i>fuerte</i></b></body></html>");
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let text_box = find_text_box(&root, "fuerte").expect("deberia existir una caja de texto 'fuerte'");
 
         assert_eq!(text_box.computed_style.get("font-weight").map(String::as_str), Some("bold"), "deberia heredar font-weight: bold del <b> ancestro");
@@ -844,7 +963,7 @@ mod tests {
         let dom = HtmlParser::parse("<html><body><div><span>anidado</span></div></body></html>");
         let stylesheet = CssParser::parse("div { text-align: center; line-height: 1.5; }");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let text_box = find_text_box(&root, "anidado").expect("deberia existir una caja de texto 'anidado'");
 
         assert_eq!(text_box.computed_style.get("text-align").map(String::as_str), Some("center"), "text-align deberia heredarse, ahora que esta en INHERITABLE_PROPERTIES");
@@ -883,7 +1002,7 @@ mod tests {
         let dom = HtmlParser::parse("<html><body><div><span>anidado</span></div></body></html>");
         let stylesheet = CssParser::parse("div { color: #0000ff; }");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let text_box = find_text_box(&root, "anidado").expect("deberia existir una caja de texto 'anidado'");
 
         assert_eq!(
@@ -901,7 +1020,7 @@ mod tests {
         let dom = HtmlParser::parse("<html><body><p>hola</p></body></html>");
         let stylesheet = CssParser::parse("body { background-color: #dbe9f4; }");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let text_box = find_text_box(&root, "hola").expect("deberia existir una caja de texto 'hola'");
 
         assert!(
@@ -917,7 +1036,7 @@ mod tests {
         let dom = HtmlParser::parse("<html><body><div><span>texto</span></div></body></html>");
         let stylesheet = CssParser::parse("div { color: #0000ff; } span { color: #00ff00; }");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let text_box = find_text_box(&root, "texto").expect("deberia existir una caja de texto 'texto'");
 
         assert_eq!(
@@ -937,12 +1056,12 @@ mod tests {
 
         let dom_small = HtmlParser::parse("<html><body><p>hola</p></body></html>");
         let stylesheet_small = CssParser::parse("p { font-size: 16px; }");
-        let root_small = LayoutTreeBuilder::build(&dom_small, &stylesheet_small, 800.0, 600.0, Some(&font_set));
+        let root_small = LayoutTreeBuilder::build(&dom_small, &stylesheet_small, 800.0, 600.0, Some(&font_set), &ImageMap::new());
         let small = find_text_box(&root_small, "hola").expect("deberia existir una caja de texto 'hola'");
 
         let dom_big = HtmlParser::parse("<html><body><p>hola</p></body></html>");
         let stylesheet_big = CssParser::parse("p { font-size: 64px; }");
-        let root_big = LayoutTreeBuilder::build(&dom_big, &stylesheet_big, 800.0, 600.0, Some(&font_set));
+        let root_big = LayoutTreeBuilder::build(&dom_big, &stylesheet_big, 800.0, 600.0, Some(&font_set), &ImageMap::new());
         let big = find_text_box(&root_big, "hola").expect("deberia existir una caja de texto 'hola'");
 
         assert!(
@@ -963,11 +1082,11 @@ mod tests {
         let stylesheet = CssParser::parse("");
 
         let dom_wide = HtmlParser::parse(&format!("<html><body><p>{long_text}</p></body></html>"));
-        let root_wide = LayoutTreeBuilder::build(&dom_wide, &stylesheet, 2000.0, 600.0, Some(&font_set));
+        let root_wide = LayoutTreeBuilder::build(&dom_wide, &stylesheet, 2000.0, 600.0, Some(&font_set), &ImageMap::new());
         let wide = find_text_box(&root_wide, long_text).expect("deberia existir la caja de texto larga");
 
         let dom_narrow = HtmlParser::parse(&format!("<html><body><p>{long_text}</p></body></html>"));
-        let root_narrow = LayoutTreeBuilder::build(&dom_narrow, &stylesheet, 150.0, 600.0, Some(&font_set));
+        let root_narrow = LayoutTreeBuilder::build(&dom_narrow, &stylesheet, 150.0, 600.0, Some(&font_set), &ImageMap::new());
         let narrow = find_text_box(&root_narrow, long_text).expect("deberia existir la caja de texto larga");
 
         assert!(
@@ -981,7 +1100,7 @@ mod tests {
         let dom = HtmlParser::parse("<html><body><span>hola</span></body></html>");
         let stylesheet = CssParser::parse("body { font-size: 20px; } span { font-size: 2em; }");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let text_box = find_text_box(&root, "hola").expect("deberia existir una caja de texto 'hola'");
 
         assert_eq!(
@@ -996,7 +1115,7 @@ mod tests {
         let dom = HtmlParser::parse("<html><body><span>hola</span></body></html>");
         let stylesheet = CssParser::parse("body { font-size: 20px; } span { font-size: 150%; }");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let text_box = find_text_box(&root, "hola").expect("deberia existir una caja de texto 'hola'");
 
         assert_eq!(
@@ -1016,7 +1135,7 @@ mod tests {
         let dom = HtmlParser::parse("<html><body><div><span>hola</span></div></body></html>");
         let stylesheet = CssParser::parse("div { font-size: 2em; } span { font-size: 1.5em; }");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let text_box = find_text_box(&root, "hola").expect("deberia existir una caja de texto 'hola'");
 
         assert_eq!(
@@ -1034,7 +1153,7 @@ mod tests {
         // fingir un numero.
         let stylesheet = CssParser::parse("body { font-size: 20px; } span { font-size: 3rem; }");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let text_box = find_text_box(&root, "hola").expect("deberia existir una caja de texto 'hola'");
 
         assert_eq!(
@@ -1052,7 +1171,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div style="padding: 20px"><div>hola</div></div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let div_box = find_box_with_style(&root, "padding").expect("el div deberia tener padding en su computed_style");
         let child_box = div_box.children.first().expect("el div deberia tener un hijo");
 
@@ -1068,7 +1187,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="container"><div>hola</div></div></body></html>"#);
         let stylesheet = CssParser::parse(""); // sin padding en ningun sitio
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let container_node = Node::find_by_id(&dom, "container").expect("container deberia existir en el DOM");
         let container_box = find_box_for_dom_node(&root, &container_node).expect("container deberia tener una caja de layout");
         let child_box = container_box.children.first().expect("container deberia tener un hijo");
@@ -1083,7 +1202,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div style="padding: 15px">contenido</div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let div_box = find_box_with_style(&root, "padding").expect("el div deberia tener padding en su computed_style");
 
         assert_eq!(div_box.box_dimensions.padding.top, 15.0);
@@ -1105,7 +1224,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div style="padding: 25px"><p>hola</p></div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let div_box = find_box_with_style(&root, "padding").expect("el div deberia tener padding en su computed_style");
 
         let reconstructed = div_box.box_dimensions.padding_box();
@@ -1120,7 +1239,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div style="padding: not-a-length">hola</div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let div_box = find_box_with_style(&root, "padding").expect("el div deberia tener padding en su computed_style (aunque el valor sea invalido)");
 
         assert_eq!(div_box.box_dimensions.padding.top, 0.0, "un valor de padding invalido deberia caer a cero, no a ningun numero inventado");
@@ -1131,7 +1250,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="container"><p style="margin: 10px">hola</p></div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let container_node = Node::find_by_id(&dom, "container").expect("container deberia existir en el DOM");
         let container_box = find_box_for_dom_node(&root, &container_node).expect("container deberia tener una caja de layout");
         let child_box = container_box.children.first().expect("container deberia tener un hijo (el <p>)");
@@ -1148,7 +1267,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="container"><div>uno</div><div>dos</div></div></body></html>"#);
         let stylesheet = CssParser::parse(""); // sin margin en ningun sitio
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let container_node = Node::find_by_id(&dom, "container").expect("container deberia existir en el DOM");
         let container_box = find_box_for_dom_node(&root, &container_node).expect("container deberia tener una caja de layout");
         let first = &container_box.children[0];
@@ -1171,7 +1290,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="container"><p style="margin: 10px">uno</p><p style="margin: 20px">dos</p></div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let container_node = Node::find_by_id(&dom, "container").expect("container deberia existir en el DOM");
         let container_box = find_box_for_dom_node(&root, &container_node).expect("container deberia tener una caja de layout");
         let first = &container_box.children[0];
@@ -1194,7 +1313,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="target" style="margin: 12px">contenido</div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
         let div_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja de layout");
 
@@ -1217,7 +1336,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="container"><p style="margin: 15px">hola</p></div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let container_node = Node::find_by_id(&dom, "container").expect("container deberia existir en el DOM");
         let container_box = find_box_for_dom_node(&root, &container_node).expect("container deberia tener una caja de layout");
         let child_box = container_box.children.first().expect("container deberia tener un hijo (el <p>)");
@@ -1236,7 +1355,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="container" style="border: 5px solid #000000"><div>hola</div></div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let container_node = Node::find_by_id(&dom, "container").expect("container deberia existir en el DOM");
         let container_box = find_box_for_dom_node(&root, &container_node).expect("container deberia tener una caja de layout");
         let child_box = container_box.children.first().expect("container deberia tener un hijo");
@@ -1255,7 +1374,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="container" style="border: 5px #000000"><div>hola</div></div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let container_node = Node::find_by_id(&dom, "container").expect("container deberia existir en el DOM");
         let container_box = find_box_for_dom_node(&root, &container_node).expect("container deberia tener una caja de layout");
         let child_box = container_box.children.first().expect("container deberia tener un hijo");
@@ -1269,7 +1388,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div style="border: 3px solid #ff0000">contenido</div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let div_box = find_box_with_style(&root, "border").expect("el div deberia tener border en su computed_style");
 
         assert_eq!(div_box.box_dimensions.border.top, 3.0);
@@ -1287,7 +1406,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div style="padding: 8px; border: 4px solid #000000"><p>hola</p></div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let div_box = find_box_with_style(&root, "border").expect("el div deberia tener border en su computed_style");
 
         let reconstructed = div_box.box_dimensions.border_box();
@@ -1301,7 +1420,7 @@ mod tests {
     fn hit_test_at_a_point_inside_an_element_returns_that_elements_real_node() {
         let dom = HtmlParser::parse(r#"<html><body><div id="target">contenido</div></body></html>"#);
         let stylesheet = CssParser::parse("");
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir en el DOM");
         let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener una caja de layout");
@@ -1317,7 +1436,7 @@ mod tests {
     fn hit_test_outside_every_box_returns_none() {
         let dom = HtmlParser::parse("<html><body><p>hola</p></body></html>");
         let stylesheet = CssParser::parse("");
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         assert!(root.hit_test(99999.0, 99999.0).is_none());
     }
@@ -1331,7 +1450,7 @@ mod tests {
     fn hit_test_over_a_text_box_resolves_to_the_containing_element_not_none() {
         let dom = HtmlParser::parse(r#"<html><body><p id="target">algo de texto</p></body></html>"#);
         let stylesheet = CssParser::parse("");
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
         let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
@@ -1355,7 +1474,7 @@ mod tests {
     fn container_height_accounts_for_a_childs_own_margin_not_just_its_box() {
         let dom = HtmlParser::parse(r#"<html><body><div id="child" style="margin: 40px">hola</div></body></html>"#);
         let stylesheet = CssParser::parse("");
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let html_box = root.children.first().expect("root deberia tener un hijo (<html>)");
         let body_box = html_box.children.first().expect("html deberia tener un hijo (<body>)");
@@ -1375,7 +1494,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="target" style="width: 200px; padding: 10px; border: 5px solid #000000">hola</div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
         let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
 
@@ -1390,7 +1509,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="target">hola</div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
         let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
 
@@ -1405,7 +1524,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="target" style="width: 500px; max-width: 300px">hola</div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
         let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
 
@@ -1417,7 +1536,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="target" style="max-width: 250px">hola</div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
         let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
 
@@ -1429,7 +1548,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="target" style="width: 50px; max-width: 100px; min-width: 400px">hola</div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
         let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
 
@@ -1441,7 +1560,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="parent" style="width: 300px"><div id="child">hola</div></div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let child_node = Node::find_by_id(&dom, "child").expect("child deberia existir");
         let child_box = find_box_for_dom_node(&root, &child_node).expect("child deberia tener caja");
 
@@ -1453,7 +1572,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="target" style="height: 400px">hola</div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
         let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
 
@@ -1465,7 +1584,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="target" style="height: 100px; padding: 10px; border: 5px solid #000000">hola</div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
         let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
 
@@ -1478,7 +1597,7 @@ mod tests {
         let dom = HtmlParser::parse(r#"<html><body><div id="target" style="height: 50px; padding: 8px">hola</div></body></html>"#);
         let stylesheet = CssParser::parse("");
 
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
         let target_box = find_box_for_dom_node(&root, &target_node).expect("target deberia tener caja");
 
@@ -1494,7 +1613,7 @@ mod tests {
     fn text_and_inline_element_share_the_same_line_and_continue_horizontally() {
         let dom = HtmlParser::parse(r#"<html><body><p>Text <span id="target">bold</span></p></body></html>"#);
         let stylesheet = CssParser::parse("body { margin: 0px; }");
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let text_box = find_text_box(&root, "Text ").expect("deberia existir una caja de texto 'Text '");
         let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
@@ -1517,7 +1636,7 @@ mod tests {
     fn strong_and_em_are_inline_level_like_b_and_i() {
         let dom = HtmlParser::parse(r#"<html><body><p>Texto <strong id="s">fuerte</strong> <em id="e">enfasis</em></p></body></html>"#);
         let stylesheet = CssParser::parse("body { margin: 0px; }");
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let text_box = find_text_box(&root, "Texto ").expect("deberia existir una caja de texto 'Texto '");
         let strong_node = Node::find_by_id(&dom, "s").expect("s deberia existir");
@@ -1529,13 +1648,45 @@ mod tests {
         assert_eq!(strong_box.dimensions.y, em_box.dimensions.y, "<em> deberia seguir en la misma linea que <strong>");
     }
 
+    /// Regresion encontrada en vivo al verificar la Fase 3.1 con una imagen
+    /// real: una `<img>` mas alta que la linea de texto en la que cae
+    /// (el caso comun - casi cualquier foto es mucho mas alta que una
+    /// linea de texto de 16px) empujaba el `<p>` siguiente hacia arriba lo
+    /// bastante como para solaparse con la propia imagen, porque
+    /// `flow_inline_run` avanzaba `cursor_y` por el alto FIJO del texto,
+    /// ignorando que la imagen de esa misma linea era mas alta. Arreglado
+    /// con `line_extent` (ver su doc-comment en `flow_inline_run`).
+    #[test]
+    fn a_tall_image_grows_the_line_so_the_next_block_does_not_overlap_it() {
+        let dom = HtmlParser::parse(r#"<html><body><p>foto: <img id="photo" src="tall.png"></p><p id="after">despues</p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; }");
+
+        let mut images = ImageMap::new();
+        images.insert("tall.png".to_string(), Arc::new(engine_image::DecodedImage { width: 40, height: 300, rgba: vec![255u8; 40 * 300 * 4] }));
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &images);
+
+        let photo_node = Node::find_by_id(&dom, "photo").expect("photo deberia existir");
+        let photo_box = find_box_for_dom_node(&root, &photo_node).expect("photo deberia tener caja");
+        assert_eq!(photo_box.dimensions.height, 300.0, "la imagen deberia medir su alto natural real (300px), no un valor fijo");
+
+        let after_node = Node::find_by_id(&dom, "after").expect("after deberia existir");
+        let after_box = find_box_for_dom_node(&root, &after_node).expect("after deberia tener caja");
+
+        assert!(
+            after_box.dimensions.y >= photo_box.dimensions.y + photo_box.dimensions.height,
+            "el <p> siguiente (y={}) no deberia solaparse con el borde inferior de la imagen (y={} + alto={} = {})",
+            after_box.dimensions.y, photo_box.dimensions.y, photo_box.dimensions.height, photo_box.dimensions.y + photo_box.dimensions.height,
+        );
+    }
+
     /// Varios elementos inline consecutivos (no solo texto+inline) tambien
     /// deberian compartir linea entre si.
     #[test]
     fn multiple_inline_elements_in_a_row_share_the_same_line() {
         let dom = HtmlParser::parse(r#"<html><body><p><b id="first">uno</b><i id="second">dos</i></p></body></html>"#);
         let stylesheet = CssParser::parse("body { margin: 0px; }");
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let first_node = Node::find_by_id(&dom, "first").expect("first deberia existir");
         let second_node = Node::find_by_id(&dom, "second").expect("second deberia existir");
@@ -1559,7 +1710,7 @@ mod tests {
         // (120+56=176 > 150).
         let dom = HtmlParser::parse(r#"<html><body><div id="container" style="width: 150px"><b id="first">primera_palabra</b><i id="second">segunda</i></div></body></html>"#);
         let stylesheet = CssParser::parse("body { margin: 0px; }");
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let first_text = find_text_box(&root, "primera_palabra").expect("deberia existir la caja de texto 'primera_palabra'");
         let second_text = find_text_box(&root, "segunda").expect("deberia existir la caja de texto 'segunda'");
@@ -1575,7 +1726,7 @@ mod tests {
     fn a_block_sibling_after_an_inline_run_starts_below_it_not_on_the_same_line() {
         let dom = HtmlParser::parse(r#"<html><body><div id="container"><span id="inline_child">texto</span><div id="block_child">bloque</div></div></body></html>"#);
         let stylesheet = CssParser::parse("body { margin: 0px; }");
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let inline_node = Node::find_by_id(&dom, "inline_child").expect("inline_child deberia existir");
         let block_node = Node::find_by_id(&dom, "block_child").expect("block_child deberia existir");
@@ -1595,7 +1746,7 @@ mod tests {
     fn sibling_fragments_on_the_same_line_dont_inflate_the_containers_height() {
         let dom = HtmlParser::parse(r#"<html><body><div id="container"><b id="one">a</b><i id="two">b</i><span id="three">c</span></div></body></html>"#);
         let stylesheet = CssParser::parse("body { margin: 0px; }");
-        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let container_node = Node::find_by_id(&dom, "container").expect("container deberia existir");
         let container_box = find_box_for_dom_node(&root, &container_node).expect("container deberia tener caja");

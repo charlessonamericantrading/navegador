@@ -5,7 +5,7 @@
 //! el layout con tiny-skia y devuelve la captura PNG en Base64. La salida
 //! estándar contiene exclusivamente JSON; los logs van a stderr.
 
-use crate::pipeline::{build_page_keeping_runtime, find_external_script_srcs, find_external_stylesheet_hrefs, PageResult};
+use crate::pipeline::{build_page_keeping_runtime, find_external_script_srcs, find_external_stylesheet_hrefs, find_image_srcs, PageResult};
 use crate::protocol::{
     ElementAttributes, ElementRect, EngineRequest, EngineResponse, InteractiveElement,
     PROTOCOL_VERSION,
@@ -13,8 +13,9 @@ use crate::protocol::{
 use base64::Engine as _;
 use engine_dom::{Node, NodeType};
 use engine_gfx::render_layout_to_png;
+use engine_image::decode_image;
 use engine_js::JsRuntime;
-use engine_layout::LayoutTreeBuilder;
+use engine_layout::{ImageMap, LayoutTreeBuilder};
 use engine_net::{NetworkEngine, NetworkRequest};
 use engine_text::FontSet;
 use std::collections::HashMap;
@@ -27,6 +28,7 @@ struct LoadedPage {
     page: PageResult,
     runtime: JsRuntime,
     font_set: Option<FontSet>,
+    images: ImageMap,
     focused_node: Option<std::sync::Arc<std::sync::RwLock<Node>>>,
 }
 
@@ -83,6 +85,7 @@ impl EngineServer {
                         self.width as f32,
                         self.height as f32,
                         page.font_set.as_ref(),
+                        &page.images,
                     );
                     self.scroll_offset_y = clamp_scroll_offset(
                         self.scroll_offset_y,
@@ -165,9 +168,11 @@ impl EngineServer {
         let discovery_dom = engine_dom::HtmlParser::parse(&html);
         let stylesheet_hrefs = find_external_stylesheet_hrefs(&discovery_dom);
         let script_srcs = find_external_script_srcs(&discovery_dom);
+        let image_srcs = find_image_srcs(&discovery_dom);
 
         let external_css = self.fetch_external_stylesheets(stylesheet_hrefs, &page_url).await;
         let external_scripts = self.fetch_external_scripts(script_srcs, &page_url).await;
+        let images = self.fetch_images(image_srcs, &page_url).await;
 
         let font_set = FontSet::load_default_sans_serif();
         let (page, runtime) = build_page_keeping_runtime(
@@ -177,6 +182,7 @@ impl EngineServer {
             self.height as f32,
             Some(&font_set),
             &external_scripts,
+            &images,
         );
         let title = Node::find_all_by_tag(&page.dom_root, "title")
             .first()
@@ -189,6 +195,7 @@ impl EngineServer {
             page,
             runtime,
             font_set: Some(font_set),
+            images,
             focused_node: None,
         });
         self.scroll_offset_y = 0.0;
@@ -284,6 +291,47 @@ impl EngineServer {
         fetched
     }
 
+    /// Descarga cada `src` de `<img src>` ya descubierto por
+    /// `find_image_srcs` y lo decodifica a RGBA8 (`engine_image::
+    /// decode_image`) - mismo criterio exacto que `fetch_external_scripts`
+    /// (resuelve contra `page_url`, un fallo se omite con un aviso en vez
+    /// de abortar la carga entera de la pagina), solo que el resultado son
+    /// bytes binarios decodificados en vez de texto. La clave sigue siendo
+    /// el `src` SIN resolver - lo unico que `engine-layout`/`engine-gfx`
+    /// ven al recorrer las cajas (`BoxType::Image`), igual que
+    /// `external_scripts`.
+    async fn fetch_images(&self, srcs: Vec<String>, page_url: &url::Url) -> ImageMap {
+        let mut fetched = ImageMap::new();
+        for src in srcs {
+            let Ok(image_url) = page_url.join(&src) else {
+                tracing::warn!("[server] src de <img> invalido, se omite: {src}");
+                continue;
+            };
+            let request = match NetworkRequest::new(image_url.as_str()) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!("[server] no se pudo construir la peticion para {image_url}: {error}");
+                    continue;
+                }
+            };
+            match self.network.fetch(&request).await {
+                Ok(response) if response.is_success() => match decode_image(&response.body) {
+                    Some(image) => {
+                        fetched.insert(src, image);
+                    }
+                    None => tracing::warn!("[server] {image_url} no se pudo decodificar como imagen, se omite"),
+                },
+                Ok(response) => tracing::warn!(
+                    "[server] {image_url} respondio {} {}, se omite",
+                    response.status_code,
+                    response.status_text
+                ),
+                Err(error) => tracing::warn!("[server] no se pudo descargar {image_url}: {error}"),
+            }
+        }
+        fetched
+    }
+
     fn click(&mut self, id: Option<String>, x: f32, y: f32) -> EngineResponse {
         let Some(page) = &mut self.current_page else {
             return Self::error(id, "no hay ninguna página cargada".to_string());
@@ -308,6 +356,7 @@ impl EngineServer {
                 self.width as f32,
                 self.height as f32,
                 page.font_set.as_ref(),
+                        &page.images,
             );
         }
         self.state_response(id)
@@ -358,6 +407,7 @@ impl EngineServer {
             self.width as f32,
             self.height as f32,
             page.font_set.as_ref(),
+                        &page.images,
         );
         self.state_response(id)
     }
@@ -394,6 +444,7 @@ impl EngineServer {
         let screenshot = match render_layout_to_png(
             &page.page.layout_root,
             page.font_set.as_ref(),
+                        &page.images,
             self.width,
             self.height,
             self.scroll_offset_y,

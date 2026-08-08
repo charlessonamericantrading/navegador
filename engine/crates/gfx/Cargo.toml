@@ -10,6 +10,7 @@ thiserror.workspace = true
 tracing.workspace = true
 engine-layout = { path = "../layout" }
 engine-text = { path = "../text" }
+engine-image = { path = "../image" }
 winit = "0.29"
 wgpu = "0.19"
 tiny-skia = "0.11"

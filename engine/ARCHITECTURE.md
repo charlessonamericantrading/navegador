@@ -341,6 +341,52 @@ A fecha de esta limpieza, el motor:
   ninguna de las nuevas (se propaga el string crudo, igual que `color`
   siempre ha hecho) - solo `font-size` tiene esa conversion especial,
   porque solo `font-size` tiene hoy quien consuma el valor ya resuelto.
+- **Imagenes de trama reales** (Fase 3.1): `<img src="...">` se descarga,
+  decodifica (PNG/JPEG/GIF/BMP/WebP/TIFF/ICO via el crate `image`, nuevo
+  crate propio `engine-image` - ver "Doctrina de dependencias") y se PINTA
+  con sus pixeles reales, no un rectangulo de relleno. Arquitectura en 3
+  capas: `engine-image::decode_image` (bytes -> `DecodedImage` RGBA8, sin
+  saber nada de DOM/layout/red), `engine-layout` (`BoxType::Image(src)`,
+  nuevo - `<img>` es inline-level por defecto como en el spec real; su caja
+  se dimensiona con `resolve_image_dimensions`: si el autor puso AMBOS
+  `width`/`height` (CSS o los atributos HTML del mismo nombre - ver
+  `apply_image_size_attributes`, que los inserta en `computed_style` SOLO
+  si CSS no los puso ya, como un hint de presentacion de la especificidad
+  mas baja posible) se usan tal cual; si solo puso UNO, el otro se escala
+  para mantener la proporcion real de la imagen decodificada; sin ninguna
+  imagen decodificada disponible, 0x0 siempre - sin icono de "imagen rota"
+  ni el tamaño de respaldo 300x150 que el spec real exige para un
+  reemplazado sin tamaño intrinseco, simplificacion declarada) y
+  `engine-gfx` (`DisplayItem::Image` lleva el `Arc<DecodedImage>` YA
+  resuelto - `raster.rs`/`window.rs` comparten `image_paint::paint_image`,
+  que premultiplica alpha - `tiny_skia::Pixmap` lo exige, `DecodedImage`
+  guarda straight alpha - y escala con `Transform` al tamaño final resuelto
+  por el layout, que puede diferir del tamaño natural). `ImageMap` (`src`
+  crudo -> `Arc<DecodedImage>`) es un `HashMap` normal, no `Option` como
+  `FontSet`: una pagina sin imagenes es simplemente un mapa vacio, sin el
+  caso especial de "subsistema entero ausente" que si existe para fuentes.
+  `core/server.rs::fetch_images` sigue el mismo patron exacto que
+  `fetch_external_scripts`/`fetch_external_stylesheets` (resuelve `src`
+  contra la URL de la pagina, una descarga o decodificacion fallida se
+  omite con un aviso, no aborta la pagina) - `core/main.rs` (el arnes
+  manual sin red, ver su doc-comment) pasa siempre un `ImageMap` vacio.
+  - **Bug real encontrado en vivo, no teorico**: una imagen mas alta que la
+    linea de texto en la que cae (el caso comun - casi cualquier foto es
+    mucho mas alta que una linea de 16px) empujaba el bloque SIGUIENTE
+    hacia arriba lo bastante como para solaparse con la propia imagen,
+    porque `flow_inline_run` avanzaba `cursor_y` por un alto de linea FIJO
+    (el de la fuente de texto), ignorando que la imagen de esa misma linea
+    era mas alta. Arreglado con `line_extent` (`flow_inline_run`/
+    `place_inline_node` en `tree.rs`): el alto real de avance de CADA
+    linea, que arranca en el alto de texto y crece si algo mas alto
+    (una imagen) se coloca en ella - verificado en vivo con una imagen real
+    200x100 (antes/despues: parrafo solapado -> parrafo debajo del todo).
+  NO implementado: SVG (`resvg`, mencionado en la doctrina de dependencias,
+  sigue sin integrarse - vectorial, no un simple decode-a-RGBA), `srcset`/
+  `<picture>` (imagenes responsivas), carga perezosa (`loading="lazy"`),
+  `object-fit`/`object-position`, `max-width`/`max-height` sobre imagenes
+  (solo `width`/`height` exactos), cache de imagenes repetidas entre
+  navegaciones, imagen de "recurso roto" cuando la decodificacion falla.
 - **Pinta en una ventana nativa real** (`winit` + `tiny-skia` + `softbuffer`):
   rectangulos solidos para cajas de bloque con `background-color`, y **texto
   con glifos reales** via `engine-text` (`rustybuzz` para shaping +
@@ -918,14 +964,15 @@ estan resueltos por crates maduros y probados en produccion.
 | Bidi / saltos de linea | `unicode-bidi`, `unicode-linebreak` | Es el algoritmo del estandar Unicode, no se mejora a mano |
 | Rasterizado 2D | `tiny-skia` (ya en uso) | Anti-aliasing correcto es matematica no trivial |
 | Compositacion GPU | `wgpu` (dependencia integrada, `gfx/src/gpu_pipeline.rs::WebGpuPipeline` consulta un adaptador real - pero nada del pipeline real la llama todavia; el rasterizado actual es 100% CPU via tiny-skia) | Abstraccion real sobre Vulkan/Metal/DX12 |
-| Imagenes | `image`, `resvg` | JPEG/PNG/WebP/AVIF/SVG, cada uno con su propio infierno de formato |
+| Imagenes de trama | `image` (integrado - `engine-image`, Fase 3.1: PNG/JPEG/GIF/BMP/WebP/TIFF/ICO) | Cada formato tiene su propio infierno de casos borde |
+| Imagenes vectoriales | `resvg` (pendiente de integrar) | SVG es su propio motor de render, no un simple decode-a-RGBA |
 | Ventanas + eventos | `winit` (ya en uso) | Cada sistema operativo tiene el suyo propio |
 | Presentacion a pantalla | `softbuffer` (ya en uso) | Blit de pixeles a superficie de ventana, multiplataforma |
 
 **Si se escribe a mano — es donde vive el motor de verdad:**
 
 - El **DOM** y su semantica viva (arbol, eventos, en el futuro colecciones/rangos/observers)
-- La **cascada CSS**: fusion de declaraciones por especificidad ya real (via `selectors`), con el atributo `style="..."` del elemento ganando siempre al final (como en el spec real), y herencia real de `color`/`font-size` (incluidas unidades relativas `em`/`%`) hasta las cajas de texto; el resto de propiedades heredables del spec (`font-family`, `font-weight`, `line-height`...) y `rem` siguen sin resolverse
+- La **cascada CSS**: fusion de declaraciones por especificidad ya real (via `selectors`), con el atributo `style="..."` del elemento ganando siempre al final (como en el spec real), y herencia real de 20 propiedades (`color`/`font-size` con unidades relativas `em`/`%`, `font-weight`/`font-style` ya pintados como negrita/cursiva real, mas `font-family`/`line-height`/`text-align`/... - ver Fases 2.4/2.5 en "Estado real" - todavia sin efecto visual); `rem` (relativo a `<html>`, no al padre inmediato) sigue sin resolverse
 - El **layout**: modelo de cajas, contextos de formato, flex, grid, floats
 - El **arbol de pintado** (`display_list.rs`) y su recorrido a la superficie
 - El **bucle de eventos** del navegador y el hit-testing
@@ -961,9 +1008,10 @@ engine/
 │   ├── net/         HTTP/HTTPS real (hyper+rustls); CookieStore/WebStorage/CorsPolicy son stubs honestos (mapas en memoria / permite-todo) SIN conectar a `NetworkEngine::fetch` ni a bindings JS todavia - ver doc-comments en cookie.rs/storage.rs/cors.rs
 │   ├── dom/         Nodos, arbol, adaptador TreeSink para html5ever (los eventos DOM viven en js/dom_bindings.rs - ver ese crate - no aqui: guardar listeners exige poder guardar un JsObject, y este crate no depende de Boa a proposito)
 │   ├── css/         Parseo real (cssparser), matching de selectores real (selectors: combinadores, compuestos, atributos), resolucion de cascada real (`cascade::resolve_style` - matching+especificidad+atributo style inline; se traslado aqui desde `layout` para que `js` tambien pueda reusarla, ver "Metrica de progreso")
-│   ├── layout/      Cajas con layout de bloque real + cascada CSS aplicada (via `engine_css::resolve_style`, ya no propia), texto medido con metricas reales de fuente; box model completo desde CSS - `padding`/`border`/`margin` reales (`LayoutBox::box_dimensions`, `Dimensions::padding_box()`/`border_box()`/`margin_box()` en box_model.rs reconstruyen `dimensions` de verdad, sin colapso de margenes, solo estilo `solid` reconocido para border); floats/grid/flex/inline real siguen sin existir - eso sigue siendo Fase 2
-│   ├── text/         Shaping real (rustybuzz), medida sin construir contornos (measure_text), carga de fuentes del sistema (fontdb), contornos de glifo -> tiny-skia
-│   ├── gfx/         Display list, ventana real (winit+tiny-skia+softbuffer), texto con glifos reales, adaptador GPU real (wgpu), scroll real de la rueda del raton (offset aplicado en pintado + hit-testing, sin relayout - ver "Scroll real de la rueda del raton" mas abajo)
+│   ├── layout/      Cajas con layout de bloque Y inline real (`BoxType::Block`/`Inline`/`Text`/`Image`) + cascada CSS aplicada (via `engine_css::resolve_style`), texto medido con metricas reales de fuente (negrita/cursiva incluidas, via `FontSet`); box model completo desde CSS - `padding`/`border`/`margin` reales (`LayoutBox::box_dimensions`, `Dimensions::padding_box()`/`border_box()`/`margin_box()` en box_model.rs); floats/grid/flex/position siguen sin existir - eso es Fase 3
+│   ├── image/       Decodificacion real de imagenes de trama (`image`: PNG/JPEG/GIF/BMP/WebP/TIFF/ICO) a RGBA8 - crate propio y minimo porque tanto `layout` (dimensiones) como `gfx` (pixeles) lo necesitan sin que `layout` dependa de `gfx`
+│   ├── text/         Shaping real (rustybuzz), medida sin construir contornos (measure_text), carga de fuentes del sistema en 4 variantes peso/estilo (`FontSet`, fontdb), contornos de glifo -> tiny-skia
+│   ├── gfx/         Display list (incluye `DisplayItem::Image`, pintado real via `image_paint.rs`), ventana real (winit+tiny-skia+softbuffer), texto con glifos reales, adaptador GPU real (wgpu), scroll real de la rueda del raton (offset aplicado en pintado + hit-testing, sin relayout - ver "Scroll real de la rueda del raton" mas abajo)
 │   ├── js/          Runtime Boa enganchado al pipeline (via core/scripting.rs), bindings DOM con mutacion real (getElementById/querySelector(All)/setAttribute/textContent/createElement/appendChild/removeChild/insertBefore/replaceChild/classList/style/parentElement/children/firstElementChild.../documentElement/body), eventos reales (addEventListener/removeEventListener/dispatchEvent/Event con preventDefault/stopPropagation/target/bubbling/fase de captura real) - el clic del raton SI esta conectado a input real del SO (ver "Clic real del SO cableado de punta a punta"), scroll/teclado todavia no; microtasks reales (queueMicrotask), arnes minimo tipo testharness.js (test_harness.rs, ya conectado a wpt_runner - ver core/)
 │   └── core/        Orquestacion: lib.rs (pipeline/scripting/platform, compartido) + main.rs (red -> pipeline.rs -> ventana) + bin/wpt_runner.rs (corredor real de fixtures estilo WPT, sin ventana)
 ```

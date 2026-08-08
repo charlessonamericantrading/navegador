@@ -26,6 +26,16 @@ pub enum BoxType {
     Block,
     Inline,
     Text(String),
+    /// `<img>` - guarda el `src` CRUDO (sin resolver contra la URL de la
+    /// pagina), igual que `external_scripts`/`find_external_script_srcs`
+    /// ya hacen para `<script src>` (ver `core/pipeline.rs`) - es la clave
+    /// con la que se busca la imagen ya decodificada en el mapa que
+    /// `LayoutTreeBuilder::build` recibe (Fase 3.1, ver ARCHITECTURE.md).
+    /// Elemento inline-level por defecto (como en el spec real, "inline
+    /// replaced element" - ver `is_inline_level` en tree.rs), a diferencia
+    /// de todo lo demas que no sea `span`/`a`/`b`/`i`/`strong`/`em`, que
+    /// cae a `Block`.
+    Image(String),
 }
 
 #[derive(Debug, Clone)]

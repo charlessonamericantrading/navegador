@@ -1,5 +1,7 @@
-use engine_layout::{LayoutBox, BoxType, Rect};
+use engine_image::DecodedImage;
+use engine_layout::{ImageMap, LayoutBox, BoxType, Rect};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Valores iniciales CSS reales para las dos propiedades heredables que
 /// aplicamos (ver `INHERITABLE_PROPERTIES` en engine-layout): un navegador
@@ -18,6 +20,14 @@ pub enum DisplayItem {
     /// dibuja un marco de `width` de grosor hacia adentro desde el borde de
     /// `rect`, no un rectangulo aparte fuera de `dimensions`.
     Border { rect: Rect, width: f32, color: [u8; 4] },
+    /// `image` ya viene RESUELTA (el `Arc<DecodedImage>` real, no el `src`
+    /// crudo) desde `DisplayList::build` - quien pinta esto (`raster.rs`/
+    /// `window.rs`) no necesita saber nada de `ImageMap` ni de red, solo
+    /// escalar+volcar los pixeles ya decodificados sobre `rect` (que ya es
+    /// el tamaño FINAL resuelto por el layout - ver `resolve_image_dimensions`
+    /// en `engine-layout::tree` - no necesariamente el tamaño natural de la
+    /// imagen).
+    Image { rect: Rect, image: Arc<DecodedImage> },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -26,13 +36,13 @@ pub struct DisplayList {
 }
 
 impl DisplayList {
-    pub fn build(layout_root: &LayoutBox) -> Self {
+    pub fn build(layout_root: &LayoutBox, images: &ImageMap) -> Self {
         let mut list = Self::default();
-        Self::build_items(layout_root, &mut list);
+        Self::build_items(layout_root, &mut list, images);
         list
     }
 
-    fn build_items(layout_box: &LayoutBox, list: &mut DisplayList) {
+    fn build_items(layout_box: &LayoutBox, list: &mut DisplayList, images: &ImageMap) {
         match &layout_box.box_type {
             BoxType::Block | BoxType::Inline => {
                 // Sin background-color explicito en la cascada, las cajas de
@@ -62,10 +72,22 @@ impl DisplayList {
                     italic: resolve_font_style_is_italic(&layout_box.computed_style),
                 });
             }
+            BoxType::Image(src) => {
+                // Sin imagen resuelta (`src` vacio, descarga fallida,
+                // formato no soportado) el layout ya dejo `dimensions` en
+                // 0x0 (ver `resolve_image_dimensions` en
+                // `engine-layout::tree`) - `images.get(src)` sera `None` en
+                // ese mismo caso (misma fuente de verdad), asi que no hace
+                // falta comprobar el tamaño por separado: sin imagen, no se
+                // pinta nada, en vez de un rectangulo de relleno inventado.
+                if let Some(image) = images.get(src) {
+                    list.items.push(DisplayItem::Image { rect: layout_box.dimensions.clone(), image: image.clone() });
+                }
+            }
         }
 
         for child in &layout_box.children {
-            Self::build_items(child, list);
+            Self::build_items(child, list, images);
         }
     }
 }

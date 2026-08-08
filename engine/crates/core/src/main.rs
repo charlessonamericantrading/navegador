@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ARCHITECTURE.md), no el camino real del producto - `server.rs` (el
     // proceso NDJSON que si habla con el backend) es quien descarga
     // recursos externos de verdad.
-    let (page, mut runtime) = build_page_keeping_runtime(&html, "", VIEWPORT_WIDTH, VIEWPORT_HEIGHT, Some(&font_set), &std::collections::HashMap::new());
+    let (page, mut runtime) = build_page_keeping_runtime(&html, "", VIEWPORT_WIDTH, VIEWPORT_HEIGHT, Some(&font_set), &std::collections::HashMap::new(), &engine_layout::ImageMap::new());
 
     for result in &page.script_results {
         match result {
@@ -107,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stylesheet_for_relayout = page.stylesheet.clone();
     let font_set_for_relayout = font_set.clone();
     let relayout = move |width: f32, height: f32| {
-        LayoutTreeBuilder::build(&dom_root_for_relayout, &stylesheet_for_relayout, width, height, Some(&font_set_for_relayout))
+        LayoutTreeBuilder::build(&dom_root_for_relayout, &stylesheet_for_relayout, width, height, Some(&font_set_for_relayout), &engine_layout::ImageMap::new())
     };
 
     // `on_click` es el ultimo eslabon de la cadena clic-real -> evento-real
@@ -136,11 +136,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             current_layout.dimensions.width,
             current_layout.dimensions.height,
             Some(&font_set_for_click),
+            &engine_layout::ImageMap::new(),
         ))
     };
 
     info!("Abriendo ventana nativa...");
-    NativeEngineWindow::run("Navegador IA - Motor Nativo (Fase 1, en progreso)", page.layout_root, Some(font_set), relayout, on_click);
+    NativeEngineWindow::run("Navegador IA - Motor Nativo (Fase 1, en progreso)", page.layout_root, Some(font_set), engine_layout::ImageMap::new(), relayout, on_click);
 
     Ok(())
 }

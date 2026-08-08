@@ -1,0 +1,15 @@
+[package]
+name = "engine-image"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing.workspace = true
+# Decodificacion real de PNG/JPEG/GIF/BMP/WebP/... - ver "Doctrina de
+# dependencias" en ARCHITECTURE.md: cada formato de imagen tiene su propio
+# infierno de casos borde, no se reescribe a mano. `resvg` (SVG) queda
+# fuera a proposito: SVG es vectorial, no un simple decode-a-RGBA como el
+# resto, y la Fase 3.1 solo cubre imagenes de trama (raster).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff"] }
