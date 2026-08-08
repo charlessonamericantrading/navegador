@@ -11,7 +11,7 @@ pub const INITIAL_FONT_SIZE: f32 = 16.0;
 #[derive(Debug, Clone)]
 pub enum DisplayItem {
     SolidRect { rect: Rect, color: [u8; 4] },
-    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32 },
+    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool },
     /// `rect` es el border-box COMPLETO (`layout_box.dimensions`, que ya
     /// incluye el propio border - ver `engine_layout::tree::
     /// flow_block_children`); quien pinta esto (`engine-gfx/src/window.rs`)
@@ -58,6 +58,8 @@ impl DisplayList {
                     text: content.clone(),
                     color,
                     font_size,
+                    bold: resolve_font_weight_is_bold(&layout_box.computed_style),
+                    italic: resolve_font_style_is_italic(&layout_box.computed_style),
                 });
             }
         }
@@ -100,6 +102,32 @@ fn parse_css_color(value: &str) -> Option<[u8; 4]> {
 fn parse_css_font_size(value: &str) -> Option<f32> {
     let px = value.trim().strip_suffix("px")?;
     px.trim().parse::<f32>().ok().filter(|size| *size > 0.0)
+}
+
+/// Copia deliberada de `resolve_font_weight_is_bold` en
+/// `engine-layout::tree` (misma razon de siempre: dos crates que no deben
+/// depender entre si, y unas pocas lineas no justifican enredar la
+/// dependencia) - decide que variante de `FontSet` pedir al pintar
+/// (`engine-gfx/src/raster.rs`, `engine-gfx/src/window.rs`), igual que la
+/// copia de layout decide que variante pedir al MEDIR. Misma
+/// simplificacion binaria: negrita si/no, no el espacio 1-1000 completo del
+/// spec.
+fn resolve_font_weight_is_bold(computed_style: &HashMap<String, String>) -> bool {
+    let Some(raw) = computed_style.get("font-weight") else { return false };
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("bold") || trimmed.eq_ignore_ascii_case("bolder") {
+        return true;
+    }
+    trimmed.parse::<u16>().map(|weight| weight >= 600).unwrap_or(false)
+}
+
+/// Copia deliberada de `resolve_font_style_is_italic` en
+/// `engine-layout::tree` - misma razon que `resolve_font_weight_is_bold`
+/// arriba.
+fn resolve_font_style_is_italic(computed_style: &HashMap<String, String>) -> bool {
+    let Some(raw) = computed_style.get("font-style") else { return false };
+    let trimmed = raw.trim();
+    trimmed.eq_ignore_ascii_case("italic") || trimmed.eq_ignore_ascii_case("oblique")
 }
 
 /// Igual que `parse_css_font_size`, pero SI acepta cero (un ancho de
@@ -158,6 +186,25 @@ mod tests {
     fn parses_pixel_font_size() {
         assert_eq!(parse_css_font_size("32px"), Some(32.0));
         assert_eq!(parse_css_font_size("  18px "), Some(18.0));
+    }
+
+    #[test]
+    fn resolve_font_weight_is_bold_recognizes_keywords_and_heavy_numeric_weights() {
+        let style = |value: &str| { let mut m = HashMap::new(); m.insert("font-weight".to_string(), value.to_string()); m };
+
+        assert!(resolve_font_weight_is_bold(&style("bold")));
+        assert!(resolve_font_weight_is_bold(&style("700")));
+        assert!(!resolve_font_weight_is_bold(&style("normal")));
+        assert!(!resolve_font_weight_is_bold(&HashMap::new()));
+    }
+
+    #[test]
+    fn resolve_font_style_is_italic_recognizes_italic_and_oblique() {
+        let style = |value: &str| { let mut m = HashMap::new(); m.insert("font-style".to_string(), value.to_string()); m };
+
+        assert!(resolve_font_style_is_italic(&style("italic")));
+        assert!(resolve_font_style_is_italic(&style("oblique")));
+        assert!(!resolve_font_style_is_italic(&HashMap::new()));
     }
 
     #[test]

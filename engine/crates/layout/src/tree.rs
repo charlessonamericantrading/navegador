@@ -2,15 +2,55 @@ use crate::box_model::EdgeSizes;
 use crate::layout_box::{LayoutBox, BoxType, Rect};
 use engine_dom::{Node, NodeType};
 use engine_css::StyleSheet;
-use engine_text::SystemFont;
+use engine_text::FontSet;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// Propiedades que SI se propagan de un elemento a sus descendientes cuando
-/// estos no las redefinen (herencia CSS real, aunque solo para estas dos
-/// - el resto de propiedades heredables del spec, tipografia como
-/// `font-family`/`font-weight`/`line-height`, quedan pendientes).
-const INHERITABLE_PROPERTIES: &[&str] = &["color", "font-size"];
+/// estos no las redefinen (herencia CSS real). Ampliada en la Fase 2.5 a la
+/// lista real de propiedades heredables del spec que tienen sentido para
+/// este motor hoy - se excluyen a proposito las que son especificas de
+/// tablas (`border-collapse`, `border-spacing`, `caption-side`,
+/// `empty-cells` - el motor no tiene layout de tablas, Fase 3.4 pendiente)
+/// y las de paginacion impresa (`orphans`/`widows` - un renderer de
+/// pantalla sin paginacion no tiene "pagina" que romper).
+///
+/// Igual que ya pasaba con `font-weight`/`font-style` (Fase 2.4) antes de
+/// que `engine-gfx` las pintara: que una propiedad este aqui significa que
+/// la herencia CSS es correcta para ella (cascada real, verificable en
+/// `computed_style`), NO que algo la lea todavia para layout/pintado -
+/// varias de las nuevas (`text-align`, `list-style-type`, `letter-spacing`,
+/// `white-space` mas alla de collapse de espacios, `visibility`...) no
+/// tienen efecto visual todavia (Fase 3+). Documentado asi a proposito en
+/// vez de fingir que ya se ven en pantalla.
+///
+/// Sin resolucion de unidades relativas para ninguna de las nuevas (a
+/// diferencia de `font-size`, que SI convierte `em`/`%` via
+/// `resolve_font_size` porque algo -el layout- ya consume ese valor
+/// resuelto) - se propagan como el string crudo que declaro el autor, igual
+/// que `color` siempre ha hecho.
+const INHERITABLE_PROPERTIES: &[&str] = &[
+    "color",
+    "font-size",
+    "font-weight",
+    "font-style",
+    "font-family",
+    "font-variant",
+    "line-height",
+    "text-align",
+    "text-indent",
+    "text-transform",
+    "letter-spacing",
+    "word-spacing",
+    "white-space",
+    "visibility",
+    "cursor",
+    "direction",
+    "list-style-type",
+    "list-style-position",
+    "list-style-image",
+    "quotes",
+];
 
 /// Mismo valor inicial que usa `engine-gfx` al pintar (`display_list.rs`) -
 /// duplicado a proposito en vez de compartido: son dos crates que no se
@@ -194,6 +234,39 @@ fn resolve_font_size(raw_value: &str, parent_font_size_px: f32) -> f32 {
     parent_font_size_px
 }
 
+/// `font-weight` computado -> negrita si/no. Simplificacion binaria
+/// deliberada: el spec real admite cualquier numero 1-1000 (con caras
+/// intermedias reales en fuentes variables), pero `FontSet` (ver
+/// `engine-text::font`) solo carga 4 combinaciones fijas por pagina, no una
+/// por cada peso posible - negrita/normal es la distincion que de verdad
+/// importa para el 99% de la web (`<b>`/`<strong>`/`font-weight: bold` o
+/// numeros >= 600, que es donde los navegadores reales empiezan a preferir
+/// una cara "bold" sobre la variante regular al hacer matching de fuente).
+/// Sin la propiedad, o con un valor que no es ni palabra clave ni numero
+/// valido, cae a "no negrita" (el valor inicial real de `font-weight` es
+/// `normal`/400).
+fn resolve_font_weight_is_bold(computed_style: &HashMap<String, String>) -> bool {
+    let Some(raw) = computed_style.get("font-weight") else { return false };
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("bold") || trimmed.eq_ignore_ascii_case("bolder") {
+        return true;
+    }
+    trimmed.parse::<u16>().map(|weight| weight >= 600).unwrap_or(false)
+}
+
+/// `font-style` computado -> cursiva si/no. `oblique` (una inclinacion
+/// sintetica de la cara regular, distinta de `italic` en el spec real, que
+/// tiene sus propios glifos dibujados a mano) se trata igual que `italic`
+/// aqui a proposito: `FontSet` solo distingue cursiva-si/cursiva-no, no
+/// tiene una tercera variante "inclinada sinteticamente" - la misma
+/// simplificacion binaria que `resolve_font_weight_is_bold`, por la misma
+/// razon.
+fn resolve_font_style_is_italic(computed_style: &HashMap<String, String>) -> bool {
+    let Some(raw) = computed_style.get("font-style") else { return false };
+    let trimmed = raw.trim();
+    trimmed.eq_ignore_ascii_case("italic") || trimmed.eq_ignore_ascii_case("oblique")
+}
+
 pub struct LayoutTreeBuilder;
 
 impl LayoutTreeBuilder {
@@ -206,15 +279,16 @@ impl LayoutTreeBuilder {
     /// `box_dimensions` en cada `LayoutBox`, sin colapso de margenes);
     /// floats e inline real todavia no — eso sigue siendo Fase 2, ver
     /// ARCHITECTURE.md. Esto es honesto-minimo, no el layout final.
-    /// `font`: la misma fuente de sistema que usara `engine-gfx` para pintar
-    /// (cargada una sola vez por quien orquesta el pipeline, ver
-    /// `core/main.rs`), para que el layout mida el texto con las metricas
-    /// reales de la fuente que de verdad se va a pintar - no una fuente
-    /// distinta ni una recargada aparte. `None` si no hay fuente de sistema
-    /// disponible: cae a la aproximacion anterior por caracteres (ver
-    /// `flow_block_children`), igual que `engine-gfx` cae a un bloque de
-    /// relleno cuando pinta sin fuente.
-    pub fn build(dom_root: &Arc<RwLock<Node>>, stylesheet: &StyleSheet, viewport_width: f32, viewport_height: f32, font: Option<&SystemFont>) -> LayoutBox {
+    /// `font_set`: las 4 variantes de peso/estilo de la MISMA fuente de
+    /// sistema que usara `engine-gfx` para pintar (cargadas una sola vez
+    /// por quien orquesta el pipeline, ver `core/main.rs`), para que el
+    /// layout mida el texto con las metricas reales de la fuente que de
+    /// verdad se va a pintar - no una fuente distinta ni una recargada
+    /// aparte. `None` si no hay fuente de sistema disponible: cae a la
+    /// aproximacion anterior por caracteres (ver `flow_block_children`),
+    /// igual que `engine-gfx` cae a un bloque de relleno cuando pinta sin
+    /// fuente.
+    pub fn build(dom_root: &Arc<RwLock<Node>>, stylesheet: &StyleSheet, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>) -> LayoutBox {
         let mut root_box = LayoutBox::new(BoxType::Block);
         root_box.dimensions = Rect {
             x: 0.0,
@@ -224,7 +298,7 @@ impl LayoutTreeBuilder {
         };
 
         Self::build_node(dom_root, &mut root_box, stylesheet, &HashMap::new());
-        Self::flow_block_children(&mut root_box, font);
+        Self::flow_block_children(&mut root_box, font_set);
         root_box
     }
 
@@ -247,8 +321,22 @@ impl LayoutTreeBuilder {
                 if matches!(tag_name.as_str(), "head" | "script" | "style" | "meta" | "link" | "title") {
                     return;
                 }
+                // `strong`/`em` faltaban aqui desde que existen como reglas
+                // de la hoja de agente de usuario (Fase 2.1, `font-weight:
+                // bold`/`font-style: italic`) - sin esto caian al `_ =>
+                // BoxType::Block` de abajo, asi que un `<strong>`/`<em>`
+                // mezclado con texto suelto (p.ej. "Titular <strong>fuerte
+                // </strong> normal") rompia la racha inline en dos: el
+                // texto de ANTES se quedaba solo en su propia linea, el
+                // `<strong>` se apilaba debajo como si fuera un bloque
+                // (un parrafo entero), y el texto de DESPUES empezaba una
+                // tercera linea - encontrado en vivo al verificar la Fase
+                // 2.4 (negrita/cursiva reales) con una pagina que de verdad
+                // mezclaba `<strong>` con texto vecino, caso que ningun
+                // test anterior de layout inline (Fase 2.3) cubria porque
+                // todos usaban `<b>`/`<i>`, no `<strong>`/`<em>`.
                 let box_type = match tag_name.as_str() {
-                    "span" | "a" | "b" | "i" => BoxType::Inline,
+                    "span" | "a" | "b" | "i" | "strong" | "em" => BoxType::Inline,
                     _ => BoxType::Block,
                 };
                 let mut current_box = LayoutBox::new(box_type);
@@ -334,7 +422,7 @@ impl LayoutTreeBuilder {
     /// linea varias veces si dos fragmentos inline la comparten. Devolver
     /// el `cursor_y` final ya resuelve eso por construccion, sin necesitar
     /// un caso aparte para "hijos que se solapan".
-    fn flow_block_children(container: &mut LayoutBox, font: Option<&SystemFont>) -> f32 {
+    fn flow_block_children(container: &mut LayoutBox, font_set: Option<&FontSet>) -> f32 {
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
         let padding = resolve_padding(&container.computed_style);
@@ -362,7 +450,7 @@ impl LayoutTreeBuilder {
                     .position(|c| !Self::is_inline_level(c))
                     .map(|rel| i + rel)
                     .unwrap_or(container.children.len());
-                cursor_y = Self::flow_inline_run(&mut container.children[i..run_end], origin_x, inner_width, cursor_y, font);
+                cursor_y = Self::flow_inline_run(&mut container.children[i..run_end], origin_x, inner_width, cursor_y, font_set);
                 i = run_end;
                 continue;
             }
@@ -387,7 +475,7 @@ impl LayoutTreeBuilder {
             child.dimensions.width = resolve_block_width(&child.computed_style, auto_width);
             let child_width = child.dimensions.width;
 
-            let content_height = Self::flow_block_children(child, font);
+            let content_height = Self::flow_block_children(child, font_set);
             // `flow_block_children(child, ...)`, arriba, ya dejo
             // `child.box_dimensions.padding`/`.border` resueltos (child
             // pasa a ser el "container" de esa llamada) - se reusan en vez
@@ -463,13 +551,16 @@ impl LayoutTreeBuilder {
     ///
     /// Devuelve el `cursor_y` final (el tope de una linea nueva lista para
     /// lo que venga despues de la racha).
-    fn flow_inline_run(nodes: &mut [LayoutBox], origin_x: f32, inner_width: f32, start_y: f32, font: Option<&SystemFont>) -> f32 {
+    fn flow_inline_run(nodes: &mut [LayoutBox], origin_x: f32, inner_width: f32, start_y: f32, font_set: Option<&FontSet>) -> f32 {
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
-        let line_height = match font {
-            Some(f) => {
-                let font_size = Self::first_leaf_font_size(nodes).unwrap_or(INITIAL_FONT_SIZE);
-                engine_text::measure_text(f, "", font_size).line_height
+        let line_height = match font_set {
+            Some(set) => {
+                let (font_size, bold, italic) = Self::first_leaf_font_info(nodes).unwrap_or((INITIAL_FONT_SIZE, false, false));
+                match set.pick(bold, italic) {
+                    Some(f) => engine_text::measure_text(f, "", font_size).line_height,
+                    None => LINE_HEIGHT_FALLBACK,
+                }
             }
             None => LINE_HEIGHT_FALLBACK,
         };
@@ -477,30 +568,32 @@ impl LayoutTreeBuilder {
         let mut cursor_x = origin_x;
         let mut cursor_y = start_y;
         for node in nodes.iter_mut() {
-            Self::place_inline_node(node, origin_x, inner_width, line_height, &mut cursor_x, &mut cursor_y, font);
+            Self::place_inline_node(node, origin_x, inner_width, line_height, &mut cursor_x, &mut cursor_y, font_set);
         }
         cursor_y + line_height
     }
 
-    /// Busca el `font-size` de la primera hoja de TEXTO de la racha,
-    /// atravesando elementos inline anidados (`<b>`, `<i>`...) - la base
-    /// para el `line_height` COMPARTIDO de toda la racha (ver
-    /// `flow_inline_run`). `None` si la racha no tiene ninguna hoja de
-    /// texto real (p.ej. un `<span></span>` vacio suelto).
-    fn first_leaf_font_size(nodes: &[LayoutBox]) -> Option<f32> {
+    /// Busca `font-size`/`font-weight`/`font-style` de la primera hoja de
+    /// TEXTO de la racha, atravesando elementos inline anidados (`<b>`,
+    /// `<i>`...) - la base para el `line_height` COMPARTIDO de toda la
+    /// racha (ver `flow_inline_run`). `None` si la racha no tiene ninguna
+    /// hoja de texto real (p.ej. un `<span></span>` vacio suelto).
+    fn first_leaf_font_info(nodes: &[LayoutBox]) -> Option<(f32, bool, bool)> {
         for node in nodes {
             match &node.box_type {
                 BoxType::Text(_) => {
-                    return Some(
-                        node.computed_style
-                            .get("font-size")
-                            .and_then(|v| parse_css_font_size(v))
-                            .unwrap_or(INITIAL_FONT_SIZE),
-                    );
+                    let font_size = node
+                        .computed_style
+                        .get("font-size")
+                        .and_then(|v| parse_css_font_size(v))
+                        .unwrap_or(INITIAL_FONT_SIZE);
+                    let bold = resolve_font_weight_is_bold(&node.computed_style);
+                    let italic = resolve_font_style_is_italic(&node.computed_style);
+                    return Some((font_size, bold, italic));
                 }
                 BoxType::Inline => {
-                    if let Some(fs) = Self::first_leaf_font_size(&node.children) {
-                        return Some(fs);
+                    if let Some(info) = Self::first_leaf_font_info(&node.children) {
+                        return Some(info);
                     }
                 }
                 BoxType::Block => {}
@@ -512,7 +605,7 @@ impl LayoutTreeBuilder {
     /// Coloca UN nodo inline-level (hoja de texto, o elemento inline cuyos
     /// hijos se recorren recursivamente con el MISMO cursor compartido) -
     /// ver `flow_inline_run` para la logica de ajuste de linea.
-    fn place_inline_node(node: &mut LayoutBox, origin_x: f32, inner_width: f32, line_height: f32, cursor_x: &mut f32, cursor_y: &mut f32, font: Option<&SystemFont>) {
+    fn place_inline_node(node: &mut LayoutBox, origin_x: f32, inner_width: f32, line_height: f32, cursor_x: &mut f32, cursor_y: &mut f32, font_set: Option<&FontSet>) {
         match &node.box_type {
             BoxType::Text(content) => {
                 let font_size = node
@@ -520,6 +613,17 @@ impl LayoutTreeBuilder {
                     .get("font-size")
                     .and_then(|v| parse_css_font_size(v))
                     .unwrap_or(INITIAL_FONT_SIZE);
+                // Negrita/cursiva de ESTA hoja de texto (heredadas hasta
+                // aqui via INHERITABLE_PROPERTIES desde el `<b>`/`<i>` que
+                // la contenga, ver el doc-comment de esa constante) eligen
+                // la variante real de `font_set` con la que se mide - la
+                // misma que `engine-gfx` elegira despues para pintar (ver
+                // `DisplayItem::Text::bold`/`.italic` en
+                // `engine-gfx/src/display_list.rs`), para que medir y
+                // pintar seleccionen exactamente la misma cara de fuente.
+                let bold = resolve_font_weight_is_bold(&node.computed_style);
+                let italic = resolve_font_style_is_italic(&node.computed_style);
+                let font = font_set.and_then(|set| set.pick(bold, italic));
 
                 let natural_width = match font {
                     Some(f) => engine_text::measure_text(f, content, font_size).width,
@@ -566,7 +670,7 @@ impl LayoutTreeBuilder {
                 let start_x = *cursor_x;
                 let start_y = *cursor_y;
                 for child in &mut node.children {
-                    Self::place_inline_node(child, origin_x, inner_width, line_height, cursor_x, cursor_y, font);
+                    Self::place_inline_node(child, origin_x, inner_width, line_height, cursor_x, cursor_y, font_set);
                 }
                 // Rectangulo delimitador de todo lo que contuvo - honesto
                 // solo para el caso comun (contenido que cabe en una sola
@@ -711,6 +815,66 @@ mod tests {
         assert_eq!(text_box.computed_style.get("font-size").map(String::as_str), Some("32px"));
     }
 
+    /// El punto real de la Fase 2.4: `<b>` deja `font-weight: bold` en SU
+    /// PROPIO `computed_style` (la cascada, via `user_agent_stylesheet.rs`,
+    /// ya lo hacia desde la Fase 2.1) - pero sin `font-weight` en
+    /// `INHERITABLE_PROPERTIES`, la caja de TEXTO hija (la que
+    /// `place_inline_node` de verdad mide/pinta) nunca lo veia. Mismo caso
+    /// para `<i>`/`font-style: italic`.
+    #[test]
+    fn text_box_inherits_font_weight_and_font_style_from_a_bold_italic_ancestor() {
+        let dom = HtmlParser::parse("<html><body><b><i>fuerte</i></b></body></html>");
+        let stylesheet = CssParser::parse("");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let text_box = find_text_box(&root, "fuerte").expect("deberia existir una caja de texto 'fuerte'");
+
+        assert_eq!(text_box.computed_style.get("font-weight").map(String::as_str), Some("bold"), "deberia heredar font-weight: bold del <b> ancestro");
+        assert_eq!(text_box.computed_style.get("font-style").map(String::as_str), Some("italic"), "deberia heredar font-style: italic del <i> ancestro");
+    }
+
+    /// El punto real de la Fase 2.5: propiedades heredables del spec mas
+    /// alla de las cuatro que ya cubrian color/tipografia basica -
+    /// muestreo de un par de la lista nueva (`text-align`, `line-height`),
+    /// no las 15 completas, para no duplicar exactamente la misma
+    /// aserción quince veces - el mecanismo de propagacion (el bucle sobre
+    /// `INHERITABLE_PROPERTIES` en `build_node`) es el mismo para todas.
+    #[test]
+    fn newly_inheritable_fase_2_5_properties_propagate_to_text_boxes() {
+        let dom = HtmlParser::parse("<html><body><div><span>anidado</span></div></body></html>");
+        let stylesheet = CssParser::parse("div { text-align: center; line-height: 1.5; }");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+        let text_box = find_text_box(&root, "anidado").expect("deberia existir una caja de texto 'anidado'");
+
+        assert_eq!(text_box.computed_style.get("text-align").map(String::as_str), Some("center"), "text-align deberia heredarse, ahora que esta en INHERITABLE_PROPERTIES");
+        assert_eq!(text_box.computed_style.get("line-height").map(String::as_str), Some("1.5"), "line-height deberia heredarse, sin resolver la unidad (se propaga el valor crudo)");
+    }
+
+    #[test]
+    fn resolve_font_weight_is_bold_recognizes_keywords_and_heavy_numeric_weights() {
+        let style = |value: &str| { let mut m = HashMap::new(); m.insert("font-weight".to_string(), value.to_string()); m };
+
+        assert!(resolve_font_weight_is_bold(&style("bold")));
+        assert!(resolve_font_weight_is_bold(&style("bolder")));
+        assert!(resolve_font_weight_is_bold(&style("700")));
+        assert!(resolve_font_weight_is_bold(&style("600")));
+        assert!(!resolve_font_weight_is_bold(&style("normal")));
+        assert!(!resolve_font_weight_is_bold(&style("400")));
+        assert!(!resolve_font_weight_is_bold(&style("500")));
+        assert!(!resolve_font_weight_is_bold(&HashMap::new()), "sin font-weight en absoluto, el valor inicial real (normal/400) no es negrita");
+    }
+
+    #[test]
+    fn resolve_font_style_is_italic_recognizes_italic_and_oblique() {
+        let style = |value: &str| { let mut m = HashMap::new(); m.insert("font-style".to_string(), value.to_string()); m };
+
+        assert!(resolve_font_style_is_italic(&style("italic")));
+        assert!(resolve_font_style_is_italic(&style("oblique")));
+        assert!(!resolve_font_style_is_italic(&style("normal")));
+        assert!(!resolve_font_style_is_italic(&HashMap::new()));
+    }
+
     /// La herencia debe atravesar mas de un nivel (no solo el padre
     /// inmediato): un <span> sin estilo propio dentro de un <div> con
     /// `color` debe seguir heredandolo para su texto.
@@ -765,19 +929,20 @@ mod tests {
 
     #[test]
     fn text_box_height_scales_with_font_size_when_a_real_font_is_available() {
-        let Some(font) = SystemFont::load_default_sans_serif() else {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
             eprintln!("sin fuentes de sistema en este entorno, test omitido");
             return;
-        };
+        }
 
         let dom_small = HtmlParser::parse("<html><body><p>hola</p></body></html>");
         let stylesheet_small = CssParser::parse("p { font-size: 16px; }");
-        let root_small = LayoutTreeBuilder::build(&dom_small, &stylesheet_small, 800.0, 600.0, Some(&font));
+        let root_small = LayoutTreeBuilder::build(&dom_small, &stylesheet_small, 800.0, 600.0, Some(&font_set));
         let small = find_text_box(&root_small, "hola").expect("deberia existir una caja de texto 'hola'");
 
         let dom_big = HtmlParser::parse("<html><body><p>hola</p></body></html>");
         let stylesheet_big = CssParser::parse("p { font-size: 64px; }");
-        let root_big = LayoutTreeBuilder::build(&dom_big, &stylesheet_big, 800.0, 600.0, Some(&font));
+        let root_big = LayoutTreeBuilder::build(&dom_big, &stylesheet_big, 800.0, 600.0, Some(&font_set));
         let big = find_text_box(&root_big, "hola").expect("deberia existir una caja de texto 'hola'");
 
         assert!(
@@ -788,20 +953,21 @@ mod tests {
 
     #[test]
     fn text_wraps_into_more_lines_when_the_container_is_narrower() {
-        let Some(font) = SystemFont::load_default_sans_serif() else {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
             eprintln!("sin fuentes de sistema en este entorno, test omitido");
             return;
-        };
+        }
 
         let long_text = "este es un parrafo bastante largo que deberia necesitar mas de una linea en un contenedor estrecho";
         let stylesheet = CssParser::parse("");
 
         let dom_wide = HtmlParser::parse(&format!("<html><body><p>{long_text}</p></body></html>"));
-        let root_wide = LayoutTreeBuilder::build(&dom_wide, &stylesheet, 2000.0, 600.0, Some(&font));
+        let root_wide = LayoutTreeBuilder::build(&dom_wide, &stylesheet, 2000.0, 600.0, Some(&font_set));
         let wide = find_text_box(&root_wide, long_text).expect("deberia existir la caja de texto larga");
 
         let dom_narrow = HtmlParser::parse(&format!("<html><body><p>{long_text}</p></body></html>"));
-        let root_narrow = LayoutTreeBuilder::build(&dom_narrow, &stylesheet, 150.0, 600.0, Some(&font));
+        let root_narrow = LayoutTreeBuilder::build(&dom_narrow, &stylesheet, 150.0, 600.0, Some(&font_set));
         let narrow = find_text_box(&root_narrow, long_text).expect("deberia existir la caja de texto larga");
 
         assert!(
@@ -1336,6 +1502,31 @@ mod tests {
 
         assert_eq!(text_box.dimensions.y, target_box.dimensions.y, "el <span> deberia compartir la misma linea que el texto anterior, no saltar a la suya propia");
         assert_eq!(target_box.dimensions.x, text_box.dimensions.x + text_box.dimensions.width, "el <span> deberia continuar justo donde termina el texto anterior");
+    }
+
+    /// Regresion encontrada en vivo al verificar la Fase 2.4: `<strong>`/
+    /// `<em>` faltaban en la lista de tags inline de `build_node` (solo
+    /// tenia `span`/`a`/`b`/`i`), asi que caian a `BoxType::Block` y
+    /// rompian la racha inline en dos - el texto antes del `<strong>` se
+    /// quedaba solo en su linea, `<strong>` se apilaba debajo como un
+    /// bloque entero, y el texto de despues empezaba una tercera linea.
+    /// Mismo caso que `text_and_inline_element_share_the_same_line...` de
+    /// arriba, pero con `strong` en vez de `span` - el punto exacto que esa
+    /// prueba no cubria.
+    #[test]
+    fn strong_and_em_are_inline_level_like_b_and_i() {
+        let dom = HtmlParser::parse(r#"<html><body><p>Texto <strong id="s">fuerte</strong> <em id="e">enfasis</em></p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None);
+
+        let text_box = find_text_box(&root, "Texto ").expect("deberia existir una caja de texto 'Texto '");
+        let strong_node = Node::find_by_id(&dom, "s").expect("s deberia existir");
+        let em_node = Node::find_by_id(&dom, "e").expect("e deberia existir");
+        let strong_box = find_box_for_dom_node(&root, &strong_node).expect("strong deberia tener caja");
+        let em_box = find_box_for_dom_node(&root, &em_node).expect("em deberia tener caja");
+
+        assert_eq!(text_box.dimensions.y, strong_box.dimensions.y, "<strong> deberia compartir linea con el texto anterior, no caer a BoxType::Block");
+        assert_eq!(strong_box.dimensions.y, em_box.dimensions.y, "<em> deberia seguir en la misma linea que <strong>");
     }
 
     /// Varios elementos inline consecutivos (no solo texto+inline) tambien

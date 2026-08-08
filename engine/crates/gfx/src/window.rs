@@ -5,7 +5,7 @@ use winit::{
 };
 use tiny_skia::{Pixmap, Paint, Rect, Transform, Color, FillRule};
 use engine_layout::LayoutBox;
-use engine_text::SystemFont;
+use engine_text::FontSet;
 use crate::display_list::{DisplayList, DisplayItem};
 use std::rc::Rc;
 use std::num::NonZeroU32;
@@ -32,12 +32,13 @@ impl NativeEngineWindow {
     /// (eso sigue siendo Fase 3, ver ARCHITECTURE.md). Clic izquierdo si,
     /// via `on_click` (mas abajo).
     ///
-    /// `font`: la MISMA fuente que ya uso el layout para medir el texto
-    /// (`engine_layout::LayoutTreeBuilder::build`, ver `core/main.rs`) - se
-    /// recibe ya cargada en vez de cargarla aqui otra vez, para que quien
-    /// mide el texto y quien lo pinta usen exactamente la misma fuente
-    /// (antes se cargaba solo aqui, y el layout ni la usaba: medir con una
-    /// fuente y pintar con otra podria desalinear cajas y glifos).
+    /// `font_set`: las MISMAS 4 variantes de fuente que ya uso el layout
+    /// para medir el texto (`engine_layout::LayoutTreeBuilder::build`, ver
+    /// `core/main.rs`) - se reciben ya cargadas en vez de cargarlas aqui
+    /// otra vez, para que quien mide el texto y quien lo pinta usen
+    /// exactamente la misma fuente/variante (antes se cargaba solo aqui, y
+    /// el layout ni la usaba: medir con una fuente y pintar con otra podria
+    /// desalinear cajas y glifos).
     ///
     /// `on_click`: se llama con el `LayoutBox` ACTUALMENTE mostrado (no el
     /// inicial - este crate ahora retiene su propio arbol de layout, mas
@@ -56,7 +57,7 @@ impl NativeEngineWindow {
     pub fn run(
         title: &str,
         layout_root: LayoutBox,
-        font: Option<SystemFont>,
+        font_set: Option<FontSet>,
         relayout: impl Fn(f32, f32) -> LayoutBox + 'static,
         mut on_click: impl FnMut(&LayoutBox, f32, f32) -> Option<LayoutBox> + 'static,
     ) {
@@ -216,12 +217,12 @@ impl NativeEngineWindow {
                                     pixmap.fill_rect(sk_rect, &paint, Transform::identity(), None);
                                 }
                             }
-                            DisplayItem::Text { rect, text, color, font_size } => {
+                            DisplayItem::Text { rect, text, color, font_size, bold, italic } => {
                                 let mut paint = Paint::default();
                                 paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
                                 let screen_y = rect.y - scroll_offset_y;
 
-                                match &font {
+                                match font_set.as_ref().and_then(|set| set.pick(*bold, *italic)) {
                                     Some(font) => {
                                         // Mismo wrap_text que ya uso el layout para
                                         // reservar el alto de esta caja (mismo

@@ -13,11 +13,12 @@
 //!   horizontal en cero; aqui el mismo valor tambien empuja los lados. Se
 //!   declara asi a proposito en vez de fingir una precision que el motor
 //!   de layout no tiene todavia.
-//! - `font-weight`/`font-style`/`text-decoration` SI quedan en el
-//!   `computed_style` resultante (eso es correcto segun el spec: son
-//!   declaraciones reales de la cascada), pero `engine-gfx` todavia no las
-//!   LEE al pintar (negrita/cursiva/subrayado - Fase 2.4, pendiente) -
-//!   estan aqui porque son cascada real, no porque ya se vean en pantalla.
+//! - `font-weight`/`font-style` SI quedan en el `computed_style` resultante
+//!   Y SI se pintan de verdad (negrita/cursiva reales via `FontSet`, ver
+//!   `engine-text::font` y la Fase 2.4 en ARCHITECTURE.md). `text-decoration`
+//!   tambien queda en la cascada pero `engine-gfx` todavia no lo LEE al
+//!   pintar (subrayado de `<a>` - pendiente) - esta aqui porque es cascada
+//!   real, no porque ya se vea en pantalla.
 //! - Sin `list-style` (viñetas), sin sangria de listas, sin `display`
 //!   propio por tag (`<li>` no es mas que otro bloque generico todavia,
 //!   ver "layout inline" pendiente).

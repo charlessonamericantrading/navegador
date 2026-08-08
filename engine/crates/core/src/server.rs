@@ -16,7 +16,7 @@ use engine_gfx::render_layout_to_png;
 use engine_js::JsRuntime;
 use engine_layout::LayoutTreeBuilder;
 use engine_net::{NetworkEngine, NetworkRequest};
-use engine_text::SystemFont;
+use engine_text::FontSet;
 use std::collections::HashMap;
 use std::io;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -26,7 +26,7 @@ struct LoadedPage {
     title: String,
     page: PageResult,
     runtime: JsRuntime,
-    font: Option<SystemFont>,
+    font_set: Option<FontSet>,
     focused_node: Option<std::sync::Arc<std::sync::RwLock<Node>>>,
 }
 
@@ -82,7 +82,7 @@ impl EngineServer {
                         &page.page.stylesheet,
                         self.width as f32,
                         self.height as f32,
-                        page.font.as_ref(),
+                        page.font_set.as_ref(),
                     );
                     self.scroll_offset_y = clamp_scroll_offset(
                         self.scroll_offset_y,
@@ -169,13 +169,13 @@ impl EngineServer {
         let external_css = self.fetch_external_stylesheets(stylesheet_hrefs, &page_url).await;
         let external_scripts = self.fetch_external_scripts(script_srcs, &page_url).await;
 
-        let font = SystemFont::load_default_sans_serif();
+        let font_set = FontSet::load_default_sans_serif();
         let (page, runtime) = build_page_keeping_runtime(
             &html,
             &external_css,
             self.width as f32,
             self.height as f32,
-            font.as_ref(),
+            Some(&font_set),
             &external_scripts,
         );
         let title = Node::find_all_by_tag(&page.dom_root, "title")
@@ -188,7 +188,7 @@ impl EngineServer {
             title,
             page,
             runtime,
-            font,
+            font_set: Some(font_set),
             focused_node: None,
         });
         self.scroll_offset_y = 0.0;
@@ -307,7 +307,7 @@ impl EngineServer {
                 &page.page.stylesheet,
                 self.width as f32,
                 self.height as f32,
-                page.font.as_ref(),
+                page.font_set.as_ref(),
             );
         }
         self.state_response(id)
@@ -357,7 +357,7 @@ impl EngineServer {
             &page.page.stylesheet,
             self.width as f32,
             self.height as f32,
-            page.font.as_ref(),
+            page.font_set.as_ref(),
         );
         self.state_response(id)
     }
@@ -393,7 +393,7 @@ impl EngineServer {
 
         let screenshot = match render_layout_to_png(
             &page.page.layout_root,
-            page.font.as_ref(),
+            page.font_set.as_ref(),
             self.width,
             self.height,
             self.scroll_offset_y,

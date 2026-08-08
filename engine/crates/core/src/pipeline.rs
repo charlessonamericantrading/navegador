@@ -19,7 +19,7 @@ use engine_css::{CssParser, StyleSheet};
 use engine_dom::{HtmlParser, Node, NodeType};
 use engine_js::{JsRuntime, TestResult};
 use engine_layout::{LayoutBox, LayoutTreeBuilder};
-use engine_text::SystemFont;
+use engine_text::FontSet;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -78,7 +78,7 @@ pub struct PageResult {
 /// sitio exacto en la lista de `<script>` del documento, sin alterar el
 /// orden. Un `src` ausente del mapa (no se pudo descargar, o quien llama no
 /// tiene red - como los tests de este archivo) se omite, igual que antes.
-pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font: Option<&SystemFont>, external_scripts: &HashMap<String, String>) -> PageResult {
+pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>) -> PageResult {
     let dom_root = HtmlParser::parse(html);
     let script_results = scripting::execute_inline_scripts(&dom_root, external_scripts);
 
@@ -90,7 +90,7 @@ pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f
     combined_css.push_str(css);
 
     let stylesheet = CssParser::parse(&combined_css);
-    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font);
+    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set);
 
     PageResult { dom_root, stylesheet, layout_root, script_results }
 }
@@ -103,7 +103,7 @@ pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f
 /// `bin/wpt_runner.rs`, el unico llamador real de esto - `build_page`
 /// normal se queda intacta a proposito: ninguna pagina real deberia ver
 /// `test`/`assert_equals` como globales.
-pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font: Option<&SystemFont>, external_scripts: &HashMap<String, String>) -> (PageResult, Vec<TestResult>) {
+pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>) -> (PageResult, Vec<TestResult>) {
     let dom_root = HtmlParser::parse(html);
     let (script_results, test_results) = scripting::execute_inline_scripts_with_harness(&dom_root, external_scripts);
 
@@ -115,7 +115,7 @@ pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewp
     combined_css.push_str(css);
 
     let stylesheet = CssParser::parse(&combined_css);
-    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font);
+    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set);
 
     (PageResult { dom_root, stylesheet, layout_root, script_results }, test_results)
 }
@@ -129,7 +129,7 @@ pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewp
 /// normal (sin runtime) sigue siendo la opcion correcta para cualquier uso
 /// headless que no necesite interactividad despues de la carga inicial
 /// (`wpt_runner`, los tests de este mismo archivo).
-pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font: Option<&SystemFont>, external_scripts: &HashMap<String, String>) -> (PageResult, JsRuntime) {
+pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>) -> (PageResult, JsRuntime) {
     let dom_root = HtmlParser::parse(html);
     let (script_results, runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts);
 
@@ -141,7 +141,7 @@ pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, vi
     combined_css.push_str(css);
 
     let stylesheet = CssParser::parse(&combined_css);
-    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font);
+    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set);
 
     (PageResult { dom_root, stylesheet, layout_root, script_results }, runtime)
 }

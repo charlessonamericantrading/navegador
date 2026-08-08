@@ -4,7 +4,7 @@ use engine_core::platform::CrossPlatformTarget;
 use engine_net::{NetworkEngine, NetworkRequest};
 use engine_gfx::NativeEngineWindow;
 use engine_layout::LayoutTreeBuilder;
-use engine_text::SystemFont;
+use engine_text::FontSet;
 use tracing::{info, warn};
 
 const VIEWPORT_WIDTH: f32 = 1280.0;
@@ -63,8 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ventana (para pintarlo) - antes solo la cargaba la ventana, y el
     // layout medía el texto con una aproximacion fija que ignoraba el
     // font-size real.
-    let font = SystemFont::load_default_sans_serif();
-    match &font {
+    let font_set = FontSet::load_default_sans_serif();
+    match font_set.pick(false, false) {
         Some(_) => info!("Fuente de sistema cargada para medir y pintar texto real"),
         None => warn!("Sin fuente de sistema disponible: el texto se medira/pintara como aproximacion/relleno"),
     }
@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ARCHITECTURE.md), no el camino real del producto - `server.rs` (el
     // proceso NDJSON que si habla con el backend) es quien descarga
     // recursos externos de verdad.
-    let (page, mut runtime) = build_page_keeping_runtime(&html, "", VIEWPORT_WIDTH, VIEWPORT_HEIGHT, font.as_ref(), &std::collections::HashMap::new());
+    let (page, mut runtime) = build_page_keeping_runtime(&html, "", VIEWPORT_WIDTH, VIEWPORT_HEIGHT, Some(&font_set), &std::collections::HashMap::new());
 
     for result in &page.script_results {
         match result {
@@ -105,9 +105,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // necesitan sus propias copias.
     let dom_root_for_relayout = page.dom_root.clone();
     let stylesheet_for_relayout = page.stylesheet.clone();
-    let font_for_relayout = font.clone();
+    let font_set_for_relayout = font_set.clone();
     let relayout = move |width: f32, height: f32| {
-        LayoutTreeBuilder::build(&dom_root_for_relayout, &stylesheet_for_relayout, width, height, font_for_relayout.as_ref())
+        LayoutTreeBuilder::build(&dom_root_for_relayout, &stylesheet_for_relayout, width, height, Some(&font_set_for_relayout))
     };
 
     // `on_click` es el ultimo eslabon de la cadena clic-real -> evento-real
@@ -123,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // layout inicial de abajo) coexisten.
     let dom_root_for_click = page.dom_root.clone();
     let stylesheet_for_click = page.stylesheet.clone();
-    let font_for_click = font.clone();
+    let font_set_for_click = font_set.clone();
     let on_click = move |current_layout: &engine_layout::LayoutBox, x: f32, y: f32| {
         let node = current_layout.hit_test(x, y)?;
         match runtime.dispatch_event(&node, "click") {
@@ -135,12 +135,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &stylesheet_for_click,
             current_layout.dimensions.width,
             current_layout.dimensions.height,
-            font_for_click.as_ref(),
+            Some(&font_set_for_click),
         ))
     };
 
     info!("Abriendo ventana nativa...");
-    NativeEngineWindow::run("Navegador IA - Motor Nativo (Fase 1, en progreso)", page.layout_root, font, relayout, on_click);
+    NativeEngineWindow::run("Navegador IA - Motor Nativo (Fase 1, en progreso)", page.layout_root, Some(font_set), relayout, on_click);
 
     Ok(())
 }

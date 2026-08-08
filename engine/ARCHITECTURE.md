@@ -260,6 +260,87 @@ A fecha de esta limpieza, el motor:
   patron de "codigo que miente" de la seccion de abajo, asi que se borro en
   vez de dejarlo fingiendo. Flexbox real, conectado a `display: flex` y
   probado contra casos concretos del spec, sigue pendiente (Fase 2).
+- **Negrita/cursiva reales** (Fase 2.4): `<b>`/`<strong>`/`font-weight: bold`
+  y `<i>`/`<em>`/`font-style: italic` ya se PINTAN con una cara de fuente de
+  verdad, no solo se resuelven en la cascada sin efecto visible (que era el
+  estado tras la Fase 2.1: la hoja de agente de usuario ya escribia
+  `font-weight`/`font-style` en `computed_style`, pero nada los leia al
+  pintar). `engine_text::font::FontSet` (nuevo) carga las 4 combinaciones
+  reales de peso/estilo (`regular`/`bold`/`italic`/`bold_italic`) UNA sola
+  vez por pagina via `fontdb::Query` con `weight`/`style`, compartidas entre
+  quien MIDE el texto (`engine-layout`, para el layout/wrap) y quien lo
+  PINTA (`engine-gfx`) — misma razon que ya existia para una unica
+  `SystemFont` compartida: medir con una variante y pintar con otra
+  desalinearia cajas y glifos. `FontSet::pick(bold, italic)` elige la
+  variante; sin cara de negrita/cursiva de verdad instalada para esa
+  familia, `fontdb` devuelve la cara mas cercana que SI tenga (normalmente
+  la regular) — sin negrita sintetica/oblicua artificial, igual que un
+  navegador real sin esa cara instalada.
+  - **Simplificacion binaria deliberada**: `resolve_font_weight_is_bold`/
+    `resolve_font_style_is_italic` (duplicadas en `engine-layout::tree` y
+    `engine-gfx::display_list`, mismo criterio de siempre para no enredar
+    la dependencia entre crates) colapsan el espacio real del spec
+    (`font-weight` 1-1000, `font-style: normal | italic | oblique`) a un
+    binario negrita-si/no y cursiva-si/no — `FontSet` solo carga 4
+    combinaciones fijas, no una cara por cada peso posible. `bold`/`bolder`
+    o cualquier numero >= 600 cuenta como negrita (el umbral real donde los
+    navegadores empiezan a preferir una cara "bold" al hacer matching de
+    fuente); `oblique` se trata igual que `italic` (misma variante, sin una
+    tercera cara "inclinada sinteticamente" aparte).
+  - **`font-weight`/`font-style` se sumaron a `INHERITABLE_PROPERTIES`**
+    (antes solo `color`/`font-size`): sin esto, un `<b>texto</b>` dejaba
+    `font-weight: bold` en el `computed_style` del propio `<b>` (la cascada
+    ya lo resolvia desde la Fase 2.1) pero la caja de TEXTO hija — la que de
+    verdad se mide/pinta — nunca lo veia. Mismo mecanismo de herencia que ya
+    existia para `color`/`font-size`, solo con dos propiedades mas; el resto
+    de la lista real de propiedades heredables del spec sigue pendiente
+    (Fase 2.5).
+  - **Bug real encontrado (no teorico) al verificar esto en vivo**:
+    `build_node` (`tree.rs`) solo trataba `span`/`a`/`b`/`i` como
+    `BoxType::Inline` — `strong`/`em` faltaban en esa lista pese a tener
+    reglas propias en la hoja de agente de usuario desde la Fase 2.1, asi
+    que caian al `_ => BoxType::Block` de respaldo. Un parrafo como "Texto
+    `<strong>fuerte</strong>` mas texto" se partia en TRES lineas en vez de
+    una: el texto antes del `<strong>` se quedaba solo en su propia racha
+    inline (el `<strong>` bloque rompia la racha), el `<strong>` se apilaba
+    debajo como si fuera un bloque/parrafo entero, y el texto de despues
+    empezaba una tercera linea. Invisible en los tests de la Fase 2.3
+    porque todos usaban `<b>`/`<i>`, nunca `<strong>`/`<em>` mezclados con
+    texto vecino. Arreglado añadiendolos a la lista de tags inline; test de
+    regresion (`strong_and_em_are_inline_level_like_b_and_i`) y verificado
+    en vivo (antes/despues: tres lineas sueltas -> una sola linea con
+    negrita/cursiva reales).
+  NO implementado: `font-family` (el motor sigue pintando SIEMPRE con la
+  fuente sans-serif por defecto del sistema, sin importar que la pagina
+  pida una familia concreta — Fase 2.4 cubrio peso/estilo, no familia,
+  porque `font-family` real necesitaria ademas estar en
+  `INHERITABLE_PROPERTIES`, ver Fase 2.5, para no quedarse solo en
+  elementos con la propiedad puesta directamente); `text-decoration`
+  (subrayado de `<a>`, que la cascada ya resuelve igual que negrita/cursiva
+  pero nada pinta todavia); pesos intermedios reales (100/200/300...) mas
+  alla del binario negrita-si/no; `font-weight: bolder/lighter` RELATIVOS
+  al peso heredado (se tratan igual que `bold`/`normal` absolutos, sin
+  sumar/restar sobre el peso del padre).
+- **`INHERITABLE_PROPERTIES` ampliada a la lista real del spec** (Fase 2.5):
+  de 4 propiedades (`color`, `font-size`, `font-weight`, `font-style`) a 20,
+  sumando `font-family`, `font-variant`, `line-height`, `text-align`,
+  `text-indent`, `text-transform`, `letter-spacing`, `word-spacing`,
+  `white-space`, `visibility`, `cursor`, `direction`, `list-style-type`,
+  `list-style-position`, `list-style-image`, `quotes` - las heredables del
+  spec real que tienen sentido dado lo que el motor soporta hoy. Se
+  excluyeron a proposito las especificas de tablas (`border-collapse`,
+  `border-spacing`, `caption-side`, `empty-cells` - sin layout de tablas,
+  Fase 3.4 pendiente) y las de paginacion impresa (`orphans`/`widows` - un
+  renderer de pantalla sin paginacion no tiene pagina que romper). Mismo
+  patron que `font-weight`/`font-style` en la Fase 2.4 antes de que
+  `engine-gfx` las pintara: que una propiedad este en esta lista es cascada
+  CSS correcta y verificable en `computed_style`, no implica que algo la
+  lea todavia para layout o pintado - `text-align`, `list-style-type`,
+  `letter-spacing`, `visibility`... siguen sin efecto visual (Fase 3+),
+  documentado asi a proposito. Sin resolucion de unidades relativas para
+  ninguna de las nuevas (se propaga el string crudo, igual que `color`
+  siempre ha hecho) - solo `font-size` tiene esa conversion especial,
+  porque solo `font-size` tiene hoy quien consuma el valor ya resuelto.
 - **Pinta en una ventana nativa real** (`winit` + `tiny-skia` + `softbuffer`):
   rectangulos solidos para cajas de bloque con `background-color`, y **texto
   con glifos reales** via `engine-text` (`rustybuzz` para shaping +

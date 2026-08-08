@@ -6,12 +6,12 @@
 
 use crate::display_list::{DisplayItem, DisplayList};
 use engine_layout::{LayoutBox, Rect};
-use engine_text::{measure_text, shape_text, wrap_text, SystemFont};
+use engine_text::{measure_text, shape_text, wrap_text, FontSet};
 use tiny_skia::{Color, FillRule, Paint, Pixmap, Rect as SkiaRect, Transform};
 
 pub fn render_layout_to_png(
     layout_root: &LayoutBox,
-    font: Option<&SystemFont>,
+    font_set: Option<&FontSet>,
     width: u32,
     height: u32,
     scroll_offset_y: f32,
@@ -30,9 +30,11 @@ pub fn render_layout_to_png(
                 text,
                 color,
                 font_size,
+                bold,
+                italic,
             } => {
                 let mut paint = paint(color);
-                match font {
+                match font_set.and_then(|set| set.pick(bold, italic)) {
                     Some(font) => {
                         let lines = wrap_text(font, &text, font_size, rect.width);
                         let line_height = measure_text(font, "", font_size).line_height;
