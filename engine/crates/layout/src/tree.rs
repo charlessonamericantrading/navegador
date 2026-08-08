@@ -89,6 +89,56 @@ fn parse_css_length(value: &str) -> Option<f32> {
     px.trim().parse::<f32>().ok().filter(|n| *n >= 0.0)
 }
 
+/// Igual que `parse_css_length`, pero SI acepta negativos - a diferencia de
+/// padding/border/width (que nunca son negativos en el spec real),
+/// `top`/`right`/`bottom`/`left` (Fase 3.3, `position: relative/absolute/
+/// fixed`) legitimamente pueden serlo (`top: -10px` es una forma comun de
+/// desplazar un elemento hacia arriba de donde caeria en el flujo normal).
+fn parse_css_offset(value: &str) -> Option<f32> {
+    let px = value.trim().strip_suffix("px")?;
+    px.trim().parse::<f32>().ok()
+}
+
+/// `position: absolute`/`fixed` (Fase 3.3) saca al elemento del flujo
+/// normal por completo - ni reserva espacio ni afecta donde caen sus
+/// hermanos, como si no estuviera ahi para efectos de layout de bloque/
+/// inline/flex (se posiciona aparte, ver `resolve_positioned_boxes`).
+/// `relative` NO cuenta como fuera de flujo (sigue reservando su espacio
+/// normal, solo se desplaza visualmente despues - ver
+/// `apply_relative_offset`); `static` (el valor inicial real) tampoco.
+fn is_out_of_flow(computed_style: &HashMap<String, String>) -> bool {
+    matches!(computed_style.get("position").map(String::as_str), Some("absolute") | Some("fixed"))
+}
+
+/// Desplaza `node.dimensions.x`/`.y` segun `top`/`right`/`bottom`/`left`
+/// (Fase 3.3, `position: relative`) - se llama DESPUES de que `node` ya
+/// ocupo su lugar normal en el flujo (sigue reservando su espacio de
+/// siempre, esto es SOLO un desplazamiento visual, no afecta a los
+/// hermanos) pero ANTES de posicionar a los HIJOS de `node`, para que todo
+/// su subarbol herede el desplazamiento automaticamente - sus propias
+/// coordenadas se calculan a partir de `node.dimensions.x`/`.y` YA
+/// desplazadas, sin necesitar recorrer el subarbol por separado. `left`
+/// gana sobre `right` si ambos estan puestos (`right` se ignora), mismo
+/// criterio para `top`/`bottom` - asi resuelve un navegador real un caso
+/// sobre-especificado. No-op si `position` no es `relative`.
+fn apply_relative_offset(node: &mut LayoutBox) {
+    if node.computed_style.get("position").map(String::as_str) != Some("relative") {
+        return;
+    }
+    let dx = match (node.computed_style.get("left").and_then(|v| parse_css_offset(v)), node.computed_style.get("right").and_then(|v| parse_css_offset(v))) {
+        (Some(l), _) => l,
+        (None, Some(r)) => -r,
+        (None, None) => 0.0,
+    };
+    let dy = match (node.computed_style.get("top").and_then(|v| parse_css_offset(v)), node.computed_style.get("bottom").and_then(|v| parse_css_offset(v))) {
+        (Some(t), _) => t,
+        (None, Some(b)) => -b,
+        (None, None) => 0.0,
+    };
+    node.dimensions.x += dx;
+    node.dimensions.y += dy;
+}
+
 /// `padding` real, leido de la cascada - sustituye a la constante fija que
 /// habia antes (12px para TODA caja, sin importar lo que diga su CSS de
 /// verdad). Solo la forma de un unico valor (aplicado a los 4 lados por
@@ -506,7 +556,115 @@ impl LayoutTreeBuilder {
 
         Self::build_node(dom_root, &mut root_box, stylesheet, &HashMap::new());
         Self::flow_block_children(&mut root_box, font_set, images);
+        // Segunda pasada (Fase 3.3): `flow_block_children`/`flow_inline_run`/
+        // `flow_flex_children`, arriba, ya dejaron cada `position: absolute`/
+        // `fixed` SIN resolver a proposito (`is_out_of_flow`, ver esas
+        // funciones) - se posicionan aparte aqui, ahora que el flujo normal
+        // entero ya existe de verdad y hay "containing blocks" reales contra
+        // los que resolverlos. Ver el doc-comment de `resolve_positioned_boxes`.
+        let viewport = root_box.dimensions.clone();
+        Self::resolve_positioned_boxes(&mut root_box, &viewport, &viewport, font_set, images);
         root_box
+    }
+
+    /// Recorre TODO el arbol (ya construido por `flow_block_children` en la
+    /// primera pasada) buscando cajas `position: absolute`/`fixed` que
+    /// quedaron sin resolver a proposito, y las posiciona contra su
+    /// "containing block" real: la PADDING-BOX del ancestro mas cercano con
+    /// `position` distinto de `static` (asi es el spec real), o el
+    /// viewport entero si no hay ninguno - `fixed` SIEMPRE usa el viewport,
+    /// ignorando cualquier ancestro posicionado (tambien real: `fixed` se
+    /// ancla a la ventana, no al documento).
+    ///
+    /// Recursa por TODO el arbol, no solo los nodos de nivel superior: un
+    /// `position: absolute` puede estar anidado a cualquier profundidad
+    /// dentro de contenido que la primera pasada ya coloco con normalidad.
+    fn resolve_positioned_boxes(node: &mut LayoutBox, containing_block: &Rect, viewport: &Rect, font_set: Option<&FontSet>, images: &ImageMap) {
+        // Clonado (no `&str` prestado de `node.computed_style`) a proposito:
+        // esta funcion necesita mutar `node` (`flow_block_children`,
+        // `shift_subtree_y`) mientras `position` sigue en alcance mas abajo
+        // (para decidir el containing block de los hijos) - un prestamo
+        // vivo lo impediria (borrow checker real, no capricho de estilo).
+        let position = node.computed_style.get("position").cloned();
+
+        if matches!(position.as_deref(), Some("absolute") | Some("fixed")) {
+            let reference = if position.as_deref() == Some("fixed") { viewport } else { containing_block };
+
+            let left = node.computed_style.get("left").and_then(|v| parse_css_offset(v));
+            let right = node.computed_style.get("right").and_then(|v| parse_css_offset(v));
+            let top = node.computed_style.get("top").and_then(|v| parse_css_offset(v));
+            let bottom = node.computed_style.get("bottom").and_then(|v| parse_css_offset(v));
+
+            // Ancho: mismo criterio que el flujo normal (`resolve_block_width`,
+            // ya existente) usando el ancho del containing block como "auto" -
+            // simplificacion declarada: el spec real usaria shrink-to-fit
+            // para un `width: auto` fuera de flujo, no "llenar el
+            // contenedor"; el motor no mide shrink-to-fit todavia (mismo
+            // hueco que `measure_flex_item`, ver su doc-comment).
+            let width = resolve_block_width(&node.computed_style, reference.width);
+            node.dimensions.width = width;
+            node.dimensions.x = match (left, right) {
+                (Some(l), _) => reference.x + l,
+                (None, Some(r)) => reference.x + reference.width - width - r,
+                (None, None) => reference.x,
+            };
+            // Y provisional: si `top` esta puesto, ya es el Y final (`bottom`
+            // se ignora cuando ambos estan puestos - un caso sobre-
+            // especificado que el spec real resuelve igual, descartando
+            // `bottom`). Sin `top`, se coloca provisionalmente en el origen
+            // del containing block hasta conocer el alto real de contenido
+            // (mas abajo) y poder aplicar `bottom` correctamente.
+            node.dimensions.y = match top {
+                Some(t) => reference.y + t,
+                None => reference.y,
+            };
+
+            let content_height = Self::flow_block_children(node, font_set, images);
+            let node_padding = node.box_dimensions.padding;
+            let node_border = node.box_dimensions.border;
+            let explicit_height = node.computed_style.get("height").and_then(|v| parse_css_length(v));
+            let resolved_height = explicit_height.unwrap_or(content_height) + node_padding.top + node_padding.bottom + node_border.top + node_border.bottom;
+            node.dimensions.height = resolved_height;
+
+            if top.is_none() {
+                if let Some(b) = bottom {
+                    let corrected_y = reference.y + reference.height - resolved_height - b;
+                    let delta_y = corrected_y - node.dimensions.y;
+                    if delta_y != 0.0 {
+                        Self::shift_subtree_y(node, delta_y);
+                    }
+                }
+            }
+        }
+
+        // El "containing block" para los DESCENDIENTES de `node` es su
+        // propia padding-box si `node` mismo es `position: relative`/
+        // `absolute`/`fixed` (asi es el spec real - un `relative` SIN
+        // moverse ya establece containing block para hijos absolutos, no
+        // hace falta que tenga `top`/`left` puestos); si no, se propaga el
+        // mismo que ya traiamos.
+        let next_containing_block =
+            if matches!(position.as_deref(), Some("relative") | Some("absolute") | Some("fixed")) { node.box_dimensions.padding_box() } else { containing_block.clone() };
+
+        for child in &mut node.children {
+            Self::resolve_positioned_boxes(child, &next_containing_block, viewport, font_set, images);
+        }
+    }
+
+    /// Desplaza `node.dimensions.y` Y TODO su subarbol (recursivamente) por
+    /// `delta` - necesario cuando un `position: absolute`/`fixed` solo tiene
+    /// `bottom` puesto (sin `top`): la Y final solo se conoce DESPUES de
+    /// medir el alto real de contenido (ver `resolve_positioned_boxes`), asi
+    /// que los hijos, ya posicionados por el `flow_block_children` de esa
+    /// misma funcion con la Y provisional, quedan desfasados y hay que
+    /// corregirlos - mas barato que volver a layoutear todo el subarbol
+    /// desde cero con la Y ya correcta.
+    fn shift_subtree_y(node: &mut LayoutBox, delta: f32) {
+        node.dimensions.y += delta;
+        node.box_dimensions.content.y += delta;
+        for child in &mut node.children {
+            Self::shift_subtree_y(child, delta);
+        }
     }
 
     /// `inherited` son las propiedades heredables (ver `INHERITABLE_PROPERTIES`)
@@ -666,6 +824,15 @@ impl LayoutTreeBuilder {
 
         let mut i = 0;
         while i < container.children.len() {
+            // `position: absolute`/`fixed` (Fase 3.3) se saca del flujo por
+            // completo aqui: no reserva espacio ni avanza `cursor_y`, como
+            // si no estuviera - se posiciona aparte, ver
+            // `resolve_positioned_boxes`, despues de que el flujo normal
+            // entero ya este resuelto.
+            if is_out_of_flow(&container.children[i].computed_style) {
+                i += 1;
+                continue;
+            }
             if Self::is_inline_level(&container.children[i]) {
                 // Racha de hijos inline-level (texto y/o span/a/b/i)
                 // consecutivos: fluyen juntos en la(s) misma(s) linea(s) en
@@ -699,6 +866,12 @@ impl LayoutTreeBuilder {
             let auto_width = (inner_width - margin.left - margin.right).max(0.0);
             child.dimensions.width = resolve_block_width(&child.computed_style, auto_width);
             let child_width = child.dimensions.width;
+            // `position: relative` (Fase 3.3): `child` YA ocupo su lugar
+            // normal arriba (sigue reservando su espacio de siempre, esto
+            // es solo un desplazamiento visual) - se aplica ANTES de
+            // recursar en sus hijos para que hereden el desplazamiento
+            // automaticamente.
+            apply_relative_offset(child);
 
             let content_height = Self::flow_block_children(child, font_set, images);
             // `flow_block_children(child, ...)`, arriba, ya dejo
@@ -791,13 +964,23 @@ impl LayoutTreeBuilder {
         }
 
         let mut taffy_tree: taffy::TaffyTree<usize> = taffy::TaffyTree::new();
-        let mut child_node_ids = Vec::with_capacity(container.children.len());
+        // `(indice ORIGINAL en container.children, NodeId de taffy)` - un
+        // item `position: absolute`/`fixed` (Fase 3.3) se saca del algoritmo
+        // de flex por completo (ni siquiera se crea su nodo hoja en taffy,
+        // igual que el spec real: un item flex fuera de flujo no participa
+        // en el reparto de espacio), asi que los indices ya NO son 1-a-1
+        // con `container.children` - de ahi la tupla en vez de un `Vec`
+        // simple.
+        let mut child_node_ids: Vec<(usize, taffy::NodeId)> = Vec::with_capacity(container.children.len());
         for (index, child) in container.children.iter().enumerate() {
+            if is_out_of_flow(&child.computed_style) {
+                continue;
+            }
             let style = flex_item_style(&child.computed_style);
             let node_id = taffy_tree
                 .new_leaf_with_context(style, index)
                 .expect("crear un nodo hoja de taffy no deberia fallar (sin limite de nodos alcanzado)");
-            child_node_ids.push(node_id);
+            child_node_ids.push((index, node_id));
         }
         // El PROPIO tamaño del contenedor va en su `Style.size`, no solo en
         // el `available_space` de `compute_layout_with_measure` (que taffy
@@ -817,8 +1000,9 @@ impl LayoutTreeBuilder {
         if let Some(h) = explicit_container_height {
             root_style.size.height = taffy::style_helpers::length(h);
         }
+        let flex_node_ids: Vec<taffy::NodeId> = child_node_ids.iter().map(|(_, id)| *id).collect();
         let root_id = taffy_tree
-            .new_with_children(root_style, &child_node_ids)
+            .new_with_children(root_style, &flex_node_ids)
             .expect("crear el nodo contenedor de taffy no deberia fallar");
 
         // Alto explicito del CONTENEDOR (si lo hay): un contenedor flex sin
@@ -850,13 +1034,18 @@ impl LayoutTreeBuilder {
         // taffy) y se posicionan sus propios hijos (los nietos de
         // `container`) en una pasada final autoritativa.
         let mut max_bottom = origin_y;
-        for (index, node_id) in child_node_ids.iter().enumerate() {
+        for (index, node_id) in &child_node_ids {
             let layout = *taffy_tree.layout(*node_id).expect("layout deberia existir tras compute_layout_with_measure");
-            let child = &mut container.children[index];
+            let child = &mut container.children[*index];
             child.dimensions.x = origin_x + layout.location.x;
             child.dimensions.y = origin_y + layout.location.y;
             child.dimensions.width = layout.size.width;
             child.dimensions.height = layout.size.height;
+            // `position: relative` (Fase 3.3) tambien aplica a items flex -
+            // el item sigue participando en el algoritmo de flex con su
+            // tamaño/posicion normal, solo se desplaza visualmente despues,
+            // igual que un hijo de bloque normal (ver `flow_block_children`).
+            apply_relative_offset(child);
             finalize_flex_item_children(child, font_set, images);
             max_bottom = max_bottom.max(child.dimensions.y + child.dimensions.height);
         }
@@ -963,6 +1152,12 @@ impl LayoutTreeBuilder {
     /// hijos se recorren recursivamente con el MISMO cursor compartido) -
     /// ver `flow_inline_run` para la logica de ajuste de linea.
     fn place_inline_node(node: &mut LayoutBox, origin_x: f32, inner_width: f32, text_line_height: f32, line_extent: &mut f32, cursor_x: &mut f32, cursor_y: &mut f32, font_set: Option<&FontSet>, images: &ImageMap) {
+        // Mismo criterio que en `flow_block_children`: `position: absolute`/
+        // `fixed` (Fase 3.3) no consume espacio ni avanza el cursor de la
+        // linea - `resolve_positioned_boxes` lo posiciona aparte despues.
+        if is_out_of_flow(&node.computed_style) {
+            return;
+        }
         match &node.box_type {
             BoxType::Text(content) => {
                 let font_size = node
@@ -1211,6 +1406,122 @@ mod tests {
 
         assert_eq!(photo_box.dimensions.width, 80.0);
         assert_eq!(photo_box.dimensions.height, 40.0);
+    }
+
+    /// El punto real de `position: relative`: el elemento sigue ocupando
+    /// EXACTAMENTE su lugar normal en el flujo (el hermano siguiente no se
+    /// mueve ni un pixel), solo se desplaza VISUALMENTE por `top`/`left`.
+    #[test]
+    fn position_relative_offsets_visually_without_moving_the_next_sibling() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="a" style="position: relative; top: 10px; left: 20px; height: 30px;">a</div><div id="b" style="height: 10px;">b</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let a_node = Node::find_by_id(&dom, "a").expect("a deberia existir");
+        let b_node = Node::find_by_id(&dom, "b").expect("b deberia existir");
+        let a_box = find_box_for_dom_node(&root, &a_node).expect("a deberia tener caja");
+        let b_box = find_box_for_dom_node(&root, &b_node).expect("b deberia tener caja");
+
+        assert_eq!(a_box.dimensions.x, 20.0, "desplazado 20px por left");
+        assert_eq!(a_box.dimensions.y, 10.0, "desplazado 10px por top (su lugar normal seria y=0)");
+        assert_eq!(b_box.dimensions.y, 30.0, "b deberia caer justo donde a habria terminado SIN desplazarse (su alto normal, 30px) - el desplazamiento de a no debe afectarle");
+    }
+
+    /// `position: relative` en un descendiente de un elemento relative
+    /// desplazado deberia heredar el desplazamiento del padre (su propia
+    /// posicion se calcula a partir de `dimensions.x`/`.y` YA desplazados
+    /// del padre).
+    #[test]
+    fn a_child_of_a_relatively_offset_parent_inherits_the_offset() {
+        let dom = HtmlParser::parse(r#"<html><body><div style="position: relative; top: 50px;"><p id="child">hijo</p></div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } div, p { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let child_node = Node::find_by_id(&dom, "child").expect("child deberia existir");
+        let child_box = find_box_for_dom_node(&root, &child_node).expect("child deberia tener caja");
+
+        assert_eq!(child_box.dimensions.y, 50.0, "el hijo deberia heredar el desplazamiento de 50px de su padre relative");
+    }
+
+    /// El punto real de `position: absolute`: se saca del flujo POR
+    /// COMPLETO - el hermano siguiente ocupa el espacio como si el
+    /// elemento absoluto no existiera, y este se posiciona aparte contra
+    /// su containing block (aqui, el viewport - sin ancestro `position`
+    /// distinto de `static` de por medio).
+    #[test]
+    fn position_absolute_is_removed_from_flow_and_positioned_against_the_viewport() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="a" style="position: absolute; top: 100px; left: 200px; width: 50px; height: 50px;">a</div><div id="b" style="height: 10px;">b</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let a_node = Node::find_by_id(&dom, "a").expect("a deberia existir");
+        let b_node = Node::find_by_id(&dom, "b").expect("b deberia existir");
+        let a_box = find_box_for_dom_node(&root, &a_node).expect("a deberia tener caja");
+        let b_box = find_box_for_dom_node(&root, &b_node).expect("b deberia tener caja");
+
+        assert_eq!(a_box.dimensions.x, 200.0);
+        assert_eq!(a_box.dimensions.y, 100.0);
+        assert_eq!(b_box.dimensions.y, 0.0, "b deberia estar en y=0, como si el <div> absoluto no existiera en el flujo en absoluto");
+    }
+
+    /// El containing block real de un `position: absolute` es el ancestro
+    /// mas cercano con `position` distinto de `static` - NO necesariamente
+    /// el viewport si hay un `position: relative` de por medio.
+    #[test]
+    fn position_absolute_uses_the_nearest_positioned_ancestor_as_containing_block() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="position: relative; width: 300px; height: 300px;"><div id="child" style="position: absolute; top: 10px; left: 10px; width: 20px; height: 20px;">c</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 50px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let child_node = Node::find_by_id(&dom, "child").expect("child deberia existir");
+        let child_box = find_box_for_dom_node(&root, &child_node).expect("child deberia tener caja");
+
+        // El padre relative arranca en (50, 50) por el margin del body; el
+        // hijo absoluto deberia anclarse a ESE padre, no al viewport (que
+        // le daria x=10, y=10 en vez de 60, 60).
+        assert_eq!(child_box.dimensions.x, 60.0, "10px del padre (en x=50) + 10px de left");
+        assert_eq!(child_box.dimensions.y, 60.0, "10px del padre (en y=50) + 10px de top");
+    }
+
+    /// `position: fixed` SIEMPRE se ancla al viewport, incluso con un
+    /// ancestro `position: relative` de por medio (a diferencia de
+    /// `absolute`, que si lo usaria como containing block).
+    #[test]
+    fn position_fixed_always_anchors_to_the_viewport_ignoring_positioned_ancestors() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="position: relative; top: 200px; left: 200px;"><div id="child" style="position: fixed; top: 5px; left: 5px; width: 20px; height: 20px;">c</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let child_node = Node::find_by_id(&dom, "child").expect("child deberia existir");
+        let child_box = find_box_for_dom_node(&root, &child_node).expect("child deberia tener caja");
+
+        assert_eq!(child_box.dimensions.x, 5.0, "fixed deberia ignorar el padre relative desplazado y anclarse al viewport (x=0) + left");
+        assert_eq!(child_box.dimensions.y, 5.0);
+    }
+
+    /// `bottom` sin `top`: la Y final solo se conoce tras medir el alto
+    /// real de contenido - prueba que `shift_subtree_y` corrige tanto la
+    /// caja como a sus propios hijos.
+    #[test]
+    fn position_absolute_with_only_bottom_anchors_to_the_bottom_edge() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="a" style="position: absolute; bottom: 50px; left: 0px; width: 100px; height: 80px;">a</div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let a_node = Node::find_by_id(&dom, "a").expect("a deberia existir");
+        let a_box = find_box_for_dom_node(&root, &a_node).expect("a deberia tener caja");
+
+        // Viewport 600 de alto, altura de la caja 80, bottom 50:
+        // y = 600 - 80 - 50 = 470.
+        assert_eq!(a_box.dimensions.y, 470.0);
     }
 
     #[test]

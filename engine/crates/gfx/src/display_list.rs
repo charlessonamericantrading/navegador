@@ -36,13 +36,33 @@ pub struct DisplayList {
 }
 
 impl DisplayList {
+    /// `z_layers` acumula el contenido de cada subarbol posicionado
+    /// (`position: relative`/`absolute`/`fixed`, ver `engine-layout::tree`)
+    /// que ademas trae un `z-index` numerico - se pintan DESPUES de todo el
+    /// contenido normal, ordenados por z-index ascendente (mayor z-index
+    /// pinta encima), en vez de en su orden de documento original. Un
+    /// elemento posicionado SIN `z-index` (el caso mas comun -
+    /// `position: relative` sin mas) sigue pintandose en su sitio normal,
+    /// en orden de documento, exactamente como el resto del contenido -
+    /// solo `z-index` cambia el orden de pintado, no `position` por si
+    /// sola. Simplificacion declarada: no hay contextos de apilamiento
+    /// anidados de verdad (un z-index dentro de otro z-index se aplana al
+    /// mismo nivel que todos los demas, en vez de resolverse DENTRO de su
+    /// propio contenedor primero) - cubre el caso real mas comun (un modal/
+    /// tooltip/dropdown con z-index alto pintando por encima de todo lo
+    /// demas), no el spec completo de contextos de apilamiento.
     pub fn build(layout_root: &LayoutBox, images: &ImageMap) -> Self {
         let mut list = Self::default();
-        Self::build_items(layout_root, &mut list, images);
+        let mut z_layers: Vec<(i32, Vec<DisplayItem>)> = Vec::new();
+        Self::build_items(layout_root, &mut list.items, images, &mut z_layers);
+        z_layers.sort_by_key(|(z, _)| *z);
+        for (_, items) in z_layers {
+            list.items.extend(items);
+        }
         list
     }
 
-    fn build_items(layout_box: &LayoutBox, list: &mut DisplayList, images: &ImageMap) {
+    fn build_items(layout_box: &LayoutBox, target: &mut Vec<DisplayItem>, images: &ImageMap, z_layers: &mut Vec<(i32, Vec<DisplayItem>)>) {
         match &layout_box.box_type {
             BoxType::Block | BoxType::Inline => {
                 // Sin background-color explicito en la cascada, las cajas de
@@ -54,16 +74,16 @@ impl DisplayList {
                 // real de `background-clip` (`border-box`) - el border, si
                 // lo hay, se pinta DESPUES y encima, tapando esa franja.
                 if let Some(color) = layout_box.computed_style.get("background-color").and_then(|v| parse_css_color(v)) {
-                    list.items.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color });
+                    target.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color });
                 }
                 if let Some((width, color)) = parse_css_border(&layout_box.computed_style) {
-                    list.items.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color });
+                    target.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color });
                 }
             }
             BoxType::Text(content) => {
                 let color = layout_box.computed_style.get("color").and_then(|v| parse_css_color(v)).unwrap_or(INITIAL_COLOR);
                 let font_size = layout_box.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
-                list.items.push(DisplayItem::Text {
+                target.push(DisplayItem::Text {
                     rect: layout_box.dimensions.clone(),
                     text: content.clone(),
                     color,
@@ -81,15 +101,36 @@ impl DisplayList {
                 // falta comprobar el tamaño por separado: sin imagen, no se
                 // pinta nada, en vez de un rectangulo de relleno inventado.
                 if let Some(image) = images.get(src) {
-                    list.items.push(DisplayItem::Image { rect: layout_box.dimensions.clone(), image: image.clone() });
+                    target.push(DisplayItem::Image { rect: layout_box.dimensions.clone(), image: image.clone() });
                 }
             }
         }
 
         for child in &layout_box.children {
-            Self::build_items(child, list, images);
+            match z_index_for_stacking(&child.computed_style) {
+                Some(z) => {
+                    let mut layer_items = Vec::new();
+                    Self::build_items(child, &mut layer_items, images, z_layers);
+                    z_layers.push((z, layer_items));
+                }
+                None => Self::build_items(child, target, images, z_layers),
+            }
         }
     }
+}
+
+/// `z-index` SOLO participa en el orden de pintado si el elemento tambien
+/// esta posicionado (`position: relative`/`absolute`/`fixed`) - en un
+/// elemento `static` (el valor inicial real), `z-index` no tiene ningun
+/// efecto (asi es el spec real: `z-index` sin `position` se ignora por
+/// completo), asi que ese caso deliberadamente devuelve `None` en vez de
+/// crear una capa de apilamiento que el spec real nunca crearia.
+fn z_index_for_stacking(computed_style: &HashMap<String, String>) -> Option<i32> {
+    let is_positioned = matches!(computed_style.get("position").map(String::as_str), Some("relative") | Some("absolute") | Some("fixed"));
+    if !is_positioned {
+        return None;
+    }
+    computed_style.get("z-index").and_then(|v| v.trim().parse::<i32>().ok())
 }
 
 /// Parseo de color CSS deliberadamente minimo: solo hex (#rgb, #rrggbb).
@@ -218,6 +259,56 @@ mod tests {
         assert!(resolve_font_weight_is_bold(&style("700")));
         assert!(!resolve_font_weight_is_bold(&style("normal")));
         assert!(!resolve_font_weight_is_bold(&HashMap::new()));
+    }
+
+    #[test]
+    fn z_index_for_stacking_only_applies_to_positioned_elements() {
+        let style = |position: Option<&str>, z: &str| {
+            let mut m = HashMap::new();
+            if let Some(p) = position {
+                m.insert("position".to_string(), p.to_string());
+            }
+            m.insert("z-index".to_string(), z.to_string());
+            m
+        };
+        assert_eq!(z_index_for_stacking(&style(Some("relative"), "5")), Some(5));
+        assert_eq!(z_index_for_stacking(&style(Some("static"), "5")), None, "z-index sin position real (static) no deberia tener efecto, igual que el spec real");
+        assert_eq!(z_index_for_stacking(&style(None, "5")), None, "sin position en absoluto (static por defecto), z-index se ignora igual");
+    }
+
+    /// El punto real del pintado por z-index: un elemento posicionado con
+    /// `z-index` alto deberia pintarse DESPUES (encima) de contenido sin
+    /// z-index, sin importar que venga ANTES en el documento.
+    #[test]
+    fn a_document_earlier_box_with_a_higher_z_index_paints_after_a_later_one() {
+        let mut low_in_document_but_high_z_index = LayoutBox::new(BoxType::Block);
+        low_in_document_but_high_z_index.computed_style.insert("position".to_string(), "relative".to_string());
+        low_in_document_but_high_z_index.computed_style.insert("z-index".to_string(), "10".to_string());
+        low_in_document_but_high_z_index.computed_style.insert("background-color".to_string(), "#ff0000".to_string());
+        low_in_document_but_high_z_index.dimensions = Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
+
+        let mut later_in_document_no_z_index = LayoutBox::new(BoxType::Block);
+        later_in_document_no_z_index.computed_style.insert("background-color".to_string(), "#00ff00".to_string());
+        later_in_document_no_z_index.dimensions = Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
+
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.children.push(low_in_document_but_high_z_index);
+        root.children.push(later_in_document_no_z_index);
+
+        let list = DisplayList::build(&root, &ImageMap::new());
+
+        let red_index = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [255, 0, 0, 255]))
+            .expect("deberia existir el rectangulo rojo (z-index alto)");
+        let green_index = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [0, 255, 0, 255]))
+            .expect("deberia existir el rectangulo verde (sin z-index)");
+
+        assert!(red_index > green_index, "el z-index alto (rojo, primero en el documento) deberia pintarse DESPUES del verde (sin z-index), pese a venir antes en el DOM");
     }
 
     #[test]

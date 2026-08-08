@@ -333,6 +333,61 @@ A fecha de esta limpieza, el motor:
     deliberadamente desactivada en `Cargo.toml` - esta tarea era solo
     flexbox); reactivarla cuando llegue esa fase es sumar la feature y un
     puente equivalente, `taffy` ya la trae.
+- **`position: relative`/`absolute`/`fixed` + `z-index` reales** (Fase 3.3):
+  layout en DOS pasadas. La primera (`flow_block_children`/
+  `flow_inline_run`/`flow_flex_children`, ya existentes) trata `relative`
+  como flujo normal (`is_out_of_flow` es `false`) y aplica el
+  desplazamiento visual (`apply_relative_offset`, `top`/`right`/`bottom`/
+  `left`) justo ANTES de recursar en los hijos de la caja - asi todo su
+  subarbol hereda el desplazamiento sin tener que recorrerlo aparte, ya que
+  sus propias coordenadas se calculan a partir de las de su padre, ya
+  desplazadas. `absolute`/`fixed` (`is_out_of_flow` es `true`) se SACAN del
+  flujo por completo en esa misma pasada - no reservan espacio, los
+  hermanos actuan como si no existieran (mismo criterio en las 3 funciones
+  de flujo, y en `flow_flex_children` ni siquiera se crea su nodo hoja de
+  taffy) - dejando sus `dimensions` sin resolver a proposito.
+  La segunda pasada (`resolve_positioned_boxes`, nueva, se ejecuta despues
+  de que la primera termine el arbol ENTERO) recorre todo el arbol
+  buscando esas cajas sin resolver y las posiciona contra su "containing
+  block" real: la padding-box del ancestro mas cercano con `position`
+  distinto de `static` (asi es el spec real - un `relative` sin `top`/
+  `left` puestos YA establece containing block para descendientes
+  absolutos), o el viewport si no hay ninguno; `fixed` SIEMPRE usa el
+  viewport, ignorando cualquier ancestro posicionado. El alto de contenido
+  (cuando no hay `height` explicita) se mide con el mismo
+  `flow_block_children` de siempre, DESPUES de fijar ancho/x - si solo hay
+  `bottom` (sin `top`), la Y final solo se conoce tras esa medicion, y los
+  hijos que se posicionaron con la Y provisional durante esa misma llamada
+  se corrigen con `shift_subtree_y` (desplaza el subarbol entero, mas
+  barato que re-layoutear desde cero).
+  `z-index` se resuelve en el PINTADO (`engine-gfx::display_list`), no en
+  el layout: `DisplayList::build_items` pinta en orden de documento como
+  siempre, EXCEPTO que al descender a un hijo `position != static` con
+  `z-index` numerico (sin `position`, `z-index` no tiene ningun efecto,
+  igual que el spec real), su subarbol entero se acumula en una capa
+  aparte en vez de en la lista principal; al terminar, esas capas se
+  ordenan por z-index ascendente y se anexan al final - un elemento
+  posicionado con z-index alto pinta encima de todo lo demas sin importar
+  su orden de documento. Simplificacion declarada: sin contextos de
+  apilamiento anidados de verdad (un z-index dentro de otro se aplana al
+  mismo nivel que todos los demas), cubre el caso real mas comun (un
+  modal/tooltip/dropdown por encima de todo) no el spec completo.
+  Verificado en vivo: un contenedor `relative` con dos hijos `absolute`
+  anclados a sus esquinas (no al viewport), un `relative` con `top`
+  negativo desplazado sin afectar al parrafo siguiente, y un `absolute`
+  con `z-index` alto sin ancestro posicionado anclado al viewport -
+  captura de pantalla revisada, todo en su sitio esperado.
+  Tests reales: `relative` no mueve al hermano siguiente, un hijo hereda
+  el desplazamiento de su padre `relative`, `absolute` se saca del flujo
+  por completo, containing block correcto (ancestro `relative` vs
+  viewport), `fixed` ignora ancestros posicionados, `bottom` sin `top`
+  ancla al borde inferior, y el orden de pintado por z-index.
+  NO implementado: `position: sticky`, `inset` (shorthand), `%` en
+  `top`/`right`/`bottom`/`left` (solo `px`, mismo criterio que el resto del
+  motor), shrink-to-fit real para `width: auto` en elementos fuera de
+  flujo (usa el mismo criterio "llenar el containing block" que el flujo
+  normal - simplificacion declarada), contextos de apilamiento anidados de
+  verdad para `z-index`.
 - **Negrita/cursiva reales** (Fase 2.4): `<b>`/`<strong>`/`font-weight: bold`
   y `<i>`/`<em>`/`font-style: italic` ya se PINTAN con una cara de fuente de
   verdad, no solo se resuelven en la cascada sin efecto visible (que era el
