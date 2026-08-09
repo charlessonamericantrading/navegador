@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ARCHITECTURE.md), no el camino real del producto - `server.rs` (el
     // proceso NDJSON que si habla con el backend) es quien descarga
     // recursos externos de verdad.
-    let (page, mut runtime) = build_page_keeping_runtime(&html, "", VIEWPORT_WIDTH, VIEWPORT_HEIGHT, Some(&font_set), &std::collections::HashMap::new(), &engine_layout::ImageMap::new());
+    let (page, mut runtime) = build_page_keeping_runtime(&html, "", VIEWPORT_WIDTH, VIEWPORT_HEIGHT, Some(&font_set), &std::collections::HashMap::new(), &engine_layout::ImageMap::new(), None);
 
     for result in &page.script_results {
         match result {
@@ -127,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let on_click = move |current_layout: &engine_layout::LayoutBox, x: f32, y: f32| {
         let node = current_layout.hit_test(x, y)?;
         match runtime.dispatch_event(&node, "click") {
-            Ok(()) => info!("[click] evento 'click' disparado sobre el nodo bajo ({x}, {y})"),
+            Ok(_) => info!("[click] evento 'click' disparado sobre el nodo bajo ({x}, {y})"),
             Err(e) => warn!("[click] fallo al disparar 'click' sobre el nodo bajo ({x}, {y}): {e}"),
         }
         Some(LayoutTreeBuilder::build(

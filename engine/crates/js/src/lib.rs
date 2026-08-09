@@ -1,6 +1,7 @@
 pub mod runtime;
 pub mod dom_bindings;
 pub mod event_loop;
+pub mod fetch;
 pub mod test_harness;
 
 pub use runtime::{JsRuntime, JsError};

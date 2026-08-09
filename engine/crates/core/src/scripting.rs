@@ -29,6 +29,7 @@
 
 use engine_dom::{Node, NodeType};
 use engine_js::{JsRuntime, TestHarness, TestResult};
+use engine_net::NetworkEngine;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -87,12 +88,25 @@ pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, externa
 /// nada que evaluar), esta SIEMPRE crea y enlaza uno, incluso sin scripts -
 /// quien llama quiere un runtime vivo pase lo que pase, no solo cuando hubo
 /// algo que ejecutar al principio.
-pub fn execute_inline_scripts_keeping_runtime(dom_root: &Arc<RwLock<Node>>, external_scripts: &HashMap<String, String>) -> (Vec<Result<String, String>>, JsRuntime) {
+///
+/// `network`: `Some` registra `fetch()` real (Fase 4.3, ver
+/// `engine_js::fetch`) ANTES de correr ningun script - asi el PRIMER
+/// `<script>` de la pagina ya lo ve disponible, no solo listeners
+/// registrados mas tarde. `None` (p.ej. `core::main`, que no descarga
+/// recursos externos por diseño) deja `fetch` sin definir - `fetch(...)`
+/// en JS lanza `ReferenceError`, la respuesta honesta cuando de verdad no
+/// hay red disponible en ese contexto.
+pub fn execute_inline_scripts_keeping_runtime(dom_root: &Arc<RwLock<Node>>, external_scripts: &HashMap<String, String>, network: Option<Arc<NetworkEngine>>) -> (Vec<Result<String, String>>, JsRuntime) {
     let scripts = Node::find_all_by_tag(dom_root, "script");
 
     let mut runtime = JsRuntime::new();
     if let Err(e) = runtime.bind_dom(dom_root.clone()) {
         tracing::warn!("[js] no se pudo enlazar el DOM al runtime: {e}");
+    }
+    if let Some(network) = network {
+        if let Err(e) = runtime.register_fetch(network) {
+            tracing::warn!("[js] no se pudo registrar fetch: {e}");
+        }
     }
 
     let script_results = run_scripts(&mut runtime, &scripts, external_scripts);
@@ -246,7 +260,7 @@ mod tests {
                 });
             </script></body></html>"#,
         );
-        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new());
+        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None);
         assert_eq!(script_results.len(), 1, "el <script> que registra el listener deberia haberse ejecutado");
 
         let target = Node::find_by_id(&dom, "target").expect("target deberia existir");
@@ -259,7 +273,7 @@ mod tests {
     #[test]
     fn execute_inline_scripts_keeping_runtime_returns_a_bound_runtime_even_with_no_scripts() {
         let dom = HtmlParser::parse("<html><body><p>sin scripts</p></body></html>");
-        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new());
+        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None);
         assert!(script_results.is_empty());
         // Sin scripts no hay forma de que se haya registrado ningun
         // listener, pero el runtime en si deberia seguir siendo usable

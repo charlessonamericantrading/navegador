@@ -451,18 +451,55 @@ impl DomBindings {
     /// nodo - el clic ya existe (ver ARCHITECTURE.md), teclado sigue
     /// pendiente. No-op honesto (no un panic) si `registry` no viene de un
     /// `DomBindings::register` real sobre este mismo `context`.
-    pub fn dispatch_event(registry: &EventRegistry, node: &Arc<RwLock<Node>>, event_type: &str, context: &mut Context) -> JsResult<()> {
+    /// Devuelve si algun listener llamo `event.preventDefault()` (Fase
+    /// 4.2) - quien dispara el evento desde Rust (p.ej.
+    /// `core::server::click` antes de navegar por un `<a href>`) necesita
+    /// saber esto para decidir si la ACCION POR DEFECTO (seguir el
+    /// enlace) debe cancelarse, igual que un navegador real. `Ok(false)`
+    /// (nunca `Err`) si `registry` no viene de un `DomBindings::register`
+    /// real - "nadie llamo preventDefault porque nadie llego a ver el
+    /// evento" es la respuesta honesta para ese no-op.
+    pub fn dispatch_event(registry: &EventRegistry, node: &Arc<RwLock<Node>>, event_type: &str, context: &mut Context) -> JsResult<bool> {
+        Self::dispatch_event_impl(registry, node, event_type, None, context)
+    }
+
+    /// Igual que `dispatch_event`, pero el objeto `Event` construido
+    /// ademas lleva `.key` real puesto (Fase 4.1) - antes de esta tarea,
+    /// CUALQUIER evento disparado desde Rust (incluidos los de teclado
+    /// sinteticos de `core::server::press_key`) llegaba a los listeners de
+    /// `addEventListener('keydown', ...)` con un `Event` generico SIN
+    /// ninguna propiedad de tecla, asi que un listener real que mirara
+    /// `event.key` (el caso de uso mas comun de `keydown`) no podia
+    /// funcionar. Sin variante de `KeyboardEvent` completa (`.code`/
+    /// `.shiftKey`/`.ctrlKey`/... - fuera del alcance de esta tarea, ver
+    /// ARCHITECTURE.md), solo `.key`.
+    pub fn dispatch_keyboard_event(registry: &EventRegistry, node: &Arc<RwLock<Node>>, event_type: &str, key: &str, context: &mut Context) -> JsResult<bool> {
+        Self::dispatch_event_impl(registry, node, event_type, Some(key), context)
+    }
+
+    fn dispatch_event_impl(registry: &EventRegistry, node: &Arc<RwLock<Node>>, event_type: &str, key: Option<&str>, context: &mut Context) -> JsResult<bool> {
         let target: JsValue = element_to_js_object(node, registry, context).into();
-        // `bubbles`/`cancelable` a `true` a fuego: hoy el UNICO evento
-        // real que pasa por aqui es "click" (ver gfx::window + core::main),
-        // y un click real siempre burbujea y siempre es cancelable en el
-        // spec real. Si algun dia se cablea un tipo de evento con
-        // semantica distinta, este es el sitio a parametrizar - no antes.
+        // `bubbles`/`cancelable` a `true` a fuego: los eventos reales que
+        // pasan por aqui (clic, foco, teclado - ver gfx::window +
+        // core::main/server) burbujean y son cancelables en el spec real.
+        // Si algun dia se cablea un tipo de evento con semantica distinta,
+        // este es el sitio a parametrizar - no antes.
         let event_value = build_event_object(event_type, true, true, context);
         if let Some(event_obj) = event_value.as_object() {
             event_obj.set(js_string!("target"), target.clone(), true, context)?;
+            if let Some(k) = key {
+                event_obj.set(js_string!("key"), js_string!(k), true, context)?;
+            }
         }
-        dispatch_event_with_bubbling(registry, node, &target, event_type, &event_value, context)
+        dispatch_event_with_bubbling(registry, node, &target, event_type, &event_value, context)?;
+        event_default_prevented(&event_value, context)
+    }
+}
+
+fn event_default_prevented(event_value: &JsValue, context: &mut Context) -> JsResult<bool> {
+    match event_value.as_object() {
+        Some(event_obj) => Ok(event_obj.get(js_string!("defaultPrevented"), context)?.to_boolean()),
+        None => Ok(false),
     }
 }
 
@@ -1549,6 +1586,80 @@ mod tests {
 
         let result = runtime.eval("document.getElementById('output').textContent").expect("leer el resultado deberia ser JS valido");
         assert_eq!(result, "\"disparado desde rust\"");
+    }
+
+    /// El punto real de la Fase 4.1: `dispatch_keyboard_event` (a
+    /// diferencia de `dispatch_event`) deja `event.key` con el valor real
+    /// de la tecla - antes de esta tarea, un evento disparado desde Rust
+    /// (el unico camino real para teclado, ver `core::server::press_key`)
+    /// llegaba SIEMPRE con `event.key === undefined`, sin importar que
+    /// tecla fuera.
+    #[test]
+    fn dispatch_keyboard_event_populates_the_real_key_property() {
+        let dom = HtmlParser::parse(r#"<html><body><input id="target"></body></html>"#);
+        let mut runtime = JsRuntime::new();
+        runtime.bind_dom(dom.clone()).expect("bind_dom no deberia fallar");
+        runtime
+            .eval("var teclaVista = null; document.getElementById('target').addEventListener('keydown', function(e) { teclaVista = e.key; });")
+            .expect("registrar el listener deberia ser JS valido");
+
+        let target = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        runtime.dispatch_keyboard_event(&target, "keydown", "Backspace").expect("dispatch_keyboard_event no deberia fallar");
+
+        let result = runtime.eval("teclaVista").expect("leer el resultado deberia ser JS valido");
+        assert_eq!(result, "\"Backspace\"");
+    }
+
+    /// El punto real de la Fase 4.2: `runtime.dispatch_event` (invocado
+    /// desde Rust, no via `el.dispatchEvent(...)` en JS) devuelve si algun
+    /// listener llamo `preventDefault()` - `core::server::click` lo usa
+    /// para decidir si debe cancelar la navegacion por un `<a href>`.
+    #[test]
+    fn dispatch_event_returns_true_when_a_listener_calls_prevent_default() {
+        let dom = HtmlParser::parse(r#"<html><body><a id="link" href="/otra">texto</a></body></html>"#);
+        let mut runtime = JsRuntime::new();
+        runtime.bind_dom(dom.clone()).expect("bind_dom no deberia fallar");
+        runtime
+            .eval("document.getElementById('link').addEventListener('click', function(e) { e.preventDefault(); });")
+            .expect("registrar el listener deberia ser JS valido");
+
+        let target = Node::find_by_id(&dom, "link").expect("link deberia existir");
+        let prevented = runtime.dispatch_event(&target, "click").expect("dispatch_event no deberia fallar");
+        assert!(prevented, "un listener que llama preventDefault() deberia hacer que dispatch_event devuelva true");
+    }
+
+    #[test]
+    fn dispatch_event_returns_false_when_no_listener_calls_prevent_default() {
+        let dom = HtmlParser::parse(r#"<html><body><a id="link" href="/otra">texto</a></body></html>"#);
+        let mut runtime = JsRuntime::new();
+        runtime.bind_dom(dom.clone()).expect("bind_dom no deberia fallar");
+        runtime
+            .eval("document.getElementById('link').addEventListener('click', function() {});")
+            .expect("registrar el listener deberia ser JS valido");
+
+        let target = Node::find_by_id(&dom, "link").expect("link deberia existir");
+        let prevented = runtime.dispatch_event(&target, "click").expect("dispatch_event no deberia fallar");
+        assert!(!prevented, "sin ningun preventDefault(), dispatch_event deberia devolver false");
+    }
+
+    /// `dispatch_event` normal (sin tecla) sigue dejando `.key` SIN poblar
+    /// (`undefined`, no `""`/`null` inventados) - regresion: que
+    /// `dispatch_keyboard_event` exista no deberia cambiar el
+    /// comportamiento de la funcion original para clic/foco/etc.
+    #[test]
+    fn dispatch_event_without_a_key_leaves_the_key_property_undefined() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="target"></div></body></html>"#);
+        let mut runtime = JsRuntime::new();
+        runtime.bind_dom(dom.clone()).expect("bind_dom no deberia fallar");
+        runtime
+            .eval("var teclaVista = 'sin_tocar'; document.getElementById('target').addEventListener('click', function(e) { teclaVista = e.key; });")
+            .expect("registrar el listener deberia ser JS valido");
+
+        let target = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        runtime.dispatch_event(&target, "click").expect("dispatch_event no deberia fallar");
+
+        let result = runtime.eval("teclaVista").expect("leer el resultado deberia ser JS valido");
+        assert_eq!(result, "undefined");
     }
 
     #[test]

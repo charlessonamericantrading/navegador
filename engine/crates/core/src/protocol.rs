@@ -48,6 +48,41 @@ pub enum EngineRequest {
         id: Option<String>,
         key: String,
     },
+    /// Historial atras/adelante (Fase 4.4) - sin parametros propios: la URL
+    /// a la que ir ya se conoce del historial que `EngineServer` mantiene
+    /// internamente (ver `server::EngineServer::back`/`forward`), igual
+    /// que `history.back()`/`history.forward()` reales de JS no reciben
+    /// ninguna URL como argumento.
+    Back {
+        id: Option<String>,
+    },
+    Forward {
+        id: Option<String>,
+    },
+    /// Pestañas (Fase 4.5). `NewTab` crea una pestaña y la hace ACTIVA de
+    /// inmediato (igual que `target="_blank"` real, ver
+    /// `server::EngineServer::open_new_tab`); `url` ausente deja la pestaña
+    /// en blanco, igual que abrir una pestaña nueva a mano. `CloseTab`/
+    /// `SwitchTab` referencian la pestaña por su `tab_id` (el `id` de
+    /// `TabInfo`, NO el `id` de correlacion de peticion/respuesta que ya
+    /// llevan TODAS las variantes de este enum). `ListTabs` no tiene
+    /// parametros propios: la lista completa se deriva del estado interno
+    /// del servidor.
+    NewTab {
+        id: Option<String>,
+        url: Option<String>,
+    },
+    CloseTab {
+        id: Option<String>,
+        tab_id: u32,
+    },
+    SwitchTab {
+        id: Option<String>,
+        tab_id: u32,
+    },
+    ListTabs {
+        id: Option<String>,
+    },
     Shutdown {
         id: Option<String>,
     },
@@ -64,6 +99,12 @@ impl EngineRequest {
             | Self::Scroll { id, .. }
             | Self::TypeText { id, .. }
             | Self::PressKey { id, .. }
+            | Self::Back { id }
+            | Self::Forward { id }
+            | Self::NewTab { id, .. }
+            | Self::CloseTab { id, .. }
+            | Self::SwitchTab { id, .. }
+            | Self::ListTabs { id }
             | Self::Shutdown { id } => id.as_deref(),
         }
     }
@@ -88,11 +129,32 @@ pub enum EngineResponse {
     State {
         id: Option<String>,
         renderer_status: &'static str,
+        /// Pestañas (Fase 4.5) - el `id` de la pestaña ACTIVA a la que
+        /// pertenece este estado (screenshot/url/titulo/historial), para
+        /// que el frontend pueda contrastarlo con la pestaña que cree tener
+        /// seleccionada sin llevar su propia cuenta paralela.
+        tab_id: u32,
         scroll_offset_y: f32,
         url: String,
         title: String,
         screenshot: String,
         elements: Vec<InteractiveElement>,
+        /// Historial atras/adelante (Fase 4.4) - si hay una entrada real a
+        /// la que ir con `back`/`forward` en este momento, para que el
+        /// frontend pueda habilitar/deshabilitar sus botones sin tener que
+        /// llevar su propia copia paralela del historial.
+        can_go_back: bool,
+        can_go_forward: bool,
+    },
+    /// Lista de pestañas abiertas (Fase 4.5, respuesta a `list_tabs`) - cada
+    /// `TabInfo` lleva su propio titulo/URL (vacios si esa pestaña todavia
+    /// no cargo ninguna pagina) para que el frontend pueda pintar una barra
+    /// de pestañas real sin tener que pedir el estado completo (con
+    /// screenshot) de cada una.
+    Tabs {
+        id: Option<String>,
+        tabs: Vec<TabInfo>,
+        active_tab_id: u32,
     },
     Ok {
         id: Option<String>,
@@ -102,6 +164,13 @@ pub enum EngineResponse {
         id: Option<String>,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TabInfo {
+    pub id: u32,
+    pub title: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,6 +200,16 @@ pub struct ElementAttributes {
     pub role: Option<String>,
     pub href: Option<String>,
     pub value: Option<String>,
+    /// `checked` (Fase 4.1) - `bool`, no `Option<bool>`: a diferencia de
+    /// `value` (que puede legitimamente no existir), "marcado" siempre
+    /// tiene una respuesta real para cualquier elemento (`false` para todo
+    /// lo que no sea un checkbox/radio, tambien correcto - un `<div>` no
+    /// esta "marcado" ni "sin marcar", simplemente la pregunta no aplica,
+    /// que es lo mismo que reportar `false`). Semantica de atributo
+    /// booleano HTML real: presencia de `checked` en el DOM = `true`,
+    /// ausencia = `false`, el VALOR del atributo (si lo hay) se ignora -
+    /// ver `core::server::toggle_checked`.
+    pub checked: bool,
 }
 
 #[cfg(test)]

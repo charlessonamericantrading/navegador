@@ -13,3 +13,13 @@ boa_gc = "0.19"
 boa_parser = "0.19"
 engine-dom = { path = "../dom" }
 engine-css = { path = "../css" }
+# `fetch()` real (Fase 4.3, ver fetch.rs) - peticiones HTTP de verdad desde
+# JS, no un mock. Primera dependencia de red de este crate.
+engine-net = { path = "../net" }
+
+[dev-dependencies]
+# Solo para construir un `NetworkResponse` de prueba a mano en los tests de
+# fetch.rs (sin peticion HTTP real - ver su doc-comment) - los mismos tipos
+# que `engine-net` ya usa.
+bytes.workspace = true
+url.workspace = true

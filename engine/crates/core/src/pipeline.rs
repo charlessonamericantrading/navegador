@@ -19,6 +19,7 @@ use engine_css::{CssParser, StyleSheet};
 use engine_dom::{HtmlParser, Node, NodeType};
 use engine_js::{JsRuntime, TestResult};
 use engine_layout::{ImageMap, LayoutBox, LayoutTreeBuilder};
+use engine_net::NetworkEngine;
 use engine_text::FontSet;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -129,9 +130,17 @@ pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewp
 /// normal (sin runtime) sigue siendo la opcion correcta para cualquier uso
 /// headless que no necesite interactividad despues de la carga inicial
 /// (`wpt_runner`, los tests de este mismo archivo).
-pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap) -> (PageResult, JsRuntime) {
+///
+/// `network`: un simple PASE-DE-MANO opaco hacia
+/// `scripting::execute_inline_scripts_keeping_runtime` (Fase 4.3, `fetch()`
+/// real) - `pipeline.rs` en si sigue sin hacer NADA con el (ninguna
+/// resolucion de URL, ninguna llamada a `NetworkEngine::fetch`), asi que no
+/// contradice el aviso de mas arriba sobre mantener este archivo libre de
+/// red: ese aviso es sobre LOGICA de red (resolver/descargar), no sobre
+/// reenviar un handle que otra capa mas abajo sabe usar.
+pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap, network: Option<Arc<NetworkEngine>>) -> (PageResult, JsRuntime) {
     let dom_root = HtmlParser::parse(html);
-    let (script_results, runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts);
+    let (script_results, runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network);
 
     let mut combined_css = String::new();
     for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
@@ -414,6 +423,7 @@ mod tests {
             None,
             &HashMap::new(),
             &ImageMap::new(),
+            None,
         );
 
         let target_node = Node::find_by_id(&page.dom_root, "target").expect("target deberia existir");

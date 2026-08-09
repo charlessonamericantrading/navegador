@@ -890,10 +890,13 @@ dependencies = [
  "boa_engine",
  "boa_gc",
  "boa_parser",
+ "bytes",
  "engine-css",
  "engine-dom",
+ "engine-net",
  "thiserror",
  "tracing",
+ "url",
 ]
 
 [[package]]
