@@ -4,6 +4,7 @@
 [![Graphics Pipeline](https://img.shields.io/badge/Graphics-WebGPU_%2F_Vulkan_%2F_Metal-blue.svg)](file:///c:/Users/repre/Desktop/navegador%20ia/engine/crates/gfx)
 [![Platforms](https://img.shields.io/badge/Plataformas-Windows_%7C_macOS_%7C_Linux-green.svg)](file:///c:/Users/repre/Desktop/navegador%20ia/desktop)
 [![UI Theme](https://img.shields.io/badge/UI_Theme-Light_Glassmorphism-violet.svg)](file:///c:/Users/repre/Desktop/navegador%20ia/frontend)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Un navegador web de próxima generación impulsado por un **motor de renderizado nativo escrito desde cero en Rust**, diseñado para ofrecer consumo de memoria ultra-bajo (<30MB por pestaña), aceleración GPU por hardware directa y ejecución paralela multihilo.
 

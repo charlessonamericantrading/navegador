@@ -2,6 +2,7 @@
   "name": "navegador-ia-root",
   "version": "1.0.0",
   "description": "Root workspace for AI Agent Browser Native Desktop",
+  "license": "MIT",
   "private": true,
   "scripts": {
     "install:frontend": "cd frontend && npm install",

@@ -2,6 +2,7 @@
   "name": "navegador-ia-desktop",
   "version": "1.0.0",
   "description": "Desktop wrapper for AI Agent Browser",
+  "license": "MIT",
   "main": "main.js",
   "private": true,
   "scripts": {
