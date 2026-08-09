@@ -5,7 +5,7 @@
 
 use engine_image::DecodedImage;
 use engine_layout::Rect;
-use tiny_skia::{IntSize, Pixmap, PixmapPaint, Transform};
+use tiny_skia::{IntSize, Mask, Pixmap, PixmapPaint, Transform};
 
 /// `tiny_skia::Pixmap` exige RGBA8 PREMULTIPLICADO (`color * alpha / 255`
 /// por canal) - `engine_image::DecodedImage` guarda RGBA8 SIN premultiplicar
@@ -37,7 +37,10 @@ fn to_premultiplied_pixmap(image: &DecodedImage) -> Option<Pixmap> {
 /// que el resto del pintado: sin rectangulo de relleno inventado para un
 /// caso que no deberia ocurrir en la practica (`decode_image` ya rechaza
 /// imagenes 0x0).
-pub fn paint_image(pixmap: &mut Pixmap, rect: &Rect, image: &DecodedImage, scroll_offset_y: f32) {
+/// `mask`: el recorte activo de `overflow: hidden` (Fase 3.5), si lo hay -
+/// ver `engine-gfx::paint::build_clip_mask`. `None` pinta sin recortar,
+/// igual que siempre antes de esa tarea.
+pub fn paint_image(pixmap: &mut Pixmap, rect: &Rect, image: &DecodedImage, scroll_offset_y: f32, mask: Option<&Mask>) {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return;
     }
@@ -47,5 +50,5 @@ pub fn paint_image(pixmap: &mut Pixmap, rect: &Rect, image: &DecodedImage, scrol
     let scale_y = rect.height / image.height as f32;
     let transform = Transform::from_row(scale_x, 0.0, 0.0, scale_y, rect.x, rect.y - scroll_offset_y);
 
-    pixmap.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), transform, None);
+    pixmap.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), transform, mask);
 }

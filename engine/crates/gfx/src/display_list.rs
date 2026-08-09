@@ -12,14 +12,22 @@ pub const INITIAL_FONT_SIZE: f32 = 16.0;
 
 #[derive(Debug, Clone)]
 pub enum DisplayItem {
-    SolidRect { rect: Rect, color: [u8; 4] },
+    /// `radius` (Fase 3.5, `border-radius`) - 0.0 es el caso de siempre
+    /// (esquinas cuadradas, `fill_rect` normal); mayor que cero pinta un
+    /// rectangulo redondeado de verdad (`paint::rounded_rect_path`). Un
+    /// unico valor para las 4 esquinas - misma simplificacion "un solo
+    /// numero" ya establecida para `padding`/`margin`/`border` (ver sus
+    /// doc-comments en `engine-layout::tree`), no las 4 esquinas
+    /// independientes del spec real.
+    SolidRect { rect: Rect, color: [u8; 4], radius: f32 },
     Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool },
     /// `rect` es el border-box COMPLETO (`layout_box.dimensions`, que ya
     /// incluye el propio border - ver `engine_layout::tree::
-    /// flow_block_children`); quien pinta esto (`engine-gfx/src/window.rs`)
+    /// flow_block_children`); quien pinta esto (`engine-gfx/src/paint.rs`)
     /// dibuja un marco de `width` de grosor hacia adentro desde el borde de
-    /// `rect`, no un rectangulo aparte fuera de `dimensions`.
-    Border { rect: Rect, width: f32, color: [u8; 4] },
+    /// `rect`, no un rectangulo aparte fuera de `dimensions`. `radius`
+    /// mismo criterio que en `SolidRect`.
+    Border { rect: Rect, width: f32, color: [u8; 4], radius: f32 },
     /// `image` ya viene RESUELTA (el `Arc<DecodedImage>` real, no el `src`
     /// crudo) desde `DisplayList::build` - quien pinta esto (`raster.rs`/
     /// `window.rs`) no necesita saber nada de `ImageMap` ni de red, solo
@@ -28,6 +36,32 @@ pub enum DisplayItem {
     /// en `engine-layout::tree` - no necesariamente el tamaño natural de la
     /// imagen).
     Image { rect: Rect, image: Arc<DecodedImage> },
+    /// `box-shadow` (Fase 3.5) - `rect` YA lleva el desplazamiento
+    /// (`offset-x`/`offset-y`) aplicado (ver `parse_css_box_shadow`), asi
+    /// que quien pinta esto solo rellena `rect` con `color`, ni sabe que
+    /// existio un desplazamiento por separado. Se pinta ANTES que
+    /// `SolidRect`/`Border` de la misma caja (orden real del spec: la
+    /// sombra queda DETRAS del fondo/border). Simplificacion declarada:
+    /// sombra "dura" sin difuminado - el tercer valor de `box-shadow`
+    /// (blur radius) se PARSEA (para no romper el resto de tokens) pero se
+    /// descarta, un blur gaussiano real no esta implementado.
+    Shadow { rect: Rect, color: [u8; 4], radius: f32 },
+    /// `overflow: hidden` (Fase 3.5) - todo lo que se pinte entre un
+    /// `PushClip` y su `PopClip` correspondiente (mismo anidamiento que el
+    /// arbol de cajas: `build_items` los emite envolviendo la recursion en
+    /// los hijos) debe recortarse a `rect` (la padding-box de la caja con
+    /// `overflow: hidden`). Quien pinta esto (`engine-gfx/src/paint.rs`)
+    /// mantiene una pila de rectangulos de recorte y construye una mascara
+    /// con la INTERSECCION de todos los activos - varios `overflow: hidden`
+    /// anidados recortan correctamente al mas pequeño de todos, no solo al
+    /// mas cercano. Simplificacion declarada: una caja `position: relative/
+    /// absolute/fixed` con `z-index` numerico DENTRO de un `overflow:
+    /// hidden` no queda recortada - su subarbol se desvia a `z_layers`
+    /// (ver `DisplayList::build`) ANTES de que el `PushClip` que la
+    /// envuelve llegue a la lista principal, mismo hueco ya declarado para
+    /// contextos de apilamiento anidados.
+    PushClip { rect: Rect },
+    PopClip,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -65,6 +99,15 @@ impl DisplayList {
     fn build_items(layout_box: &LayoutBox, target: &mut Vec<DisplayItem>, images: &ImageMap, z_layers: &mut Vec<(i32, Vec<DisplayItem>)>) {
         match &layout_box.box_type {
             BoxType::Block | BoxType::Inline => {
+                let radius = parse_css_border_radius(&layout_box.computed_style).unwrap_or(0.0);
+                // `box-shadow` se pinta ANTES que fondo/border (orden real
+                // del spec - ver el doc-comment de `DisplayItem::Shadow`).
+                if let Some((dx, dy, color)) = parse_css_box_shadow(&layout_box.computed_style) {
+                    let mut rect = layout_box.dimensions.clone();
+                    rect.x += dx;
+                    rect.y += dy;
+                    target.push(DisplayItem::Shadow { rect, color, radius });
+                }
                 // Sin background-color explicito en la cascada, las cajas de
                 // bloque no pintan fondo propio (transparente = se ve el
                 // fondo de la ventana), en vez del blanco solido fijo de
@@ -74,10 +117,10 @@ impl DisplayList {
                 // real de `background-clip` (`border-box`) - el border, si
                 // lo hay, se pinta DESPUES y encima, tapando esa franja.
                 if let Some(color) = layout_box.computed_style.get("background-color").and_then(|v| parse_css_color(v)) {
-                    target.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color });
+                    target.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color, radius });
                 }
                 if let Some((width, color)) = parse_css_border(&layout_box.computed_style) {
-                    target.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color });
+                    target.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color, radius });
                 }
             }
             BoxType::Text(content) => {
@@ -106,6 +149,18 @@ impl DisplayList {
             }
         }
 
+        // `overflow: hidden` (Fase 3.5) envuelve TODO el subarbol de hijos
+        // en un `PushClip`/`PopClip` - ver el doc-comment de
+        // `DisplayItem::PushClip`. Solo `hidden` esta reconocido (`scroll`/
+        // `auto` recortarian igual en un motor con scroll interno por
+        // elemento, que este motor no tiene - solo el scroll de pagina
+        // completa de `window.rs`; `visible`, el valor inicial real, no
+        // recorta nada, que es tambien lo que pasa si la propiedad
+        // simplemente no esta puesta).
+        let clips = layout_box.computed_style.get("overflow").map(String::as_str) == Some("hidden");
+        if clips {
+            target.push(DisplayItem::PushClip { rect: layout_box.dimensions.clone() });
+        }
         for child in &layout_box.children {
             match z_index_for_stacking(&child.computed_style) {
                 Some(z) => {
@@ -115,6 +170,9 @@ impl DisplayList {
                 }
                 None => Self::build_items(child, target, images, z_layers),
             }
+        }
+        if clips {
+            target.push(DisplayItem::PopClip);
         }
     }
 }
@@ -239,6 +297,49 @@ fn parse_css_border(computed_style: &HashMap<String, String>) -> Option<(f32, [u
         .or_else(|| computed_style.get("color").and_then(|v| parse_css_color(v)))
         .unwrap_or(INITIAL_COLOR);
     Some((resolved_width, resolved_color))
+}
+
+/// `border-radius` (Fase 3.5) - un unico valor en `px`, aplicado a las 4
+/// esquinas por igual (misma simplificacion "un solo numero" que
+/// `padding`/`margin`/`border-width`). `None`/cero/negativo resuelve a
+/// "sin redondeo" (esquinas cuadradas, el valor inicial real).
+fn parse_css_border_radius(computed_style: &HashMap<String, String>) -> Option<f32> {
+    computed_style.get("border-radius").and_then(|v| parse_css_length(v)).filter(|r| *r > 0.0)
+}
+
+/// `box-shadow: <offset-x> <offset-y> [<blur-radius>] <color>` (Fase 3.5) -
+/// el `blur-radius` opcional SI se parsea (para no romper el resto de
+/// tokens, p.ej. tomar el color por el blur) pero se DESCARTA - ver el
+/// doc-comment de `DisplayItem::Shadow` para el porque (sombra "dura", sin
+/// difuminado real). `offset-x`/`offset-y` aceptan negativos (a diferencia
+/// de `parse_css_length`, que rechaza negativos porque un padding/border
+/// negativo no tiene sentido - un offset de sombra si) via `parse_css_offset`
+/// local, deliberadamente NO compartida con la copia de `engine-layout::tree`
+/// (misma razon de siempre: crates que no deben depender entre si). `None`
+/// si faltan offset-x/offset-y o el color, o si la propiedad no esta
+/// puesta - sin sombra por defecto, el valor inicial real de la propiedad.
+fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32, f32, [u8; 4])> {
+    fn parse_offset(value: &str) -> Option<f32> {
+        let px = value.trim().strip_suffix("px")?;
+        px.trim().parse::<f32>().ok()
+    }
+
+    let raw = computed_style.get("box-shadow")?;
+    let mut offsets: Vec<f32> = Vec::new();
+    let mut color: Option<[u8; 4]> = None;
+
+    for token in raw.split_whitespace() {
+        if let Some(c) = parse_css_color(token) {
+            color = Some(c);
+        } else if let Some(n) = parse_offset(token) {
+            offsets.push(n);
+        }
+        // Un tercer numero (blur-radius) cae aqui y se ignora a proposito.
+    }
+
+    let dx = *offsets.first()?;
+    let dy = *offsets.get(1)?;
+    Some((dx, dy, color.unwrap_or(INITIAL_COLOR)))
 }
 
 #[cfg(test)]
@@ -368,5 +469,105 @@ mod tests {
     #[test]
     fn missing_border_property_is_none() {
         assert_eq!(parse_css_border(&HashMap::new()), None);
+    }
+
+    fn style_with(key: &str, value: &str) -> HashMap<String, String> {
+        let mut style = HashMap::new();
+        style.insert(key.to_string(), value.to_string());
+        style
+    }
+
+    #[test]
+    fn parse_css_border_radius_reads_a_positive_px_value() {
+        assert_eq!(parse_css_border_radius(&style_with("border-radius", "8px")), Some(8.0));
+    }
+
+    #[test]
+    fn parse_css_border_radius_rejects_zero_negative_and_missing() {
+        assert_eq!(parse_css_border_radius(&style_with("border-radius", "0px")), None);
+        assert_eq!(parse_css_border_radius(&style_with("border-radius", "-3px")), None);
+        assert_eq!(parse_css_border_radius(&HashMap::new()), None);
+    }
+
+    #[test]
+    fn parse_css_box_shadow_reads_offsets_and_color_in_any_order() {
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255])));
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "#ff0000 4px 6px")), Some((4.0, 6.0, [255, 0, 0, 255])), "el orden deberia ser libre, igual que border");
+    }
+
+    #[test]
+    fn parse_css_box_shadow_ignores_the_optional_blur_radius_token() {
+        // El tercer numero (blur-radius) se parsea para no romper el color
+        // que viene despues, pero se descarta - offsets siguen siendo los
+        // dos primeros numeros encontrados.
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px 10px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255])));
+    }
+
+    #[test]
+    fn parse_css_box_shadow_accepts_negative_offsets() {
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "-4px -6px #000000")), Some((-4.0, -6.0, [0, 0, 0, 255])));
+    }
+
+    #[test]
+    fn parse_css_box_shadow_defaults_color_to_black_when_missing() {
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px")), Some((4.0, 6.0, [0, 0, 0, 255])));
+    }
+
+    #[test]
+    fn missing_box_shadow_property_is_none() {
+        assert_eq!(parse_css_box_shadow(&HashMap::new()), None);
+    }
+
+    /// El punto real de `box-shadow`: la sombra se pinta ANTES que el
+    /// fondo/border de la misma caja (orden real del spec - la sombra
+    /// queda DETRAS), y su rectangulo ya lleva el offset aplicado.
+    #[test]
+    fn a_box_shadow_paints_before_the_boxs_own_background_with_the_offset_applied() {
+        let mut node = LayoutBox::new(BoxType::Block);
+        node.dimensions = Rect { x: 10.0, y: 10.0, width: 50.0, height: 30.0 };
+        node.computed_style.insert("background-color".to_string(), "#ffffff".to_string());
+        node.computed_style.insert("box-shadow".to_string(), "4px 6px #000000".to_string());
+
+        let list = DisplayList::build(&node, &ImageMap::new());
+
+        let shadow_index = list.items.iter().position(|item| matches!(item, DisplayItem::Shadow { .. })).expect("deberia existir la sombra");
+        let background_index = list.items.iter().position(|item| matches!(item, DisplayItem::SolidRect { .. })).expect("deberia existir el fondo");
+        assert!(shadow_index < background_index, "la sombra deberia pintarse ANTES que el fondo");
+
+        let DisplayItem::Shadow { rect, .. } = &list.items[shadow_index] else { unreachable!() };
+        assert_eq!((rect.x, rect.y), (14.0, 16.0), "10+4 y 10+6: el rectangulo de la sombra ya lleva el offset aplicado");
+    }
+
+    /// El punto real de `overflow: hidden`: los hijos quedan envueltos
+    /// entre un `PushClip` y su `PopClip` correspondiente, con el
+    /// rectangulo de la propia caja (no del hijo).
+    #[test]
+    fn overflow_hidden_wraps_children_in_a_matching_push_and_pop_clip() {
+        let mut child = LayoutBox::new(BoxType::Block);
+        child.dimensions = Rect { x: 0.0, y: 0.0, width: 999.0, height: 999.0 };
+        child.computed_style.insert("background-color".to_string(), "#ff0000".to_string());
+
+        let mut parent = LayoutBox::new(BoxType::Block);
+        parent.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 50.0 };
+        parent.computed_style.insert("overflow".to_string(), "hidden".to_string());
+        parent.children.push(child);
+
+        let list = DisplayList::build(&parent, &ImageMap::new());
+
+        let push_index = list.items.iter().position(|item| matches!(item, DisplayItem::PushClip { .. })).expect("deberia existir PushClip");
+        let pop_index = list.items.iter().position(|item| matches!(item, DisplayItem::PopClip)).expect("deberia existir PopClip");
+        let child_index = list.items.iter().position(|item| matches!(item, DisplayItem::SolidRect { .. })).expect("deberia existir el fondo del hijo");
+
+        assert!(push_index < child_index && child_index < pop_index, "el hijo deberia quedar ENTRE el PushClip y su PopClip");
+        let DisplayItem::PushClip { rect } = &list.items[push_index] else { unreachable!() };
+        assert_eq!((rect.width, rect.height), (100.0, 50.0), "el recorte usa las dimensiones del PADRE (overflow: hidden), no las del hijo desbordado");
+    }
+
+    #[test]
+    fn overflow_visible_does_not_emit_any_clip() {
+        let mut node = LayoutBox::new(BoxType::Block);
+        node.computed_style.insert("overflow".to_string(), "visible".to_string());
+        let list = DisplayList::build(&node, &ImageMap::new());
+        assert!(!list.items.iter().any(|item| matches!(item, DisplayItem::PushClip { .. } | DisplayItem::PopClip)));
     }
 }

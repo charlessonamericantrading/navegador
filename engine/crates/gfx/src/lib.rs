@@ -2,6 +2,7 @@ pub mod display_list;
 pub mod window;
 pub mod gpu_pipeline;
 pub mod image_paint;
+pub mod paint;
 pub mod raster;
 
 pub use display_list::{DisplayList, DisplayItem};

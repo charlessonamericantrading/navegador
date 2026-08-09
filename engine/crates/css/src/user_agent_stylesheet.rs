@@ -22,6 +22,14 @@
 //! - Sin `list-style` (viñetas), sin sangria de listas, sin `display`
 //!   propio por tag (`<li>` no es mas que otro bloque generico todavia,
 //!   ver "layout inline" pendiente).
+//! - `table`/`tr`/`td`/`th` (Fase 3.4) SI tienen su `display` real
+//!   (`table`/`table-row`/`table-cell` - ver `flow_table_children` en
+//!   `engine-layout::tree`), pero sin `thead`/`tbody`/`tfoot` con rol propio
+//!   (son transparentes para el layout de tabla, ver
+//!   `collect_table_rows`), sin `border-collapse`/`border-spacing`, y `th`
+//!   solo declara `font-weight: bold` (que si se pinta, igual que `b`/
+//!   `strong`), sin el `text-align: center` que un navegador real tambien
+//!   le da (esa propiedad todavia no se PINTA - ver `INHERITABLE_PROPERTIES`).
 
 use crate::parser::CssParser;
 use crate::stylesheet::StyleSheet;
@@ -43,6 +51,10 @@ b { font-weight: bold; }
 strong { font-weight: bold; }
 i { font-style: italic; }
 em { font-style: italic; }
+table { display: table; }
+tr { display: table-row; }
+td { display: table-cell; padding: 1px; }
+th { display: table-cell; padding: 1px; font-weight: bold; }
 "#;
 
 /// Devuelve la hoja de agente de usuario, parseada UNA sola vez con el

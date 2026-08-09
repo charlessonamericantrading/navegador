@@ -139,6 +139,40 @@ fn apply_relative_offset(node: &mut LayoutBox) {
     node.dimensions.y += dy;
 }
 
+fn is_table_cell(b: &LayoutBox) -> bool {
+    b.computed_style.get("display").map(String::as_str) == Some("table-cell")
+}
+
+/// Recoge, EN ORDEN DE DOCUMENTO, todas las cajas `display: table-row`
+/// dentro de una `display: table` (Fase 3.4) - a CUALQUIER profundidad, no
+/// solo hijos directos: una tabla real casi siempre envuelve sus filas en
+/// `<thead>`/`<tbody>`/`<tfoot>` (o incluso un `<div>` mal formado), y este
+/// motor no genera cajas anonimas de "grupo de filas" (`table-row-group`)
+/// para darles un rol propio en el layout - en vez de eso, cualquier
+/// contenedor que NO sea el propio `table`/una `table-row`/una `table-cell`
+/// es transparente: se atraviesa buscando filas mas abajo, como si no
+/// existiera para efectos de layout de tabla (sigue existiendo como caja de
+/// bloque normal, solo no participa en el algoritmo de columnas).
+///
+/// La recursion se DETIENE en una `table-cell` (el contenido de una celda
+/// no son filas de ESTA tabla) y en una `table` anidada (sus filas son de
+/// ESA tabla, se resuelven aparte cuando `flow_block_children` recurse en
+/// ella como cualquier otro hijo de bloque normal) - sin este corte, una
+/// tabla dentro de una celda aplanaria sus filas con las de la tabla
+/// exterior.
+fn collect_table_rows(node: &mut LayoutBox) -> Vec<&mut LayoutBox> {
+    let mut rows = Vec::new();
+    for child in &mut node.children {
+        let display = child.computed_style.get("display").map(String::as_str);
+        if display == Some("table-row") {
+            rows.push(child);
+        } else if display != Some("table") && display != Some("table-cell") {
+            rows.extend(collect_table_rows(child));
+        }
+    }
+    rows
+}
+
 /// `padding` real, leido de la cascada - sustituye a la constante fija que
 /// habia antes (12px para TODA caja, sin importar lo que diga su CSS de
 /// verdad). Solo la forma de un unico valor (aplicado a los 4 lados por
@@ -805,6 +839,12 @@ impl LayoutTreeBuilder {
         if container.computed_style.get("display").map(String::as_str) == Some("flex") {
             return Self::flow_flex_children(container, font_set, images);
         }
+        // `display: table` (Fase 3.4) se desvia igual que `flex` arriba -
+        // ver `flow_table_children` para el porque no es "otro flujo de
+        // bloque mas".
+        if container.computed_style.get("display").map(String::as_str) == Some("table") {
+            return Self::flow_table_children(container, font_set, images);
+        }
 
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
@@ -1051,6 +1091,116 @@ impl LayoutTreeBuilder {
         }
 
         (max_bottom - origin_y).max(0.0)
+    }
+
+    /// Layout real de `display: table` (Fase 3.4) - a diferencia de flex
+    /// (Fase 3.2, delegado a `taffy`), el algoritmo aqui SI es codigo propio:
+    /// el layout de tablas no es del mismo orden de complejidad que flexbox/
+    /// grid (ver "Doctrina de dependencias" en ARCHITECTURE.md - esa entrada
+    /// justifica la excepcion de flex/grid precisamente porque SON
+    /// complejos; una tabla de columnas iguales no lo es).
+    ///
+    /// Algoritmo (simplificado, "auto table layout" honesto-minimo):
+    /// 1. Recoge las filas (`collect_table_rows` - atraviesa `thead`/`tbody`/
+    ///    `tfoot` de forma transparente, ver su doc-comment).
+    /// 2. Numero de columnas = el maximo de celdas (`display: table-cell`)
+    ///    que tiene CUALQUIER fila - filas con menos celdas simplemente
+    ///    dejan columnas de mas sin ocupar a la derecha.
+    /// 3. TODAS las columnas miden lo mismo (`inner_width / column_count`) -
+    ///    simplificacion declarada: el spec real (`auto` table layout)
+    ///    reparte el ancho segun el contenido de cada columna
+    ///    (min-content/max-content por celda); este motor no mide eso
+    ///    todavia para NINGUN contexto (mismo hueco ya declarado en
+    ///    `flow_flex_children`, un item flex sin `width` propio tampoco mide
+    ///    su min-content real) - columnas iguales es la aproximacion mas
+    ///    honesta disponible sin inventar un medidor de contenido nuevo.
+    /// 4. Cada celda se layoutea (recursion normal via `flow_block_children`,
+    ///    la celda pasa a ser "container" de sus propios hijos) al ancho de
+    ///    su columna; el alto de la FILA es el maximo de sus celdas, y todas
+    ///    las celdas de esa fila se estiran a ese alto (asi es el spec real:
+    ///    `vertical-align` inicial es `baseline`, pero el efecto visible por
+    ///    defecto es que las celdas de una fila comparten alto).
+    ///
+    /// Sin `colspan`/`rowspan`, sin `border-collapse`/`border-spacing`
+    /// (cada celda pinta su propio `border` via el box model normal, sin
+    /// fusionar bordes adyacentes), sin celdas fuera de flujo
+    /// (`position: absolute` en una `td` participa en el reparto de
+    /// columnas igual que cualquier otra, en vez de sacarse del algoritmo
+    /// como hace `flow_block_children`/`flow_flex_children` con
+    /// `is_out_of_flow` - caso raro en tablas reales).
+    fn flow_table_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+        let padding = resolve_padding(&container.computed_style);
+        let border = resolve_border_width(&container.computed_style);
+        container.box_dimensions.padding = padding;
+        container.box_dimensions.border = border;
+
+        let inset_left = border.left + padding.left;
+        let inset_right = border.right + padding.right;
+        let inset_top = border.top + padding.top;
+
+        let origin_x = container.dimensions.x + inset_left;
+        let inner_width = (container.dimensions.width - inset_left - inset_right).max(0.0);
+        let content_top = container.dimensions.y + inset_top;
+
+        let rows = collect_table_rows(container);
+        if rows.is_empty() {
+            return 0.0;
+        }
+
+        let column_count = rows.iter().map(|row| row.children.iter().filter(|c| is_table_cell(c)).count()).max().unwrap_or(0).max(1);
+        let column_width = inner_width / column_count as f32;
+
+        let mut cursor_y = content_top;
+        for row in rows {
+            row.dimensions.x = origin_x;
+            row.dimensions.y = cursor_y;
+            row.dimensions.width = inner_width;
+
+            let mut row_height: f32 = 0.0;
+            for (col, cell) in row.children.iter_mut().filter(|c| is_table_cell(c)).enumerate() {
+                cell.dimensions.x = origin_x + column_width * col as f32;
+                cell.dimensions.y = cursor_y;
+                cell.dimensions.width = column_width;
+                apply_relative_offset(cell);
+
+                let content_height = Self::flow_block_children(cell, font_set, images);
+                // `height` explicita en la propia celda (mismo criterio que
+                // `flow_block_children` ya aplica a cualquier caja de
+                // bloque, ver su doc-comment) - sin esto, un `<td
+                // style="height: 100px">` vacio se colapsaria a su alto de
+                // contenido real en vez de respetar el valor que puso el
+                // autor.
+                let explicit_content_height = cell.computed_style.get("height").and_then(|v| parse_css_length(v));
+                let resolved_content_height = explicit_content_height.unwrap_or(content_height);
+                let cell_padding = cell.box_dimensions.padding;
+                let cell_border = cell.box_dimensions.border;
+                let total_height = resolved_content_height + cell_padding.top + cell_padding.bottom + cell_border.top + cell_border.bottom;
+                cell.dimensions.height = total_height.max(0.0);
+                cell.box_dimensions.content = Rect {
+                    x: cell.dimensions.x + cell_border.left + cell_padding.left,
+                    y: cell.dimensions.y + cell_border.top + cell_padding.top,
+                    width: column_width - cell_border.left - cell_border.right - cell_padding.left - cell_padding.right,
+                    height: resolved_content_height,
+                };
+                row_height = row_height.max(cell.dimensions.height);
+            }
+
+            // Segunda pasada corta: estira cada celda de la fila al alto
+            // MAXIMO que acaba de calcularse arriba (no se conocia todavia
+            // mientras se colocaba la primera celda) - el comportamiento
+            // visible por defecto de cualquier tabla real.
+            for cell in row.children.iter_mut().filter(|c| is_table_cell(c)) {
+                cell.dimensions.height = row_height;
+                let cell_padding = cell.box_dimensions.padding;
+                let cell_border = cell.box_dimensions.border;
+                cell.box_dimensions.content.height = row_height - cell_padding.top - cell_padding.bottom - cell_border.top - cell_border.bottom;
+            }
+
+            row.dimensions.height = row_height;
+            cursor_y += row_height;
+        }
+
+        (cursor_y - content_top).max(0.0)
     }
 
     fn is_inline_level(b: &LayoutBox) -> bool {
@@ -2444,5 +2594,121 @@ mod tests {
         // Los 3 fragmentos comparten linea (caben de sobra), asi que el
         // contenedor deberia medir UNA sola linea de alto, no tres.
         assert_eq!(container_box.dimensions.height, one_box.dimensions.height, "3 fragmentos en la misma linea no deberian multiplicar la altura del contenedor");
+    }
+
+    /// El punto real de la Fase 3.4: dos `<td>` en la misma `<tr>` se
+    /// colocan uno al lado del otro (no apilados como haria el flujo de
+    /// bloque normal), cada uno con la mitad exacta del ancho de la tabla -
+    /// el algoritmo de columnas iguales declarado en el doc-comment de
+    /// `flow_table_children`.
+    #[test]
+    fn table_lays_out_cells_side_by_side_in_equal_columns() {
+        let dom = HtmlParser::parse(r#"<html><body><table id="t" style="width: 400px;"><tr><td id="a">a</td><td id="b">b</td></tr></table></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let a_node = Node::find_by_id(&dom, "a").expect("a deberia existir");
+        let b_node = Node::find_by_id(&dom, "b").expect("b deberia existir");
+        let a_box = find_box_for_dom_node(&root, &a_node).expect("a deberia tener caja");
+        let b_box = find_box_for_dom_node(&root, &b_node).expect("b deberia tener caja");
+
+        assert_eq!(a_box.dimensions.x, 0.0);
+        assert_eq!(a_box.dimensions.width, 200.0, "cada columna deberia medir la mitad del ancho de la tabla");
+        assert_eq!(b_box.dimensions.x, 200.0, "la segunda celda deberia empezar donde termina la primera columna");
+        assert_eq!(a_box.dimensions.y, b_box.dimensions.y, "las celdas de la misma fila deberian compartir Y");
+    }
+
+    /// Dos filas se apilan verticalmente (segunda fila empieza donde termina
+    /// la primera), cada una con su propio alto - la parte "de bloque" del
+    /// algoritmo de tabla, analoga a `flow_block_children` pero fila a fila.
+    #[test]
+    fn table_stacks_multiple_rows_vertically() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table id="t" style="width: 200px;">
+                <tr id="row1"><td id="a" style="height: 30px;">a</td></tr>
+                <tr id="row2"><td id="b" style="height: 50px;">b</td></tr>
+            </table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let a_node = Node::find_by_id(&dom, "a").expect("a deberia existir");
+        let b_node = Node::find_by_id(&dom, "b").expect("b deberia existir");
+        let a_box = find_box_for_dom_node(&root, &a_node).expect("a deberia tener caja");
+        let b_box = find_box_for_dom_node(&root, &b_node).expect("b deberia tener caja");
+
+        assert_eq!(a_box.dimensions.y, 0.0);
+        assert_eq!(a_box.dimensions.height, 30.0);
+        assert_eq!(b_box.dimensions.y, 30.0, "la segunda fila deberia empezar justo donde termina la primera");
+        assert_eq!(b_box.dimensions.height, 50.0);
+    }
+
+    /// Todas las celdas de una fila se estiran al alto de la celda MAS ALTA
+    /// de esa fila - el comportamiento visible por defecto de cualquier
+    /// tabla real (ver el doc-comment de `flow_table_children`, punto 4).
+    #[test]
+    fn table_stretches_every_cell_in_a_row_to_the_tallest_cells_height() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table id="t" style="width: 200px;"><tr><td id="short" style="height: 10px;">a</td><td id="tall" style="height: 90px;">b</td></tr></table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let short_node = Node::find_by_id(&dom, "short").expect("short deberia existir");
+        let tall_node = Node::find_by_id(&dom, "tall").expect("tall deberia existir");
+        let short_box = find_box_for_dom_node(&root, &short_node).expect("short deberia tener caja");
+        let tall_box = find_box_for_dom_node(&root, &tall_node).expect("tall deberia tener caja");
+
+        assert_eq!(tall_box.dimensions.height, 90.0);
+        assert_eq!(short_box.dimensions.height, 90.0, "la celda mas corta deberia estirarse al alto de la mas alta de su fila");
+    }
+
+    /// `collect_table_rows` debe atravesar `<thead>`/`<tbody>` de forma
+    /// transparente - el marcado real de casi cualquier tabla real, no solo
+    /// `<table><tr>` directo (ver su doc-comment).
+    #[test]
+    fn table_rows_wrapped_in_thead_and_tbody_are_still_found() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table id="t" style="width: 200px;">
+                <thead><tr><td id="header">h</td></tr></thead>
+                <tbody><tr><td id="body_cell">b</td></tr></tbody>
+            </table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; height: 20px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let header_node = Node::find_by_id(&dom, "header").expect("header deberia existir");
+        let body_node = Node::find_by_id(&dom, "body_cell").expect("body_cell deberia existir");
+        let header_box = find_box_for_dom_node(&root, &header_node).expect("header deberia tener caja");
+        let body_box = find_box_for_dom_node(&root, &body_node).expect("body_cell deberia tener caja");
+
+        assert_eq!(header_box.dimensions.y, 0.0, "la fila de thead deberia layoutearse como la primera fila de la tabla");
+        assert_eq!(body_box.dimensions.y, 20.0, "la fila de tbody deberia layoutearse justo debajo de la de thead");
+    }
+
+    /// El numero de columnas es el MAXIMO de celdas de cualquier fila - una
+    /// fila con menos celdas que otra no reduce el numero de columnas de
+    /// toda la tabla.
+    #[test]
+    fn table_column_count_is_the_max_cell_count_of_any_row() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table id="t" style="width: 300px;">
+                <tr><td id="only">a</td></tr>
+                <tr><td id="first">b</td><td id="second">c</td><td id="third">d</td></tr>
+            </table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let only_node = Node::find_by_id(&dom, "only").expect("only deberia existir");
+        let third_node = Node::find_by_id(&dom, "third").expect("third deberia existir");
+        let only_box = find_box_for_dom_node(&root, &only_node).expect("only deberia tener caja");
+        let third_box = find_box_for_dom_node(&root, &third_node).expect("third deberia tener caja");
+
+        // 3 columnas de 100px cada una (300 / 3) - la fila de una sola celda
+        // deberia usar el MISMO ancho de columna que la fila de 3 celdas,
+        // no ensanchar su unica celda a los 300px completos.
+        assert_eq!(only_box.dimensions.width, 100.0, "el numero de columnas lo fija la fila con MAS celdas, no la fila individual");
+        assert_eq!(third_box.dimensions.x, 200.0);
     }
 }

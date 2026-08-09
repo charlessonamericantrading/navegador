@@ -3,11 +3,11 @@ use winit::{
     event_loop::EventLoop,
     window::WindowBuilder,
 };
-use tiny_skia::{Pixmap, Paint, Rect, Transform, Color, FillRule};
+use tiny_skia::{Pixmap, Color};
 use engine_layout::{ImageMap, LayoutBox};
 use engine_text::FontSet;
-use crate::display_list::{DisplayList, DisplayItem};
-use crate::image_paint::paint_image;
+use crate::display_list::DisplayList;
+use crate::paint::paint_display_list;
 use std::rc::Rc;
 use std::num::NonZeroU32;
 
@@ -206,66 +206,13 @@ impl NativeEngineWindow {
 
                     // `display_list` guarda geometria en content-space (las
                     // mismas coordenadas que calculo el layout, ajenas al
-                    // scroll); la transformacion a screen-space pasa UNA
-                    // sola vez aqui, restando `scroll_offset_y` a cada `y` -
-                    // `display_list` en si no se reconstruye por scroll.
-                    for item in &display_list.items {
-                        match item {
-                            DisplayItem::SolidRect { rect, color } => {
-                                let mut paint = Paint::default();
-                                paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
-                                let screen_y = rect.y - scroll_offset_y;
-                                if let Some(sk_rect) = Rect::from_xywh(rect.x, screen_y, rect.width.max(1.0), rect.height.max(1.0)) {
-                                    pixmap.fill_rect(sk_rect, &paint, Transform::identity(), None);
-                                }
-                            }
-                            DisplayItem::Text { rect, text, color, font_size, bold, italic } => {
-                                let mut paint = Paint::default();
-                                paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
-                                let screen_y = rect.y - scroll_offset_y;
-
-                                match font_set.as_ref().and_then(|set| set.pick(*bold, *italic)) {
-                                    Some(font) => {
-                                        // Mismo wrap_text que ya uso el layout para
-                                        // reservar el alto de esta caja (mismo
-                                        // font_size, mismo ancho) - el numero de
-                                        // lineas que se pinta aqui coincide con el
-                                        // que se reservo alli por construccion, no
-                                        // por coincidencia.
-                                        let lines = engine_text::wrap_text(font, text, *font_size, rect.width);
-                                        let line_height = engine_text::measure_text(font, "", *font_size).line_height;
-                                        for (i, line) in lines.iter().enumerate() {
-                                            let line_top_y = screen_y + i as f32 * line_height;
-                                            let glyphs = engine_text::shape_text(font, line, *font_size, rect.x, line_top_y);
-                                            for glyph in &glyphs {
-                                                pixmap.fill_path(&glyph.path, &paint, FillRule::Winding, Transform::identity(), None);
-                                            }
-                                        }
-                                    }
-                                    None => {
-                                        // Sin fuente de sistema disponible: bloque de
-                                        // relleno en vez de fingir que hay glifos.
-                                        if let Some(sk_rect) = Rect::from_xywh(rect.x, screen_y, rect.width.max(1.0), rect.height.max(1.0)) {
-                                            pixmap.fill_rect(sk_rect, &paint, Transform::identity(), None);
-                                        }
-                                    }
-                                }
-                            }
-                            DisplayItem::Border { rect, width, color } => {
-                                let mut paint = Paint::default();
-                                paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
-                                let screen_rect = engine_layout::Rect { x: rect.x, y: rect.y - scroll_offset_y, width: rect.width, height: rect.height };
-                                for strip in border_strip_rects(&screen_rect, *width) {
-                                    if let Some(sk_rect) = Rect::from_xywh(strip.x, strip.y, strip.width.max(1.0), strip.height.max(1.0)) {
-                                        pixmap.fill_rect(sk_rect, &paint, Transform::identity(), None);
-                                    }
-                                }
-                            }
-                            DisplayItem::Image { rect, image } => {
-                                paint_image(&mut pixmap, rect, image, scroll_offset_y);
-                            }
-                        }
-                    }
+                    // scroll); la transformacion a screen-space (restar
+                    // `scroll_offset_y` a cada `y`), el redondeo/recorte de
+                    // border-radius, la sombra y el recorte de `overflow:
+                    // hidden` (Fase 3.5) viven en `paint::paint_display_list`,
+                    // compartido con el rasterizado headless (`raster.rs`) -
+                    // ver su doc-comment para el porque de este reparto.
+                    paint_display_list(&mut pixmap, &display_list.items, font_set.as_ref(), scroll_offset_y);
 
                     // Copiar el Pixmap (RGBA8) al buffer de softbuffer (0RGB32).
                     if let Ok(mut buffer) = surface.buffer_mut() {
@@ -295,23 +242,6 @@ fn clamp_scroll_offset(offset: f32, content_extent: f32, viewport_height: f32) -
     offset.clamp(0.0, max_offset)
 }
 
-/// Los 4 rectangulos (arriba/derecha/abajo/izquierda) que forman el marco
-/// de un border, hacia ADENTRO desde el borde de `border_box` - no un
-/// stroke con la API de tiny-skia (que exigiria construir un `Path` y un
-/// `Stroke` nuevos, API sin usar en el resto del archivo): 4 `fill_rect`
-/// reusa exactamente la misma operacion ya probada que pinta `SolidRect`/
-/// el relleno de texto sin fuente, para el mismo resultado visual en un
-/// border UNIFORME (mismo ancho/color en los 4 lados, la unica forma que
-/// se resuelve hoy - ver `parse_css_border` en `display_list.rs`).
-fn border_strip_rects(border_box: &engine_layout::Rect, width: f32) -> [engine_layout::Rect; 4] {
-    [
-        engine_layout::Rect { x: border_box.x, y: border_box.y, width: border_box.width, height: width }, // arriba
-        engine_layout::Rect { x: border_box.x, y: border_box.y + border_box.height - width, width: border_box.width, height: width }, // abajo
-        engine_layout::Rect { x: border_box.x, y: border_box.y, width, height: border_box.height }, // izquierda
-        engine_layout::Rect { x: border_box.x + border_box.width - width, y: border_box.y, width, height: border_box.height }, // derecha
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,16 +265,5 @@ mod tests {
     #[test]
     fn clamp_scroll_offset_passes_through_valid_values_unchanged() {
         assert_eq!(clamp_scroll_offset(300.0, 2000.0, 720.0), 300.0);
-    }
-
-    #[test]
-    fn border_strip_rects_produces_four_strips_of_the_given_width() {
-        let border_box = engine_layout::Rect { x: 10.0, y: 20.0, width: 100.0, height: 50.0 };
-        let [top, bottom, left, right] = border_strip_rects(&border_box, 5.0);
-
-        assert_eq!((top.x, top.y, top.width, top.height), (10.0, 20.0, 100.0, 5.0));
-        assert_eq!((bottom.x, bottom.y, bottom.width, bottom.height), (10.0, 65.0, 100.0, 5.0), "y = 20 + 50 - 5 = 65: la tira inferior empieza donde termina el border-box menos su propio ancho");
-        assert_eq!((left.x, left.y, left.width, left.height), (10.0, 20.0, 5.0, 50.0));
-        assert_eq!((right.x, right.y, right.width, right.height), (105.0, 20.0, 5.0, 50.0), "x = 10 + 100 - 5 = 105");
     }
 }
