@@ -388,6 +388,631 @@ A fecha de esta limpieza, el motor:
   flujo (usa el mismo criterio "llenar el containing block" que el flujo
   normal - simplificacion declarada), contextos de apilamiento anidados de
   verdad para `z-index`.
+- **Layout de tablas real** (Fase 3.4): `display: table`/`table-row`/
+  `table-cell` (nuevas reglas en la hoja de agente de usuario para
+  `table`/`tr`/`td`/`th`) desvian el contenedor entero a
+  `LayoutTreeBuilder::flow_table_children`, igual que `display: flex` ya
+  desviaba a `flow_flex_children` (Fase 3.2) - misma tecnica de dispatch,
+  algoritmo distinto: a diferencia de flex/grid, el layout de tablas NO se
+  delega a `taffy` (ver la entrada de la doctrina de dependencias mas
+  abajo, actualizada) - es codigo propio de principio a fin.
+  - **Filas transparentes a traves de `thead`/`tbody`/`tfoot`**:
+    `collect_table_rows` recoge las cajas `display: table-row` a CUALQUIER
+    profundidad bajo la tabla (no solo hijos directos), atravesando
+    cualquier contenedor que no sea la propia `table`/una fila/una celda -
+    el motor no genera cajas anonimas de "grupo de filas" para darle a
+    `thead`/`tbody`/`tfoot` un rol propio en el algoritmo (siguen
+    existiendo como cajas de bloque normales, simplemente invisibles para
+    el layout de tabla); sin este atajo, la inmensa mayoria de tablas
+    reales (que SI envuelven sus filas en `tbody`) no habrian funcionado.
+  - **Columnas de ancho IGUAL, simplificacion declarada**: numero de
+    columnas = el maximo de celdas de cualquier fila; cada columna mide
+    `ancho_interior / numero_columnas`. El spec real (`auto` table layout)
+    reparte el ancho segun el contenido MIN/MAX de cada columna - este
+    motor no mide min-content/max-content todavia para NINGUN contexto
+    (mismo hueco ya declarado en `flow_flex_children` para items flex sin
+    ancho propio), asi que columnas iguales es la aproximacion mas honesta
+    disponible sin inventar un medidor de contenido nuevo.
+  - Alto de fila = el maximo de sus celdas (cada celda se layoutea con el
+    `flow_block_children` de siempre, la celda pasa a ser "container" de
+    sus propios hijos); todas las celdas de la fila se ESTIRAN a ese alto
+    en una segunda pasada corta - el comportamiento visible por defecto de
+    cualquier tabla real.
+  - **Bug real encontrado y arreglado al verificar en vivo, no teorico,
+    fuera de `engine-layout`**: una columna de ancho fraccionario (500px /
+    3 = 166.66...px) con un `border: 1px solid` hacia panic la aplicacion
+    ENTERA (no solo el layout) - `debug_assert!(false)` real DENTRO de
+    tiny-skia (`scan::hairline_aa::fill_dot8`, tiny-skia 0.11.4) al pintar
+    un rectangulo de borde "hairline" (mas fino que 1px tras redondeo de
+    punto fijo) en una posicion no alineada a pixel; un limite conocido de
+    su rasterizador de rectangulos finos, no una entrada invalida por
+    nuestra parte. Bloques con `border` de antes de esta tarea nunca lo
+    disparaban porque sus coordenadas eran siempre numeros enteros (flujo
+    de bloque simple, sin division fraccionaria en ningun sitio); las
+    columnas de tabla son el primer caso real con bordes en coordenadas
+    fraccionarias. Arreglado en LAS DOS copias de `border_strip_rects`
+    (`engine-gfx::raster`, la captura headless, y `engine-gfx::window`, la
+    ventana nativa en vivo - duplicadas desde antes de esta tarea, mismo
+    bug en ambas) redondeando `x`/`y` y el borde OPUESTO
+    (`x+width`/`y+height`) cada uno por separado a pixel entero antes de
+    construir las franjas ("pixel snapping" - la tecnica estandar para que
+    cajas vecinas sigan encajando sin huecos). Diagnosticado leyendo el
+    backtrace completo (`RUST_BACKTRACE=full`) hasta el `debug_assert!`
+    exacto dentro de la dependencia. Verificado con test dedicado
+    (`renders_without_panicking_when_a_bordered_box_sits_at_a_fractional_x`,
+    que SI hacia panic antes del arreglo) y en vivo (tabla real de 3
+    columnas con `thead`/`tbody`, bordes y `background-color` en las
+    celdas de cabecera - captura de pantalla revisada, sin panic, columnas
+    iguales, fila con texto largo estirando ambas celdas de su fila).
+  - Tests reales: celdas lado a lado en columnas iguales, filas apiladas
+    verticalmente, una celda corta estirandose al alto de la mas alta de
+    su fila, filas dentro de `thead`/`tbody` encontradas correctamente, y
+    el numero de columnas fijado por la fila con MAS celdas.
+  - NO implementado: `colspan`/`rowspan`, `border-collapse`/
+    `border-spacing` (cada celda pinta su propio border por separado, sin
+    fusionar bordes adyacentes), medicion de contenido real para el ancho
+    de columnas (ver arriba), celdas fuera de flujo (un `position:
+    absolute` en una celda participa en el reparto de columnas igual que
+    cualquier otra, en vez de sacarse del algoritmo), `text-align: center`
+    de `th` (la propiedad todavia no se PINTA en ningun contexto).
+- **`border-radius`, `box-shadow`, `overflow: hidden`** (Fase 3.5): las tres
+  son propiedades puramente de PINTADO - ningun cambio en `engine-layout`,
+  todo vive en `engine-gfx` (`display_list.rs` genera los `DisplayItem`
+  nuevos, `paint.rs`, nuevo, los pinta).
+  - **Refactor previo, no opcional**: antes de añadir nada nuevo, se
+    extrajo el bucle de pintado (antes duplicado ENTERO en `raster.rs` y
+    `window.rs`, cada uno con su propia copia de `border_strip_rects`) a un
+    modulo compartido, `paint.rs`, con una unica funcion
+    `paint_display_list` que ambos consumidores llaman. Motivo real, no
+    limpieza porque si: el bug de tiny-skia con bordes fraccionarios (Fase
+    3.4) se encontro y arreglo DOS VECES, una por copia, exactamente
+    porque el codigo estaba duplicado - añadir 3 propiedades nuevas de
+    pintado a DOS copias habria repetido ese riesgo por partida triple.
+    `raster.rs` y `window.rs` quedaron mucho mas cortos (solo preparan la
+    superficie/pixmap y llaman a `paint_display_list`); `image_paint::
+    paint_image` gano un parametro `mask: Option<&Mask>` para poder
+    participar en el recorte de `overflow: hidden` igual que el resto.
+  - **`border-radius`**: un unico valor en `px` para las 4 esquinas (misma
+    simplificacion "un solo numero" que `padding`/`margin`/`border-width`).
+    tiny-skia no trae un `push_round_rect`, asi que `paint::
+    rounded_rect_path` construye el contorno a mano con curvas cuadraticas
+    (`quad_to`, control point en la esquina exacta) por esquina -
+    visualmente indistinguible de un arco real a los radios tipicos de una
+    UI, no matematicamente perfecto (eso pediria curvas cubicas con la
+    constante magica ~0.5522847498). El FONDO redondeado se pinta con
+    `fill_path` sobre ese contorno; el BORDER redondeado NO reusa las 4
+    franjas rectangulares de siempre (no encajarian en las esquinas) - se
+    pinta como un `stroke_path` sobre el mismo contorno, con el rectangulo
+    INSET la mitad del grosor del border para que el trazo caiga DENTRO
+    del border-box (tiny-skia centra un stroke sobre su path, mitad hacia
+    afuera/mitad hacia adentro por defecto - sin el inset, la mitad
+    exterior del trazo se saldria de `dimensions`).
+  - **`box-shadow`**: `<offset-x> <offset-y> [<blur>] <color>` - el
+    `blur-radius` opcional SI se parsea (para no romper el resto de
+    tokens, ej. tomar el color por el blur) pero se DESCARTA a proposito:
+    sombra "dura", sin difuminado gaussiano real (simplificacion
+    declarada, un blur de verdad es su propio problema matematico). Se
+    pinta como un `DisplayItem::Shadow` ANTES que `SolidRect`/`Border` de
+    la misma caja (orden real del spec: la sombra queda DETRAS del fondo/
+    border), con el offset YA aplicado al rectangulo por
+    `DisplayList::build_items` - quien pinta la sombra no sabe que existio
+    un desplazamiento por separado, solo rellena un rectangulo.
+  - **`overflow: hidden`**: `DisplayList::build_items` envuelve TODO el
+    subarbol de hijos de una caja con `overflow: hidden` entre un
+    `DisplayItem::PushClip { rect }` (la caja, `dimensions` completo) y su
+    `PopClip` correspondiente - mismo anidamiento que el arbol de cajas.
+    `paint_display_list` mantiene una PILA de rectangulos de recorte
+    activos y solo reconstruye la `tiny_skia::Mask` real cuando la pila
+    CAMBIA (Push/Pop), no en cada item individual pintado dentro. La
+    mascara se construye con la INTERSECCION GEOMETRICA de TODOS los
+    recortes activos (no solo el mas cercano) - varios `overflow: hidden`
+    anidados recortan correctamente al mas pequeño de todos; si la
+    interseccion resulta vacia (recortes que no se solapan en absoluto),
+    la mascara queda toda a cero (todo oculto), no `None` (que pintaria
+    sin recortar, el bug contrario). Solo `overflow: hidden` esta
+    reconocido - `scroll`/`auto` recortarian igual en un motor con scroll
+    interno POR ELEMENTO, que este no tiene (solo el scroll de pagina
+    completa de `window.rs`); `visible`, el valor inicial real, no recorta
+    nada, igual que si la propiedad no estuviera puesta.
+  - **Bug residual cerrado de paso, no teorico**: al escribir
+    `paint_display_list` se noto que `scroll_offset_y` (acumulado por
+    rueda del raton, puede llegar fraccionario desde un
+    `MouseScrollDelta::PixelDelta` de trackpad) se restaba de cada
+    coordenada Y DESPUES de que `border_strip_rects` ya hubiera redondeado
+    esa misma coordenada a pixel entero (el arreglo de la Fase 3.4) -
+    reintroduciendo una Y fraccionaria por la puerta de atras, mismo tipo
+    de entrada que dispara el `debug_assert!` de tiny-skia. Cerrado
+    redondeando `scroll_offset_y` una sola vez, al principio de
+    `paint_display_list`, antes de usarse en NINGUN calculo - protege a
+    TODOS los tipos de item (no solo `Border`), no solo el caso que ya
+    tenia un test dedicado.
+  - Tests reales: los 3 parsers CSS nuevos (`border-radius`, `box-shadow`
+    con offsets/color en cualquier orden, blur ignorado, offsets
+    negativos), orden sombra-antes-que-fondo con el offset ya aplicado,
+    `overflow: hidden` envolviendo a los hijos en `PushClip`/`PopClip` con
+    el rectangulo del PADRE, `overflow: visible` sin emitir ningun recorte,
+    interseccion de rectangulos (solapados y disjuntos), `rounded_rect_path`
+    clampando el radio a la mitad del lado corto, y una prueba de
+    integracion (`render_layout_to_png`) con las 3 propiedades combinadas
+    que NO hace panic. Verificado en vivo: una tarjeta con esquinas
+    redondeadas + sombra dura, y un contenedor `overflow: hidden` con un
+    hijo de 400x400 desbordandolo a proposito, recortado EXACTAMENTE al
+    borde del contenedor - captura de pantalla revisada (con zoom sobre el
+    borde de recorte para confirmar el pixel exacto de corte).
+  - NO implementado: 4 radios independientes por esquina (`border-radius:
+    <tl> <tr> <br> <bl>`), blur gaussiano real en `box-shadow`, `inset`
+    box-shadow, multiples sombras (`box-shadow` con comas), `overflow:
+    scroll`/`auto` (sin scroll interno por elemento), recorte de
+    `DisplayItem::Image` por `border-radius` (una imagen con esquinas
+    redondeadas via `border-radius` en su propia caja no se recorta a esas
+    esquinas todavia - `overflow: hidden` SI la recorta, via la mascara
+    generica), y el hueco ya declarado en `z-index` (Fase 3.3) que ahora
+    tambien aplica a `overflow: hidden`: un descendiente `position`+
+    `z-index` numerico dentro de un `overflow: hidden` se desvia a
+    `z_layers` ANTES de que el `PushClip` que lo envuelve llegue a la
+    lista principal, asi que NO queda recortado.
+- **Teclado real + foco + `checked` de checkbox/radio** (Fase 4.1): a
+  diferencia de Fases anteriores, el punto de partida NO era cero -
+  `core::server` (el puente NDJSON real que usa el producto - Electron +
+  `BrowserManager`, no la ventana winit de `core::main`, que sigue sin
+  ninguna fuente de teclado) ya tenia `focused_node`, `type_text` (escribe
+  texto real en `value`) y `press_key` (disparaba `keydown`/`keyup`) desde
+  una tarea muy anterior. Lo que faltaba, y era honestamente falso hasta
+  ahora, es lo que se completa aqui:
+  - **`event.key` real**: `press_key`/`type_text` disparaban `keydown`/
+    `keyup` con un `Event` generico SIN ninguna propiedad de tecla - un
+    listener JS real (`addEventListener('keydown', e => e.key)`, el caso
+    de uso mas comun de este evento) no podia funcionar en absoluto.
+    Arreglado con `DomBindings::dispatch_keyboard_event`/`JsRuntime::
+    dispatch_keyboard_event` (nuevas, `dispatch_event` normal SIN cambios
+    de comportamiento para clic/foco - ver su doc-comment) que ademas
+    dejan `.key` puesto en el objeto `Event`. Sin `KeyboardEvent` completo
+    (`.code`/`.shiftKey`/`.ctrlKey`/`.altKey`/`.metaKey` - fuera del
+    alcance de esta tarea).
+  - **`Backspace`/`Delete` mutan `value` de verdad**: antes de esta tarea,
+    `press_key` disparaba `keydown`/`keyup` para CUALQUIER tecla sin tocar
+    el texto - pulsar `Backspace` sobre un campo enfocado literalmente no
+    hacia nada al contenido, solo emitia el evento. `backspace_control_value`
+    quita el ULTIMO caracter de `value` (misma simplificacion "sin cursor,
+    siempre al final" ya declarada en `append_control_value`/`type_text`),
+    dispara `"input"` despues (orden real: primero cambia el contenido,
+    despues se notifica) y fuerza un relayout (el nuevo `value` mas corto
+    puede cambiar cuanto envuelve el texto, aunque el motor todavia no lo
+    PINTE - ver mas abajo). Cualquier otra tecla suelta (`Enter`, `Tab`,
+    una letra) no muta nada por su cuenta - escribir texto de verdad sigue
+    siendo trabajo de `type_text`.
+  - **`checked` real de checkbox/radio**: clicar un `input[type=checkbox]`/
+    `input[type=radio]` antes disparaba `"click"` sin cambiar ningun
+    estado - visualmente y semanticamente, marcar la casilla no existia.
+    `toggle_checked` conmuta el atributo booleano `checked` (presencia =
+    marcado, ausencia = sin marcar, semantica HTML real) ANTES de disparar
+    `"click"` (asi es el orden real: la accion por defecto ya ocurrio
+    cuando el listener ve el evento) y dispara `"change"` despues. El
+    nuevo campo `ElementAttributes::checked` (protocolo NDJSON,
+    `InteractiveElement.attributes.checked`) lo expone al puente para que
+    el frontend (que overlaya inputs HTML reales posicionados sobre la
+    captura del motor - ver mas abajo) pueda reflejarlo. Simplificacion
+    declarada: SIN comportamiento de grupo para `radio` (marcar uno NO
+    desmarca a los demas `input[type=radio]` del mismo `name` - el spec
+    real si lo hace; exigiria recorrer el DOM entero buscando
+    coincidencias por `name`, fuera del alcance de esta tarea).
+  - **Por que el PINTADO del `value`/`checked` sigue sin tocarse**: el
+    `value` de un `<input>`/`<textarea>` (y su `checked`) YA viajan de
+    vuelta al frontend via `InteractiveElement` en cada `state_response` -
+    la hipotesis de trabajo (no verificada leyendo el codigo del frontend
+    en esta tarea, pero consistente con que `collect_interactive_elements`
+    exista y reporte posicion+valor+marcado de cada control) es que el
+    frontend renderiza controles de formulario reales superpuestos
+    POSICIONALMENTE sobre la captura PNG del motor, en vez de esperar que
+    el motor los pinte el mismo - de ahi que `engine-layout`/`engine-gfx`
+    nunca hayan necesitado un `BoxType`/`DisplayItem` para "contenido de
+    input" (a diferencia de `<img>`, Fase 3.1, que si lo tiene: una imagen
+    no tiene otra via de renderizado). Si esa hipotesis resultara
+    incorrecta, pintar `value`/un cursor de verdad seguiria pendiente.
+  - **`core::main`/`gfx::window` (la ventana winit nativa) siguen sin
+    ninguna fuente de teclado** - cero cambios en esta tarea. Es un camino
+    secundario de desarrollo/pruebas del motor, no el que usa el producto
+    real (`engine_server.exe` vía NDJSON/WebSocket, que si gano todo lo de
+    arriba) - queda como hueco conocido, no honestamente resuelto todavia.
+  - Tests reales: `is_checkable_input`/`is_text_control` clasificando cada
+    combinacion de tag/type, `toggle_checked` conmutando en ambas
+    direcciones (incluido un checkbox que ya venia marcado en el HTML),
+    `backspace_control_value` quitando exactamente un caracter (y no
+    haciendo nada sobre un valor ya vacio), y `dispatch_keyboard_event`/
+    `dispatch_event` verificados AMBOS por separado (uno deja `.key`
+    poblado, el otro lo deja `undefined`, sin regresion cruzada). Verificado
+    en vivo end-to-end contra `engine_server.exe` real (protocolo NDJSON,
+    proceso hijo real, sin mocks): marcar/desmarcar un checkbox dos veces
+    seguidas, escribir "XYZ" en un campo con valor inicial, borrar un
+    caracter con `Backspace`, y un listener JS real de `keydown` leyendo
+    `event.key` y escribiendolo en otro elemento - las 4 verificaciones
+    coincidieron exactamente con lo esperado.
+- **Navegacion real por clic en `<a href>`** (Fase 4.2): clicar un enlace
+  (o cualquier DESCENDIENTE suyo - el texto, un `<b>` decorativo dentro,
+  el caso real mas comun, ver mas abajo) en `core::server::click` ahora
+  dispara una navegacion de verdad: el mismo `EngineServer::navigate` que
+  ya usaba el comando NDJSON `navigate` (fetch HTTP real, reparseo,
+  reconstruccion completa de DOM/CSS/JS/layout), no una simulacion aparte.
+  - **`find_link_href`**: sube por `Node::parent` (un `Weak`, ver su
+    doc-comment en `dom/src/node.rs`) desde el nodo clicado hasta encontrar
+    el `<a>` mas cercano - EMPEZANDO por el propio nodo, porque un clic
+    real casi nunca aterriza en el `<a>` mismo sino en su contenido (texto
+    suelto, un `<b>`/`<span>` decorativo). Se detiene en el PRIMER `<a>`
+    que encuentra, tenga `href` navegable o no - no sigue subiendo mas
+    alla buscando uno exterior (un `<a>` anidado dentro de otro es HTML
+    invalido de todas formas; el propio parser real - `html5ever`,
+    verificado en vivo leyendo el arbol resultante - ya los separa en
+    hermanos en vez de dejarlos anidados, via el algoritmo de adopcion del
+    spec HTML5, asi que ese caso ni siquiera es alcanzable en la practica).
+    "Navegable" excluye deliberadamente `href` vacio/ausente (un `<a>` sin
+    `href` no es ni siquiera un hyperlink real), anclas internas
+    (`href="#seccion"` - debiera hacer scroll a un elemento con ese `id`,
+    no una navegacion de pagina nueva) y `javascript:` (ejecutaria script,
+    no navegaria) - ambos huecos declarados, sin implementar todavia.
+  - **Resolucion de URL relativa**: el `href` (posiblemente relativo) se
+    resuelve contra la URL de la pagina ACTUAL (`page.url`, re-parseada con
+    `url::Url::parse` + `.join(href)`) - mismo patron ya establecido para
+    `<link href>`/`<script src>`/`<img src>` en `fetch_external_stylesheets`/
+    `fetch_external_scripts`/`fetch_images`.
+  - **Respeta `preventDefault()` real**: `DomBindings::dispatch_event`/
+    `dispatch_keyboard_event` (y `JsRuntime::dispatch_event`/
+    `dispatch_keyboard_event`) cambiaron su tipo de retorno de
+    `JsResult<()>`/`Result<(), JsError>` a `JsResult<bool>`/
+    `Result<bool, JsError>` - el `bool` es si algun listener llamo
+    `event.preventDefault()`, leido directamente del objeto `Event` tras el
+    bubbling (`event_default_prevented`, nueva). Cambio NO disruptivo para
+    los mas de 10 sitios que ya llamaban a estas funciones (todos
+    ignoraban el valor `Ok`, `.expect()`/`if let Err(...)`/`.is_ok()` -
+    ninguno necesito cambios de logica, solo `main.rs` tuvo que cambiar un
+    `Ok(())` literal por `Ok(_)` en un `match`). `click` en `server.rs`
+    ahora SI usa el valor: si el listener de `"click"` llamo
+    `preventDefault()`, la navegacion por `<a href>` se CANCELA - igual
+    que un navegador real (un `<a>` con un handler de JS que hace
+    `e.preventDefault()` para manejar la navegacion el mismo, p.ej. una
+    SPA, no debe recargar la pagina).
+  - **`click` paso a ser `async`**: antes era sincrona; ahora puede
+    `.await` una navegacion real. La deteccion/resolucion del enlace
+    ocurre DENTRO del prestamo de `self.current_page` (necesita `page.url`
+    para resolver el `href`), pero la llamada a `self.navigate(...).await`
+    en si ocurre DESPUES de que ese prestamo termine (en un bloque `{ }`
+    separado) - `navigate` reasigna `self.current_page` entero, no puede
+    convivir con un prestamo activo de la pagina actual.
+  - **Bug real encontrado y arreglado en la propia infraestructura de
+    tests, no en el codigo de produccion**: el helper de test `find(html,
+    id)` (usado por decenas de tests ya existentes en `server.rs`) solo
+    devolvia el nodo buscado, dejando que la UNICA referencia FUERTE al
+    arbol DOM completo (`dom`, local a la funcion) se liberara al
+    terminar - como `Node::parent` es un `Weak` (a proposito, para no
+    crear un ciclo de referencias con `children`), cualquier test que
+    necesitara subir a un ANCESTRO del nodo devuelto encontraba
+    `parent.upgrade()` devolviendo `None` sistematicamente, aunque el
+    arbol se hubiera construido bien. Invisible hasta esta tarea porque
+    ningun test anterior necesitaba subir mas alla del propio nodo
+    devuelto. Arreglado con `std::mem::forget(dom)` dentro del helper
+    (inofensivo en un proceso de test de corta vida) - en produccion esto
+    nunca ocurre, `LoadedPage::page::dom_root` mantiene el arbol entero
+    vivo mientras la pagina este cargada.
+  - Tests reales: `find_link_href` sobre el propio `<a>`, subiendo desde un
+    descendiente, sin ancestro `<a>` en absoluto, y las 4 formas de
+    `href` no navegable (ausente/vacio/ancla/`javascript:`); `dispatch_event`
+    devolviendo `true`/`false` segun si un listener llamo `preventDefault()`.
+    Verificado en vivo end-to-end contra `engine_server.exe` real (dos
+    paginas HTTP reales servidas localmente): clicar un `<b>` DENTRO de un
+    `<a href="pagina2.html">` navego de verdad (la URL y el `<title>` del
+    estado devuelto cambiaron a los de la pagina 2), y clicar un enlace
+    cuyo listener de `"click"` llama `preventDefault()` NO navego (la URL
+    se quedo en la pagina original).
+  - NO implementado (en el momento de esta fase): anclas internas
+    (`href="#id"`, deberia hacer scroll), `javascript:` (deberia ejecutar
+    el script), `target="_blank"` (ya implementado desde la Fase 4.5, ver
+    mas abajo), historial atras/adelante tras la navegacion (Fase 4.4,
+    todavia no existe ningun historial en absoluto en este punto), y lo
+    mismo que el resto de Fase 4.1: `core::main`/`gfx::window` (la ventana
+    winit nativa) NO ganaron esta capacidad - solo el camino NDJSON real
+    (`core::server`) la tiene.
+- **`fetch()` real** (Fase 4.3, `engine-js::fetch`, nuevo): peticion HTTP DE
+  VERDAD via `engine-net` (el mismo `NetworkEngine`/cliente HTTP/pool de
+  conexiones que ya usa el resto del motor, no uno nuevo), resuelta como
+  una `Promise` real de Boa - `await fetch(url)` y `fetch(url).then(...)`
+  funcionan tal cual en JS, con encadenamiento de promises real
+  (`.then().then()`, incluyendo aplanar una promise devuelta DESDE un
+  callback `.then`, verificado en vivo).
+  - **Simplificacion de concurrencia declarada, la mas importante de esta
+    tarea, no un bug escondido**: el motor de scripts (`Context::eval`)
+    es siempre SINCRONO de punta a punta - nunca hay un `.await` de Rust
+    corriendo DENTRO de la pila de llamadas de un script JS (`core::
+    server::navigate`/`click` hacen TODO el trabajo async en Rust ANTES
+    de invocar `runtime.eval`, nunca durante). La cola de trabajos POR
+    DEFECTO de Boa (`SimpleJobQueue`, la unica que usa `JsRuntime::new`)
+    resuelve `enqueue_future_job` con `pollster::block_on` - bloqueando
+    el hilo actual hasta que el future termine, no liberandolo. Asi que
+    `fetch()`, aunque tiene la FORMA de API correcta de principio a fin,
+    en la practica BLOQUEA el hilo que esta evaluando el script hasta que
+    la peticion HTTP real termine. Un fetch NO bloqueante de verdad
+    exigiria reestructurar la ejecucion de scripts para intercalarse con
+    jobs de tokio pendientes DURANTE el script, no solo antes o despues -
+    fuera del alcance de esta tarea. Aceptable para el uso real de este
+    motor hoy: `core::server` procesa un comando NDJSON a la vez, sin
+    trabajo concurrente que este bloqueo pudiera interferir - y el hilo
+    bloqueado es un worker de tokio dentro de un runtime MULTI-hilo
+    (`#[tokio::main]`, su modo por defecto), no el unico hilo del
+    proceso.
+  - **Registrado por pase-de-mano, no una dependencia nueva de
+    `pipeline.rs`**: `engine-js` gano su primera dependencia de red
+    (`engine-net`, antes solo `engine-dom`/`engine-css`) - pero
+    `core::pipeline`/`core::scripting` siguen sin RESOLVER ninguna URL ni
+    llamar a `NetworkEngine::fetch` ellos mismos, solo reenvian un
+    `Option<Arc<NetworkEngine>>` opaco hacia `JsRuntime::register_fetch`
+    (nueva). `Some` (siempre en `core::server`, ANTES de correr el primer
+    `<script>` de la pagina, para que lo vea disponible desde la carga
+    inicial, no solo listeners tardios) registra `fetch` de verdad;
+    `None` (siempre en `core::main`, que no descarga recursos externos
+    por diseño) deja `fetch` SIN DEFINIR - `fetch(...)` en JS lanza
+    `ReferenceError: fetch is not defined`, la respuesta honesta cuando
+    de verdad no hay red disponible en ese contexto, en vez de fingir un
+    `fetch` que nunca conecta a nada.
+  - **El puente Rust<->Boa a mano**: `JsPromise::new_pending(context)` da
+    una promise pendiente + un par `resolve`/`reject` invocable MAS
+    TARDE, desde Rust, despues de que el script que llamo a `fetch`
+    ya devolvio el control. El future real (la peticion HTTP en si) NO
+    puede tocar `Context` (no es `Send`/`'static` de esa forma) - solo
+    hace trabajo Rust puro y produce un `NativeJob` como resultado,
+    encolado via `context.job_queue().enqueue_future_job(...)`; ESE job,
+    ejecutado despues CON `context` real disponible, es quien construye
+    el objeto `Response` y llama `resolve`/`reject`. Mismo patron interno
+    que usa `JsPromise::from_future` (leido en el codigo fuente de
+    `boa_engine` para entenderlo), adaptado a mano porque `from_future`
+    exige que el future produzca el `JsValue` el mismo, y construir un
+    objeto `Response` RICO (con metodos `.text()`/`.json()`) necesita
+    `Context`, que el future no tiene.
+  - **Captures `Trace`-ables**: las "captures" de
+    `NativeFunction::from_copy_closure_with_captures` (el `Arc<NetworkEngine>`
+    del cliente HTTP, el `Result<String, String>` del cuerpo ya
+    descargado para `.text()`/`.json()`) deben implementar `Trace` (el
+    recolector de basura de Boa necesita saber que recorrer) - se
+    declaran con `boa_gc::empty_trace!()`, correcto y no un atajo
+    inseguro: ninguna de las dos contiene ningun valor de Boa
+    (`JsValue`/`JsObject`/`Gc<T>`), son datos Rust puros ajenos al heap
+    de Boa.
+  - **`response.json()` reusa el `JSON.parse` REAL de Boa**, invocandolo
+    como si fuera JS (buscando `JSON.parse` en el objeto global y
+    llamandolo) en vez de reinventar un parser JSON propio - un JSON
+    invalido lanza de forma natural (un `SyntaxError` real de Boa),
+    capturado y convertido en promise rechazada.
+  - Sin `options` (metodo/headers/body de la peticion - `engine-net`
+    mismo todavia no envia cuerpo de peticion en ninguna forma, gap
+    preexistente sin relacion con esta tarea): solo `fetch(url)`, siempre
+    GET. Sin la clase `Headers` real (`response.headers` es un objeto
+    plano nombre-minuscula -> valor, no `Headers` con `.get()`/`.has()`/
+    iteracion). Sin `XMLHttpRequest` (solo `fetch` - el nombre de la
+    Fase menciona XHR pero es la API vieja/basada en eventos, mucho menos
+    usada en codigo moderno; `fetch` cubre el caso real).
+  - Tests reales: forma del objeto `Response` (status/ok/statusText/url/
+    headers) para 200 y 404, `.text()` resolviendo al cuerpo real,
+    `.json()` parseando JSON valido Y rechazando JSON invalido (sin
+    peticion HTTP real en NINGUNO de estos - una `NetworkResponse` de
+    prueba se construye a mano, igual que los propios tests de
+    `engine-net::http_client` prueban su logica sin tocar la red),
+    `fetch` registrado como global real, y una URL invalida rechazando
+    SIN tocar la red (falla al parsear antes de que exista un future que
+    ejecutar). Verificado en vivo end-to-end contra `engine_server.exe`
+    real (servidor HTTP local real sirviendo JSON): `fetch(url).then(r =>
+    {...; return r.json()}).then(data => {...})` con status/ok/`.json()`
+    correctos, y un `fetch` a una URL que responde 404 resolviendo
+    (NO rechazando - asi es el spec real, un error HTTP no es un error de
+    red) con `status:404 ok:false`.
+- **Historial atras/adelante** (Fase 4.4, `core::server`): `EngineServer`
+  mantiene `history: Vec<String>` (URLs finales, post-redireccion) +
+  `history_index: Option<usize>` (posicion actual; `None` hasta la primera
+  navegacion exitosa). Semantica real de navegador: visitar una pagina
+  NUEVA tras haber ido "atras" TRUNCA cualquier entrada "adelante" que
+  quedara por delante (`Vec::truncate` antes de `push`) - verificado en
+  vivo (navegar a una URL nueva desde mitad del historial deja
+  `can_go_forward: false`, e intentar `forward` despues falla).
+  - **`back`/`forward` siempre vuelven a pedir la pagina por red de
+    verdad** (mismo `navigate` que una visita nueva) - simplificacion
+    declarada, NO restauran un snapshot en memoria (`bfcache` de un
+    navegador real). Mas honesto que fingir una cache que no existe, a
+    cambio de poder fallar si la pagina ya no es alcanzable (mismo riesgo
+    que ya acepta cualquier `navigate` normal) y de recargar recursos
+    externos/re-ejecutar scripts en cada vuelta (un navegador real con
+    bfcache no lo haria).
+  - **Mismo `navigate`, con un flag para no auto-destruirse el historial**:
+    `navigate` gano un parametro `record_history: bool` - `true` para una
+    navegacion nueva (comando NDJSON `navigate`, o clicar un `<a href>` -
+    Fase 4.2) empuja al historial; `false` para `back`/`forward` (que YA
+    movieron `history_index` ellos mismos antes de llamar) evita que
+    `navigate` vuelva a empujar y descarte el historial "adelante" al que
+    `back` deberia poder volver despues.
+  - **`can_go_back`/`can_go_forward` en cada `State`** (protocolo NDJSON,
+    nuevos) - calculados directamente de `history_index`/`history.len()`,
+    para que el frontend pueda habilitar/deshabilitar sus botones de
+    atras/adelante sin llevar su propia copia paralela del historial.
+  - Tests reales: `back`/`forward` sin ningun historial todavia reportan
+    un error honesto (en vez de un no-op silencioso) SIN tocar la red -
+    fallan en el guard de `history_index: None` antes de llegar a llamar
+    `navigate`; `state_response` sin ninguna pagina cargada reporta
+    `can_go_back`/`can_go_forward` en `false`. La logica de push/truncate
+    en si (necesita `navigate` real, red de por medio) se verifico en vivo
+    end-to-end: 3 navegaciones reales a paginas distintas, `back` x2,
+    intentar ir mas atras del principio (error honesto), `forward`, y
+    navegar a una URL nueva desde mitad del historial truncando
+    "adelante" - las 6 verificaciones (URLs, titulos, `can_go_back`/
+    `can_go_forward` y los dos errores esperados) coincidieron exactamente
+    con lo esperado en cada paso.
+  - NO implementado: `bfcache` (ver arriba), un evento `popstate` real
+    hacia JS (`window.addEventListener('popstate', ...)` no tiene ninguna
+    fuente que lo dispare todavia), `history.pushState`/`replaceState`
+    (historial manipulado desde JS, comun en SPAs), y lo mismo que el
+    resto de Fase 4: `core::main`/`gfx::window` (la ventana winit nativa)
+    NO ganaron esta capacidad - solo el camino NDJSON real (`core::server`)
+    la tiene.
+- **Pestañas reales** (Fase 4.5, `core::server`): antes de esta fase,
+  `EngineServer` solo podia tener UNA pagina cargada a la vez (`current_page`
+  directamente en el struct, junto con `history`/`history_index`/
+  `scroll_offset_y`). Se extrajo todo eso a un nuevo struct `Tab { id,
+  current_page, history, history_index, scroll_offset_y }`, y `EngineServer`
+  paso a llevar `tabs: Vec<Tab>` (invariante: nunca vacio) + `active_tab:
+  usize` (indice, NO id) + `next_tab_id: u32` (monotono, nunca se reutiliza).
+  `width`/`height` se QUEDARON en `EngineServer` (son el tamaño de la
+  VENTANA, compartido por todas las pestañas - cambiar de pestaña no cambia
+  el tamaño de la ventana, igual que un navegador real).
+  - **Protocolo NDJSON nuevo**: `new_tab` (con `url` opcional - sin ella la
+    pestaña queda en blanco), `close_tab`/`switch_tab` (por `tab_id`, el id
+    ESTABLE de la pestaña, no su posicion en la lista), `list_tabs` (sin
+    parametros propios, devuelve `EngineResponse::Tabs { tabs: Vec<TabInfo>,
+    active_tab_id }` con el titulo/URL de CADA pestaña abierta). `State`
+    (la respuesta de `navigate`/`click`/`back`/`forward`/etc.) gano un campo
+    `tab_id` - a que pestaña pertenece el estado devuelto.
+  - **`target="_blank"` real, antes declarado explicitamente NO
+    implementado** (ver la entrada de Fase 4.2 mas arriba): `find_link_href`
+    se renombro a `find_link_target` y ahora devuelve tambien
+    `opens_new_tab` (si el MISMO `<a>` navegable lleva `target="_blank"`,
+    comparacion insensible a mayusculas) - `click` en `core::server` llama a
+    `open_new_tab` en vez de `navigate` cuando `opens_new_tab` es `true`.
+    Simplificacion declarada: solo se reconoce `target="_blank"`
+    exactamente - cualquier OTRO valor de `target` (un nombre de frame
+    inventado, `_parent`, `_top`...) navega en la misma pestaña, un
+    navegador real tambien abriria pestaña nueva para un nombre de frame
+    que no existe, este motor no.
+  - **`open_new_tab` SIEMPRE enfoca la pestaña recien creada** (igual que
+    `target="_blank"` real) - sin comportamiento de "abrir en segundo
+    plano" (p.ej. Ctrl+clic en un navegador real), fuera del alcance de
+    esta tarea.
+  - **Cerrar la pestaña ACTIVA activa la que queda a su IZQUIERDA** (o la
+    nueva primera, si se cerraba la de mas a la izquierda) - mismo criterio
+    que la mayoria de navegadores reales. Cerrar una pestaña en SEGUNDO
+    PLANO no cambia cual esta activa. Error honesto (no un no-op
+    silencioso) al intentar cerrar la UNICA pestaña abierta (un navegador
+    real cerraria la ventana entera, fuera del alcance de este servidor,
+    que siempre mantiene al menos una) o una `tab_id` que no existe.
+  - **Relayout perezoso de pestañas en segundo plano**: `resize` (cambio de
+    tamaño de ventana) solo relayouta la pestaña ACTIVA en ese momento, no
+    las demas - pagar un relayout completo por cada pestaña en segundo
+    plano en cada `resize` seria trabajo desperdiciado si el usuario nunca
+    vuelve a esa pestaña. `switch_tab` relayouta (y reclampa el scroll de)
+    la pestaña recien activada antes de devolver su estado, para ponerla al
+    dia si el tamaño de ventana cambio mientras estaba en segundo plano.
+  - Tests reales (15 nuevos): `find_link_target` distingue `target="_blank"`
+    (con variante en mayusculas) de `_self`/ausente/cualquier otro valor;
+    `open_new_tab` crea una segunda pestaña y la activa; `close_tab` sobre
+    la unica pestaña / sobre un id inexistente reportan error; cerrar la
+    pestaña activa activa la de la izquierda (o la nueva primera si era la
+    de mas a la izquierda); cerrar una pestaña en segundo plano no cambia
+    la activa; `switch_tab` sobre un id inexistente reporta error;
+    `list_tabs` reporta todas las pestañas con la activa marcada.
+    Verificado en vivo end-to-end contra `engine_server.exe` real (tres
+    paginas HTTP reales servidas localmente): navegar la pestaña 1, abrir
+    una pestaña 2 en blanco a mano y navegarla, volver a la pestaña 1 y
+    clicar un enlace `target="_blank"` (abrio una pestaña 3 NUEVA con la
+    pagina correcta y la activo), clicar despues un enlace NORMAL en la
+    pestaña 1 (navego la MISMA pestaña, sin crear ninguna otra), cerrar la
+    pestaña 3 en segundo plano (la activa no cambio), cerrar con un id
+    inexistente (error), y cerrar hasta quedar con una sola pestaña e
+    intentar cerrarla tambien (error) - las 9 verificaciones coincidieron
+    exactamente con lo esperado en cada paso.
+  - NO implementado: "abrir en segundo plano" (ver arriba), reordenar
+    pestañas arrastrando, `window.open()` desde JS (crearia una pestaña
+    nueva sin pasar por un clic real - sin ningun binding hacia
+    `open_new_tab` desde `engine-js` todavia), y lo mismo que el resto de
+    Fase 4: `core::main`/`gfx::window` (la ventana winit nativa) NO
+    ganaron esta capacidad - solo el camino NDJSON real (`core::server`)
+    la tiene. El frontend React real (`frontend/`) tampoco consume este
+    protocolo todavia en absoluto - habla con un backend Python/Playwright
+    completamente distinto por WebSocket en el puerto 8000, sin ninguna
+    conexion con este motor todavia. Esta fase implementa pestañas del
+    LADO DEL MOTOR (protocolo +
+    `core::server`), no una barra de pestañas visual en ningun frontend -
+    de ahi que el nombre original de esta tarea en el plan ("pestañas en
+    el frontend") sea impreciso: no existe todavia ningun frontend real
+    conectado a este motor al que añadirle una.
+- **Cache de proceso para la carga de fuentes de sistema** (Fase 5.1,
+  `engine-text::font::FontSet`) - primer hallazgo real de rendimiento de
+  esta fase, medido en vivo, no una optimizacion especulativa.
+  `FontSet::load_default_sans_serif()` construia un `fontdb::Database`
+  NUEVO y llamaba a `load_system_fonts()` (rescanea TODAS las fuentes
+  instaladas en el sistema operativo desde disco) CUATRO veces por
+  llamada (una por combinacion peso/estilo) - y se llamaba en CADA
+  `navigate()` real (`core::server::EngineServer::navigate`), es decir,
+  en cada navegacion de pagina, antes de que empezara ningun trabajo real
+  de esa pagina.
+  - **Medido con un benchmark desechable** (`cargo run --release --example
+    bench_font`, borrado tras confirmar el arreglo - el test de regresion
+    de mas abajo es lo que queda): ~500-670ms por llamada SIN cache, en
+    release. Con el cache (`static DEFAULT_SANS_SERIF: OnceLock<FontSet>`,
+    primera llamada paga el escaneo real, las siguientes son un `clone()`
+    de los bytes ya cargados en memoria), las llamadas siguientes bajan a
+    ~3ms - un factor de ~150-200x. Verificado tambien en vivo end-to-end
+    contra `engine_server.exe` real (build de depuracion, no release):
+    la primera `navigate` de la sesion tarda ~1.25s, las siguientes
+    ~0.13-0.22s.
+  - **Por que cachear UN solo `FontSet` global es correcto y no una
+    simplificacion arriesgada**: hoy el motor solo sabe pedir UNA familia
+    (sans-serif del sistema, `fontdb::Family::SansSerif`) - la eleccion de
+    `font-family` real de la pagina todavia no existe (Fase 2.4b,
+    pendiente). Nada varia todavia entre paginas ni entre pestañas, asi
+    que cachear por proceso entero (no por pagina, no por pestaña) no
+    pierde ninguna distincion real que el motor ya hiciera. El dia que
+    llegue la Fase 2.4b, este cache tendra que crecer a un mapa por
+    familia solicitada en vez de una sola entrada - documentado aqui para
+    que no se olvide al implementarla.
+  - **Sin invalidacion, a proposito**: un proceso de este motor no cambia
+    las fuentes instaladas del sistema operativo mientras esta vivo (nadie
+    instala/desinstala fuentes concurrentemente con una sesion de
+    navegacion real), asi que no hay ningun escenario real en el que el
+    valor cacheado quede obsoleto durante la vida del proceso - `OnceLock`
+    sin ningun mecanismo de expiracion es la eleccion correcta, no una
+    simplificacion que corta esquinas.
+  - Tests reales (2 nuevos): una segunda llamada tarda menos de 50ms (dos
+    ordenes de magnitud por debajo de los ~500ms medidos sin cache - margen
+    generoso a proposito para no ser fragil en una maquina cargada, sin
+    dejar de detectar una regresion real a "vuelve a escanear cada vez");
+    dos llamadas devuelven exactamente los mismos bytes de fuente (prueba
+    que el cache es una unica fuente compartida, no una copia
+    independiente por llamada que podria variar si el sistema tuviera
+    varias candidatas empatadas).
+- **Fixture WPT-style de eventos y microtasks** (Fase 5.2, cobertura -
+  `tests/wpt-style/events-and-microtasks.html`, nuevo): hallazgo real al
+  revisar `tests/wpt-style/` antes de esta fase solo habia DOS fixtures
+  (`class-list-and-style.html`, `dom-mutation-and-navigation.html`, 11
+  tests en total) - ninguna cubria `addEventListener`/`removeEventListener`/
+  `dispatchEvent`, bubbling, fase de captura, `preventDefault`/
+  `stopPropagation`/`defaultPrevented`, `new Event(tipo, opciones)`, ni
+  `queueMicrotask`, pese a que las seis son funcionalidad real que este
+  motor ya tenia implementada desde fases anteriores (tareas #68, #75,
+  #77, #79, #44 del plan) y con tests unitarios de Rust, pero sin ningun
+  ejercicio end-to-end en el ESTILO testharness.js real que una pagina
+  JS de verdad usaria.
+  - 10 tests nuevos, TODOS pasando en la primera ejecucion contra
+    `wpt_runner` real (sin necesitar ningun arreglo en el motor - esto es
+    cobertura de algo que ya funcionaba, no un hallazgo de bug): listener
+    invocado con un `Event` real (`.type`/`.target` correctos);
+    `removeEventListener` detiene invocaciones futuras sin afectar a la ya
+    ocurrida; bubbling real hijo->padre->abuelo; `stopPropagation` corta el
+    burbujeo antes del ancestro; la fase de CAPTURA se ejecuta antes que la
+    de objetivo/burbuja (verificado con un `addEventListener(tipo, fn,
+    true)` en el ancestro); `preventDefault` marca `defaultPrevented` solo
+    si `cancelable` es `true` (no-op honesto si es `false`); `new
+    Event(tipo, opciones)` respeta `bubbles`/`cancelable` (falso por
+    defecto sin opciones); `queueMicrotask` NO ejecuta su callback de forma
+    sincrona (verificado dentro del mismo `<script>`) PERO si se ha
+    ejecutado ya para cuando empieza el SIGUIENTE `<script>` de la pagina
+    (verificado repartiendo el test en dos bloques `<script>` separados,
+    apoyandose en que `JsRuntime::eval` drena la cola de microtasks
+    despues de cada script por separado, no solo al final de la pagina -
+    ver `event_loop.rs`).
+  - `tests/wpt-style/` pasa de 11 a 21 tests reales en total (`cargo run -p
+    engine-core --bin wpt_runner -- tests/wpt-style`).
+  - Sigue habiendo gaps reales de cobertura tras esta fase, deliberadamente
+    fuera de alcance de este incremento: nada del camino NDJSON
+    (`core::server` - teclado/clics reales, `target="_blank"`, historial,
+    pestañas) tiene fixtures WPT-style, porque `wpt_runner` ejercita
+    unicamente el pipeline headless DOM+CSS+JS (`build_page_with_harness`),
+    sin simulacion de clic/teclado real ni red - esos caminos ya tienen su
+    propia cobertura real (tests unitarios de Rust en `core::server` +
+    verificacion en vivo end-to-end contra `engine_server.exe`, ver las
+    entradas de Fase 4.1-4.5 mas arriba), pero en un estilo distinto, no
+    testharness.js.
 - **Negrita/cursiva reales** (Fase 2.4): `<b>`/`<strong>`/`font-weight: bold`
   y `<i>`/`<em>`/`font-style: italic` ya se PINTAN con una cara de fuente de
   verdad, no solo se resuelven en la cascada sin efecto visible (que era el
@@ -457,9 +1082,12 @@ A fecha de esta limpieza, el motor:
   `list-style-position`, `list-style-image`, `quotes` - las heredables del
   spec real que tienen sentido dado lo que el motor soporta hoy. Se
   excluyeron a proposito las especificas de tablas (`border-collapse`,
-  `border-spacing`, `caption-side`, `empty-cells` - sin layout de tablas,
-  Fase 3.4 pendiente) y las de paginacion impresa (`orphans`/`widows` - un
-  renderer de pantalla sin paginacion no tiene pagina que romper). Mismo
+  `border-spacing`, `caption-side`, `empty-cells` - el layout de tablas
+  (Fase 3.4) no las necesita: sin `border-collapse` no hay nada que
+  colapsar, sin medicion de contenido no hay `caption`/`empty-cells` que
+  cambien nada visible todavia) y las de paginacion impresa (`orphans`/
+  `widows` - un renderer de pantalla sin paginacion no tiene pagina que
+  romper). Mismo
   patron que `font-weight`/`font-style` en la Fase 2.4 antes de que
   `engine-gfx` las pintara: que una propiedad este en esta lista es cascada
   CSS correcta y verificable en `computed_style`, no implica que algo la
@@ -557,8 +1185,9 @@ A fecha de esta limpieza, el motor:
   punta a punta"); el scroll de la rueda del raton YA repinta con un
   nuevo desplazamiento vertical (sin relayout - el contenido no cambia de
   forma, solo que porcion se ve, ver "Scroll real de la rueda del raton"
-  mas abajo); el teclado sigue sin ninguna fuente de eventos — sigue
-  siendo Fase 3.
+  mas abajo); el teclado en ESTA ventana (winit/`core::main`) sigue sin
+  ninguna fuente de eventos - el camino NDJSON real (`core::server`, el
+  que usa el producto) si la tiene desde la Fase 4.1, ver mas arriba.
 - **Ya NO quema ~100% de un nucleo de CPU en reposo**: medido en vivo antes
   del arreglo, con la ventana abierta y SIN ninguna interaccion —
   ~97% de un nucleo de forma continua (16.85s de CPU en 17.36s de reloj,
@@ -722,8 +1351,9 @@ A fecha de esta limpieza, el motor:
   (ver "Scroll real de la rueda del raton" mas abajo) pero SOLO a nivel
   de pintado/hit-testing en `gfx` — no dispara ningun evento `scroll`
   hacia JS todavia (`addEventListener('scroll', ...)` no tiene ninguna
-  fuente que lo dispare); el teclado sigue sin ninguna fuente real en
-  absoluto.
+  fuente que lo dispare); el teclado en esta ventana (winit) sigue sin
+  ninguna fuente real - el camino NDJSON real (`core::server`) si la
+  tiene, ver Fase 4.1 mas arriba.
 - **Bubbling real + `preventDefault`/`stopPropagation`/`event.target`**:
   `dispatchEvent` ya no se queda en el nodo exacto — sube por los
   ancestros (`dispatch_event_with_bubbling`) llamando a sus listeners
@@ -1011,12 +1641,13 @@ A fecha de esta limpieza, el motor:
   `dimensions` sin cambios: coincide con el valor inicial real de
   `background-clip` (`border-box`), el border se pinta despues y encima.
   Pintado como 4 rectangulos solidos (arriba/derecha/abajo/izquierda,
-  `border_strip_rects` en `window.rs`, probado) en vez de un stroke con
-  la API de trazado de tiny-skia — mismo resultado visual para un border
-  UNIFORME (unica forma que se resuelve hoy), reusando `fill_rect`, ya
-  probado, en vez de investigar API nueva sin necesidad. 15 tests nuevos
-  entre las tres capas (layout, parseo de color en gfx, geometria de
-  pintado).
+  `border_strip_rects`, hoy en `engine-gfx::paint` - ver Fase 3.5 mas
+  arriba, vivia en `window.rs` cuando se escribio esto) en vez de un
+  stroke con la API de trazado de tiny-skia — mismo resultado visual para
+  un border UNIFORME sin `border-radius` (con `border-radius` SI se usa
+  stroke, ver Fase 3.5), reusando `fill_rect`, ya probado, en vez de
+  investigar API nueva sin necesidad. 15 tests nuevos entre las tres capas
+  (layout, parseo de color en gfx, geometria de pintado).
 - **`resolve_style` trasladado de `layout` a `css`** (paso 1, preparatorio,
   hacia `getComputedStyle` - todavia NO implementado, ver mas abajo por
   que). La funcion de cascada real (matching + especificidad + atributo
@@ -1103,6 +1734,7 @@ estan resueltos por crates maduros y probados en produccion.
 - El **DOM** y su semantica viva (arbol, eventos, en el futuro colecciones/rangos/observers)
 - La **cascada CSS**: fusion de declaraciones por especificidad ya real (via `selectors`), con el atributo `style="..."` del elemento ganando siempre al final (como en el spec real), y herencia real de 20 propiedades (`color`/`font-size` con unidades relativas `em`/`%`, `font-weight`/`font-style` ya pintados como negrita/cursiva real, mas `font-family`/`line-height`/`text-align`/... - ver Fases 2.4/2.5 en "Estado real" - todavia sin efecto visual); `rem` (relativo a `<html>`, no al padre inmediato) sigue sin resolverse
 - El **layout de bloque e inline** (`BoxType::Block`/`Inline`/`Text`/`Image`, contextos de formato de bloque/inline reales - `flow_block_children`/`flow_inline_run` en `tree.rs`) y el **puente hacia `taffy`** para flex/grid (ver la fila de la tabla de arriba): el ALGORITMO de Flexible Box Layout/Grid en si NO se reescribe a mano (razon en la tabla), pero SI se escribe a mano todo el puente real - mapear `computed_style` a `taffy::Style`, medir contenido de texto/imagenes via el callback `MeasureFunction` de `taffy` reusando `flow_block_children`/`measure_text` YA existentes, y volcar el resultado de vuelta en `LayoutBox::dimensions` - eso sigue siendo "como se comporta la pagina", solo que el ALGORITMO interno de reparto de espacio en el eje principal/cruzado no se reinventa
+- El **layout de tablas** (`flow_table_children` en `tree.rs`, Fase 3.4) SI es codigo propio de punta a punta, sin delegar a ningun crate - a diferencia de flex/grid, repartir filas/columnas en un algoritmo de columnas de ancho igual no es del mismo orden de complejidad que el arbol de HTML5; no hay una virtud real en traer una dependencia para esto
 - El **arbol de pintado** (`display_list.rs`) y su recorrido a la superficie
 - El **bucle de eventos** del navegador y el hit-testing
 - El **puente IA↔DOM** — la diferenciacion real del producto (crate `ai`, pendiente de crear cuando haya un DOM+layout real que exponer; no antes)
@@ -1137,11 +1769,11 @@ engine/
 │   ├── net/         HTTP/HTTPS real (hyper+rustls); CookieStore/WebStorage/CorsPolicy son stubs honestos (mapas en memoria / permite-todo) SIN conectar a `NetworkEngine::fetch` ni a bindings JS todavia - ver doc-comments en cookie.rs/storage.rs/cors.rs
 │   ├── dom/         Nodos, arbol, adaptador TreeSink para html5ever (los eventos DOM viven en js/dom_bindings.rs - ver ese crate - no aqui: guardar listeners exige poder guardar un JsObject, y este crate no depende de Boa a proposito)
 │   ├── css/         Parseo real (cssparser), matching de selectores real (selectors: combinadores, compuestos, atributos), resolucion de cascada real (`cascade::resolve_style` - matching+especificidad+atributo style inline; se traslado aqui desde `layout` para que `js` tambien pueda reusarla, ver "Metrica de progreso")
-│   ├── layout/      Cajas con layout de bloque, inline Y flex real (`BoxType::Block`/`Inline`/`Text`/`Image`; `display: flex` via `taffy`, ver `flow_flex_children`) + cascada CSS aplicada (via `engine_css::resolve_style`), texto medido con metricas reales de fuente (negrita/cursiva incluidas, via `FontSet`); box model completo desde CSS - `padding`/`border`/`margin` reales (`LayoutBox::box_dimensions`, `Dimensions::padding_box()`/`border_box()`/`margin_box()` en box_model.rs); floats/grid/position siguen sin existir
+│   ├── layout/      Cajas con layout de bloque, inline, flex Y tabla real (`BoxType::Block`/`Inline`/`Text`/`Image`; `display: flex` via `taffy` (`flow_flex_children`), `display: table` a mano (`flow_table_children`, Fase 3.4)) + cascada CSS aplicada (via `engine_css::resolve_style`), texto medido con metricas reales de fuente (negrita/cursiva incluidas, via `FontSet`); box model completo desde CSS - `padding`/`border`/`margin` reales (`LayoutBox::box_dimensions`, `Dimensions::padding_box()`/`border_box()`/`margin_box()` en box_model.rs); `position: relative/absolute/fixed` + `z-index` reales (Fase 3.3, `resolve_positioned_boxes`); floats/grid siguen sin existir
 │   ├── image/       Decodificacion real de imagenes de trama (`image`: PNG/JPEG/GIF/BMP/WebP/TIFF/ICO) a RGBA8 - crate propio y minimo porque tanto `layout` (dimensiones) como `gfx` (pixeles) lo necesitan sin que `layout` dependa de `gfx`
 │   ├── text/         Shaping real (rustybuzz), medida sin construir contornos (measure_text), carga de fuentes del sistema en 4 variantes peso/estilo (`FontSet`, fontdb), contornos de glifo -> tiny-skia
-│   ├── gfx/         Display list (incluye `DisplayItem::Image`, pintado real via `image_paint.rs`), ventana real (winit+tiny-skia+softbuffer), texto con glifos reales, adaptador GPU real (wgpu), scroll real de la rueda del raton (offset aplicado en pintado + hit-testing, sin relayout - ver "Scroll real de la rueda del raton" mas abajo)
-│   ├── js/          Runtime Boa enganchado al pipeline (via core/scripting.rs), bindings DOM con mutacion real (getElementById/querySelector(All)/setAttribute/textContent/createElement/appendChild/removeChild/insertBefore/replaceChild/classList/style/parentElement/children/firstElementChild.../documentElement/body), eventos reales (addEventListener/removeEventListener/dispatchEvent/Event con preventDefault/stopPropagation/target/bubbling/fase de captura real) - el clic del raton SI esta conectado a input real del SO (ver "Clic real del SO cableado de punta a punta"), scroll/teclado todavia no; microtasks reales (queueMicrotask), arnes minimo tipo testharness.js (test_harness.rs, ya conectado a wpt_runner - ver core/)
+│   ├── gfx/         Display list (`DisplayItem::Image`/`Shadow`/`PushClip`/`PopClip` incluidos) + pintado real COMPARTIDO en `paint.rs` (border-radius, box-shadow, overflow:hidden via mascara de recorte - Fase 3.5) entre el rasterizado headless (`raster.rs`) y la ventana nativa (`window.rs`, winit+tiny-skia+softbuffer); texto con glifos reales, adaptador GPU real (wgpu), scroll real de la rueda del raton (offset aplicado en pintado + hit-testing, sin relayout - ver "Scroll real de la rueda del raton" mas abajo)
+│   ├── js/          Runtime Boa enganchado al pipeline (via core/scripting.rs), bindings DOM con mutacion real (getElementById/querySelector(All)/setAttribute/textContent/createElement/appendChild/removeChild/insertBefore/replaceChild/classList/style/parentElement/children/firstElementChild.../documentElement/body), eventos reales (addEventListener/removeEventListener/dispatchEvent/Event con preventDefault/stopPropagation/target/bubbling/fase de captura real, `.key` real en eventos de teclado - Fase 4.1) - el clic del raton SI esta conectado a input real del SO en la ventana winit (ver "Clic real del SO cableado de punta a punta"), el teclado SI en el camino NDJSON real (`core::server`, Fase 4.1) pero no en la ventana winit; microtasks reales (queueMicrotask), `fetch()` real respaldado por `engine-net` (Fase 4.3, primera dependencia de red de este crate - bloqueante bajo el capó, ver su entrada mas arriba), arnes minimo tipo testharness.js (test_harness.rs, ya conectado a wpt_runner - ver core/)
 │   └── core/        Orquestacion: lib.rs (pipeline/scripting/platform, compartido) + main.rs (red -> pipeline.rs -> ventana) + bin/wpt_runner.rs (corredor real de fixtures estilo WPT, sin ventana)
 ```
 
@@ -1208,18 +1840,23 @@ mencionado arriba):
 
 **Lo que esto NO es, a proposito**: `wpt_runner` no descarga ni vendoriza
 la corpus real de [Web Platform Tests](https://github.com/web-platform-tests/wpt).
-Los fixtures que corre hoy (`engine/tests/wpt-style/*.html`, 2 archivos, 11
-`test(...)` en total) estan escritos A MANO en el mismo estilo
-(`test`/`assert_equals`/`assert_true`) para ejercitar capacidad real que el
-motor ya tiene — mutacion/navegacion del DOM y `classList`/`style` — no son
-la suite oficial. Vendorizar la corpus real sigue sin empezar, y no serviria
-de mucho todavia: la inmensa mayoria de esos archivos fallarian en cascada
-por falta de `fetch`/`XMLHttpRequest`, eventos, la mayor parte de CSSOM...
-antes hay que decidir que categorias de WPT tienen siquiera sentido de
-intentar dado lo que el motor soporta hoy (mas que antes gracias a las
-mutaciones DOM reales - `setAttribute`/`textContent`/`createElement`/
-`appendChild`/`insertBefore`/`replaceChild`/`classList`/`style` - pero
-sigue siendo casi ninguna categoria completa).
+Los fixtures que corre hoy (`engine/tests/wpt-style/*.html`, 3 archivos, 21
+`test(...)` en total tras la Fase 5.2) estan escritos A MANO en el mismo
+estilo (`test`/`assert_equals`/`assert_true`) para ejercitar capacidad real
+que el motor ya tiene — mutacion/navegacion del DOM, `classList`/`style`, y
+(desde la Fase 5.2) eventos reales (`addEventListener`/bubbling/captura/
+`preventDefault`/`stopPropagation`) y `queueMicrotask` — no son la suite
+oficial. Vendorizar la corpus real sigue sin empezar, y no serviria de mucho
+todavia: la inmensa mayoria de esos archivos fallarian en cascada por falta
+de `XMLHttpRequest` (`fetch` SI es real desde la Fase 4.3, pero sigue siendo
+la unica primitiva de red expuesta a JS), la mayor parte de CSSOM
+(`getComputedStyle`, `CSSStyleSheet`...) y layout inspeccionable desde JS
+(`getBoundingClientRect` y similares no existen todavia, asi que ningun test
+que necesite leer posiciones/tamaños reales desde JS podria pasar aunque el
+LAYOUT en si sea correcto)... antes hay que decidir que categorias de WPT
+tienen siquiera sentido de intentar dado lo que el motor soporta hoy (mas
+que antes gracias a las mutaciones DOM reales y los eventos con
+bubbling/captura - pero sigue siendo casi ninguna categoria completa).
 
 ## Integracion con el producto
 

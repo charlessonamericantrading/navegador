@@ -1,0 +1,119 @@
+<!--
+  Fixture escrita a mano en estilo testharness.js, NO parte de la corpus
+  real de WPT - ver el aviso en crates/core/src/bin/wpt_runner.rs. Ejercita
+  addEventListener/removeEventListener/dispatchEvent, el objeto Event real
+  (bubbling, fase de captura, preventDefault/stopPropagation,
+  defaultPrevented, target, `new Event(tipo, opciones)`) y queueMicrotask -
+  todo implementado desde hace varias fases pero sin ninguna fixture WPT-
+  style que lo ejercitara todavia (gap real de cobertura, Fase 5).
+-->
+<html>
+<body>
+<div id="abuelo">
+  <div id="padre">
+    <div id="hijo"></div>
+  </div>
+</div>
+<script>
+test(function() {
+  var el = document.getElementById('hijo');
+  var oido = false;
+  var eventoRecibido = null;
+  el.addEventListener('click', function(e) {
+    oido = true;
+    eventoRecibido = e;
+  });
+  el.dispatchEvent(new Event('click'));
+  assert_true(oido, 'el listener deberia haberse invocado de verdad');
+  assert_equals(eventoRecibido.type, 'click');
+  assert_equals(eventoRecibido.target, el, 'target deberia ser el elemento que disparo el evento');
+}, 'addEventListener + dispatchEvent invocan el listener con un Event real');
+
+test(function() {
+  var el = document.getElementById('hijo');
+  var veces = 0;
+  var listener = function() { veces++; };
+  el.addEventListener('miEvento', listener);
+  el.dispatchEvent(new Event('miEvento'));
+  el.removeEventListener('miEvento', listener);
+  el.dispatchEvent(new Event('miEvento'));
+  assert_equals(veces, 1, 'removeEventListener deberia impedir invocaciones futuras, sin afectar a la ya ocurrida');
+}, 'removeEventListener detiene invocaciones futuras del mismo listener');
+
+test(function() {
+  var hijo = document.getElementById('hijo');
+  var padre = document.getElementById('padre');
+  var abuelo = document.getElementById('abuelo');
+  var orden = [];
+  padre.addEventListener('burbuja', function() { orden.push('padre'); });
+  abuelo.addEventListener('burbuja', function() { orden.push('abuelo'); });
+  hijo.addEventListener('burbuja', function() { orden.push('hijo'); });
+  hijo.dispatchEvent(new Event('burbuja', {bubbles: true}));
+  assert_equals(orden.join(','), 'hijo,padre,abuelo', 'deberia burbujear del nodo mas interno hacia fuera');
+}, 'bubbling real: un evento disparado en el hijo llega a padre y abuelo en orden');
+
+test(function() {
+  var hijo = document.getElementById('hijo');
+  var padre = document.getElementById('padre');
+  var oidoEnPadre = false;
+  padre.addEventListener('burbuja2', function() { oidoEnPadre = true; });
+  hijo.addEventListener('burbuja2', function(e) { e.stopPropagation(); });
+  hijo.dispatchEvent(new Event('burbuja2', {bubbles: true}));
+  assert_false(oidoEnPadre, 'stopPropagation en el hijo deberia impedir que el padre vea el evento');
+}, 'stopPropagation detiene el burbujeo antes de llegar al ancestro');
+
+test(function() {
+  var hijo = document.getElementById('hijo');
+  var abuelo = document.getElementById('abuelo');
+  var orden = [];
+  abuelo.addEventListener('captura', function() { orden.push('abuelo-captura'); }, true);
+  hijo.addEventListener('captura', function() { orden.push('hijo-objetivo'); });
+  hijo.dispatchEvent(new Event('captura', {bubbles: true}));
+  assert_equals(orden.join(','), 'abuelo-captura,hijo-objetivo', 'la fase de captura deberia ejecutarse ANTES que la fase de objetivo/burbuja');
+}, 'fase de captura real: un listener de captura en el ancestro se dispara antes que el del objetivo');
+
+test(function() {
+  var el = document.getElementById('hijo');
+  var e = new Event('cancelable-test', {cancelable: true});
+  assert_false(e.defaultPrevented);
+  e.preventDefault();
+  assert_true(e.defaultPrevented, 'preventDefault deberia marcar defaultPrevented cuando cancelable es true');
+}, 'preventDefault marca defaultPrevented en un evento cancelable');
+
+test(function() {
+  var e = new Event('no-cancelable-test', {cancelable: false});
+  e.preventDefault();
+  assert_false(e.defaultPrevented, 'preventDefault deberia ser un no-op honesto cuando cancelable es false, igual que el spec real');
+}, 'preventDefault no hace nada si cancelable es false');
+
+test(function() {
+  var e = new Event('opciones-test', {bubbles: true, cancelable: true});
+  assert_true(e.bubbles);
+  assert_true(e.cancelable);
+  var sinOpciones = new Event('sin-opciones');
+  assert_false(sinOpciones.bubbles, 'sin opciones, bubbles deberia ser false por defecto, igual que el spec real');
+  assert_false(sinOpciones.cancelable);
+}, 'new Event(tipo, opciones) respeta bubbles/cancelable, false por defecto sin ellas');
+
+test(function() {
+  var orden = [];
+  orden.push('sincrono-1');
+  queueMicrotask(function() { orden.push('microtask'); });
+  orden.push('sincrono-2');
+  assert_equals(orden.join(','), 'sincrono-1,sincrono-2', 'el microtask NO deberia haberse ejecutado todavia en este punto sincrono');
+  ordenMicrotask = orden;
+}, 'queueMicrotask no ejecuta el callback de forma inmediata/sincrona');
+</script>
+<script>
+// Segundo <script> aparte a proposito (Fase 5, cobertura): `JsRuntime::eval`
+// drena la cola de microtasks DESPUES de cada <script> por separado (ver
+// event_loop.rs), asi que el microtask encolado arriba ya se ejecuto para
+// cuando este segundo bloque empieza - lo contrario de "queda encolado para
+// siempre" o "no se ejecuta nunca", que un test de un unico <script> no
+// puede distinguir de "todavia no le tocaba" (ver el test de arriba).
+test(function() {
+  assert_equals(ordenMicrotask.join(','), 'sincrono-1,sincrono-2,microtask', 'el microtask deberia haberse ejecutado de verdad ya, entre el primer <script> y este segundo');
+}, 'el microtask encolado en un <script> anterior se ejecuta antes del siguiente <script>');
+</script>
+</body>
+</html>

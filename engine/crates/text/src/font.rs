@@ -86,8 +86,37 @@ pub struct FontSet {
     pub bold_italic: Option<SystemFont>,
 }
 
+/// Cache de proceso (Fase 5, hallazgo real de rendimiento) de la unica
+/// combinacion de familia que este motor sabe pedir hoy (sans-serif del
+/// sistema - la eleccion de `font-family` real todavia esta pendiente,
+/// Fase 2.4b), asi que cachear UN solo `FontSet` global es correcto: nada
+/// varia todavia entre paginas. Ver el doc-comment de
+/// `FontSet::load_default_sans_serif` para el numero real medido.
+static DEFAULT_SANS_SERIF: std::sync::OnceLock<FontSet> = std::sync::OnceLock::new();
+
 impl FontSet {
+    /// Medido en vivo (Fase 5, `examples/bench_font.rs`): ~500ms por
+    /// llamada SIN cache - `fontdb::Database::new()` + `load_system_fonts()`
+    /// se ejecutan 4 veces (una por combinacion peso/estilo), cada una
+    /// reescaneando TODAS las fuentes instaladas en el sistema desde disco,
+    /// y esta funcion se llamaba en CADA `navigate()` real
+    /// (`core::server::EngineServer::navigate`) - medio segundo perdido en
+    /// cada navegacion antes de que empezara ningun trabajo real de la
+    /// pagina. Con el cache (`OnceLock`, primera llamada paga el escaneo
+    /// real, todas las siguientes son un `clone()` barato - los bytes de
+    /// una fuente son cientos de KB, un memcpy de microsegundos comparado
+    /// con los ~500ms del escaneo), navegaciones sucesivas ya no lo pagan.
+    /// Invalidacion: ninguna - un proceso de este motor no cambia las
+    /// fuentes instaladas del sistema operativo mientras esta vivo, asi
+    /// que no hay ningun escenario real en el que el valor cacheado quede
+    /// obsoleto durante la vida del proceso.
     pub fn load_default_sans_serif() -> Self {
+        DEFAULT_SANS_SERIF
+            .get_or_init(Self::load_default_sans_serif_uncached)
+            .clone()
+    }
+
+    fn load_default_sans_serif_uncached() -> Self {
         Self {
             regular: SystemFont::load_default_sans_serif_variant(false, false),
             bold: SystemFont::load_default_sans_serif_variant(true, false),
@@ -145,5 +174,36 @@ mod tests {
         assert!(empty.pick(true, false).is_none());
         assert!(empty.pick(false, true).is_none());
         assert!(empty.pick(true, true).is_none());
+    }
+
+    /// Regresion real (Fase 5) del hallazgo de rendimiento documentado en el
+    /// doc-comment de `load_default_sans_serif`: SIN cache, una llamada
+    /// tarda ~500ms de verdad (escanea TODAS las fuentes del sistema 4
+    /// veces) - si alguien quita el `OnceLock` sin darse cuenta, este test
+    /// lo detecta. Margen deliberadamente generoso (50ms, dos ordenes de
+    /// magnitud por debajo de los ~500ms medidos) para no ser fragil en una
+    /// maquina cargada, sin dejar de detectar una regresion real a "vuelve
+    /// a escanear cada vez".
+    #[test]
+    fn load_default_sans_serif_is_cached_after_the_first_call() {
+        let _ = FontSet::load_default_sans_serif(); // fuerza la carga real primero, fuera de la medicion
+        let start = std::time::Instant::now();
+        let _ = FontSet::load_default_sans_serif();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 50,
+            "una segunda llamada deberia ser un clone barato desde el cache, no un rescan de ~500ms (tardo {elapsed:?})"
+        );
+    }
+
+    /// El cache es un UNICO `FontSet` global, no una copia por llamada - dos
+    /// llamadas deberian devolver los mismos bytes de fuente real, no dos
+    /// fuentes potencialmente distintas si el sistema tuviera varias
+    /// candidatas empatadas.
+    #[test]
+    fn load_default_sans_serif_returns_the_same_bytes_across_calls() {
+        let Some(first) = FontSet::load_default_sans_serif().regular else { return };
+        let Some(second) = FontSet::load_default_sans_serif().regular else { return };
+        assert_eq!(first.bytes, second.bytes, "el cache deberia devolver siempre la misma fuente");
     }
 }
