@@ -37,6 +37,23 @@ pub fn paint_display_list(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: 
     let mut current_mask: Option<Mask> = None;
 
     for item in items {
+        // Descarte por viewport (Fase 5): un item cuyo rectangulo cae
+        // ENTERO por encima o por debajo del pixmap no puede pintar ni un
+        // pixel visible, asi que hacerlo es trabajo tirado. No es una
+        // optimizacion cosmetica: medido sobre una pagina de 200 filas
+        // (~4800px de contenido en un viewport de 800px), pintar era el
+        // 98% del coste de cada respuesta del servidor y ~5/6 de ese
+        // trabajo era para pixeles fuera de pantalla.
+        //
+        // `PushClip`/`PopClip` NUNCA se descartan aunque su rectangulo
+        // este fuera: no pintan nada, cambian ESTADO (la pila de recorte),
+        // y saltarselos desemparejaria la pila y recortaria mal todo lo
+        // que viniera despues.
+        if let Some(rect) = item_rect(item) {
+            if is_offscreen(rect, height, scroll_offset_y) {
+                continue;
+            }
+        }
         match item {
             DisplayItem::PushClip { rect } => {
                 clip_stack.push(rect.clone());
@@ -63,6 +80,42 @@ pub fn paint_display_list(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: 
             }
         }
     }
+}
+
+/// El rectangulo de un item que PINTA, o `None` para los que solo cambian
+/// estado (`PushClip`/`PopClip`) - devolver `None` es lo que garantiza que
+/// esos dos nunca se descarten.
+fn item_rect(item: &DisplayItem) -> Option<&Rect> {
+    match item {
+        DisplayItem::PushClip { .. } | DisplayItem::PopClip => None,
+        DisplayItem::Shadow { rect, .. }
+        | DisplayItem::SolidRect { rect, .. }
+        | DisplayItem::Text { rect, .. }
+        | DisplayItem::Border { rect, .. }
+        | DisplayItem::Image { rect, .. } => Some(rect),
+    }
+}
+
+/// Cuanto se ensancha el viewport antes de decidir que algo esta fuera.
+/// No es paranoia gratuita: el rectangulo de un item no siempre acota todo
+/// lo que ese item llega a pintar - una sombra se difumina mas alla de su
+/// caja, y los glifos de un texto pueden sobresalir del alto de linea por
+/// ascendentes/descendentes. Con este margen, cualquier item que pudiera
+/// tocar aunque fuera un pixel del borde se sigue pintando; lo que se
+/// descarta esta fuera con holgura.
+const MARGEN_DESCARTE: f32 = 64.0;
+
+/// `true` si `rect` (en coordenadas de documento) cae entero fuera del alto
+/// del pixmap una vez aplicado el scroll.
+///
+/// Solo se comprueba el eje vertical: es donde el contenido se desborda de
+/// verdad (una pagina larga) y donde esta todo el ahorro. En horizontal el
+/// layout ya acota las cajas al ancho del viewport y no hay scroll lateral,
+/// asi que comprobarlo no descartaria practicamente nada.
+fn is_offscreen(rect: &Rect, viewport_height: u32, scroll_offset_y: f32) -> bool {
+    let top = rect.y - scroll_offset_y;
+    let bottom = top + rect.height;
+    bottom < -MARGEN_DESCARTE || top > viewport_height as f32 + MARGEN_DESCARTE
 }
 
 fn paint_of(color: [u8; 4]) -> Paint<'static> {
@@ -270,6 +323,81 @@ fn border_strip_rects(border_box: &Rect, width: f32) -> [Rect; 4] {
 
 #[cfg(test)]
 mod tests {
+    use super::{is_offscreen, item_rect, MARGEN_DESCARTE};
+
+    fn r(y: f32, height: f32) -> Rect {
+        Rect { x: 0.0, y, width: 100.0, height }
+    }
+
+    /// El punto de la Fase 5: lo que esta muy por debajo del viewport se
+    /// descarta sin pintar.
+    #[test]
+    fn a_box_far_below_the_viewport_is_offscreen() {
+        assert!(is_offscreen(&r(5000.0, 20.0), 800, 0.0));
+    }
+
+    #[test]
+    fn a_box_inside_the_viewport_is_not_offscreen() {
+        assert!(!is_offscreen(&r(400.0, 20.0), 800, 0.0));
+    }
+
+    /// La otra mitad, la que de verdad importa para no romper nada: hacer
+    /// scroll cambia QUE esta fuera. Lo que estaba abajo entra, y lo que
+    /// estaba arriba sale.
+    #[test]
+    fn scrolling_brings_a_far_box_into_view_and_pushes_the_top_one_out() {
+        let abajo = r(5000.0, 20.0);
+        let arriba = r(10.0, 20.0);
+        assert!(is_offscreen(&abajo, 800, 0.0));
+        assert!(!is_offscreen(&arriba, 800, 0.0));
+
+        assert!(!is_offscreen(&abajo, 800, 4800.0), "tras bajar hasta ella, deberia pintarse");
+        assert!(is_offscreen(&arriba, 800, 4800.0), "lo que quedo muy por encima deberia dejar de pintarse");
+    }
+
+    /// Una caja que asoma solo por el borde inferior TIENE que pintarse -
+    /// descartarla dejaria una franja en blanco visible.
+    #[test]
+    fn a_box_straddling_the_bottom_edge_is_still_painted() {
+        assert!(!is_offscreen(&r(790.0, 40.0), 800, 0.0));
+    }
+
+    /// Y una que asoma por el borde superior, igual.
+    #[test]
+    fn a_box_straddling_the_top_edge_is_still_painted() {
+        assert!(!is_offscreen(&r(-10.0, 40.0), 800, 0.0));
+    }
+
+    /// El margen de seguridad existe para sombras y para glifos que
+    /// sobresalen del alto de linea: algo justo fuera del viewport, pero
+    /// dentro del margen, se sigue pintando.
+    #[test]
+    fn something_just_outside_the_viewport_but_within_the_margin_is_still_painted() {
+        let justo_debajo = r(800.0 + MARGEN_DESCARTE / 2.0, 10.0);
+        assert!(!is_offscreen(&justo_debajo, 800, 0.0));
+    }
+
+    /// La regla que impide el bug mas peligroso de esta optimizacion:
+    /// `PushClip`/`PopClip` no tienen rectangulo con el que descartarlos,
+    /// asi que nunca pueden saltarse - si se saltaran, la pila de recorte
+    /// se desemparejaria y todo lo posterior se recortaria mal.
+    #[test]
+    fn clip_items_have_no_cullable_rect_so_they_can_never_be_skipped() {
+        use crate::display_list::DisplayItem;
+        let push = DisplayItem::PushClip { rect: r(9999.0, 10.0) };
+        assert!(item_rect(&push).is_none(), "PushClip no deberia poder descartarse ni estando fuera de pantalla");
+        assert!(item_rect(&DisplayItem::PopClip).is_none());
+    }
+
+    /// Un item que SI pinta expone su rectangulo, que es lo que permite
+    /// descartarlo.
+    #[test]
+    fn painting_items_expose_their_rect_for_culling() {
+        use crate::display_list::DisplayItem;
+        let solido = DisplayItem::SolidRect { rect: r(10.0, 20.0), color: [0, 0, 0, 255], radius: 0.0 };
+        assert!(item_rect(&solido).is_some());
+    }
+
     use super::*;
 
     #[test]
