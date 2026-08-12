@@ -16,8 +16,23 @@ engine-css = { path = "../css" }
 # `fetch()` real (Fase 4.3, ver fetch.rs) - peticiones HTTP de verdad desde
 # JS, no un mock. Primera dependencia de red de este crate.
 engine-net = { path = "../net" }
+# `XMLHttpRequest` sincrono (Fase 9, ver xhr.rs): necesita esperar a que la
+# peticion HTTP termine ANTES de devolver el control al script. Es el mismo
+# ejecutor minimo que la cola de trabajos por defecto de Boa
+# (`SimpleJobQueue`) ya usa por dentro para resolver `fetch()`, asi que no
+# entra nada nuevo en el arbol de dependencias - solo se llama directamente.
+pollster = "0.3"
 
 [dev-dependencies]
+# Solo para los dos tests de `xhr.rs` que recorren el camino de RED de
+# verdad (fallo de conexion). `pollster::block_on` sobre un future de
+# `hyper` necesita un contexto de runtime de tokio vivo para que el
+# reactor de I/O exista; en produccion siempre lo hay (`core::server` es
+# `#[tokio::main]`, que es por lo que `fetch()` ya funciona ahi), pero un
+# `#[test]` normal corre sin ninguno. Hace falta el sabor multi-hilo: con
+# el de un solo hilo, bloquear ese hilo impediria al propio reactor
+# avanzar y el test se colgaria.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Solo para construir un `NetworkResponse` de prueba a mano en los tests de
 # fetch.rs (sin peticion HTTP real - ver su doc-comment) - los mismos tipos
 # que `engine-net` ya usa.

@@ -90,12 +90,14 @@ pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, externa
 /// algo que ejecutar al principio.
 ///
 /// `network`: `Some` registra `fetch()` real (Fase 4.3, ver
-/// `engine_js::fetch`) ANTES de correr ningun script - asi el PRIMER
+/// `engine_js::fetch`) y `XMLHttpRequest` (Fase 9, ver `engine_js::xhr`)
+/// ANTES de correr ningun script - asi el PRIMER
 /// `<script>` de la pagina ya lo ve disponible, no solo listeners
 /// registrados mas tarde. `None` (p.ej. `core::main`, que no descarga
 /// recursos externos por diseño) deja `fetch` sin definir - `fetch(...)`
 /// en JS lanza `ReferenceError`, la respuesta honesta cuando de verdad no
-/// hay red disponible en ese contexto.
+/// hay red disponible en ese contexto - y lo mismo para `new
+/// XMLHttpRequest()`.
 pub fn execute_inline_scripts_keeping_runtime(dom_root: &Arc<RwLock<Node>>, external_scripts: &HashMap<String, String>, network: Option<Arc<NetworkEngine>>) -> (Vec<Result<String, String>>, JsRuntime) {
     let scripts = Node::find_all_by_tag(dom_root, "script");
 
@@ -104,9 +106,35 @@ pub fn execute_inline_scripts_keeping_runtime(dom_root: &Arc<RwLock<Node>>, exte
         tracing::warn!("[js] no se pudo enlazar el DOM al runtime: {e}");
     }
     if let Some(network) = network {
-        if let Err(e) = runtime.register_fetch(network) {
+        if let Err(e) = runtime.register_fetch(network.clone()) {
             tracing::warn!("[js] no se pudo registrar fetch: {e}");
         }
+        // Fase 9: mismo `NetworkEngine`, misma condicion. Un motor con
+        // `fetch` pero sin `XMLHttpRequest` deja sin red a toda la parte
+        // de la web (enorme) que nunca migro - ver `engine_js::xhr`.
+        if let Err(e) = runtime.register_xhr(network) {
+            tracing::warn!("[js] no se pudo registrar XMLHttpRequest: {e}");
+        }
+    }
+    // `window` se registra SIEMPRE (Fase 6.4), a diferencia de `fetch`
+    // (condicional). El motivo no es que aqui haya siempre pestañas que
+    // abrir - no las hay en `core::main` - sino que `window` es el objeto
+    // que TODA pagina real da por sentado: dejarlo sin definir haria que
+    // un `window.loQueSea` de deteccion de capacidades, comunisimo en la
+    // web real, lanzara `ReferenceError` y rompiera la pagina entera. Que
+    // `window.open()` acabe abriendo una pestaña de verdad depende de si
+    // quien construyo este runtime drena la cola (`core::server` lo hace
+    // al procesar un clic; `core::main` no, porque ese camino no tiene
+    // pestañas - ver ARCHITECTURE.md).
+    if let Err(e) = runtime.register_window() {
+        tracing::warn!("[js] no se pudo registrar window: {e}");
+    }
+    // DESPUES de `bind_dom` y `register_window` a proposito (Fase 7):
+    // `register_history` engancha ademas `window.addEventListener`
+    // delegando en `document.documentElement`, asi que necesita que los
+    // dos ya existan - ver el shim en `engine_js::history`.
+    if let Err(e) = runtime.register_history() {
+        tracing::warn!("[js] no se pudo registrar history: {e}");
     }
 
     let script_results = run_scripts(&mut runtime, &scripts, external_scripts);

@@ -644,11 +644,12 @@ A fecha de esta limpieza, el motor:
     verificado en vivo leyendo el arbol resultante - ya los separa en
     hermanos en vez de dejarlos anidados, via el algoritmo de adopcion del
     spec HTML5, asi que ese caso ni siquiera es alcanzable en la practica).
-    "Navegable" excluye deliberadamente `href` vacio/ausente (un `<a>` sin
-    `href` no es ni siquiera un hyperlink real), anclas internas
-    (`href="#seccion"` - debiera hacer scroll a un elemento con ese `id`,
-    no una navegacion de pagina nueva) y `javascript:` (ejecutaria script,
-    no navegaria) - ambos huecos declarados, sin implementar todavia.
+    Lo unico que no produce ninguna accion es un `href` vacio/ausente (un
+    `<a>` sin `href` no es ni siquiera un hyperlink real). Las anclas
+    internas (`href="#seccion"`) y `javascript:`, que en el momento de esta
+    fase se descartaban como "no navegables", tienen su propia accion real
+    desde la Fase 6 (ver mas abajo): esta funcion pasó de devolver un
+    `Option<String>` a un `Option<LinkAction>` con las tres posibilidades.
   - **Resolucion de URL relativa**: el `href` (posiblemente relativo) se
     resuelve contra la URL de la pagina ACTUAL (`page.url`, re-parseada con
     `url::Url::parse` + `.join(href)`) - mismo patron ya establecido para
@@ -702,10 +703,11 @@ A fecha de esta limpieza, el motor:
     estado devuelto cambiaron a los de la pagina 2), y clicar un enlace
     cuyo listener de `"click"` llama `preventDefault()` NO navego (la URL
     se quedo en la pagina original).
-  - NO implementado (en el momento de esta fase): anclas internas
-    (`href="#id"`, deberia hacer scroll), `javascript:` (deberia ejecutar
-    el script), `target="_blank"` (ya implementado desde la Fase 4.5, ver
-    mas abajo), historial atras/adelante tras la navegacion (Fase 4.4,
+  - NO implementado (en el momento de esta fase, TODOS resueltos despues):
+    anclas internas (`href="#id"`, deberia hacer scroll - Fase 6.1),
+    `javascript:` (deberia ejecutar el script - Fase 6.2),
+    `target="_blank"` (Fase 4.5), historial atras/adelante tras la
+    navegacion (Fase 4.4,
     todavia no existe ningun historial en absoluto en este punto), y lo
     mismo que el resto de Fase 4.1: `core::main`/`gfx::window` (la ventana
     winit nativa) NO ganaron esta capacidad - solo el camino NDJSON real
@@ -784,9 +786,12 @@ A fecha de esta limpieza, el motor:
     preexistente sin relacion con esta tarea): solo `fetch(url)`, siempre
     GET. Sin la clase `Headers` real (`response.headers` es un objeto
     plano nombre-minuscula -> valor, no `Headers` con `.get()`/`.has()`/
-    iteracion). Sin `XMLHttpRequest` (solo `fetch` - el nombre de la
-    Fase menciona XHR pero es la API vieja/basada en eventos, mucho menos
-    usada en codigo moderno; `fetch` cubre el caso real).
+    iteracion). Sin `XMLHttpRequest` **cuando se escribio esto** - ya no:
+    llego en la Fase 9 (ver mas arriba), sobre este mismo
+    `NetworkEngine`. El razonamiento de entonces ("`fetch` cubre el caso
+    real") resulto ser falso en la practica: hay demasiado codigo real,
+    empezando por versiones de jQuery que se siguen sirviendo hoy, que
+    nunca migro.
   - Tests reales: forma del objeto `Response` (status/ok/statusText/url/
     headers) para 200 y 404, `.text()` resolviendo al cuerpo real,
     `.json()` parseando JSON valido Y rechazando JSON invalido (sin
@@ -840,10 +845,9 @@ A fecha de esta limpieza, el motor:
     "adelante" - las 6 verificaciones (URLs, titulos, `can_go_back`/
     `can_go_forward` y los dos errores esperados) coincidieron exactamente
     con lo esperado en cada paso.
-  - NO implementado: `bfcache` (ver arriba), un evento `popstate` real
-    hacia JS (`window.addEventListener('popstate', ...)` no tiene ninguna
-    fuente que lo dispare todavia), `history.pushState`/`replaceState`
-    (historial manipulado desde JS, comun en SPAs), y lo mismo que el
+  - NO implementado EN ESTA FASE (los tres primeros llegaron en la Fase 7,
+    ver mas abajo): `bfcache` (sigue sin existir), `popstate` real hacia JS
+    y `history.pushState`/`replaceState`; y lo mismo que el
     resto de Fase 4: `core::main`/`gfx::window` (la ventana winit nativa)
     NO ganaron esta capacidad - solo el camino NDJSON real (`core::server`)
     la tiene.
@@ -926,6 +930,350 @@ A fecha de esta limpieza, el motor:
     de ahi que el nombre original de esta tarea en el plan ("pestañas en
     el frontend") sea impreciso: no existe todavia ningun frontend real
     conectado a este motor al que añadirle una.
+- **Rendimiento: descarte por viewport al pintar** (Fase 5, continuacion;
+  `engine-gfx::paint`). El motor pintaba TODOS los `DisplayItem` de la
+  pagina en cada respuesta, incluidos los que caen fuera de la pantalla.
+  - **Medido antes de tocar nada**, igual que la cache de fuentes de la
+    Fase 5.1: un benchmark temporal separo las tres etapas de
+    `render_layout_to_png` sobre una pagina de 200 filas a 1000x800.
+    Resultado que contradijo la sospecha inicial (el PNG): construir el
+    display list 0.16 ms, **pintar 182.93 ms**, codificar el PNG 3.30 ms.
+    Pintar era el 98% del coste. Y con ~4800px de contenido en un viewport
+    de 800px, cinco sextos de ese trabajo eran para pixeles que no podian
+    verse.
+  - El arreglo es una comprobacion por item: si su rectangulo cae entero
+    por encima o por debajo del pixmap (con un margen de 64px, porque una
+    sombra se difumina mas alla de su caja y los glifos sobresalen del alto
+    de linea), se salta. `PushClip`/`PopClip` **nunca** se descartan: no
+    pintan, cambian estado, y saltarselos desemparejaria la pila de
+    recorte. Solo se comprueba el eje vertical - es donde el contenido se
+    desborda de verdad y donde esta todo el ahorro.
+  - **Medido despues, en vivo contra `engine_server.exe`** (release, misma
+    pagina de 200 filas): `get_state` 157 -> 36 ms (4.3x), `scroll`
+    190 -> 46 ms (4.1x), `click` 243 -> 70 ms (3.5x), `navigate`
+    341 -> 235 ms (1.45x - ahi el coste dominante es parsear y hacer el
+    layout, no pintar). El benchmark temporal se borro despues; los tests
+    de regresion se quedan.
+  - **La correccion esta PROBADA, no argumentada**: tres tests comparan el
+    PNG completo byte a byte - pintar una pagina larga da un resultado
+    identico al de pintar solo lo que cae dentro del viewport (hacia
+    abajo y, tras hacer scroll, hacia arriba), y el tercero exige lo
+    contrario para una caja que asoma por el borde (quitarla SI cambia los
+    pixeles), que es lo que detectaria un descarte demasiado agresivo. Mas
+    6 tests sobre la geometria del descarte, incluido que `PushClip`/
+    `PopClip` no exponen rectangulo con el que descartarlos.
+  - **Lo que sigue sin hacerse**, para no dejarlo implicito: el texto se
+    re-conforma (`wrap_text` + `shape_text`, rustybuzz) en CADA pintado,
+    aunque no haya cambiado - una cache de shaping es el siguiente paso
+    obvio y explica buena parte de los 36 ms que quedan. Tampoco hay
+    layout incremental (cualquier interaccion reconstruye el arbol
+    entero), ni repintado por rectangulos sucios (siempre se rasteriza el
+    viewport completo), ni se ha eliminado el doble parseo de HTML en
+    `navigate`.
+- **`XMLHttpRequest` real** (Fase 9, `engine-js::xhr` nuevo), sobre el MISMO
+  `NetworkEngine` que `fetch()` (Fase 4.3) y el resto del motor - sin
+  cliente HTTP nuevo. No es redundante con `fetch`: una parte enorme de la
+  web real, incluidas versiones de jQuery que se siguen sirviendo hoy, nunca
+  migro, y un motor que solo tiene `fetch` deja esas paginas sin red aunque
+  el transporte de debajo sea identico.
+  - **Sincrono SIEMPRE, declarado**: el tercer argumento de `open(metodo,
+    url, async)` se acepta y se ignora - `send()` hace la peticion y llama a
+    los manejadores antes de devolver el control. Es la semantica exacta de
+    `open(..., false)` del spec aplicada tambien al caso `true`, y es la
+    unica que este motor puede cumplir: un XHR asincrono de verdad exige
+    devolver el control al script y disparar `onload` mas tarde, es decir
+    poder suspender y reanudar JS a mitad de ejecucion, y `Context::eval`
+    de Boa es sincrono de punta a punta (la misma limitacion que `fetch.rs`
+    ya declaraba desde el otro lado). Fingir asincronia daria un XHR que a
+    veces no dispara nada. Consecuencia practica: `xhr.onload = ...;
+    xhr.send();` funciona igual que en un navegador; lo que cambia es el
+    ORDEN de lo que se escriba despues de `send()`, no los datos.
+  - **404 no es un error de red**: `onload` se dispara para cualquier
+    respuesta que haya llegado (incluidos 404 y 500) y `onerror` solo
+    cuando no hubo respuesta ninguna, dejando `status = 0`. Confundir los
+    dos casos es el fallo clasico de un XHR mal hecho; los dos estan
+    probados por separado, en unit tests y en vivo.
+  - Recorre los cinco `readyState` de verdad (0..4, aunque sin espera entre
+    ellos), expone las constantes (`xhr.DONE`...), `getResponseHeader`
+    (`null` si falta, no `""`), `getAllResponseHeaders` (formato exacto del
+    spec: minusculas, ordenado, CRLF) y `setRequestHeader`, que SI se
+    aplica a la peticion real.
+  - NO implementado, declarado: `responseType` (`response` es siempre la
+    misma cadena que `responseText`), `abort()`/`timeout`/
+    `withCredentials` (los tres solo tienen sentido sobre una peticion en
+    vuelo, y aqui nunca hay una), eventos `progress`/`loadstart`/`loadend`,
+    cuerpo de peticion en `send(body)` (`engine-net` todavia no lo envia -
+    misma limitacion que `fetch`), `addEventListener` sobre el XHR (el
+    registro de eventos esta indexado por nodo del DOM y un XHR no es un
+    nodo), y `this` dentro de los manejadores (el patron normal de capturar
+    el xhr por cierre si funciona).
+  - 12 tests nuevos + verificacion en vivo contra `engine_server.exe`: un
+    GET real devolvio `200` con el JSON del servidor y sus cabeceras, los
+    estados pasaron `1-2-3-4`, un 404 disparo `onload` con `status=404`, y
+    un puerto sin nadie escuchando disparo `onerror` con `status=0`.
+- **Bug real arreglado al construir la Fase 9: la cola de trabajos no se
+  vaciaba tras un evento** (`engine-js::runtime::drain_jobs`). Hasta aqui
+  lo unico que la drenaba era `eval`, al terminar cada `<script>`. La
+  consecuencia era que **`fetch()` solo funcionaba durante la CARGA de la
+  pagina**: llamado desde un manejador de eventos - que es como lo usa
+  cualquier pagina real - la peticion HTTP se hacia de verdad y la
+  respuesta llegaba, pero el trabajo que resuelve la `Promise` se quedaba
+  encolado para siempre, asi que ni `.then(...)` ni `await` llegaban a
+  ejecutarse nunca y la pagina se quedaba a medias sin ningun error
+  visible. Reproducido en vivo antes del arreglo (una pagina cuyo manejador
+  de clic hacia `fetch` se quedaba en "llamando..." indefinidamente,
+  mientras el mismo `fetch` en la carga si completaba) y verificado
+  despues. Drenar ahi no es un parche: en el spec, disparar un evento por
+  una accion real del usuario ES una tarea del bucle de eventos, y al final
+  de CADA tarea se vacia la cola de microtasks - la misma razon por la que
+  `eval` ya lo hacia. 3 tests de regresion que lo miden con
+  `queueMicrotask` (sin necesitar red, asi que corren siempre), incluido el
+  complementario que comprueba que sin drenar el microtask NO corre.
+- **CSSOM: `getComputedStyle` y `getBoundingClientRect` reales** (Fase 8,
+  `engine-js::cssom` nuevo + `core::server` + `layout::tree`). Las dos APIs
+  con las que cualquier codigo real mide la pagina antes de reaccionar a
+  ella (menus que se posicionan, lazy-loading, animaciones, drag & drop).
+  - **El problema de fondo, y el diseño que sale de el**: las dos leen el
+    ARBOL DE LAYOUT, no el DOM - y el runtime JS se construye ANTES de que
+    ese arbol exista (`build_page_keeping_runtime` corre los `<script>` y
+    hace el layout despues, igual que un navegador real donde los scripts
+    corren durante el parseo). Un navegador resuelve esa inversion
+    forzando un *reflow sincrono*: `getBoundingClientRect()` para el
+    mundo, rehace el layout ahi mismo y devuelve el resultado fresco. Este
+    motor no puede: construir un layout necesita hoja de estilos,
+    `FontSet` y mapa de imagenes, que viven en `core::server`, una capa
+    por encima e inalcanzable desde dentro de un closure de Boa. Asi que
+    el puente es un **snapshot**: `core::server` PUBLICA geometria y
+    estilo resuelto tras cada layout, y JS lee. Es el mismo patron de
+    `window.open` (6.4) e `history.pushState` (7) pero en direccion
+    contraria (alli JS escribe y el servidor drena).
+  - **Consecuencias declaradas de que sea snapshot y no reflow**: (a)
+    durante la CARGA de la pagina esta vacio, asi que un `<script>` que
+    mida en ese momento recibe un rect de ceros y un estilo sin
+    propiedades - que es exactamente lo que devuelve un navegador real
+    para un elemento fuera del arbol de render, y donde estas APIs se usan
+    de verdad (dentro de un listener) el snapshot ya esta publicado; (b)
+    mutar el DOM no lo actualiza al instante: cambiar `el.style.width` y
+    medir acto seguido da la geometria de ANTES; el layout que
+    `core::server` hace al terminar de procesar ese mismo clic lo pone al
+    dia. Es la limitacion real de la fase y no se disimula.
+  - **`engine-js` NO gano dependencia de `engine-layout`**: lo que cruza
+    la frontera son datos planos (`BoxMetrics`: cuatro `f32` y el mapa de
+    declaraciones), copiados en `core` - el unico crate que ya conoce las
+    dos capas. Coste: un clon de `HashMap` por caja y layout, despreciable
+    al lado del propio layout (que hace shaping de texto real).
+  - **Bug real encontrado y arreglado: la herencia no llegaba a las cajas
+    de ELEMENTO** (`layout::tree::build_node`). Solo se escribia una
+    propiedad heredable en la caja de un elemento si ESE elemento la
+    declaraba; lo heredado viajaba en el acumulador `inherited` y solo
+    aterrizaba en las cajas de TEXTO. Bastaba para pintar (color y tamaño
+    de letra solo hacen falta donde hay texto), pero dejaba la caja del
+    elemento diciendo media verdad, y `getComputedStyle` - que por
+    definicion devuelve el valor DESPUES de la herencia - no tenia de
+    donde sacarlo: un `<div>` dentro de un `<body>` con `color` reportaba
+    `""`. Arreglado con un `or_insert` (lo propio siempre gana sobre lo
+    heredado, que es el orden de la cascada) colocado ANTES del bucle que
+    resuelve unidades relativas, para que un `font-size: 2em` propio siga
+    resolviendose contra el del padre. 3 tests de regresion.
+  - **Simplificaciones honestas de `getComputedStyle`**: (1) solo lleva lo
+    que la cascada resolvio de verdad - una propiedad que nadie definio da
+    `""`, NO su valor inicial del spec, porque este motor no tiene tabla
+    de valores iniciales y fingirla seria inventar; (2) devuelve valores
+    ESPECIFICADOS (`"2em"`, `"50%"`), no los usados en px/`rgb()` de un
+    navegador real; (3) es de solo lectura (como el real, que lanza
+    `NoModificationAllowedError`) - para escribir esta `el.style`, que si
+    es vivo; (4) el segundo argumento (`pseudoElt`) se acepta y se ignora:
+    no hay pseudo-elementos. Expone `getPropertyValue`, `length`, `item(i)`
+    y cada propiedad por sus dos nombres (`background-color` y
+    `backgroundColor`), y se cuelga tambien de `window` para que la forma
+    canonica del spec funcione.
+  - **`getBoundingClientRect` devuelve coordenadas de VIEWPORT** (documento
+    menos scroll), que es lo que define el spec - a diferencia de
+    `elements[].rect` del protocolo NDJSON, que son de documento. Lee
+    `LayoutBox::dimensions`, que es la caja de BORDE (su
+    `box_dimensions.border_box()` la reconstruye identica), justo lo que
+    describe un `DOMRect`. Incluye los 8 campos
+    (`x`/`y`/`width`/`height`/`top`/`right`/`bottom`/`left`) y
+    `getClientRects()`, que aqui siempre da 0 o 1 rectangulos porque no
+    hay fragmentacion de inlines.
+  - **Refactor de paso**: el bloque de relayout estaba copiado literal en
+    seis sitios (`resize`, `switch_tab`, `click`, `type_text`,
+    `press_key`, `relayout_active_tab`); ahora es `LoadedPage::relayout`,
+    que ademas publica el snapshot - asi no depende de acordarse en cada
+    sitio nuevo. `EventRegistry` paso a llamarse `DocumentBindings`: al
+    entrar el snapshot de layout junto a los listeners, el nombre viejo
+    pasaba a ser falso. Y el `downcast` a `ElementCapture`, inlineado en 6
+    sitios, es ahora un solo `node_from_js_value`.
+  - Tests reales: 12 nuevos en `engine-js::cssom` + 3 de regresion de
+    herencia en `layout` (396 en total, de 387). Verificado ademas en vivo
+    contra `engine_server.exe` contrastando DOS caminos independientes:
+    `getBoundingClientRect()` (JS -> snapshot) devolvio exactamente el
+    mismo rectangulo que `elements[].rect` del protocolo (Rust -> arbol de
+    layout), y tras un scroll de 260px el `top` de un elemento a 880 del
+    documento paso a 620 - si el snapshot no se enterara del scroll, los
+    dos caminos discreparian.
+  - NO implementado: reflow sincrono (ver arriba), valores usados,
+    pseudo-elementos, `offsetTop`/`offsetWidth`/`scrollTop`,
+    `element.matches`/`closest`, y el `CSSOM` de hojas de estilo
+    (`document.styleSheets`, `insertRule`).
+- **`history.pushState`/`replaceState` + `popstate` reales** (Fase 7,
+  `engine-js::history` nuevo + `core::server`): lo que convierte a este
+  motor en capaz de correr una SPA sin destruirla. Hasta la Fase 4.4,
+  `back` SIEMPRE volvia a pedir la pagina por red; en una SPA eso equivale
+  a perder la sesion entera cada vez que el usuario pulsa "atras".
+  - **Identidad de documento, la pieza central**: una entrada de historial
+    dejo de ser un `String` con la URL y paso a ser un `HistoryEntry { url,
+    document_id }`. Cada CARGA real de documento estrena `document_id`
+    (contador monotono del servidor); las entradas creadas por `pushState`
+    heredan el del documento VIVO. Con eso, `back`/`forward`
+    (`traverse_history`, nuevo, nucleo compartido de ambos) distinguen los
+    dos casos que el spec trata de forma radicalmente distinta:
+    - **misma identidad** -> travesia DENTRO del documento: no se pide
+      nada por red, solo cambia la URL y se dispara `popstate` sobre el
+      runtime que ya esta corriendo (y se rehace el layout despues, porque
+      un listener de `popstate` casi siempre repinta).
+    - **identidad distinta** -> como hasta ahora: `navigate` de verdad.
+    Al volver ENTRE documentos, la entrada destino se sella con la
+    identidad del documento recien cargado - sin eso seguiria apuntando a
+    un documento ya inexistente y un `pushState` posterior sobre ella
+    forzaria recargas absurdas.
+  - **`popstate` se dispara sobre el ELEMENTO RAIZ**, no sobre `window`:
+    el registro de eventos de este motor esta indexado por nodo del DOM y
+    `window` no es un nodo. Se aprovecha que el elemento raiz es el ultimo
+    escalon de propagacion ANTES de `window` en el spec real (un evento
+    que burbujea llega a los dos), y `window.addEventListener` se engancha
+    justo ahi mediante un shim JS de tres lineas que delega en
+    `document.documentElement.addEventListener` - de modo que un
+    `window.addEventListener('popstate', ...)` corriente y moliente
+    funciona sin que haga falta un segundo registro de eventos paralelo.
+  - **`event.state` es siempre `null`, declarado**: el argumento `state` de
+    `pushState` se acepta y se ignora. No es pereza - sin bfcache, volver a
+    un documento distinto siempre lo reconstruye con un `JsRuntime` nuevo,
+    asi que el objeto `state` original (que vive en el heap de Boa del
+    runtime viejo) no puede sobrevivir de ninguna manera; serializarlo
+    fingiria una fidelidad inexistente (perderia funciones, ciclos e
+    identidad de objeto).
+  - **`pushState` trunca lo que hubiera "adelante"**, igual que una
+    navegacion normal, y resuelve URLs relativas contra la de la pagina
+    actual (`pushState(null,'','/ruta')` es la forma habitual en una SPA).
+    Un `replaceState` en un script de CARGA SI se honra (patron comun para
+    normalizar la ruta inicial): a diferencia de `window.open`, no abre ni
+    navega a nada, solo reescribe una entrada que ya existe, asi que no hay
+    riesgo de bucle.
+  - Tests reales (10 nuevos): los 6 de `engine-js::history` (push/replace
+    encolan lo correcto, sin URL no encolan nada, drenar vacia, el orden se
+    conserva, y registrar sin DOM no falla porque el shim esta guardado
+    tras un `typeof`) y 4 de `core::server` sobre `apply_history_ops`
+    (push añade con la identidad VIVA y mueve el indice resolviendo la URL
+    relativa; replace sobrescribe sin añadir; push desde mitad del
+    historial trunca lo de adelante; sin pagina cargada la operacion se
+    ignora en vez de corromper el historial). Estos ultimos son posibles
+    porque `build_page_keeping_runtime` con `network: None` construye una
+    pagina real SIN tocar la red. Verificado ademas en vivo end-to-end
+    contra `engine_server.exe` con una SPA de verdad: dos `pushState`
+    cambiaron la URL sin recargar, `back` disparo `popstate` **sobre el
+    mismo runtime vivo** (un contador que solo existe en memoria JS seguia
+    valiendo 2 - si el motor hubiera recargado estaria a 0, que es
+    exactamente lo que pasaba antes de esta fase), el DOM mutado siguio
+    intacto, `forward` tampoco recargo, y un `pushState` desde mitad del
+    historial descarto las entradas de adelante (el `forward` siguiente dio
+    error, como debe).
+  - NO implementado: `bfcache` (sigue sin existir - volver a otro documento
+    lo vuelve a pedir por red), `event.state` (ver arriba), `history.back()`/
+    `forward()`/`go()` llamados DESDE JS (solo existen como comandos NDJSON),
+    e `history.length`.
+- **Anclas internas, `javascript:`, grupos de radio y `window.open`**
+  (Fase 6, `core::server` + `engine-js::window`, nuevo): los cuatro huecos
+  que las Fases 4.1/4.2/4.5 habian dejado DECLARADOS como no
+  implementados. Ya no queda ninguno abierto de aquellas.
+  - **`href="#seccion"` desplaza de verdad** (6.1): `find_link_href` (que
+    devolvia un `Option<String>`, "navegar o nada") se convirtio en
+    `find_link_target -> Option<LinkAction>`, un enum con las tres cosas
+    distintas que un `<a>` puede hacer: `Navigate`, `ScrollToFragment` y
+    `RunScript`. El destino sale de `LayoutBox::find_box_for_node` (nuevo,
+    el camino inverso a `hit_test`: de nodo a coordenadas), se acota con el
+    mismo `clamp_scroll_offset` que la rueda del raton, y se resuelve
+    DESPUES del relayout del clic para que un listener que haya movido el
+    destino no deje el salto obsoleto. `href="#"` a secas va al principio
+    del documento, como en el spec real. Un ancla rota (`id` inexistente)
+    deja el scroll donde estaba, sin error - igual que un navegador real.
+  - **`href="javascript:..."` ejecuta el script** (6.2): sobre el runtime
+    real de la pagina (`page.runtime.eval`), antes del relayout, para que
+    una mutacion del DOM hecha ahi se vea ya en la captura que devuelve ese
+    mismo clic. Un error dentro del script no aborta el clic (sus eventos y
+    su relayout ya ocurrieron y son reales): se registra y se sigue, como
+    un navegador real que deja el error en la consola sin romper la pagina.
+  - **Grupos de radio reales** (6.3): antes, checkbox y radio compartian
+    `toggle_checked`, lo que era correcto para el primero y FALSO para el
+    segundo en dos cosas: un radio no se desmarca al reclicarlo (en el
+    spec no hay forma de desmarcarlo con un clic; antes un segundo clic
+    dejaba el grupo entero sin seleccion, un estado inalcanzable en un
+    formulario real) y marcar uno DESMARCA a los demas con el mismo `name`.
+    Ambas cosas ya son reales (`apply_checkable_click`). Simplificacion
+    declarada: el grupo se busca en el documento entero, no dentro del
+    `<form>` que lo contenga - el spec agrupa por "form owner", concepto
+    que este motor todavia no tiene, asi que dos formularios de la misma
+    pagina que reutilicen un `name` se pisarian.
+  - **`window.open(url)` abre una pestaña real** (6.4, `engine-js::window`,
+    nuevo): el runtime JS vive DENTRO de una pagina y las pestañas son del
+    SERVIDOR, una capa por encima, inalcanzable desde el `Context` de Boa -
+    el puente es una cola compartida (`PendingWindowOpens`) donde
+    `window.open` solo APUNTA la URL, que `core::server` drena tras
+    procesar el clic y convierte en `open_new_tab` de verdad.
+    - **`window` se registra SIEMPRE** (a diferencia de `fetch`, que es
+      condicional) - no porque siempre haya pestañas que abrir, sino
+      porque es el objeto que toda pagina real da por sentado: dejarlo sin
+      definir haria que un `window.loQueSea` de deteccion de capacidades,
+      comunisimo en la web, lanzara `ReferenceError` y rompiera la pagina.
+    - **Los `window.open` de la CARGA de la pagina se descartan**, solo se
+      honran los que vienen de un clic real. No es una limitacion
+      disfrazada: es exactamente lo que hace el bloqueador de ventanas
+      emergentes de cualquier navegador (exige "activacion del usuario"), y
+      ademas evita que una pagina que llama `window.open` al cargar se
+      abriera a si misma en bucle, ya que cada pestaña nueva vuelve a pasar
+      por el mismo camino.
+    - Devuelve `null`, no un objeto `Window` fingido - que es ademas lo que
+      devuelve un navegador real cuando el bloqueador impide la apertura,
+      asi que el codigo de paginas reales que comprueba el resultado ya
+      sabe tratarlo. Este `window` NO es el objeto global (`var x = 1;
+      window.x` da `undefined`): serlo de verdad exige un proxy con
+      semantica de `WindowProxy` en Boa, y nada de lo que el motor hace hoy
+      lo necesita.
+  - **Bug real encontrado y arreglado en `LayoutBox::hit_test`** (no en
+    codigo nuevo de esta fase, sino destapado por ella): empezaba con un
+    `if !self.dimensions.contains(x, y) { return None }` que parece una
+    poda razonable pero es falsa en cuanto un hijo se desborda de su
+    padre - y SIEMPRE hay uno que lo hace, porque la caja RAIZ mide lo que
+    el VIEWPORT, no lo que el contenido (`content_extent` existe justo por
+    eso). Consecuencia: **cualquier clic sobre contenido que el usuario
+    hubiera tenido que desplazar para ver no hacia absolutamente nada**.
+    Invisible hasta ahora porque ninguna prueba anterior combinaba scroll
+    con un clic mas abajo del primer pantallazo. Arreglado probando los
+    hijos SIEMPRE y usando la caja propia solo como respaldo; el coste es
+    que un clic que no acierta nada recorre el arbol entero en vez de
+    salir antes, irrelevante a un clic por accion del usuario.
+  - Tests reales (16 nuevos): las tres acciones de `find_link_target` por
+    separado (incluido `javascript:` con mayusculas mezcladas y `#` a
+    secas); checkbox conmutando en ambos sentidos vs radio que nunca se
+    desmarca; un radio desmarcando solo a SU grupo (sin tocar ni a otro
+    grupo ni a un checkbox que comparta `name`); radio sin `name` que no
+    forma grupo; `find_box_for_node` distinguiendo por identidad de `Arc` y
+    no por contenido; `hit_test` acertando un hijo desbordado muy por
+    debajo de la raiz (regresion del bug de arriba) y siguiendo devolviendo
+    `None` donde no hay nada; y los 5 de `window.open` (encola, vaciar la
+    cola no repite, varias llamadas se encolan en orden, sin URL utilizable
+    no encola nada, devuelve `null`). Verificado ademas en vivo end-to-end
+    contra `engine_server.exe` real: clicar un ancla dejo la seccion
+    destino DENTRO del viewport (acotada al final del documento, como debe
+    ser), `href="#"` volvio arriba, un `javascript:` mutó el texto de un
+    `<div>` de verdad, clicar un radio movio la seleccion dentro de su
+    grupo sin tocar el otro grupo, reclicarlo lo dejo marcado, el checkbox
+    si conmuto en ambos sentidos, y un `javascript:window.open(...)` abrio
+    una SEGUNDA pestaña real con su pagina cargada y enfocada.
+  - NO implementado: `window.open` con nombre de ventana o features
+    (`window.open(url, "nombre", "width=...")` - los argumentos 2 y 3 se
+    ignoran), reutilizar una pestaña por nombre, y `window` como objeto
+    global de verdad (ver arriba).
 - **Cache de proceso para la carga de fuentes de sistema** (Fase 5.1,
   `engine-text::font::FontSet`) - primer hallazgo real de rendimiento de
   esta fase, medido en vivo, no una optimizacion especulativa.
@@ -1649,8 +1997,10 @@ A fecha de esta limpieza, el motor:
   investigar API nueva sin necesidad. 15 tests nuevos entre las tres capas
   (layout, parseo de color en gfx, geometria de pintado).
 - **`resolve_style` trasladado de `layout` a `css`** (paso 1, preparatorio,
-  hacia `getComputedStyle` - todavia NO implementado, ver mas abajo por
-  que). La funcion de cascada real (matching + especificidad + atributo
+  hacia `getComputedStyle` — **ya implementado, Fase 8, ver mas arriba**;
+  lo que sigue describe el estado del motor cuando se escribio esta
+  entrada, y el ultimo parrafo explica por que la solucion final no fue
+  la que aqui se anticipaba). La funcion de cascada real (matching + especificidad + atributo
   `style` inline, antes privada dentro de `layout::tree`) ahora vive en
   `engine_css::cascade::resolve_style`, publica, SIN cambiar su logica ni
   una linea - `layout::tree::build_node` la llama desde alli en vez de
@@ -1677,6 +2027,17 @@ A fecha de esta limpieza, el motor:
   `getComputedStyle` puede pedirse sobre cualquier elemento suelto, no
   sobre el arbol entero como hace el recorrido top-down de `build_node`.
   Ninguno de esos dos pasos existe todavia - esta tarea es solo la base.
+  **Epilogo (Fase 8): ninguno de esos dos pasos hizo falta.** El diagnostico
+  del bloqueo era correcto (cuando un script corre, el `StyleSheet` aun no
+  existe) pero la salida propuesta era mas cara de lo necesario: en vez de
+  re-resolver la cascada a peticion, `getComputedStyle` lee el
+  `computed_style` que el arbol de layout YA tiene resuelto, publicado en
+  un snapshot despues de cada layout. Eso convierte el orden del pipeline
+  de obstaculo en detalle declarado (durante la carga el snapshot esta
+  vacio, igual que un elemento sin caja en un navegador real) y ahorra
+  duplicar la resolucion de cascada en dos caminos que podrian
+  divergir. Este traslado de `resolve_style` sigue siendo util - es lo que
+  `layout::tree::build_node` llama - pero `engine-js` acabo sin usarlo.
 
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"
@@ -1848,12 +2209,17 @@ que el motor ya tiene — mutacion/navegacion del DOM, `classList`/`style`, y
 `preventDefault`/`stopPropagation`) y `queueMicrotask` — no son la suite
 oficial. Vendorizar la corpus real sigue sin empezar, y no serviria de mucho
 todavia: la inmensa mayoria de esos archivos fallarian en cascada por falta
-de `XMLHttpRequest` (`fetch` SI es real desde la Fase 4.3, pero sigue siendo
-la unica primitiva de red expuesta a JS), la mayor parte de CSSOM
-(`getComputedStyle`, `CSSStyleSheet`...) y layout inspeccionable desde JS
-(`getBoundingClientRect` y similares no existen todavia, asi que ningun test
-que necesite leer posiciones/tamaños reales desde JS podria pasar aunque el
-LAYOUT en si sea correcto)... antes hay que decidir que categorias de WPT
+del CSSOM de hojas de estilo (`document.styleSheets`, `CSSStyleSheet`,
+`insertRule`...). La red expuesta a JS ya no es el cuello de botella:
+`fetch` es real desde la Fase 4.3 y `XMLHttpRequest` desde la Fase 9,
+aunque este ultimo sea sincrono siempre (declarado en su entrada), lo que
+haria fallar cualquier test que dependa del ORDEN asincrono en si. El layout SI es
+inspeccionable desde JS desde la Fase 8 (`getComputedStyle`,
+`getBoundingClientRect`/`getClientRects`), con las limitaciones declaradas
+en su entrada (sin reflow sincrono, valores especificados en vez de usados,
+y solo las propiedades que la cascada resolvio de verdad) - asi que un test
+que lea posiciones/tamaños desde JS ya puede pasar, pero uno que espere el
+valor inicial de una propiedad que nadie declaro, no... antes hay que decidir que categorias de WPT
 tienen siquiera sentido de intentar dado lo que el motor soporta hoy (mas
 que antes gracias a las mutaciones DOM reales y los eventos con
 bubbling/captura - pero sigue siendo casi ninguna categoria completa).

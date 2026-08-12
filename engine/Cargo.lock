@@ -894,7 +894,9 @@ dependencies = [
  "engine-css",
  "engine-dom",
  "engine-net",
+ "pollster",
  "thiserror",
+ "tokio",
  "tracing",
  "url",
 ]

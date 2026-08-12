@@ -14,8 +14,8 @@ use base64::Engine as _;
 use engine_dom::{Node, NodeType};
 use engine_gfx::render_layout_to_png;
 use engine_image::decode_image;
-use engine_js::JsRuntime;
-use engine_layout::{ImageMap, LayoutTreeBuilder};
+use engine_js::{BoxMetrics, JsRuntime};
+use engine_layout::{ImageMap, LayoutBox, LayoutTreeBuilder};
 use engine_net::{NetworkEngine, NetworkRequest};
 use engine_text::FontSet;
 use std::collections::HashMap;
@@ -32,6 +32,87 @@ struct LoadedPage {
     focused_node: Option<std::sync::Arc<std::sync::RwLock<Node>>>,
 }
 
+impl LoadedPage {
+    /// Rehace el arbol de layout con el tamaño de ventana dado y publica el
+    /// resultado donde JS puede verlo. Es el bloque que antes estaba
+    /// copiado literalmente en seis sitios (`resize`, `switch_tab`,
+    /// `click`, `type_text`, `press_key`, `relayout_active_tab`); tenerlo
+    /// en uno solo es lo que garantiza que el snapshot de la Fase 8 se
+    /// publique SIEMPRE que el layout cambie, sin depender de acordarse en
+    /// cada sitio nuevo.
+    ///
+    /// NO toca el scroll: rehacer el layout no mueve al usuario. Quien
+    /// necesite reajustarlo (porque el contenido encogio) llama despues a
+    /// `publish_scroll_offset` con el valor ya acotado.
+    fn relayout(&mut self, width: f32, height: f32) {
+        self.page.layout_root = LayoutTreeBuilder::build(
+            &self.page.dom_root,
+            &self.page.stylesheet,
+            width,
+            height,
+            self.font_set.as_ref(),
+            &self.images,
+        );
+        self.publish_layout_snapshot();
+    }
+
+    /// Copia la geometria y el estilo resuelto de cada caja al buzon que
+    /// leen `getComputedStyle`/`getBoundingClientRect` (Fase 8, ver
+    /// `engine_js::cssom`). No-op si este runtime no tiene DOM enlazado -
+    /// entonces tampoco tiene esas dos funciones registradas y no hay nadie
+    /// a quien publicarle nada.
+    ///
+    /// Conserva el `scroll_offset_y` que hubiera: un relayout no mueve el
+    /// scroll (ver `relayout`).
+    fn publish_layout_snapshot(&self) {
+        let Some(snapshot) = self.runtime.layout_snapshot() else { return };
+        let Ok(mut data) = snapshot.write() else { return };
+        data.boxes.clear();
+        collect_box_metrics(&self.page.layout_root, &mut data.boxes);
+    }
+
+    /// Actualiza SOLO el desplazamiento del snapshot. Separado de
+    /// `publish_layout_snapshot` porque hacer scroll no cambia la geometria
+    /// de ninguna caja - solo la relacion entre documento y viewport - y
+    /// `getBoundingClientRect` devuelve coordenadas de viewport: sin esto,
+    /// un rect leido despues de un scroll estaria desplazado justo lo que
+    /// el usuario bajo. Recorrer el arbol entero en cada evento de rueda
+    /// para actualizar un solo `f32` seria desperdiciarlo.
+    fn publish_scroll_offset(&self, scroll_offset_y: f32) {
+        let Some(snapshot) = self.runtime.layout_snapshot() else { return };
+        let Ok(mut data) = snapshot.write() else { return };
+        data.scroll_offset_y = scroll_offset_y;
+    }
+}
+
+/// Aplana el arbol de layout a la lista de `(nodo, metricas)` que espera el
+/// snapshot. Solo entran las cajas CON nodo del DOM detras: las de texto y
+/// la raiz sintetica no corresponden a ningun elemento al que JS pueda
+/// llegar (misma regla que `LayoutBox::hit_test`).
+///
+/// Aqui es donde se paga la copia que `engine_js::cssom` declara: un clon
+/// del `computed_style` por caja. Se hace en `core` y no en `layout` porque
+/// `BoxMetrics` es un tipo de `engine-js`, y es `core` - que depende de los
+/// dos - el unico sitio donde las dos capas pueden encontrarse sin crear
+/// una dependencia nueva entre ellas.
+fn collect_box_metrics(layout: &LayoutBox, out: &mut Vec<(std::sync::Arc<std::sync::RwLock<Node>>, BoxMetrics)>) {
+    if let Some(node) = &layout.dom_node {
+        out.push((
+            node.clone(),
+            BoxMetrics {
+                x: layout.dimensions.x,
+                y: layout.dimensions.y,
+                width: layout.dimensions.width,
+                height: layout.dimensions.height,
+                computed_style: layout.computed_style.clone(),
+            },
+        ));
+    }
+    for child in &layout.children {
+        collect_box_metrics(child, out);
+    }
+}
+
 /// Pestaña (Fase 4.5) - agrupa TODO lo que ya era, antes de esta fase,
 /// estado directo de `EngineServer` y que en realidad pertenece a una
 /// sesion de navegacion concreta, no a la ventana entera: la pagina
@@ -40,12 +121,38 @@ struct LoadedPage {
 /// `EngineServer` - son el tamaño de la VENTANA, compartido por todas las
 /// pestañas (igual que un navegador real: cambiar de pestaña no cambia el
 /// tamaño de la ventana).
+/// Una entrada del historial (Fase 7 - antes era un `String` suelto con la
+/// URL). `document_id` identifica QUE CARGA DE DOCUMENTO creo esta entrada,
+/// y es lo que permite distinguir los dos tipos de navegacion del historial
+/// que el spec trata de forma completamente distinta:
+///
+/// - **Entre documentos** (entradas con `document_id` distinto al del
+///   documento vivo): volver ahi exige pedir la pagina otra vez y
+///   reconstruirlo todo, como hasta la Fase 4.4.
+/// - **Dentro del mismo documento** (entradas creadas por
+///   `history.pushState`, que heredan el `document_id` del documento
+///   vivo): volver ahi NO recarga nada - solo cambia la URL y dispara
+///   `popstate` sobre el runtime que ya esta corriendo. Es exactamente lo
+///   que hace que una SPA funcione: sin esto, "atras" en una SPA recargaria
+///   la pagina entera y perderia todo su estado.
+#[derive(Debug, Clone)]
+struct HistoryEntry {
+    url: String,
+    document_id: u64,
+}
+
 struct Tab {
     id: u32,
     current_page: Option<LoadedPage>,
-    history: Vec<String>,
+    history: Vec<HistoryEntry>,
     history_index: Option<usize>,
     scroll_offset_y: f32,
+    /// El `document_id` del documento ACTUALMENTE cargado en esta pestaña -
+    /// con que se comparan las entradas del historial para decidir si una
+    /// vuelta atras es dentro del mismo documento o entre documentos.
+    /// `0` antes de la primera carga (ningun documento real tiene ese id:
+    /// `EngineServer::next_document_id` empieza en 1).
+    document_id: u64,
 }
 
 impl Tab {
@@ -56,6 +163,7 @@ impl Tab {
             history: Vec::new(),
             history_index: None,
             scroll_offset_y: 0.0,
+            document_id: 0,
         }
     }
 }
@@ -85,6 +193,11 @@ struct EngineServer {
     /// navegador real, donde el id interno de una pestaña cerrada no
     /// vuelve a aparecer).
     next_tab_id: u32,
+    /// Contador de cargas de documento (Fase 7) - monotono y compartido por
+    /// todas las pestañas, para que dos documentos nunca compartan id.
+    /// Empieza en 1 para que el `0` de `Tab::document_id` signifique
+    /// inequivocamente "todavia no se ha cargado nada aqui".
+    next_document_id: u64,
 }
 
 impl EngineServer {
@@ -96,6 +209,7 @@ impl EngineServer {
             tabs: vec![Tab::new(0)],
             active_tab: 0,
             next_tab_id: 1,
+            next_document_id: 1,
         }
     }
 
@@ -142,14 +256,7 @@ impl EngineServer {
                 let (w, h) = (self.width, self.height);
                 let tab = self.active_tab_mut();
                 if let Some(page) = &mut tab.current_page {
-                    page.page.layout_root = LayoutTreeBuilder::build(
-                        &page.page.dom_root,
-                        &page.page.stylesheet,
-                        w as f32,
-                        h as f32,
-                        page.font_set.as_ref(),
-                        &page.images,
-                    );
+                    page.relayout(w as f32, h as f32);
                     let content_extent = page.page.layout_root.content_extent();
                     tab.scroll_offset_y = clamp_scroll_offset(tab.scroll_offset_y, content_extent, h as f32);
                 }
@@ -162,7 +269,12 @@ impl EngineServer {
                 let tab = self.active_tab_mut();
                 if let Some(page) = &tab.current_page {
                     let content_extent = page.page.layout_root.content_extent();
-                    tab.scroll_offset_y = clamp_scroll_offset(tab.scroll_offset_y + dy as f32, content_extent, h as f32);
+                    let scrolled = clamp_scroll_offset(tab.scroll_offset_y + dy as f32, content_extent, h as f32);
+                    // Fase 8: `getBoundingClientRect` devuelve coordenadas
+                    // de VIEWPORT, asi que el snapshot necesita saber
+                    // cuanto se ha desplazado el documento.
+                    page.publish_scroll_offset(scrolled);
+                    tab.scroll_offset_y = scrolled;
                 }
                 (self.state_response(id), false)
             }
@@ -248,7 +360,7 @@ impl EngineServer {
         let images = self.fetch_images(image_srcs, &page_url).await;
 
         let font_set = FontSet::load_default_sans_serif();
-        let (page, runtime) = build_page_keeping_runtime(
+        let (page, mut runtime) = build_page_keeping_runtime(
             &html,
             &external_css,
             self.width as f32,
@@ -258,17 +370,50 @@ impl EngineServer {
             &images,
             Some(self.network.clone()),
         );
+        // Fase 6.4: un `window.open()` llamado durante la CARGA de la pagina
+        // (no desde un clic real del usuario) se descarta - mismo criterio
+        // que el bloqueador de ventanas emergentes de cualquier navegador
+        // real, que solo permite abrir ventanas con "activacion del
+        // usuario" de por medio. No es una limitacion tecnica disfrazada:
+        // honrarlas ademas abriria la puerta a que una pagina que llama
+        // `window.open` al cargar se abriera a si misma en bucle, ya que
+        // cada pestaña nueva vuelve a pasar por aqui.
+        let discarded = runtime.take_pending_window_opens();
+        if !discarded.is_empty() {
+            tracing::info!(
+                "[server] {} window.open() durante la carga de la pagina ignorados (hace falta un clic real, igual que un bloqueador de popups)",
+                discarded.len()
+            );
+        }
         let title = Node::find_all_by_tag(&page.dom_root, "title")
             .first()
             .map(Node::text_content)
             .unwrap_or_default();
 
+        // Fase 7: cada carga real de documento estrena identidad. Es lo que
+        // luego permite a `back`/`forward` distinguir una entrada de ESTE
+        // documento (creada por `pushState`, no hay que recargar nada) de
+        // una de otro (hay que volver a pedirla).
+        let document_id = self.next_document_id;
+        self.next_document_id += 1;
+
+        let tab = self.active_tab_mut();
+        tab.document_id = document_id;
         if record_history {
-            let tab = self.active_tab_mut();
             let next_index = tab.history_index.map(|i| i + 1).unwrap_or(0);
             tab.history.truncate(next_index);
-            tab.history.push(final_url.clone());
+            tab.history.push(HistoryEntry { url: final_url.clone(), document_id });
             tab.history_index = Some(next_index);
+        } else if let Some(index) = tab.history_index {
+            // Llegamos aqui desde `back`/`forward` ENTRE documentos: la
+            // entrada a la que se ha vuelto acaba de ser servida por una
+            // carga nueva, asi que su identidad de documento es la nueva.
+            // Sin esto, la entrada seguiria apuntando al documento viejo
+            // (ya inexistente) y un `pushState` posterior sobre ella se
+            // consideraria de otro documento, forzando recargas absurdas.
+            if let Some(entry) = tab.history.get_mut(index) {
+                entry.document_id = document_id;
+            }
         }
 
         let tab = self.active_tab_mut();
@@ -282,6 +427,28 @@ impl EngineServer {
             focused_node: None,
         });
         tab.scroll_offset_y = 0.0;
+        // Fase 8: el PRIMER snapshot del documento recien cargado.
+        // `build_page_keeping_runtime` ya construyo su arbol de layout, y
+        // hasta que esto corra los scripts de la pagina solo han podido ver
+        // el snapshot vacio (ver `engine_js::cssom`); a partir de aqui -
+        // que es cuando empiezan a llegar clics - los valores son reales.
+        if let Some(page) = &tab.current_page {
+            page.publish_layout_snapshot();
+            page.publish_scroll_offset(0.0);
+        }
+        // Fase 7: un `history.replaceState` en un script de CARGA (patron
+        // habitual en SPAs para normalizar la ruta inicial) se aplica aqui,
+        // sobre la entrada que este mismo `navigate` acaba de crear. A
+        // diferencia de `window.open`, esto SI se honra en la carga: no
+        // abre nada ni navega a ningun sitio, solo reescribe la URL de una
+        // entrada que ya existe, asi que no hay riesgo de bucle.
+        let load_time_ops = self
+            .active_tab_mut()
+            .current_page
+            .as_mut()
+            .map(|page| page.runtime.take_pending_history_ops())
+            .unwrap_or_default();
+        self.apply_history_ops(load_time_ops);
         self.state_response(id)
     }
 
@@ -300,9 +467,7 @@ impl EngineServer {
         let Some(previous_index) = index.checked_sub(1) else {
             return Self::error(id, "ya se esta en la primera pagina del historial".to_string());
         };
-        let url = tab.history[previous_index].clone();
-        self.active_tab_mut().history_index = Some(previous_index);
-        self.navigate(id, url, false).await
+        self.traverse_history(id, previous_index).await
     }
 
     /// Simetrico a `back` - avanza a la entrada SIGUIENTE del historial.
@@ -315,9 +480,130 @@ impl EngineServer {
         if next_index >= tab.history.len() {
             return Self::error(id, "ya se esta en la ultima pagina del historial".to_string());
         }
-        let url = tab.history[next_index].clone();
-        self.active_tab_mut().history_index = Some(next_index);
-        self.navigate(id, url, false).await
+        self.traverse_history(id, next_index).await
+    }
+
+    /// El nucleo compartido de `back`/`forward` (Fase 7) - decide cual de
+    /// los dos tipos de travesia toca, que el spec trata de forma
+    /// radicalmente distinta (ver el doc-comment de `HistoryEntry`):
+    ///
+    /// - **Dentro del MISMO documento** (la entrada destino nacio de un
+    ///   `history.pushState` sobre el documento que sigue vivo): NO se
+    ///   recarga nada. Solo cambia la URL y se dispara `popstate` sobre el
+    ///   runtime que ya esta corriendo, que es lo que permite a una SPA
+    ///   repintar su vista conservando todo su estado en memoria. Antes de
+    ///   la Fase 7 esto no existia: `back` SIEMPRE volvia a pedir la pagina
+    ///   por red, lo que en una SPA equivale a perder la sesion entera.
+    /// - **Entre documentos**: como hasta ahora, se vuelve a pedir la
+    ///   pagina de verdad (`navigate` con `record_history: false`).
+    async fn traverse_history(&mut self, id: Option<String>, target_index: usize) -> EngineResponse {
+        let tab = self.active_tab();
+        let entry = tab.history[target_index].clone();
+        let same_document = entry.document_id == tab.document_id && tab.current_page.is_some();
+
+        if !same_document {
+            self.active_tab_mut().history_index = Some(target_index);
+            return self.navigate(id, entry.url, false).await;
+        }
+
+        let tab = self.active_tab_mut();
+        tab.history_index = Some(target_index);
+        if let Some(page) = &mut tab.current_page {
+            page.url = entry.url;
+        }
+        if let Err(error) = self.fire_popstate() {
+            return Self::error(id, format!("popstate_error: {error}"));
+        }
+        // Un listener de `popstate` casi siempre repinta: hay que rehacer
+        // el layout antes de devolver la captura, o el estado devuelto
+        // seria el de ANTES de que la SPA reaccionara.
+        self.relayout_active_tab();
+        self.state_response(id)
+    }
+
+    /// Dispara `popstate` sobre el elemento raiz (Fase 7). El objetivo real
+    /// del spec es `window`, que no es un nodo y por tanto no existe en el
+    /// registro de eventos de este motor (indexado por nodo del DOM) - se
+    /// usa el elemento raiz porque es el ultimo escalon de propagacion
+    /// ANTES de `window`, y porque `window.addEventListener` esta enganchado
+    /// justo ahi (ver el shim en `engine_js::history`), de modo que un
+    /// `window.addEventListener('popstate', ...)` corriente lo recibe.
+    ///
+    /// `event.state` es siempre `null`: el argumento `state` de `pushState`
+    /// no se guarda, y no puede guardarse de forma honesta mientras no haya
+    /// bfcache - ver el doc-comment de `engine_js::history`.
+    fn fire_popstate(&mut self) -> Result<(), engine_js::JsError> {
+        let Some(page) = &mut self.tabs[self.active_tab].current_page else { return Ok(()) };
+        let Some(root_element) = Node::find_all_by_tag(&page.page.dom_root, "html").into_iter().next() else {
+            return Ok(());
+        };
+        page.runtime.dispatch_event(&root_element, "popstate").map(|_| ())
+    }
+
+    /// Rehace el arbol de layout de la pestaña activa con el tamaño de
+    /// ventana actual - el mismo bloque que ya repetian `click`/`type_text`/
+    /// `press_key`/`switch_tab`, extraido al hacer falta tambien tras un
+    /// `popstate` (Fase 7).
+    fn relayout_active_tab(&mut self) {
+        let (width, height) = (self.width, self.height);
+        let tab = &mut self.tabs[self.active_tab];
+        if let Some(page) = &mut tab.current_page {
+            page.relayout(width as f32, height as f32);
+            let content_extent = page.page.layout_root.content_extent();
+            tab.scroll_offset_y = clamp_scroll_offset(tab.scroll_offset_y, content_extent, height as f32);
+        }
+    }
+
+    /// Aplica las `history.pushState`/`replaceState` que JS haya pedido
+    /// (Fase 7). Las URLs se resuelven contra la de la pagina actual (un
+    /// `pushState(null, '', '/ruta')` relativo es lo normal en una SPA), y
+    /// la entrada resultante hereda el `document_id` VIVO - que es
+    /// precisamente lo que la marca como "misma pagina" para que un `back`
+    /// posterior no recargue (ver `traverse_history`).
+    ///
+    /// `pushState` ademas TRUNCA las entradas "adelante", igual que una
+    /// navegacion normal: el spec lo exige y sin ello un `forward` posterior
+    /// llevaria a una entrada que ya no pertenece a esta linea de historia.
+    fn apply_history_ops(&mut self, ops: Vec<engine_js::history::HistoryOp>) {
+        if ops.is_empty() {
+            return;
+        }
+        let document_id = self.active_tab().document_id;
+        for op in ops {
+            let (raw_url, is_push) = match op {
+                engine_js::history::HistoryOp::Push(url) => (url, true),
+                engine_js::history::HistoryOp::Replace(url) => (url, false),
+            };
+            let tab = &mut self.tabs[self.active_tab];
+            let Some(page) = &mut tab.current_page else { continue };
+            let Ok(base) = url::Url::parse(&page.url) else { continue };
+            let Ok(resolved) = base.join(&raw_url) else {
+                tracing::warn!("[server] URL de history.pushState/replaceState invalida, se ignora: {raw_url}");
+                continue;
+            };
+            let resolved = resolved.to_string();
+            page.url = resolved.clone();
+            let entry = HistoryEntry { url: resolved, document_id };
+            match (is_push, tab.history_index) {
+                (true, Some(index)) => {
+                    tab.history.truncate(index + 1);
+                    tab.history.push(entry);
+                    tab.history_index = Some(index + 1);
+                }
+                (true, None) => {
+                    tab.history.push(entry);
+                    tab.history_index = Some(0);
+                }
+                (false, Some(index)) => tab.history[index] = entry,
+                // `replaceState` sin ninguna entrada que sustituir: se
+                // comporta como la primera entrada, que es lo que habria
+                // si la pagina se hubiera cargado normalmente.
+                (false, None) => {
+                    tab.history.push(entry);
+                    tab.history_index = Some(0);
+                }
+            }
+        }
     }
 
     /// Abre una pestaña nueva (Fase 4.5) y la hace ACTIVA de inmediato -
@@ -373,14 +659,7 @@ impl EngineServer {
         let (w, h) = (self.width, self.height);
         let tab = self.active_tab_mut();
         if let Some(page) = &mut tab.current_page {
-            page.page.layout_root = LayoutTreeBuilder::build(
-                &page.page.dom_root,
-                &page.page.stylesheet,
-                w as f32,
-                h as f32,
-                page.font_set.as_ref(),
-                &page.images,
-            );
+            page.relayout(w as f32, h as f32);
             let content_extent = page.page.layout_root.content_extent();
             tab.scroll_offset_y = clamp_scroll_offset(tab.scroll_offset_y, content_extent, h as f32);
         }
@@ -547,6 +826,19 @@ impl EngineServer {
     async fn click(&mut self, id: Option<String>, x: f32, y: f32) -> EngineResponse {
         let mut link_target: Option<String> = None;
         let mut opens_new_tab = false;
+        // Fase 6.1: `#seccion` se resuelve a un desplazamiento real DESPUES
+        // del relayout de mas abajo (las posiciones tienen que estar al dia
+        // - un listener de "click", o el propio `javascript:` de la Fase
+        // 6.2, pueden haber movido el elemento destino).
+        let mut fragment_target: Option<String> = None;
+        let mut scroll_target: Option<f32> = None;
+        // Fase 6.4: URLs que un `window.open(...)` de este mismo clic pidio
+        // abrir. Se recogen dentro del prestamo de la pagina pero se
+        // atienden FUERA (abrir una pestaña reasigna la pestaña activa
+        // entera), igual que la navegacion por enlace de la Fase 4.2.
+        let mut window_opens: Vec<String> = Vec::new();
+        // Fase 7: idem para `history.pushState`/`replaceState`.
+        let mut history_ops: Vec<engine_js::history::HistoryOp> = Vec::new();
         let scroll_offset_y = self.active_tab().scroll_offset_y;
         let (width, height) = (self.width, self.height);
         {
@@ -572,7 +864,7 @@ impl EngineServer {
                 // evento, asi que `event.target.checked` dentro de un handler
                 // real ya refleja el nuevo valor - ver `toggle_checked`.
                 if is_checkable_input(&node) {
-                    toggle_checked(&node);
+                    apply_checkable_click(&page.page.dom_root, &node);
                 }
                 // El `bool` devuelto (Fase 4.2) es si algun listener llamo
                 // `event.preventDefault()` - determina mas abajo si la
@@ -598,36 +890,81 @@ impl EngineServer {
                 // listener ya cancelo la accion por defecto), sigue igual
                 // que antes: solo relayout + captura del estado actual.
                 if !click_prevented {
-                    if let Some(target) = find_link_target(&node) {
-                        if let Ok(page_url) = url::Url::parse(&page.url) {
-                            if let Ok(resolved) = page_url.join(&target.href) {
-                                link_target = Some(resolved.to_string());
-                                opens_new_tab = target.opens_new_tab;
+                    match find_link_target(&node) {
+                        Some(LinkAction::Navigate { href, opens_new_tab: blank }) => {
+                            if let Ok(page_url) = url::Url::parse(&page.url) {
+                                if let Ok(resolved) = page_url.join(&href) {
+                                    link_target = Some(resolved.to_string());
+                                    opens_new_tab = blank;
+                                }
                             }
                         }
+                        // Fase 6.2: se ejecuta AQUI, antes del relayout de
+                        // mas abajo, precisamente para que una mutacion del
+                        // DOM hecha por este script se vea reflejada en la
+                        // captura que devuelve este mismo clic.
+                        Some(LinkAction::RunScript(script)) => {
+                            if let Err(error) = page.runtime.eval(&script) {
+                                // Un error dentro de un `javascript:` NO
+                                // aborta el clic entero (el resto del clic
+                                // -sus eventos, su relayout- ya ocurrio y es
+                                // real): se reporta y se sigue, igual que un
+                                // navegador real deja el error en la consola
+                                // sin romper la pagina.
+                                tracing::warn!("[server] error ejecutando un href=javascript:: {error}");
+                            }
+                        }
+                        Some(LinkAction::ScrollToFragment(fragment)) => {
+                            fragment_target = Some(fragment);
+                        }
+                        None => {}
                     }
                 }
-                page.page.layout_root = LayoutTreeBuilder::build(
-                    &page.page.dom_root,
-                    &page.page.stylesheet,
-                    width as f32,
-                    height as f32,
-                    page.font_set.as_ref(),
-                            &page.images,
-                );
+                page.relayout(width as f32, height as f32);
+                if let Some(fragment) = fragment_target {
+                    scroll_target = fragment_scroll_offset(page, &fragment, height as f32);
+                }
+                // Fase 6.4: aqui SI se honran (a diferencia de la carga de
+                // pagina, ver `navigate`) - este es exactamente el caso con
+                // "activacion del usuario" real que un navegador permite.
+                // Incluye tanto los `window.open` de un listener de "click"
+                // como los de un `href="javascript:window.open(...)"`
+                // ejecutado justo arriba (Fase 6.2).
+                window_opens = page.runtime.take_pending_window_opens();
+                // Fase 7: un listener de "click" que llame a
+                // `history.pushState` (el caso normal en una SPA: pulsar un
+                // enlace de navegacion interna) deja aqui su operacion.
+                history_ops = page.runtime.take_pending_history_ops();
             }
         }
-        if let Some(target_url) = link_target {
+        self.apply_history_ops(history_ops);
+        // Fase 6.1: fuera del prestamo de `page` (que sale de `tab`), para
+        // poder escribir el scroll DEL TAB. `None` (fragmento que no
+        // corresponde a ningun `id` real) deja el scroll como estaba, igual
+        // que un navegador real ante un ancla rota: no es un error.
+        if let Some(offset) = scroll_target {
+            self.active_tab_mut().scroll_offset_y = offset;
+        }
+        // ORDEN (Fase 6.4): primero la navegacion por enlace, que le toca a
+        // la pestaña ACTUAL, y solo despues los `window.open`, que crean
+        // pestañas nuevas y se llevan el foco. Al reves, la navegacion
+        // acabaria aplicandose a la pestaña recien abierta en vez de a la
+        // que el usuario clico. El estado final (pestaña original navegada
+        // + popup enfocado) es el mismo que produce un navegador real
+        // cuando un clic hace las dos cosas a la vez.
+        let mut response = match link_target {
             // `target="_blank"` (Fase 4.5, antes NO implementado - ver el
             // doc-comment de `find_link_target`) abre una pestaña nueva en
             // vez de navegar la pestaña actual, igual que un navegador
             // real.
-            if opens_new_tab {
-                return self.open_new_tab(id, Some(target_url)).await;
-            }
-            return self.navigate(id, target_url, true).await;
+            Some(target_url) if opens_new_tab => self.open_new_tab(id.clone(), Some(target_url)).await,
+            Some(target_url) => self.navigate(id.clone(), target_url, true).await,
+            None => self.state_response(id.clone()),
+        };
+        for url in window_opens {
+            response = self.open_new_tab(id.clone(), Some(url)).await;
         }
-        self.state_response(id)
+        response
     }
 
     fn type_text(
@@ -671,14 +1008,7 @@ impl EngineServer {
                 }
             }
         }
-        page.page.layout_root = LayoutTreeBuilder::build(
-            &page.page.dom_root,
-            &page.page.stylesheet,
-            width as f32,
-            height as f32,
-            page.font_set.as_ref(),
-                        &page.images,
-        );
+        page.relayout(width as f32, height as f32);
         self.state_response(id)
     }
 
@@ -716,14 +1046,7 @@ impl EngineServer {
             if let Err(error) = page.runtime.dispatch_event(&node, "input") {
                 return Self::error(id, format!("input_error: {error}"));
             }
-            page.page.layout_root = LayoutTreeBuilder::build(
-                &page.page.dom_root,
-                &page.page.stylesheet,
-                width as f32,
-                height as f32,
-                page.font_set.as_ref(),
-                        &page.images,
-            );
+            page.relayout(width as f32, height as f32);
         }
         self.state_response(id)
     }
@@ -844,13 +1167,12 @@ fn is_checkable_input(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> bool {
 /// Conmuta el atributo booleano `checked` (Fase 4.1) - semantica de
 /// atributo booleano HTML real: PRESENCIA en el mapa de atributos =
 /// marcado, AUSENCIA = sin marcar (el valor en si, si lo hay, no importa -
-/// por eso se inserta la cadena vacia, no `"true"`/`"checked"`). Sin
-/// comportamiento de GRUPO para `radio` (desmarcar automaticamente los
-/// demas `input[type=radio]` con el mismo `name`) - simplificacion
-/// declarada: cada radio se conmuta de forma independiente, a diferencia
-/// del spec real donde marcar uno desmarca a sus hermanos del mismo grupo;
-/// eso exigiria recorrer el DOM entero buscando coincidencias por `name`,
-/// fuera del alcance de esta tarea.
+/// por eso se inserta la cadena vacia, no `"true"`/`"checked"`).
+///
+/// Esto es el comportamiento de un CHECKBOX. Un `radio` NO se conmuta
+/// (clicar uno ya marcado lo deja marcado) y ademas desmarca a su grupo -
+/// ver `apply_checkable_click`, que es quien decide cual de los dos
+/// comportamientos aplica.
 fn toggle_checked(node: &std::sync::Arc<std::sync::RwLock<Node>>) {
     let mut node_guard = node.write().unwrap();
     if let NodeType::Element { attributes, .. } = &mut node_guard.node_type {
@@ -860,13 +1182,132 @@ fn toggle_checked(node: &std::sync::Arc<std::sync::RwLock<Node>>) {
     }
 }
 
-/// Resultado de `find_link_target` - el `href` (posiblemente relativo, sin
-/// resolver todavia - eso es trabajo del llamador, que conoce la URL de la
-/// pagina actual) y si el enlace deberia abrirse en una pestaña NUEVA
-/// (Fase 4.5, `target="_blank"`) en vez de navegar la pestaña actual.
-struct LinkTarget {
-    href: String,
-    opens_new_tab: bool,
+/// Escribe `checked` a un valor CONCRETO (no lo conmuta) - la primitiva
+/// que necesita el comportamiento de grupo de los radio (Fase 6.3).
+fn set_checked(node: &std::sync::Arc<std::sync::RwLock<Node>>, checked: bool) {
+    let mut node_guard = node.write().unwrap();
+    if let NodeType::Element { attributes, .. } = &mut node_guard.node_type {
+        if checked {
+            attributes.insert("checked".to_string(), String::new());
+        } else {
+            attributes.remove("checked");
+        }
+    }
+}
+
+/// El `name` de un `<input>`, si lo tiene y no esta vacio - la clave que
+/// agrupa a los radio entre si (Fase 6.3).
+fn input_name(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> Option<String> {
+    let guard = node.read().unwrap();
+    match &guard.node_type {
+        NodeType::Element { attributes, .. } => attributes
+            .get("name")
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
+        _ => None,
+    }
+}
+
+fn is_radio(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> bool {
+    let guard = node.read().unwrap();
+    matches!(
+        &guard.node_type,
+        NodeType::Element { tag_name, attributes } if tag_name == "input"
+            && attributes.get("type").map(String::as_str) == Some("radio")
+    )
+}
+
+/// La accion por defecto real de clicar un checkbox o un radio (Fase 6.3) -
+/// antes de esta fase, AMBOS se limitaban a conmutar su propio `checked`
+/// (`toggle_checked`), lo que era correcto para un checkbox pero falso
+/// para un radio en dos cosas a la vez:
+///
+/// 1. **Un radio no se conmuta**: clicar uno YA marcado lo deja marcado
+///    (en el spec real no hay forma de desmarcar un radio clicandolo; solo
+///    marcando a otro de su grupo). Antes, un segundo clic lo desmarcaba,
+///    dejando el grupo entero sin ninguna opcion seleccionada - un estado
+///    que un formulario real no puede alcanzar por clics.
+/// 2. **Un radio desmarca a su grupo**: los demas `input[type=radio]` con
+///    el MISMO `name` pierden su `checked`.
+///
+/// El grupo se busca en el documento ENTERO, no dentro del `<form>` que
+/// contenga al radio - simplificacion declarada: el spec real agrupa por
+/// "form owner", asi que dos formularios distintos en la misma pagina que
+/// reutilicen el mismo `name` se pisarian entre si aqui y no deberian.
+/// Poco comun en paginas reales (reutilizar el mismo `name` en dos
+/// formularios de la misma pagina es raro y casi siempre un error), y
+/// arreglarlo exige un concepto de "form owner" que este motor todavia no
+/// tiene.
+///
+/// Un radio SIN `name` (o con el `name` vacio) no forma grupo con nadie:
+/// se marca el solo, sin tocar a ningun otro - igual que el spec real,
+/// donde el grupo se define precisamente por ese atributo.
+fn apply_checkable_click(
+    dom_root: &std::sync::Arc<std::sync::RwLock<Node>>,
+    node: &std::sync::Arc<std::sync::RwLock<Node>>,
+) {
+    if !is_radio(node) {
+        toggle_checked(node);
+        return;
+    }
+    if let Some(group) = input_name(node) {
+        for other in Node::find_all_by_tag(dom_root, "input") {
+            if std::sync::Arc::ptr_eq(&other, node) {
+                continue;
+            }
+            if is_radio(&other) && input_name(&other).as_deref() == Some(group.as_str()) {
+                set_checked(&other, false);
+            }
+        }
+    }
+    set_checked(node, true);
+}
+
+/// A que desplazamiento vertical hay que ir para un `href="#fragmento"`
+/// (Fase 6.1). `None` cuando el fragmento no corresponde a ningun elemento
+/// real (ancla rota) o cuando ese elemento no produjo ninguna caja de
+/// layout (`display: none`): el llamador deja el scroll como estaba, igual
+/// que un navegador real, que tampoco lo trata como un error.
+///
+/// `#` a secas (fragmento vacio) va al principio del documento, como en el
+/// spec real - no es un caso degenerado sino un patron comun ("volver
+/// arriba").
+///
+/// El destino se acota con el mismo `clamp_scroll_offset` que la rueda del
+/// raton: un ancla cerca del final del documento no puede desplazar mas
+/// alla del final real del contenido.
+fn fragment_scroll_offset(page: &LoadedPage, fragment: &str, viewport_height: f32) -> Option<f32> {
+    if fragment.is_empty() {
+        return Some(0.0);
+    }
+    let node = Node::find_by_id(&page.page.dom_root, fragment)?;
+    let target_box = page.page.layout_root.find_box_for_node(&node)?;
+    Some(clamp_scroll_offset(
+        target_box.dimensions.y,
+        page.page.layout_root.content_extent(),
+        viewport_height,
+    ))
+}
+
+/// Que deberia HACER un clic sobre un `<a>` (Fase 6.1/6.2) - hasta la Fase
+/// 6 esto era solo `Option<LinkTarget>`, "navegar o no hacer nada", porque
+/// las anclas internas y `javascript:` estaban declaradas como NO
+/// implementadas y se descartaban en `find_link_target` como si no fueran
+/// enlaces navegables. Ahora cada una tiene su accion real propia.
+enum LinkAction {
+    /// Navegar a `href` (posiblemente relativo, SIN resolver todavia - eso
+    /// es trabajo del llamador, que es quien conoce la URL de la pagina
+    /// actual). `opens_new_tab` es `target="_blank"` (Fase 4.5).
+    Navigate { href: String, opens_new_tab: bool },
+    /// Ancla interna `href="#seccion"` (Fase 6.1) - desplazar el scroll
+    /// hasta el elemento con ese `id`, sin ninguna peticion de red. El
+    /// `String` es el fragmento YA sin la `#`; vacio para `href="#"` a
+    /// secas, que en el spec real significa "al principio del documento".
+    ScrollToFragment(String),
+    /// `href="javascript:..."` (Fase 6.2) - ejecutar el resto como script
+    /// en el runtime de la pagina actual, sin navegar a ningun sitio. El
+    /// `String` es el codigo YA sin el prefijo `javascript:`.
+    RunScript(String),
 }
 
 /// Busca el `<a href="...">` NAVEGABLE mas cercano empezando en `node` e
@@ -876,23 +1317,23 @@ struct LinkTarget {
 /// `parent` hasta encontrar uno. Se DETIENE en el primer `<a>` que
 /// encuentra, tenga `href` navegable o no (un `<a>` sin `href`, o anidado
 /// dentro de otro `<a>` - HTML invalido de todas formas - no deberia
-/// seguir subiendo mas alla buscando un enlace exterior). "Navegable"
-/// excluye deliberadamente: `href` vacio o ausente (un `<a>` sin `href` no
-/// es ni siquiera un hyperlink real, el spec lo llama "enlace de marcador
-/// de posicion"), anclas internas (`href="#seccion"` - deberia hacer scroll
-/// a un elemento con ese `id`, no una navegacion de pagina nueva, sin
-/// implementar todavia) y `javascript:` (ejecutaria script en vez de
-/// navegar, sin implementar todavia - ver ARCHITECTURE.md para ambos
-/// huecos declarados).
+/// seguir subiendo mas alla buscando un enlace exterior). Lo unico que
+/// sigue sin producir NINGUNA accion es un `href` vacio o ausente: un `<a>`
+/// sin `href` no es ni siquiera un hyperlink real, el spec lo llama
+/// "enlace de marcador de posicion".
 ///
-/// `opens_new_tab` (Fase 4.5, antes NO implementado) es `true` cuando el
-/// MISMO `<a>` navegable lleva `target="_blank"` (comparacion insensible a
-/// mayusculas, como hacen los navegadores reales) - cualquier OTRO valor de
-/// `target` (`"_self"`, un nombre de frame inventado, ausente...) se trata
-/// como navegacion normal en la misma pestaña, simplificacion declarada:
-/// un navegador real tambien abriria pestaña nueva para un nombre de frame
-/// que no existe, este motor no.
-fn find_link_target(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> Option<LinkTarget> {
+/// Las tres acciones reales que puede devolver (ver `LinkAction`):
+/// - `href="#seccion"` -> `ScrollToFragment` (Fase 6.1, antes se descartaba
+///   como "no navegable").
+/// - `href="javascript:..."` -> `RunScript` (Fase 6.2, idem).
+/// - cualquier otra cosa -> `Navigate`, con `opens_new_tab` = `true` si el
+///   MISMO `<a>` lleva `target="_blank"` (Fase 4.5, comparacion insensible
+///   a mayusculas como hacen los navegadores reales). Cualquier OTRO valor
+///   de `target` (`"_self"`, `"_parent"`, un nombre de frame inventado...)
+///   navega en la misma pestaña - simplificacion declarada: un navegador
+///   real abriria pestaña nueva para un nombre de frame que no existe,
+///   este motor no.
+fn find_link_target(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> Option<LinkAction> {
     let mut current = Some(node.clone());
     while let Some(n) = current {
         let guard = n.read().unwrap();
@@ -900,8 +1341,18 @@ fn find_link_target(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> Option<Li
             if tag_name == "a" {
                 return attributes.get("href").and_then(|href| {
                     let trimmed = href.trim();
-                    let is_navigable = !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.to_ascii_lowercase().starts_with("javascript:");
-                    is_navigable.then(|| LinkTarget {
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    if let Some(fragment) = trimmed.strip_prefix('#') {
+                        return Some(LinkAction::ScrollToFragment(fragment.to_string()));
+                    }
+                    if trimmed.len() >= "javascript:".len()
+                        && trimmed[.."javascript:".len()].eq_ignore_ascii_case("javascript:")
+                    {
+                        return Some(LinkAction::RunScript(trimmed["javascript:".len()..].to_string()));
+                    }
+                    Some(LinkAction::Navigate {
                         href: href.clone(),
                         opens_new_tab: attributes
                             .get("target")
@@ -1175,12 +1626,35 @@ mod tests {
         assert!(!is_text_control(&find(dom, "btn")));
     }
 
+    /// Ayuda de test: el `href` de una accion `Navigate`, o `None` si la
+    /// accion es otra (ancla/script) o no hay enlace - la mayoria de tests
+    /// heredados de la Fase 4.2 solo se preguntan "¿a donde navega?".
+    fn navigate_href(action: Option<LinkAction>) -> Option<String> {
+        match action {
+            Some(LinkAction::Navigate { href, .. }) => Some(href),
+            _ => None,
+        }
+    }
+
     #[test]
     fn find_link_target_matches_the_anchor_itself() {
         let node = find(r#"<html><body><a id="link" href="/pagina">texto</a></body></html>"#, "link");
-        let target = find_link_target(&node).expect("deberia encontrar el enlace");
-        assert_eq!(target.href, "/pagina");
-        assert!(!target.opens_new_tab);
+        match find_link_target(&node) {
+            Some(LinkAction::Navigate { href, opens_new_tab }) => {
+                assert_eq!(href, "/pagina");
+                assert!(!opens_new_tab);
+            }
+            other => panic!("deberia navegar, no {}", describe(&other)),
+        }
+    }
+
+    fn describe(action: &Option<LinkAction>) -> &'static str {
+        match action {
+            Some(LinkAction::Navigate { .. }) => "Navigate",
+            Some(LinkAction::ScrollToFragment(_)) => "ScrollToFragment",
+            Some(LinkAction::RunScript(_)) => "RunScript",
+            None => "ninguna accion",
+        }
     }
 
     /// El punto real de la Fase 4.2: un clic real casi siempre aterriza en
@@ -1190,8 +1664,7 @@ mod tests {
     #[test]
     fn find_link_target_climbs_from_a_descendant_up_to_the_ancestor_anchor() {
         let node = find(r#"<html><body><a id="link" href="/pagina"><b id="bold">texto</b></a></body></html>"#, "bold");
-        let target = find_link_target(&node).expect("deberia encontrar el enlace");
-        assert_eq!(target.href, "/pagina");
+        assert_eq!(navigate_href(find_link_target(&node)), Some("/pagina".to_string()));
     }
 
     #[test]
@@ -1201,17 +1674,52 @@ mod tests {
     }
 
     #[test]
-    fn find_link_target_is_none_for_an_anchor_without_a_navigable_href() {
+    fn find_link_target_is_none_only_for_an_anchor_without_any_href_at_all() {
         let dom = r##"<html><body>
             <a id="nohref">sin href</a>
             <a id="empty" href="">vacio</a>
-            <a id="fragment" href="#seccion">ancla interna</a>
-            <a id="js" href="javascript:alert(1)">pseudo-protocolo</a>
         </body></html>"##;
         assert!(find_link_target(&find(dom, "nohref")).is_none(), "un <a> sin href no es un hyperlink real");
-        assert!(find_link_target(&find(dom, "empty")).is_none());
-        assert!(find_link_target(&find(dom, "fragment")).is_none(), "un ancla interna deberia hacer scroll, no navegar - sin implementar todavia");
-        assert!(find_link_target(&find(dom, "js")).is_none(), "javascript: ejecutaria script, no navegaria - sin implementar todavia");
+        assert!(find_link_target(&find(dom, "empty")).is_none(), "un href vacio tampoco");
+    }
+
+    /// Fase 6.1: lo que antes se descartaba como "no navegable" ahora tiene
+    /// su propia accion real (scroll), no la ausencia de accion.
+    #[test]
+    fn find_link_target_reports_a_fragment_anchor_as_a_scroll_not_as_nothing() {
+        let dom = r##"<html><body>
+            <a id="frag" href="#seccion">ancla interna</a>
+            <a id="solohash" href="#">volver arriba</a>
+        </body></html>"##;
+        match find_link_target(&find(dom, "frag")) {
+            Some(LinkAction::ScrollToFragment(fragment)) => assert_eq!(fragment, "seccion", "la # no forma parte del id"),
+            other => panic!("deberia ser un scroll a fragmento, no {}", describe(&other)),
+        }
+        match find_link_target(&find(dom, "solohash")) {
+            Some(LinkAction::ScrollToFragment(fragment)) => {
+                assert!(fragment.is_empty(), "href=\"#\" a secas significa principio del documento");
+            }
+            other => panic!("deberia ser un scroll a fragmento, no {}", describe(&other)),
+        }
+    }
+
+    /// Fase 6.2, idem: `javascript:` pasa de descartarse a ser una accion
+    /// real. El prefijo se reconoce sin importar mayusculas (igual que un
+    /// navegador real) y NO forma parte del codigo devuelto.
+    #[test]
+    fn find_link_target_reports_a_javascript_url_as_a_script_to_run() {
+        let dom = r#"<html><body>
+            <a id="js" href="javascript:hazAlgo(1)">pseudo-protocolo</a>
+            <a id="mixed" href="JavaScript:hazAlgo(2)">mayusculas mezcladas</a>
+        </body></html>"#;
+        match find_link_target(&find(dom, "js")) {
+            Some(LinkAction::RunScript(code)) => assert_eq!(code, "hazAlgo(1)"),
+            other => panic!("deberia ser un script, no {}", describe(&other)),
+        }
+        match find_link_target(&find(dom, "mixed")) {
+            Some(LinkAction::RunScript(code)) => assert_eq!(code, "hazAlgo(2)"),
+            other => panic!("deberia ser un script, no {}", describe(&other)),
+        }
     }
 
     /// `target="_blank"` (Fase 4.5) - comparacion insensible a mayusculas,
@@ -1225,10 +1733,193 @@ mod tests {
             <a id="self" href="/otra" target="_self">misma pestaña</a>
             <a id="notarget" href="/otra">sin target</a>
         </body></html>"#;
-        assert!(find_link_target(&find(dom, "blank")).unwrap().opens_new_tab);
-        assert!(find_link_target(&find(dom, "upper")).unwrap().opens_new_tab);
-        assert!(!find_link_target(&find(dom, "self")).unwrap().opens_new_tab);
-        assert!(!find_link_target(&find(dom, "notarget")).unwrap().opens_new_tab);
+        let blank = |id: &str| match find_link_target(&find(dom, id)) {
+            Some(LinkAction::Navigate { opens_new_tab, .. }) => opens_new_tab,
+            other => panic!("deberia navegar, no {}", describe(&other)),
+        };
+        assert!(blank("blank"));
+        assert!(blank("upper"));
+        assert!(!blank("self"));
+        assert!(!blank("notarget"));
+    }
+
+    /// Fase 6.3: la diferencia real entre checkbox y radio. Un checkbox se
+    /// conmuta; un radio se MARCA (nunca se desmarca clicandolo) y ademas
+    /// desmarca a su grupo.
+    #[test]
+    fn clicking_a_checkbox_toggles_it_both_ways() {
+        let dom = r#"<html><body><input id="cb" type="checkbox"></body></html>"#;
+        let root = root_of(dom);
+        let cb = Node::find_by_id(&root, "cb").expect("deberia existir");
+        apply_checkable_click(&root, &cb);
+        assert!(is_checked(&cb), "el primer clic lo marca");
+        apply_checkable_click(&root, &cb);
+        assert!(!is_checked(&cb), "el segundo clic lo desmarca - eso SI es correcto para un checkbox");
+    }
+
+    #[test]
+    fn clicking_a_radio_never_unchecks_it_unlike_a_checkbox() {
+        let dom = r#"<html><body><input id="r" type="radio" name="g"></body></html>"#;
+        let root = root_of(dom);
+        let r = Node::find_by_id(&root, "r").expect("deberia existir");
+        apply_checkable_click(&root, &r);
+        assert!(is_checked(&r));
+        apply_checkable_click(&root, &r);
+        assert!(
+            is_checked(&r),
+            "clicar un radio ya marcado deberia dejarlo marcado - en el spec real no hay forma de desmarcarlo clicandolo"
+        );
+    }
+
+    #[test]
+    fn clicking_a_radio_unchecks_the_others_of_its_group_only() {
+        let dom = r#"<html><body>
+            <input id="a" type="radio" name="grupo" checked>
+            <input id="b" type="radio" name="grupo">
+            <input id="otro" type="radio" name="otrogrupo" checked>
+            <input id="caja" type="checkbox" name="grupo" checked>
+        </body></html>"#;
+        let root = root_of(dom);
+        let b = Node::find_by_id(&root, "b").expect("deberia existir");
+        apply_checkable_click(&root, &b);
+
+        assert!(is_checked(&b), "el clicado queda marcado");
+        assert!(!is_checked(&Node::find_by_id(&root, "a").unwrap()), "su compañero de grupo se desmarca");
+        assert!(
+            is_checked(&Node::find_by_id(&root, "otro").unwrap()),
+            "un radio de OTRO grupo no deberia verse afectado"
+        );
+        assert!(
+            is_checked(&Node::find_by_id(&root, "caja").unwrap()),
+            "un checkbox que comparte name con el grupo NO es parte del grupo de radios y no deberia desmarcarse"
+        );
+    }
+
+    #[test]
+    fn a_radio_without_a_name_forms_no_group_and_only_checks_itself() {
+        let dom = r#"<html><body>
+            <input id="x" type="radio" checked>
+            <input id="y" type="radio">
+        </body></html>"#;
+        let root = root_of(dom);
+        let y = Node::find_by_id(&root, "y").expect("deberia existir");
+        apply_checkable_click(&root, &y);
+        assert!(is_checked(&y));
+        assert!(
+            is_checked(&Node::find_by_id(&root, "x").unwrap()),
+            "sin name no hay grupo, asi que no deberia desmarcar a nadie"
+        );
+    }
+
+    /// Una `LoadedPage` de verdad SIN tocar la red (Fase 7):
+    /// `build_page_keeping_runtime` con `network: None` corre el pipeline
+    /// completo (parseo, cascada, layout, scripts) sobre HTML en memoria, y
+    /// no descarga nada. Eso permite probar de verdad la logica de
+    /// historial de `apply_history_ops`, que necesita una pagina cargada
+    /// para resolver URLs relativas.
+    fn loaded_page(url: &str) -> LoadedPage {
+        let (page, runtime) = build_page_keeping_runtime(
+            "<html><body></body></html>",
+            "",
+            800.0,
+            600.0,
+            None,
+            &HashMap::new(),
+            &ImageMap::new(),
+            None,
+        );
+        LoadedPage {
+            url: url.to_string(),
+            title: String::new(),
+            page,
+            runtime,
+            font_set: None,
+            images: ImageMap::new(),
+            focused_node: None,
+        }
+    }
+
+    /// Un servidor con una pestaña que ya tiene documento y una entrada de
+    /// historial, listo para probar `apply_history_ops`.
+    fn server_with_page(url: &str) -> EngineServer {
+        let mut server = EngineServer::new();
+        let document_id = 7;
+        let tab = server.active_tab_mut();
+        tab.current_page = Some(loaded_page(url));
+        tab.document_id = document_id;
+        tab.history = vec![HistoryEntry { url: url.to_string(), document_id }];
+        tab.history_index = Some(0);
+        server
+    }
+
+    #[test]
+    fn push_state_adds_an_entry_in_the_same_document_and_moves_the_index() {
+        let mut server = server_with_page("http://ejemplo.test/app");
+        server.apply_history_ops(vec![engine_js::history::HistoryOp::Push("/app/ruta2".to_string())]);
+
+        let tab = server.active_tab();
+        assert_eq!(tab.history.len(), 2);
+        assert_eq!(tab.history_index, Some(1));
+        assert_eq!(tab.history[1].url, "http://ejemplo.test/app/ruta2", "la URL relativa se resuelve contra la de la pagina");
+        assert_eq!(
+            tab.history[1].document_id, tab.document_id,
+            "una entrada de pushState pertenece al documento VIVO - es lo que hace que volver atras no recargue"
+        );
+        assert_eq!(
+            tab.current_page.as_ref().unwrap().url,
+            "http://ejemplo.test/app/ruta2",
+            "pushState tambien cambia la URL actual de la pagina"
+        );
+    }
+
+    #[test]
+    fn replace_state_overwrites_the_current_entry_without_adding_one() {
+        let mut server = server_with_page("http://ejemplo.test/app");
+        server.apply_history_ops(vec![engine_js::history::HistoryOp::Replace("/app/normalizada".to_string())]);
+
+        let tab = server.active_tab();
+        assert_eq!(tab.history.len(), 1, "replaceState no deberia añadir ninguna entrada");
+        assert_eq!(tab.history_index, Some(0));
+        assert_eq!(tab.history[0].url, "http://ejemplo.test/app/normalizada");
+    }
+
+    /// Igual que una navegacion normal: empujar una entrada nueva desde
+    /// mitad del historial descarta lo que hubiera "adelante" (lo exige el
+    /// spec; sin ello un `forward` posterior saltaria a una entrada que ya
+    /// no pertenece a esta linea de historia).
+    #[test]
+    fn push_state_from_the_middle_of_the_history_truncates_whatever_was_ahead() {
+        let mut server = server_with_page("http://ejemplo.test/app");
+        {
+            let tab = server.active_tab_mut();
+            tab.history.push(HistoryEntry { url: "http://ejemplo.test/b".to_string(), document_id: 7 });
+            tab.history.push(HistoryEntry { url: "http://ejemplo.test/c".to_string(), document_id: 7 });
+            tab.history_index = Some(0); // como si se hubiera ido "atras" dos veces
+        }
+        server.apply_history_ops(vec![engine_js::history::HistoryOp::Push("/nueva".to_string())]);
+
+        let tab = server.active_tab();
+        assert_eq!(tab.history.len(), 2, "las dos entradas 'adelante' deberian haberse descartado");
+        assert_eq!(tab.history_index, Some(1));
+        assert_eq!(tab.history[1].url, "http://ejemplo.test/nueva");
+    }
+
+    /// Sin pagina cargada no hay URL base contra la que resolver nada, asi
+    /// que la operacion se ignora en vez de inventarse una entrada.
+    #[test]
+    fn history_ops_without_a_loaded_page_are_ignored_instead_of_corrupting_the_history() {
+        let mut server = EngineServer::new();
+        server.apply_history_ops(vec![engine_js::history::HistoryOp::Push("/x".to_string())]);
+        assert!(server.active_tab().history.is_empty());
+        assert_eq!(server.active_tab().history_index, None);
+    }
+
+    /// Igual que el helper `find`, pero devolviendo la RAIZ - los tests de
+    /// grupos de radio necesitan el arbol entero (`apply_checkable_click`
+    /// busca a los hermanos desde la raiz), no solo un nodo suelto, asi que
+    /// aqui no hace falta el `std::mem::forget` que `find` si necesita.
+    fn root_of(html: &str) -> std::sync::Arc<std::sync::RwLock<Node>> {
+        engine_dom::HtmlParser::parse(html)
     }
 
     #[tokio::test]

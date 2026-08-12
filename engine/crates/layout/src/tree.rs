@@ -756,6 +756,32 @@ impl LayoutTreeBuilder {
                     apply_image_size_attributes(&mut current_box.computed_style, attributes);
                 }
 
+                // Herencia real EN LA CAJA DEL ELEMENTO (Fase 8). Hasta
+                // aqui, `computed_style` de una caja de elemento solo
+                // llevaba lo que ESE elemento declaraba; lo heredado
+                // viajaba unicamente en `inherited` y solo aterrizaba en
+                // las cajas de TEXTO (mas abajo). Bastaba para pintar -el
+                // color/tamaño de letra solo hacen falta donde hay texto-
+                // pero deja la caja del elemento diciendo una verdad a
+                // medias, y `getComputedStyle` (que por definicion
+                // devuelve el valor DESPUES de la herencia) no tenia de
+                // donde sacar el valor: un `<div>` dentro de un `<body>`
+                // con `color` reportaba "" en vez del color heredado.
+                //
+                // `or_insert_with`, nunca sobrescribir: lo que el elemento
+                // declare el mismo gana siempre sobre lo heredado, que es
+                // exactamente el orden de la cascada. Y tiene que ir ANTES
+                // del bucle de abajo para que un `font-size: 2em` propio
+                // siga sin resolver a estas alturas y lo resuelva ese
+                // bucle contra el tamaño del padre.
+                //
+                // `inherited` solo contiene propiedades de
+                // `INHERITABLE_PROPERTIES` (es quien lo construye), asi
+                // que copiarlo entero no puede colar nada no heredable.
+                for (prop, value) in inherited {
+                    current_box.computed_style.entry(prop.clone()).or_insert_with(|| value.clone());
+                }
+
                 let mut child_inherited = inherited.clone();
                 for prop in INHERITABLE_PROPERTIES {
                     let Some(value) = current_box.computed_style.get(*prop) else { continue };
@@ -1716,6 +1742,64 @@ mod tests {
             styled_box.computed_style.get("background-color").map(String::as_str),
             Some("#00ff00"),
             "el selector de mayor especificidad (#main) deberia ganar sobre 'body'"
+        );
+    }
+
+    /// Regresion de la Fase 8: la caja de un ELEMENTO tiene que llevar
+    /// tambien lo heredado, no solo lo que ese elemento declara. Antes de
+    /// esa fase, lo heredado solo aterrizaba en las cajas de TEXTO - lo
+    /// justo para pintar, pero deja `getComputedStyle` sin nada que
+    /// devolver para el caso mas comun de todos (un `color` puesto en
+    /// `body` y leido desde un `div`).
+    #[test]
+    fn an_element_box_carries_inherited_properties_not_just_its_own_declarations() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="hijo">texto</div></body></html>"#);
+        let stylesheet = CssParser::parse("body { color: rgb(10, 20, 30); font-size: 20px }");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let hijo = Node::find_by_id(&dom, "hijo").expect("el div deberia existir");
+        let caja = root.find_box_for_node(&hijo).expect("el div deberia tener caja");
+
+        assert_eq!(
+            caja.computed_style.get("color").map(String::as_str),
+            Some("rgb(10, 20, 30)"),
+            "el div no declara color, pero lo hereda de body - su caja deberia decirlo"
+        );
+        assert_eq!(caja.computed_style.get("font-size").map(String::as_str), Some("20px"));
+    }
+
+    /// La otra mitad de la regla: lo propio SIEMPRE gana sobre lo
+    /// heredado. Si el `or_insert` de `build_node` llegara a sobrescribir,
+    /// la cascada quedaria del reves.
+    #[test]
+    fn an_element_own_declaration_wins_over_the_inherited_value() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="hijo">texto</div></body></html>"#);
+        let stylesheet = CssParser::parse("body { color: red } #hijo { color: blue }");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let hijo = Node::find_by_id(&dom, "hijo").expect("el div deberia existir");
+        let caja = root.find_box_for_node(&hijo).expect("el div deberia tener caja");
+
+        assert_eq!(caja.computed_style.get("color").map(String::as_str), Some("blue"));
+    }
+
+    /// Un `font-size` relativo propio tiene que seguir resolviendose
+    /// contra el del PADRE - es decir, el valor heredado no puede haberlo
+    /// pisado antes de que el bucle de `INHERITABLE_PROPERTIES` lo
+    /// resuelva.
+    #[test]
+    fn an_own_relative_font_size_still_resolves_against_the_inherited_one() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="hijo">texto</div></body></html>"#);
+        let stylesheet = CssParser::parse("body { font-size: 20px } #hijo { font-size: 2em }");
+
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let hijo = Node::find_by_id(&dom, "hijo").expect("el div deberia existir");
+        let caja = root.find_box_for_node(&hijo).expect("el div deberia tener caja");
+
+        assert_eq!(
+            caja.computed_style.get("font-size").map(String::as_str),
+            Some("40px"),
+            "2em sobre 20px heredados son 40px; si sale 20px es que lo heredado piso al valor propio antes de resolverlo"
         );
     }
 

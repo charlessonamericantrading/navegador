@@ -87,9 +87,9 @@
 //!   (`setProperty` en cambio SI sigue siendo generico para cualquier
 //!   nombre, como el spec real).
 //!   `addEventListener(tipo, listener)`/`removeEventListener(tipo,
-//!   listener)`/`dispatchEvent(event)` son reales: un `EventRegistry`
+//!   listener)`/`dispatchEvent(event)` son reales: un `DocumentBindings`
 //!   COMPARTIDO por todo el documento (no por elemento ni por objeto JS
-//!   envoltorio - ver `EventRegistry` mas abajo) guarda los listeners
+//!   envoltorio - ver `DocumentBindings` mas abajo) guarda los listeners
 //!   indexados por el puntero del nodo real, asi que registrar desde una
 //!   consulta y disparar desde OTRA consulta al mismo elemento se ven el
 //!   uno al otro - probado explicitamente. `removeEventListener` compara
@@ -146,7 +146,7 @@
 //!   clics. `DomBindings::dispatch_event`/`JsRuntime::dispatch_event`
 //!   (`runtime.rs`) son lo que hace esto posible: disparan un evento sobre
 //!   un nodo desde codigo Rust, SIN pasar por texto JS - necesario porque
-//!   antes de esto el `JsRuntime` entero (y con el, el `EventRegistry` con
+//!   antes de esto el `JsRuntime` entero (y con el, el `DocumentBindings` con
 //!   los listeners) se destruia justo despues de la carga inicial de la
 //!   pagina, antes de que la ventana siquiera se abriera.
 //!   `execute_inline_scripts_keeping_runtime`/`pipeline::
@@ -197,6 +197,7 @@ use boa_engine::object::{FunctionObjectBuilder, JsData, ObjectInitializer};
 use boa_engine::property::Attribute;
 use boa_engine::{js_string, Context, JsObject, JsResult, JsValue, NativeFunction};
 use boa_gc::{Finalize, Trace};
+use crate::cssom::{self, LayoutSnapshot};
 use engine_css::{CssParser, SelectorMatcher};
 use engine_dom::{Node, NodeType};
 use std::collections::HashMap;
@@ -204,15 +205,24 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 
 pub struct DomBindings;
 
-/// Registro de listeners COMPARTIDO por todo el runtime (no por elemento ni
-/// por objeto JS envoltorio, que se reconstruye nuevo en cada consulta -
-/// ver el aviso de `ElementCapture`): clave = puntero identificador del
-/// `Arc<RwLock<Node>>` real (`Arc::as_ptr`, estable entre clones del mismo
-/// `Arc`), valor = lista de `(tipo, listener)` en orden de registro. Asi
-/// que `addEventListener` registrado desde una consulta y `dispatchEvent`
-/// invocado desde OTRA consulta al MISMO elemento operan sobre el mismo
-/// registro real - ver `dispatch_event`/`add_event_listener` en
-/// `element_to_js_object`.
+/// Estado COMPARTIDO por todo el documento (no por elemento ni por objeto
+/// JS envoltorio, que se reconstruye nuevo en cada consulta - ver el aviso
+/// de `ElementCapture`). Es lo que se propaga a cada objeto de elemento que
+/// se construye, asi que aqui va lo que TODOS necesitan ver igual:
+///
+/// - `listeners`: clave = puntero identificador del `Arc<RwLock<Node>>`
+///   real (`Arc::as_ptr`, estable entre clones del mismo `Arc`), valor =
+///   lista de `(tipo, listener, captura)` en orden de registro. Asi que
+///   `addEventListener` registrado desde una consulta y `dispatchEvent`
+///   invocado desde OTRA consulta al MISMO elemento operan sobre el mismo
+///   registro real - ver `dispatch_event`/`add_event_listener` en
+///   `element_to_js_object`.
+/// - `layout`: el snapshot del ultimo layout (Fase 8), que respalda
+///   `getBoundingClientRect`.
+///
+/// Se llamaba `EventRegistry` mientras los listeners eran lo unico que
+/// contenia; al entrar el snapshot de layout ese nombre pasaba a ser
+/// falso, asi que se renombro en vez de dejarlo mintiendo.
 ///
 /// Guarda `JsObject` (valores JS reales, con punteros `Gc<_>` internos) en
 /// un `std::sync::Mutex` marcado `#[unsafe_ignore_trace]`. A diferencia de
@@ -239,8 +249,23 @@ pub struct DomBindings;
 /// `DomBindings::dispatch_event` desde fuera de este archivo. El campo
 /// interno sigue siendo privado - un llamador externo solo puede pasar el
 /// handle de un lado a otro, no fabricar uno vacio ni mirar dentro.
+/// Clave = puntero identificador del nodo (`Arc::as_ptr`); valor = sus
+/// listeners como `(tipo, callback, es_de_captura)` en orden de registro.
+type ListenerMap = Arc<Mutex<HashMap<usize, Vec<(String, JsObject, bool)>>>>;
+
 #[derive(Trace, Finalize, Clone)]
-pub struct EventRegistry(#[unsafe_ignore_trace] Arc<Mutex<HashMap<usize, Vec<(String, JsObject, bool)>>>>);
+pub struct DocumentBindings {
+    #[unsafe_ignore_trace]
+    listeners: ListenerMap,
+    /// El buzon donde `core::server` publica la geometria y el estilo
+    /// resueltos tras cada layout (Fase 8, ver `crate::cssom`). Vive aqui
+    /// - y no en un global suelto - porque `getBoundingClientRect` es un
+    /// METODO de cada objeto de elemento, y este struct es justo lo que ya
+    /// se propaga a todos ellos. Igual que los listeners: uno por
+    /// documento, compartido por todas las consultas.
+    #[unsafe_ignore_trace]
+    layout: LayoutSnapshot,
+}
 
 /// Envoltorio para poder capturar `Arc<RwLock<Node>>` en un closure nativo
 /// de Boa (`NativeFunction::from_copy_closure_with_captures` exige que las
@@ -250,16 +275,16 @@ pub struct EventRegistry(#[unsafe_ignore_trace] Arc<Mutex<HashMap<usize, Vec<(St
 /// asi que `#[unsafe_ignore_trace]` es correcto aqui, no un atajo que
 /// esconda un bug: es el mismo patron que usa Boa internamente para
 /// envolver closures de Rust (struct `Closure<F, T>` en su propio
-/// `native_function.rs`). El segundo campo (`EventRegistry`) viaja junto
+/// `native_function.rs`). El segundo campo (`DocumentBindings`) viaja junto
 /// al documento entero - todas las consultas (`getElementById`,
 /// `querySelector`...) comparten el MISMO registro de listeners.
 #[derive(Trace, Finalize, Clone)]
-struct DomRootCapture(#[unsafe_ignore_trace] Arc<RwLock<Node>>, EventRegistry);
+struct DomRootCapture(#[unsafe_ignore_trace] Arc<RwLock<Node>>, DocumentBindings);
 
 /// Igual que `DomRootCapture` pero para UN elemento concreto, no todo el
 /// documento - lo que hace que `getAttribute`/`setAttribute` sean vivos de
 /// verdad en vez de leer/escribir una copia congelada (ver el aviso al
-/// principio del archivo). El segundo campo (`EventRegistry`) es el MISMO
+/// principio del archivo). El segundo campo (`DocumentBindings`) es el MISMO
 /// registro compartido de `DomRootCapture` - `addEventListener`/
 /// `removeEventListener`/`dispatchEvent` lo usan indexado por el puntero
 /// del nodo real (`.0`), no por este objeto JS envoltorio.
@@ -271,20 +296,49 @@ struct DomRootCapture(#[unsafe_ignore_trace] Arc<RwLock<Node>>, EventRegistry);
 /// arbitrario que reciba como argumento (via `JsObject::downcast_ref`), no
 /// solo del que ya tiene capturado por cierre.
 #[derive(Trace, Finalize, Clone)]
-struct ElementCapture(#[unsafe_ignore_trace] Arc<RwLock<Node>>, EventRegistry);
+struct ElementCapture(#[unsafe_ignore_trace] Arc<RwLock<Node>>, DocumentBindings);
 
 /// Cuerpo vacio le basta: el metodo por defecto ya sirve, `NativeObject` se
 /// consigue gratis via su impl generica (`impl<T: Any + Trace + JsData>
 /// NativeObject for T`).
 impl JsData for ElementCapture {}
 
+/// Recupera el `Arc<RwLock<Node>>` REAL que hay detras de un valor JS
+/// cualquiera, o `None` si ese valor no es un objeto de elemento de este
+/// motor (una cadena, un numero, un objeto JS corriente sin nuestros datos
+/// nativos...). Es el unico sitio donde se hace ese `downcast`, y lo
+/// comparten `appendChild`/`removeChild`/`insertBefore`/`replaceChild`
+/// (que reciben nodos como argumento) y `getComputedStyle` (que vive en
+/// `crate::cssom` y no puede ver `ElementCapture`, privado de aqui - por
+/// eso esto es `pub` y se le pasa como puntero a funcion).
+///
+/// Devolver `None` en vez de fallar es lo que hace que esos metodos sean
+/// no-ops honestos ante un argumento que no es un nodo, en lugar de fingir
+/// que hicieron algo.
+pub fn node_from_js_value(value: &JsValue) -> Option<Arc<RwLock<Node>>> {
+    let object = value.as_object()?;
+    let capture = object.downcast_ref::<ElementCapture>()?;
+    Some(capture.0.clone())
+}
+
+impl DocumentBindings {
+    /// El buzon de layout que este documento comparte con sus objetos de
+    /// elemento (Fase 8). Lo necesita `core::server`, que es quien PUBLICA
+    /// ahi la geometria tras cada layout - ver `crate::cssom`. Devuelve un
+    /// clon del `Arc`, no el contenido: los dos lados apuntan al mismo
+    /// buzon a proposito.
+    pub fn layout_snapshot(&self) -> LayoutSnapshot {
+        self.layout.clone()
+    }
+}
+
 impl DomBindings {
-    /// Devuelve el `EventRegistry` que este `register` acaba de crear y
+    /// Devuelve el `DocumentBindings` que este `register` acaba de crear y
     /// enganchar a `document.*` - quien llama (`JsRuntime::bind_dom`) lo
     /// guarda para poder disparar eventos MAS TARDE desde codigo Rust (via
     /// `DomBindings::dispatch_event`), sin pasar por texto JS ni depender
     /// de que el registro siga vivo solo porque un closure lo capturo.
-    pub fn register(context: &mut Context, dom_root: Arc<RwLock<Node>>) -> JsResult<EventRegistry> {
+    pub fn register(context: &mut Context, dom_root: Arc<RwLock<Node>>) -> JsResult<DocumentBindings> {
         let print_fn = NativeFunction::from_fn_ptr(|_this, args, _context| {
             if let Some(msg) = args.first() {
                 tracing::info!("[JS Engine Console Log]: {}", msg.display());
@@ -294,8 +348,14 @@ impl DomBindings {
 
         context.register_global_builtin_callable(js_string!("printEngineLog"), 1, print_fn)?;
 
-        let event_registry = EventRegistry(Arc::new(Mutex::new(HashMap::new())));
-        let capture = DomRootCapture(dom_root, event_registry.clone());
+        let bindings = DocumentBindings { listeners: Arc::new(Mutex::new(HashMap::new())), layout: cssom::new_layout_snapshot() };
+        // `getComputedStyle` es un GLOBAL (no un metodo de elemento), asi
+        // que se registra aqui, donde nace el snapshot que consulta. Se le
+        // pasa `node_from_js_value` porque el tipo que lleva los datos
+        // nativos del elemento (`ElementCapture`) es privado de este
+        // archivo - ver `cssom::register_computed_style`.
+        cssom::register_computed_style(context, bindings.layout.clone(), node_from_js_value)?;
+        let capture = DomRootCapture(dom_root, bindings.clone());
 
         let get_element_by_id = NativeFunction::from_copy_closure_with_captures(
             |_this, args, capture: &DomRootCapture, context| {
@@ -339,17 +399,17 @@ impl DomBindings {
         );
 
         // No necesita el DOM para BUSCAR (crea un nodo nuevo y
-        // desconectado), pero SI necesita `EventRegistry` para poder pasarlo
-        // a `element_to_js_object` - por eso captura `EventRegistry` sola,
+        // desconectado), pero SI necesita `DocumentBindings` para poder pasarlo
+        // a `element_to_js_object` - por eso captura `DocumentBindings` sola,
         // no todo `DomRootCapture`.
         let create_element = NativeFunction::from_copy_closure_with_captures(
-            |_this, args, registry: &EventRegistry, context| {
+            |_this, args, registry: &DocumentBindings, context| {
                 let Some(arg) = args.first() else { return Ok(JsValue::undefined()) };
                 let tag_name = arg.to_string(context)?.to_std_string_escaped();
                 let node = Node::new(NodeType::Element { tag_name, attributes: HashMap::new() });
                 Ok(element_to_js_object(&node, registry, context).into())
             },
-            event_registry.clone(),
+            bindings.clone(),
         );
 
         // `documentElement`/`body` son GETTERS (se leen sin parentesis,
@@ -436,7 +496,7 @@ impl DomBindings {
         });
         context.register_global_callable(js_string!("Event"), 1, event_constructor)?;
 
-        Ok(event_registry)
+        Ok(bindings)
     }
 
     /// Dispara `event_type` sobre `node` de verdad, CON bubbling real
@@ -459,7 +519,7 @@ impl DomBindings {
     /// (nunca `Err`) si `registry` no viene de un `DomBindings::register`
     /// real - "nadie llamo preventDefault porque nadie llego a ver el
     /// evento" es la respuesta honesta para ese no-op.
-    pub fn dispatch_event(registry: &EventRegistry, node: &Arc<RwLock<Node>>, event_type: &str, context: &mut Context) -> JsResult<bool> {
+    pub fn dispatch_event(registry: &DocumentBindings, node: &Arc<RwLock<Node>>, event_type: &str, context: &mut Context) -> JsResult<bool> {
         Self::dispatch_event_impl(registry, node, event_type, None, context)
     }
 
@@ -473,11 +533,11 @@ impl DomBindings {
     /// funcionar. Sin variante de `KeyboardEvent` completa (`.code`/
     /// `.shiftKey`/`.ctrlKey`/... - fuera del alcance de esta tarea, ver
     /// ARCHITECTURE.md), solo `.key`.
-    pub fn dispatch_keyboard_event(registry: &EventRegistry, node: &Arc<RwLock<Node>>, event_type: &str, key: &str, context: &mut Context) -> JsResult<bool> {
+    pub fn dispatch_keyboard_event(registry: &DocumentBindings, node: &Arc<RwLock<Node>>, event_type: &str, key: &str, context: &mut Context) -> JsResult<bool> {
         Self::dispatch_event_impl(registry, node, event_type, Some(key), context)
     }
 
-    fn dispatch_event_impl(registry: &EventRegistry, node: &Arc<RwLock<Node>>, event_type: &str, key: Option<&str>, context: &mut Context) -> JsResult<bool> {
+    fn dispatch_event_impl(registry: &DocumentBindings, node: &Arc<RwLock<Node>>, event_type: &str, key: Option<&str>, context: &mut Context) -> JsResult<bool> {
         let target: JsValue = element_to_js_object(node, registry, context).into();
         // `bubbles`/`cancelable` a `true` a fuego: los eventos reales que
         // pasan por aqui (clic, foco, teclado - ver gfx::window +
@@ -562,7 +622,7 @@ fn build_event_object(event_type: &str, bubbles: bool, cancelable: bool, context
 /// fase de target, donde ambos tipos se llaman juntos, en orden de
 /// registro, igual que el spec real).
 fn dispatch_event_to_listeners(
-    registry: &EventRegistry,
+    registry: &DocumentBindings,
     node: &Arc<RwLock<Node>>,
     event_type: &str,
     phase_capture: Option<bool>,
@@ -572,7 +632,7 @@ fn dispatch_event_to_listeners(
 ) -> JsResult<()> {
     let key = Arc::as_ptr(node) as usize;
     let matching: Vec<JsObject> = registry
-        .0
+        .listeners
         .lock()
         .unwrap()
         .get(&key)
@@ -615,7 +675,7 @@ fn dispatch_event_to_listeners(
 /// igual que uno de burbujeo puede impedir que el siguiente ancestro se
 /// entere.
 fn dispatch_event_with_bubbling(
-    registry: &EventRegistry,
+    registry: &DocumentBindings,
     target: &Arc<RwLock<Node>>,
     target_this: &JsValue,
     event_type: &str,
@@ -708,11 +768,11 @@ fn event_listener_options_capture(arg: Option<&JsValue>, context: &mut Context) 
 /// Construye el objeto JS de un elemento - `tagName` es foto,
 /// `getAttribute`/`setAttribute`/`textContent`/`appendChild` son vivos; ver
 /// el aviso al principio del archivo para la distincion completa. `registry`
-/// es el `EventRegistry` COMPARTIDO por todo el documento (ver su aviso) -
+/// es el `DocumentBindings` COMPARTIDO por todo el documento (ver su aviso) -
 /// se pasa explicito en vez de crearse aqui para que `addEventListener`
 /// registrado desde una consulta y `dispatchEvent` desde otra sigan viendo
 /// el mismo registro.
-fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &EventRegistry, context: &mut Context) -> JsObject {
+fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, context: &mut Context) -> JsObject {
     let tag_name = {
         let n = node.read().unwrap();
         match &n.node_type {
@@ -809,12 +869,7 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &EventRegistry, cont
     let append_child = NativeFunction::from_copy_closure_with_captures(
         |_this, args, capture: &ElementCapture, _context| {
             let Some(child_value) = args.first() else { return Ok(JsValue::undefined()) };
-            let Some(child_object) = child_value.as_object() else { return Ok(JsValue::undefined()) };
-            let Some(child_capture) = child_object.downcast_ref::<ElementCapture>() else {
-                return Ok(JsValue::undefined());
-            };
-            let child_node = child_capture.0.clone();
-            drop(child_capture);
+            let Some(child_node) = node_from_js_value(child_value) else { return Ok(JsValue::undefined()) };
 
             detach_from_parent(&child_node);
             child_node.write().unwrap().parent = Some(Arc::downgrade(&capture.0));
@@ -832,12 +887,7 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &EventRegistry, cont
     let remove_child = NativeFunction::from_copy_closure_with_captures(
         |_this, args, capture: &ElementCapture, _context| {
             let Some(child_value) = args.first() else { return Ok(JsValue::null()) };
-            let Some(child_object) = child_value.as_object() else { return Ok(JsValue::null()) };
-            let Some(child_capture) = child_object.downcast_ref::<ElementCapture>() else {
-                return Ok(JsValue::null());
-            };
-            let child_node = child_capture.0.clone();
-            drop(child_capture);
+            let Some(child_node) = node_from_js_value(child_value) else { return Ok(JsValue::null()) };
 
             let mut parent = capture.0.write().unwrap();
             let before = parent.children.len();
@@ -866,22 +916,14 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &EventRegistry, cont
     let insert_before = NativeFunction::from_copy_closure_with_captures(
         |_this, args, capture: &ElementCapture, _context| {
             let Some(new_value) = args.first() else { return Ok(JsValue::undefined()) };
-            let Some(new_object) = new_value.as_object() else { return Ok(JsValue::undefined()) };
-            let Some(new_capture) = new_object.downcast_ref::<ElementCapture>() else {
-                return Ok(JsValue::undefined());
-            };
-            let new_node = new_capture.0.clone();
-            drop(new_capture);
+            let Some(new_node) = node_from_js_value(new_value) else { return Ok(JsValue::undefined()) };
 
             let reference_node = match args.get(1) {
                 None | Some(JsValue::Null) => None,
-                Some(v) => {
-                    let Some(object) = v.as_object() else { return Ok(JsValue::undefined()) };
-                    let Some(reference_capture) = object.downcast_ref::<ElementCapture>() else {
-                        return Ok(JsValue::undefined());
-                    };
-                    Some(reference_capture.0.clone())
-                }
+                Some(v) => match node_from_js_value(v) {
+                    Some(node) => Some(node),
+                    None => return Ok(JsValue::undefined()),
+                },
             };
 
             let insert_at = match &reference_node {
@@ -918,20 +960,10 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &EventRegistry, cont
     let replace_child = NativeFunction::from_copy_closure_with_captures(
         |_this, args, capture: &ElementCapture, _context| {
             let Some(new_value) = args.first() else { return Ok(JsValue::undefined()) };
-            let Some(new_object) = new_value.as_object() else { return Ok(JsValue::undefined()) };
-            let Some(new_capture) = new_object.downcast_ref::<ElementCapture>() else {
-                return Ok(JsValue::undefined());
-            };
-            let new_node = new_capture.0.clone();
-            drop(new_capture);
+            let Some(new_node) = node_from_js_value(new_value) else { return Ok(JsValue::undefined()) };
 
             let Some(old_value) = args.get(1) else { return Ok(JsValue::null()) };
-            let Some(old_object) = old_value.as_object() else { return Ok(JsValue::null()) };
-            let Some(old_capture) = old_object.downcast_ref::<ElementCapture>() else {
-                return Ok(JsValue::null());
-            };
-            let old_node = old_capture.0.clone();
-            drop(old_capture);
+            let Some(old_node) = node_from_js_value(old_value) else { return Ok(JsValue::null()) };
 
             let is_real_child = capture.0.read().unwrap().children.iter().any(|c| Arc::ptr_eq(c, &old_node));
             if !is_real_child {
@@ -1134,7 +1166,7 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &EventRegistry, cont
     // addEventListener(tipo, listener): valida que `listener` sea invocable
     // (`JsValue::as_callable`, mismo mecanismo que ya usa `test_harness.rs`
     // para `test(fn, name)`) - si no, no-op honesto, nada que registrar. Lo
-    // guarda en el `EventRegistry` COMPARTIDO (ver su aviso), no en este
+    // guarda en el `DocumentBindings` COMPARTIDO (ver su aviso), no en este
     // objeto JS envoltorio, bajo la clave del nodo REAL
     // (`Arc::as_ptr(&capture.0)`) - asi que un `addEventListener` desde una
     // consulta y un `dispatchEvent` desde OTRA consulta al mismo elemento
@@ -1151,7 +1183,7 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &EventRegistry, cont
             };
             let use_capture = event_listener_options_capture(args.get(2), context)?;
             let key = Arc::as_ptr(&capture.0) as usize;
-            capture.1 .0.lock().unwrap().entry(key).or_default().push((event_type, listener, use_capture));
+            capture.1.listeners.lock().unwrap().entry(key).or_default().push((event_type, listener, use_capture));
             Ok(JsValue::undefined())
         },
         capture.clone(),
@@ -1175,7 +1207,7 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &EventRegistry, cont
             };
             let use_capture = event_listener_options_capture(args.get(2), context)?;
             let key = Arc::as_ptr(&capture.0) as usize;
-            if let Some(listeners) = capture.1 .0.lock().unwrap().get_mut(&key) {
+            if let Some(listeners) = capture.1.listeners.lock().unwrap().get_mut(&key) {
                 listeners.retain(|(t, l, c)| !(t == &event_type && l == listener && *c == use_capture));
             }
             Ok(JsValue::undefined())
@@ -1204,6 +1236,38 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &EventRegistry, cont
         capture.clone(),
     );
 
+    // getBoundingClientRect() (Fase 8.2): la geometria REAL de la caja que
+    // este elemento produjo en el ultimo layout, en coordenadas de
+    // viewport. Lee el snapshot compartido (`DocumentBindings::layout`),
+    // no el arbol de layout - ver `crate::cssom` para por que es un
+    // snapshot y que implica (sobre todo: durante la carga de la pagina
+    // todavia no hay ninguno, y sale un rect de ceros, igual que un
+    // navegador real para un elemento sin caja).
+    let get_bounding_client_rect = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args, capture: &ElementCapture, context| {
+            let Ok(snapshot) = capture.1.layout.read() else {
+                return Ok(cssom::bounding_client_rect_to_js_object(None, 0.0, context).into());
+            };
+            let metrics = snapshot.metrics_for(&capture.0);
+            Ok(cssom::bounding_client_rect_to_js_object(metrics, snapshot.scroll_offset_y, context).into())
+        },
+        capture.clone(),
+    );
+
+    // getClientRects(): siempre 0 o 1 rectangulos aqui - ver
+    // `cssom::client_rects_to_js_array` para por que nunca puede haber mas
+    // en este motor.
+    let get_client_rects = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args, capture: &ElementCapture, context| {
+            let Ok(snapshot) = capture.1.layout.read() else {
+                return Ok(cssom::client_rects_to_js_array(None, 0.0, context).into());
+            };
+            let metrics = snapshot.metrics_for(&capture.0);
+            Ok(cssom::client_rects_to_js_array(metrics, snapshot.scroll_offset_y, context).into())
+        },
+        capture.clone(),
+    );
+
     ObjectInitializer::with_native_data(capture.clone(), context)
         .property(js_string!("tagName"), js_string!(tag_name.to_uppercase()), Attribute::all())
         .accessor(js_string!("textContent"), Some(text_content_getter_fn), Some(text_content_setter_fn), Attribute::all())
@@ -1224,6 +1288,8 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &EventRegistry, cont
         .function(add_event_listener, js_string!("addEventListener"), 2)
         .function(remove_event_listener, js_string!("removeEventListener"), 2)
         .function(dispatch_event, js_string!("dispatchEvent"), 1)
+        .function(get_bounding_client_rect, js_string!("getBoundingClientRect"), 0)
+        .function(get_client_rects, js_string!("getClientRects"), 0)
         .build()
 }
 
