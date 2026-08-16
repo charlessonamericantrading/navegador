@@ -103,7 +103,7 @@ try {
   }
 
   // Ejecutamos pyinstaller con recopilación de todas las librerías dinámicas necesarias
-  const pyinstallerCmd = `"${pyinstallerPath}" --onedir --noconfirm --clean --name backend-server --distpath dist --workpath build --collect-all uvicorn --collect-all fastapi --collect-all websockets --collect-all google --collect-all pydantic app/core/main.py`;
+  const pyinstallerCmd = `"${pyinstallerPath}" --onedir --noconfirm --clean --name backend-server --distpath dist --workpath build --paths . --collect-all uvicorn --collect-all fastapi --collect-all websockets --collect-all google --collect-all pydantic app/core/main.py`;
   runCmd(pyinstallerCmd, backendDir);
 
   // 4. Limpiar y recrear directorio de recursos temporales de Electron

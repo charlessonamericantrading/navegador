@@ -10,6 +10,7 @@ binario válido, el backend permanece disponible y expone un estado vacío.
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -28,12 +29,30 @@ class NativeEngineClient:
 
     def __init__(self, executable_path: Optional[str] = None):
         configured_path = executable_path or os.environ.get("NATIVE_ENGINE_PATH")
-        self.executable_path = Path(configured_path) if configured_path else None
+        if configured_path and Path(configured_path).is_file():
+            self.executable_path = Path(configured_path)
+        else:
+            self.executable_path = self._discover_engine_path()
         self.process: Optional[asyncio.subprocess.Process] = None
         self._lock = asyncio.Lock()
         self._stderr_task: Optional[asyncio.Task] = None
         self.renderer_ready = False
         self._request_number = 0
+
+    @staticmethod
+    def _discover_engine_path() -> Optional[Path]:
+        name = "engine_server.exe" if sys.platform == "win32" else "engine_server"
+        if getattr(sys, "frozen", False):
+            base_dir = Path(sys.executable).parent.parent
+            packaged_path = base_dir / "engine" / name
+            if packaged_path.is_file():
+                return packaged_path
+        root_dir = Path(__file__).resolve().parent.parent.parent.parent
+        for mode in ("release", "debug"):
+            cand = root_dir / "engine" / "target" / mode / name
+            if cand.is_file():
+                return cand
+        return None
 
     @property
     def connected(self) -> bool:
@@ -123,9 +142,12 @@ class NativeEngineClient:
                 process.stdin.write(b'{"type":"shutdown","id":"backend-close"}\n')
                 await process.stdin.drain()
                 await asyncio.wait_for(process.wait(), timeout=2)
-            except (BrokenPipeError, ConnectionError, asyncio.TimeoutError):
-                process.kill()
-                await process.wait()
+            except Exception:
+                try:
+                    process.kill()
+                    await process.wait()
+                except Exception:
+                    pass
 
         if self._stderr_task is not None:
             self._stderr_task.cancel()

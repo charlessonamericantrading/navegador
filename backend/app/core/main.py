@@ -37,7 +37,20 @@ def friendly_error(exc: Exception) -> str:
     return "Ha ocurrido un problema inesperado al interactuar con la página. Puedes intentarlo de nuevo."
 
 
-app = FastAPI(title="AI Agent Browser Backend")
+from contextlib import asynccontextmanager
+
+# Gestor de navegador global para esta sesión
+browser_manager = BrowserManager()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await browser_manager.start()
+    print("Backend listo (motor nativo Rust conectado; no se usará Chromium).")
+    yield
+    await browser_manager.close()
+    print("Servidor detenido.")
+
+app = FastAPI(title="AI Agent Browser Backend", lifespan=lifespan)
 
 # Habilitar CORS para conectar con el frontend de React
 app.add_middleware(
@@ -47,9 +60,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Gestor de navegador global para esta sesión
-browser_manager = BrowserManager()
 
 async def send_browser_state(websocket: WebSocket):
     """Obtiene la captura y elementos del navegador y los envía por el WebSocket."""
@@ -61,16 +71,6 @@ async def send_browser_state(websocket: WebSocket):
         "url": state.get("url", ""),
         "elements": state.get("elements", [])
     })
-
-@app.on_event("startup")
-async def startup_event():
-    await browser_manager.start()
-    print("Backend listo (motor nativo Rust pendiente de conexión; no se usará Chromium).")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await browser_manager.close()
-    print("Servidor detenido.")
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

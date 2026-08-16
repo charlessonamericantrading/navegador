@@ -46,9 +46,16 @@ function startPythonBackend() {
   const isWin = process.platform === 'win32';
   const isDev = !app.isPackaged;
   const nativeEngineName = isWin ? 'engine_server.exe' : 'engine_server';
-  const nativeEnginePath = isDev
+  let nativeEnginePath = isDev
     ? path.join(__dirname, '..', 'engine', 'target', 'debug', nativeEngineName)
     : path.join(process.resourcesPath, 'engine', nativeEngineName);
+
+  if (isDev && !fs.existsSync(nativeEnginePath)) {
+    const releaseEnginePath = path.join(__dirname, '..', 'engine', 'target', 'release', nativeEngineName);
+    if (fs.existsSync(releaseEnginePath)) {
+      nativeEnginePath = releaseEnginePath;
+    }
+  }
   
   // Rutas al entorno virtual según el sistema operativo (Desarrollo)
   const venvPython = isWin
