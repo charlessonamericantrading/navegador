@@ -31,6 +31,10 @@ app.on('second-instance', () => {
 
 let mainWindow = null;
 let pythonProcess = null;
+let nativeEngineProcess = null;
+let nativeEngineStdoutBuffer = '';
+let requestCounter = 0;
+const pendingEngineRequests = new Map();
 let isQuitting = false;
 let restartAttempts = 0;
 let stableTimer = null;
@@ -42,20 +46,123 @@ function notifyBackendStatus(status, extra = {}) {
   }
 }
 
-function startPythonBackend() {
+function getNativeEnginePath() {
   const isWin = process.platform === 'win32';
   const isDev = !app.isPackaged;
   const nativeEngineName = isWin ? 'engine_server.exe' : 'engine_server';
-  let nativeEnginePath = isDev
-    ? path.join(__dirname, '..', 'engine', 'target', 'debug', nativeEngineName)
+  let enginePath = isDev
+    ? path.join(__dirname, '..', 'engine', 'target', 'release', nativeEngineName)
     : path.join(process.resourcesPath, 'engine', nativeEngineName);
 
-  if (isDev && !fs.existsSync(nativeEnginePath)) {
-    const releaseEnginePath = path.join(__dirname, '..', 'engine', 'target', 'release', nativeEngineName);
-    if (fs.existsSync(releaseEnginePath)) {
-      nativeEnginePath = releaseEnginePath;
+  if (isDev && !fs.existsSync(enginePath)) {
+    const debugEnginePath = path.join(__dirname, '..', 'engine', 'target', 'debug', nativeEngineName);
+    if (fs.existsSync(debugEnginePath)) {
+      enginePath = debugEnginePath;
     }
   }
+  return enginePath;
+}
+
+function sendEngineRequest(payload) {
+  return new Promise((resolve, reject) => {
+    if (!nativeEngineProcess || !nativeEngineProcess.stdin.writable) {
+      return reject(new Error('El motor nativo Rust no está disponible'));
+    }
+    requestCounter += 1;
+    const reqId = `ipc-${requestCounter}`;
+    const message = { ...payload, id: reqId };
+
+    const timeout = setTimeout(() => {
+      pendingEngineRequests.delete(reqId);
+      reject(new Error(`Timeout esperando respuesta del motor para '${payload.type}'`));
+    }, 30000);
+
+    pendingEngineRequests.set(reqId, { resolve, reject, timeout });
+    try {
+      nativeEngineProcess.stdin.write(JSON.stringify(message) + '\n');
+    } catch (err) {
+      clearTimeout(timeout);
+      pendingEngineRequests.delete(reqId);
+      reject(err);
+    }
+  });
+}
+
+function handleEngineLine(line) {
+  if (!line.trim()) return;
+  let parsed;
+  try {
+    parsed = JSON.parse(line);
+  } catch (err) {
+    console.error('[NativeEngine-parse-error]:', line.substring(0, 100), err);
+    return;
+  }
+
+  // Notificar al frontend si es un estado o handshake de inicio
+  if (parsed.type === 'state' || parsed.type === 'ready') {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('engine:state', parsed);
+    }
+  }
+
+  // Resolver la promesa de solicitud si coincide con el ID
+  if (parsed.id && pendingEngineRequests.has(parsed.id)) {
+    const { resolve, timeout } = pendingEngineRequests.get(parsed.id);
+    clearTimeout(timeout);
+    pendingEngineRequests.delete(parsed.id);
+    resolve(parsed);
+  }
+}
+
+function startNativeEngine() {
+  const enginePath = getNativeEnginePath();
+  if (!fs.existsSync(enginePath)) {
+    console.warn(`[NativeEngine]: Binario Rust no encontrado en ${enginePath}`);
+    notifyBackendStatus('failed', { message: 'Binario de motor Rust no encontrado' });
+    return;
+  }
+
+  console.log(`[NativeEngine]: Iniciando motor Rust directamente desde ${enginePath}`);
+  nativeEngineStdoutBuffer = '';
+
+  nativeEngineProcess = child_process.spawn(enginePath, [], {
+    windowsHide: true,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+
+  nativeEngineProcess.stdout.on('data', (chunk) => {
+    nativeEngineStdoutBuffer += chunk.toString();
+    const lines = nativeEngineStdoutBuffer.split('\n');
+    nativeEngineStdoutBuffer = lines.pop(); // Mantener el fragmento incompleto al final
+    for (const line of lines) {
+      handleEngineLine(line);
+    }
+  });
+
+  nativeEngineProcess.stderr.on('data', (chunk) => {
+    console.error(`[NativeEngine-stderr]: ${chunk.toString().trim()}`);
+  });
+
+  nativeEngineProcess.on('error', (err) => {
+    console.error('[NativeEngine]: Error en proceso:', err);
+    notifyBackendStatus('failed', { message: err.message });
+  });
+
+  nativeEngineProcess.on('close', (code) => {
+    console.log(`[NativeEngine]: Proceso cerrado con código ${code}`);
+    nativeEngineProcess = null;
+    for (const [id, req] of pendingEngineRequests.entries()) {
+      clearTimeout(req.timeout);
+      req.reject(new Error('El motor Rust se cerró'));
+    }
+    pendingEngineRequests.clear();
+  });
+}
+
+function startPythonBackend() {
+  const isWin = process.platform === 'win32';
+  const isDev = !app.isPackaged;
+  const nativeEnginePath = getNativeEnginePath();
   
   // Rutas al entorno virtual según el sistema operativo (Desarrollo)
   const venvPython = isWin
@@ -72,7 +179,6 @@ function startPythonBackend() {
   if (!isDev) {
     // Modo producción (empaquetado)
     const exeName = isWin ? 'backend-server.exe' : 'backend-server';
-    // electron-builder coloca los extras en la carpeta 'resources'
     exePath = path.join(process.resourcesPath, 'backend-server', exeName);
     cwd = path.join(process.resourcesPath, 'backend-server');
     args = [];
@@ -93,21 +199,15 @@ function startPythonBackend() {
     NATIVE_ENGINE_PATH: nativeEnginePath
   };
 
-  if (!fs.existsSync(nativeEnginePath)) {
-    console.warn(`Motor Rust no encontrado todavía en ${nativeEnginePath}`);
+  if (!fs.existsSync(exePath)) {
+    console.warn(`[FastAPI]: Ejecutable Python no encontrado en ${exePath}. Usando exclusivamente motor Rust nativo directo.`);
+    return;
   }
 
-  // Iniciar el subproceso FastAPI. windowsHide oculta la ventana negra en Windows.
-  // detached (solo fuera de Windows) convierte al hijo en líder de su propio grupo
-  // de procesos, para poder matar ese grupo entero al salir (ver killProcessTree).
   pythonProcess = child_process.spawn(exePath, args, {
     cwd: cwd,
     windowsHide: true,
     detached: !isWin,
-    // PYTHONUNBUFFERED evita que los logs del backend se queden atascados en el
-    // búfer de Python cuando su salida no es una terminal (como aquí): sin esto,
-    // si el proceso muere de forma abrupta se pueden perder los últimos mensajes
-    // que explicarían por qué, justo cuando más falta hacen para depurar.
     env: backendEnv
   });
 
@@ -119,26 +219,18 @@ function startPythonBackend() {
     console.error(`[FastAPI-stderr]: ${data.toString().trim()}`);
   });
 
-  // Si el proceso sigue vivo pasado un margen, lo consideramos estable y
-  // reiniciamos el contador de reintentos (evita que un fallo puntual antiguo
-  // consuma los reintentos disponibles para un fallo futuro).
   clearTimeout(stableTimer);
   stableTimer = setTimeout(() => {
     restartAttempts = 0;
   }, 8000);
 
-  // 'error' y 'close' pueden dispararse ambos para el mismo fallo (p. ej. si el
-  // ejecutable no existe, Node emite 'error' pero puede que 'close' no llegue
-  // nunca, o llegue después): este flag evita contar el mismo fallo dos veces.
   let backendDownHandled = false;
   const handleBackendDown = () => {
     if (backendDownHandled) return;
     backendDownHandled = true;
     clearTimeout(stableTimer);
 
-    if (isQuitting) {
-      return;
-    }
+    if (isQuitting) return;
 
     if (restartAttempts < MAX_RESTART_ATTEMPTS) {
       restartAttempts += 1;
@@ -154,10 +246,6 @@ function startPythonBackend() {
     }
   };
 
-  // Sin este manejador, un fallo al arrancar el proceso (ruta incorrecta, exe
-  // ausente, sin permisos...) se propaga como excepción no capturada y puede
-  // tumbar silenciosamente todo el proceso principal de Electron, en vez de
-  // pasar por la lógica de reintento/aviso ya existente.
   pythonProcess.on('error', (err) => {
     console.error(`No se pudo iniciar el proceso del backend (${exePath}):`, err);
     handleBackendDown();
@@ -294,18 +382,18 @@ app.whenReady().then(() => {
     const baseDir = path.join(process.resourcesPath, 'frontend', 'dist');
     const absolutePath = path.normalize(path.join(baseDir, relativePath));
 
-    // Confinar la resolución dentro de frontend/dist: sin esto, una ruta con
-    // "../" en relativePath podría escapar y leer cualquier archivo del disco.
     if (!absolutePath.startsWith(baseDir)) {
       return new Response('Forbidden', { status: 403 });
     }
 
-    // Formatear barras para Windows y retornar el recurso local
     const formattedPath = absolutePath.replace(/\\/g, '/');
     return net.fetch('file:///' + formattedPath);
   });
 
-  // Arrancar el backend de Python
+  // Arrancar el motor nativo Rust directamente (prioridad)
+  startNativeEngine();
+
+  // Arrancar opcionalmente el backend de Python para retrocompatibilidad
   startPythonBackend();
 
   // Crear la ventana principal de la app
@@ -324,9 +412,10 @@ app.whenReady().then(() => {
 });
 
 // Registrar eventos IPC expuestos
-// Solo se permiten esquemas de enlace externo esperables (http/https/mailto):
-// el renderer no debería poder hacer que el proceso principal abra rutas de
-// archivo local ni esquemas de aplicación arbitrarios a través de este canal.
+ipcMain.handle('engine:request', async (_event, payload) => {
+  return await sendEngineRequest(payload);
+});
+
 ipcMain.on('open-external', (event, url) => {
   if (typeof url === 'string' && /^(https?|mailto):/i.test(url)) {
     shell.openExternal(url);
@@ -335,7 +424,7 @@ ipcMain.on('open-external', (event, url) => {
   }
 });
 
-// Asegurarse de cerrar el servidor de Python al salir de la aplicación de escritorio
+// Asegurarse de cerrar procesos al salir de la aplicación de escritorio
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
@@ -344,6 +433,14 @@ app.on('window-all-closed', () => {
 
 app.on('will-quit', () => {
   isQuitting = true;
+  if (nativeEngineProcess) {
+    console.log("Cerrando el motor Rust nativo...");
+    try {
+      nativeEngineProcess.stdin.write('{"type":"shutdown","id":"quit"}\n');
+    } catch (_) {}
+    killProcessTree(nativeEngineProcess);
+    nativeEngineProcess = null;
+  }
   if (pythonProcess) {
     console.log("Cerrando el árbol de procesos del backend...");
     killProcessTree(pythonProcess);

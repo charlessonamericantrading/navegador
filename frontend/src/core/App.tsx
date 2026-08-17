@@ -133,15 +133,51 @@ function App() {
     return unsubscribe;
   }, []);
 
-  // Conexión WebSocket con reconexión automática
+  // Conexión unificada: IPC directo en Electron o WebSocket en navegador web
   useEffect(() => {
     let reconnectTimeout: number;
-    // Propio de este montaje del efecto (no de wsRef, que puede pasar a apuntar
-    // a un socket más nuevo): evita que el cierre disparado por la propia
-    // limpieza de este efecto programe una reconexión huérfana que nadie podrá
-    // cancelar ya (se nota sobre todo con el doble-montaje de StrictMode/HMR).
     let cancelled = false;
 
+    // 1. MODO ELECTRON: Comunicación IPC directa con el motor Rust
+    if (window.electronAPI?.sendEngineRequest && window.electronAPI?.onEngineState) {
+      console.log('Modo Electron activo: usando transporte IPC nativo directo.');
+      
+      const unsubscribe = window.electronAPI.onEngineState((data) => {
+        if (data.type === 'state') {
+          setScreenshot(data.screenshot || '');
+          setBrowserUrl(data.url || '');
+          setElements(data.elements || []);
+          endLoading();
+          window.clearTimeout(scrollTimeoutRef.current);
+          scrollBusyRef.current = false;
+          flushScroll();
+        } else if (data.type === 'ready') {
+          console.log('Motor Rust listo vía IPC.');
+          if (lastSizeRef.current) {
+            window.electronAPI?.sendEngineRequest({ type: 'resize', ...lastSizeRef.current }).catch(console.error);
+          }
+        }
+      });
+
+      // Solicitar estado inicial o dimensionamiento
+      const initialWidth = lastSizeRef.current?.width || 1280;
+      const initialHeight = lastSizeRef.current?.height || 720;
+      window.electronAPI.sendEngineRequest({ type: 'resize', width: initialWidth, height: initialHeight })
+        .then((res) => {
+          if (res?.type === 'state') {
+            setScreenshot(res.screenshot || '');
+            setBrowserUrl(res.url || '');
+            setElements(res.elements || []);
+          }
+        })
+        .catch((err) => console.log('Inicializando motor vía IPC...', err));
+
+      return () => {
+        unsubscribe();
+      };
+    }
+
+    // 2. MODO NAVEGADOR WEB: Fallback mediante WebSocket a FastAPI
     const connectWS = () => {
       if (cancelled) return;
       console.log('Conectando al WebSocket del backend...');
@@ -191,10 +227,6 @@ function App() {
             if (data.status === 'thinking') {
               beginLoading();
             } else if (data.status === 'idle' || data.status === 'error' || data.status === 'finished') {
-              // El backend puede llegar a estos estados (agente cancelado o con
-              // error) sin enviar antes un browser_state/error_msg, que son los
-              // otros dos únicos sitios donde loading se desactiva: sin esto el
-              // spinner de la barra de direcciones se queda girando para siempre.
               endLoading();
             }
             break;
@@ -229,48 +261,58 @@ function App() {
   }, []);
 
   // Eventos manuales del usuario en el navegador
-  // Se ignora la acción si ya hay una en curso (loading===true): cada acción
-  // tarda 1-2.5s en el backend, así que sin esta guarda se podían encolar
-  // varias acciones que acababan ejecutándose sobre coordenadas de una página
-  // que ya había cambiado respecto a la que el usuario veía al pulsar.
+  const sendCommand = async (payload: any) => {
+    if (window.electronAPI?.sendEngineRequest) {
+      try {
+        beginLoading();
+        const res = await window.electronAPI.sendEngineRequest(payload);
+        if (res?.type === 'state') {
+          setScreenshot(res.screenshot || '');
+          setBrowserUrl(res.url || '');
+          setElements(res.elements || []);
+        } else if (res?.type === 'error') {
+          showToast(res.message || 'Error en acción del motor');
+        }
+      } catch (err: any) {
+        showToast(err.message || 'Error comunicando con el motor nativo');
+      } finally {
+        endLoading();
+      }
+    } else if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      beginLoading();
+      wsRef.current.send(JSON.stringify(payload));
+    }
+  };
+
   const handleManualNavigate = (url: string) => {
     if (loading) return;
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      beginLoading();
-      wsRef.current.send(JSON.stringify({ type: 'navigate', url }));
-    }
+    sendCommand({ type: 'navigate', url });
   };
 
   const handleManualClick = (x: number, y: number) => {
     if (loading) return;
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      beginLoading();
-      wsRef.current.send(JSON.stringify({ type: 'click', x, y }));
-    }
+    sendCommand({ type: 'click', x, y });
   };
 
   const handleManualType = (x: number, y: number, text: string) => {
     if (loading) return;
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      beginLoading();
-      wsRef.current.send(JSON.stringify({ type: 'type', x, y, text }));
-    }
+    sendCommand({ type: 'type_text', x, y, text, press_enter: true });
   };
 
-  // No se bloquea por `loading`: redimensionar el viewport no es una acción
-  // sobre la página (no hay resultado que pueda quedar encolado sobre un
-  // estado obsoleto), y el usuario puede redimensionar la ventana mientras
-  // el agente está trabajando.
-  // Tampoco se bloquea por `loading`: en un navegador real puedes seguir
-  // desplazándote mientras la página trabaja.
   const handleManualScroll = (dy: number) => {
-    scrollPendingRef.current += dy;
-    flushScroll();
+    if (window.electronAPI?.sendEngineRequest) {
+      window.electronAPI.sendEngineRequest({ type: 'scroll', dx: 0, dy }).catch(console.error);
+    } else {
+      scrollPendingRef.current += dy;
+      flushScroll();
+    }
   };
 
   const handleManualResize = (width: number, height: number) => {
     lastSizeRef.current = { width, height };
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+    if (window.electronAPI?.sendEngineRequest) {
+      window.electronAPI.sendEngineRequest({ type: 'resize', width, height }).catch(console.error);
+    } else if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'resize', width, height }));
     }
   };
