@@ -47,11 +47,15 @@ class NativeEngineClient:
             packaged_path = base_dir / "engine" / name
             if packaged_path.is_file():
                 return packaged_path
-        root_dir = Path(__file__).resolve().parent.parent.parent.parent
-        for mode in ("release", "debug"):
-            cand = root_dir / "engine" / "target" / mode / name
-            if cand.is_file():
-                return cand
+        
+        # Buscar en los directorios padre hasta encontrar la carpeta 'engine'
+        current = Path(__file__).resolve().parent
+        while current != current.parent:
+            for mode in ("release", "debug"):
+                cand = current / "engine" / "target" / mode / name
+                if cand.is_file():
+                    return cand
+            current = current.parent
         return None
 
     @property
@@ -70,6 +74,7 @@ class NativeEngineClient:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=64 * 1024 * 1024,
             )
             self._stderr_task = asyncio.create_task(self._drain_stderr())
             ready = await asyncio.wait_for(self._read_response(), timeout=10)
