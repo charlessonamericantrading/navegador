@@ -338,10 +338,7 @@ impl EngineServer {
         // `/nuevo/`, un href="foo.css" es `/nuevo/foo.css`, no `/foo.css`).
         let page_url = response.url.clone();
         let final_url = page_url.to_string();
-        let html = match response.text() {
-            Ok(html) => html,
-            Err(error) => return Self::error(id, format!("invalid_html_encoding: {error}")),
-        };
+        let html = response.text();
 
         // Se parsea UNA vez aqui solo para descubrir que recursos externos
         // hacen falta (`<link rel=stylesheet>`, `<script src>`) - un DOM de
@@ -711,13 +708,11 @@ impl EngineServer {
                 }
             };
             match self.network.fetch(&request).await {
-                Ok(response) if response.is_success() => match response.text() {
-                    Ok(css) => {
-                        combined.push_str(&css);
-                        combined.push('\n');
-                    }
-                    Err(error) => tracing::warn!("[server] {sheet_url} no es texto valido, se omite: {error}"),
-                },
+                Ok(response) if response.is_success() => {
+                    let css = response.text();
+                    combined.push_str(&css);
+                    combined.push('\n');
+                }
                 Ok(response) => tracing::warn!(
                     "[server] {sheet_url} respondio {} {}, se omite",
                     response.status_code,
@@ -756,12 +751,10 @@ impl EngineServer {
                 }
             };
             match self.network.fetch(&request).await {
-                Ok(response) if response.is_success() => match response.text() {
-                    Ok(js) => {
-                        fetched.insert(src, js);
-                    }
-                    Err(error) => tracing::warn!("[server] {script_url} no es texto valido, se omite: {error}"),
-                },
+                Ok(response) if response.is_success() => {
+                    let js = response.text();
+                    fetched.insert(src, js);
+                }
                 Ok(response) => tracing::warn!(
                     "[server] {script_url} respondio {} {}, se omite",
                     response.status_code,

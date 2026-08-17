@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(req) => match net.fetch(&req).await {
             Ok(res) if res.is_success() => {
                 info!("Descarga real completada: {} ({} bytes)", target_url, res.body.len());
-                res.text().unwrap_or_else(|_| OFFLINE_FALLBACK_HTML.to_string())
+                res.text()
             }
             Ok(res) => {
                 warn!("{} respondio {} (no 2xx); usando pagina local de prueba", target_url, res.status_code);

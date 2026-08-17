@@ -23,8 +23,8 @@ impl NetworkResponse {
         self.status_code >= 200 && self.status_code < 300
     }
 
-    pub fn text(&self) -> Result<String, std::string::FromUtf8Error> {
-        String::from_utf8(self.body.to_vec())
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
     }
 
     pub fn content_type(&self) -> Option<&str> {

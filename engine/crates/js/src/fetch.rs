@@ -140,8 +140,7 @@ fn build_response_object(response: &NetworkResponse, context: &mut Context) -> J
         headers_init.property(js_string!(name.clone()), js_string!(value.clone()), Attribute::all());
     }
     let headers_obj = headers_init.build();
-
-    let body = BodyCapture(response.text().map_err(|error| error.to_string()));
+    let body = BodyCapture(Ok(response.text()));
 
     let text_fn = NativeFunction::from_copy_closure_with_captures(
         |_this, _args, body, context| match &body.0 {

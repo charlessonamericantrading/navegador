@@ -413,10 +413,7 @@ fn send_impl(captured: &XhrCapture, context: &mut Context) -> JsResult<JsValue> 
         Err(_) => return finish_with_network_error(captured, context),
     };
 
-    // Un cuerpo que no es UTF-8 valido no es un error de red: la peticion
-    // funciono. Se reporta como respuesta con `responseText` vacio, en vez
-    // de fingir un fallo de conexion que no ocurrio.
-    let text = response.text().unwrap_or_default();
+    let text = response.text();
 
     // HEADERS_RECEIVED y LOADING se disparan de verdad, aunque sin espera
     // entre ellos: el codigo real que escucha `onreadystatechange` y

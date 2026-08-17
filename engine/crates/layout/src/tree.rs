@@ -1574,13 +1574,32 @@ impl LayoutTreeBuilder {
 
                 node.dimensions = Rect { x: *cursor_x, y: *cursor_y, width, height };
                 *cursor_x += width;
-                // Una imagen mas alta que el resto de la linea hace crecer
-                // el avance vertical de ESTA linea (ver el doc-comment de
-                // `flow_inline_run`) - sin esto, el texto/contenido
-                // siguiente se solapaba con la parte de abajo de la imagen.
                 *line_extent = line_extent.max(height);
             }
-            BoxType::Block => unreachable!("is_inline_level ya filtro los bloques antes de llegar aqui"),
+            BoxType::Block => {
+                // En HTML5 moderno (como en Google o Wikipedia), un elemento inline (ej. <a>)
+                // puede contener elementos de bloque (ej. <div> o <p>).
+                // En vez de crashear el motor con un panic, se salta a una linea nueva y se fluye como bloque.
+                if *cursor_x > origin_x {
+                    *cursor_y += *line_extent;
+                    *cursor_x = origin_x;
+                    *line_extent = text_line_height;
+                }
+                node.dimensions.x = origin_x;
+                node.dimensions.y = *cursor_y;
+                node.dimensions.width = inner_width;
+                let block_height = Self::flow_block_children(node, font_set, images);
+                let padding = resolve_padding(&node.computed_style);
+                let border = resolve_border_width(&node.computed_style);
+                node.box_dimensions.padding = padding;
+                node.box_dimensions.border = border;
+                let explicit_height = node.computed_style.get("height").and_then(|v| parse_css_length(v));
+                let total_h = explicit_height.unwrap_or(block_height) + padding.top + padding.bottom + border.top + border.bottom;
+                node.dimensions.height = total_h;
+                *cursor_y += total_h;
+                *cursor_x = origin_x;
+                *line_extent = text_line_height;
+            }
         }
     }
 }
