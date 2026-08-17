@@ -12,10 +12,5 @@ engine-dom = { path = "../dom" }
 engine-css = { path = "../css" }
 engine-text = { path = "../text" }
 engine-image = { path = "../image" }
-# Algoritmo de Flexbox real (Fase 3.2) - ver "Doctrina de dependencias" en
-# ARCHITECTURE.md, entrada "Layout flex/grid": el reparto de espacio en
-# ejes principal/cruzado es del mismo orden de complejidad que el arbol de
-# HTML5, ya resuelto por un crate maduro (usado en produccion por Bevy/
-# Dioxus). `grid` desactivado a proposito - esta tarea es solo flexbox, la
-# feature de grid no aporta nada todavia y solo alarga la compilacion.
-taffy = { version = "0.13", default-features = false, features = ["flexbox", "std", "taffy_tree", "content_size"] }
+# Algoritmo de Flexbox y CSS Grid real (Fase 3.2 y Fase 3.6)
+taffy = { version = "0.13", default-features = false, features = ["flexbox", "grid", "std", "taffy_tree", "content_size"] }
