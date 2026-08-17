@@ -453,6 +453,55 @@ fn flex_container_style(computed_style: &HashMap<String, String>) -> taffy::Styl
     }
 }
 
+/// Parsea la sintaxis basica de grid-template-columns/rows a GridTemplateComponent de Taffy
+fn parse_grid_template_tracks(value: &str) -> Vec<taffy::GridTemplateComponent<String>> {
+    let mut tracks = Vec::new();
+    for token in value.split_whitespace() {
+        if let Some(fr_val) = token.strip_suffix("fr").and_then(|s| s.parse::<f32>().ok()) {
+            tracks.push(taffy::GridTemplateComponent::Single(taffy::style_helpers::fr(fr_val)));
+        } else if let Some(px_val) = token.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
+            tracks.push(taffy::GridTemplateComponent::Single(taffy::style_helpers::length(px_val)));
+        } else if token == "auto" {
+            tracks.push(taffy::GridTemplateComponent::Single(taffy::style_helpers::auto()));
+        }
+    }
+    if tracks.is_empty() {
+        tracks.push(taffy::GridTemplateComponent::Single(taffy::style_helpers::fr(1.0)));
+    }
+    tracks
+}
+
+/// Traduce las propiedades CSS de un contenedor GRID (`grid-template-columns`,
+/// `grid-template-rows`, `gap`/`grid-gap`) a `taffy::Style`.
+fn grid_container_style(computed_style: &HashMap<String, String>) -> taffy::Style {
+    let grid_template_columns = computed_style
+        .get("grid-template-columns")
+        .map(|v| parse_grid_template_tracks(v))
+        .unwrap_or_else(|| vec![taffy::GridTemplateComponent::Single(taffy::style_helpers::fr(1.0))]);
+
+    let grid_template_rows = computed_style
+        .get("grid-template-rows")
+        .map(|v| parse_grid_template_tracks(v))
+        .unwrap_or_default();
+
+    let gap_val = computed_style
+        .get("gap")
+        .or_else(|| computed_style.get("grid-gap"))
+        .and_then(|v| parse_css_length(v))
+        .unwrap_or(0.0);
+
+    taffy::Style {
+        display: taffy::Display::Grid,
+        grid_template_columns,
+        grid_template_rows,
+        gap: taffy::geometry::Size {
+            width: taffy::style_helpers::length(gap_val),
+            height: taffy::style_helpers::length(gap_val),
+        },
+        ..Default::default()
+    }
+}
+
 /// Traduce las propiedades CSS de un ITEM flex (`flex-grow`/`flex-shrink`/
 /// `flex-basis`, mas `width`/`height` si estan puestas) al `taffy::Style`
 /// del nodo hoja correspondiente. Valores iniciales reales del spec cuando
@@ -865,6 +914,10 @@ impl LayoutTreeBuilder {
         if container.computed_style.get("display").map(String::as_str) == Some("flex") {
             return Self::flow_flex_children(container, font_set, images);
         }
+        // `display: grid` (Fase 3) desvia el contenedor al motor CSS Grid de Taffy
+        if container.computed_style.get("display").map(String::as_str) == Some("grid") {
+            return Self::flow_grid_children(container, font_set, images);
+        }
         // `display: table` (Fase 3.4) se desvia igual que `flex` arriba -
         // ver `flow_table_children` para el porque no es "otro flujo de
         // bloque mas".
@@ -1111,6 +1164,82 @@ impl LayoutTreeBuilder {
             // el item sigue participando en el algoritmo de flex con su
             // tamaño/posicion normal, solo se desplaza visualmente despues,
             // igual que un hijo de bloque normal (ver `flow_block_children`).
+            apply_relative_offset(child);
+            finalize_flex_item_children(child, font_set, images);
+            max_bottom = max_bottom.max(child.dimensions.y + child.dimensions.height);
+        }
+
+        (max_bottom - origin_y).max(0.0)
+    }
+
+    /// Layout real de `display: grid` (Fase 3) - delegado al motor CSS Grid de `taffy`.
+    fn flow_grid_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+        let padding = resolve_padding(&container.computed_style);
+        let border = resolve_border_width(&container.computed_style);
+        container.box_dimensions.padding = padding;
+        container.box_dimensions.border = border;
+
+        let inset_left = border.left + padding.left;
+        let inset_right = border.right + padding.right;
+        let inset_top = border.top + padding.top;
+
+        let origin_x = container.dimensions.x + inset_left;
+        let origin_y = container.dimensions.y + inset_top;
+        let inner_width = (container.dimensions.width - inset_left - inset_right).max(0.0);
+
+        if container.children.is_empty() {
+            return 0.0;
+        }
+
+        let mut taffy_tree: taffy::TaffyTree<usize> = taffy::TaffyTree::new();
+        let mut child_node_ids: Vec<(usize, taffy::NodeId)> = Vec::with_capacity(container.children.len());
+        for (index, child) in container.children.iter().enumerate() {
+            if is_out_of_flow(&child.computed_style) {
+                continue;
+            }
+            let style = flex_item_style(&child.computed_style);
+            let node_id = taffy_tree
+                .new_leaf_with_context(style, index)
+                .expect("crear nodo hoja de taffy para grid");
+            child_node_ids.push((index, node_id));
+        }
+
+        let explicit_container_height = container.computed_style.get("height").and_then(|v| parse_css_length(v));
+        let mut root_style = grid_container_style(&container.computed_style);
+        root_style.size.width = taffy::style_helpers::length(inner_width);
+        if let Some(h) = explicit_container_height {
+            root_style.size.height = taffy::style_helpers::length(h);
+        }
+        let grid_node_ids: Vec<taffy::NodeId> = child_node_ids.iter().map(|(_, id)| *id).collect();
+        let root_id = taffy_tree
+            .new_with_children(root_style, &grid_node_ids)
+            .expect("crear nodo contenedor grid de taffy");
+
+        let available_height = match explicit_container_height {
+            Some(h) => taffy::AvailableSpace::Definite(h),
+            None => taffy::AvailableSpace::MaxContent,
+        };
+
+        let children = &mut container.children;
+        taffy_tree
+            .compute_layout_with_measure(
+                root_id,
+                taffy::geometry::Size { width: taffy::AvailableSpace::Definite(inner_width), height: available_height },
+                |known_dimensions, available_space, _node_id, node_context, _style| match node_context {
+                    Some(&mut index) => measure_flex_item(&mut children[index], known_dimensions, available_space, font_set, images),
+                    None => taffy::geometry::Size::ZERO,
+                },
+            )
+            .expect("compute_layout_with_measure para grid");
+
+        let mut max_bottom = origin_y;
+        for (index, node_id) in &child_node_ids {
+            let layout = *taffy_tree.layout(*node_id).expect("layout deberia existir tras compute_layout_with_measure");
+            let child = &mut container.children[*index];
+            child.dimensions.x = origin_x + layout.location.x;
+            child.dimensions.y = origin_y + layout.location.y;
+            child.dimensions.width = layout.size.width;
+            child.dimensions.height = layout.size.height;
             apply_relative_offset(child);
             finalize_flex_item_children(child, font_set, images);
             max_bottom = max_bottom.max(child.dimensions.y + child.dimensions.height);
@@ -2794,5 +2923,51 @@ mod tests {
         // no ensanchar su unica celda a los 300px completos.
         assert_eq!(only_box.dimensions.width, 100.0, "el numero de columnas lo fija la fila con MAS celdas, no la fila individual");
         assert_eq!(third_box.dimensions.x, 200.0);
+    }
+
+    /// `display: grid` con `grid-template-columns: 1fr 1fr` coloca dos elementos lado a lado con 50% de ancho cada uno.
+    #[test]
+    fn grid_columns_divide_space_equally() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="grid" style="display: grid; grid-template-columns: 1fr 1fr; width: 400px;">
+                <div id="col1" style="height: 50px;">Item 1</div>
+                <div id="col2" style="height: 50px;">Item 2</div>
+            </div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let col1_node = Node::find_by_id(&dom, "col1").expect("col1 node");
+        let col2_node = Node::find_by_id(&dom, "col2").expect("col2 node");
+        let col1_box = find_box_for_dom_node(&root, &col1_node).expect("col1 box");
+        let col2_box = find_box_for_dom_node(&root, &col2_node).expect("col2 box");
+
+        assert_eq!(col1_box.dimensions.x, 0.0);
+        assert_eq!(col1_box.dimensions.width, 200.0, "columna 1 deberia ocupar 200px (la mitad de 400px)");
+        assert_eq!(col2_box.dimensions.x, 200.0, "columna 2 deberia empezar en 200px");
+        assert_eq!(col2_box.dimensions.width, 200.0, "columna 2 deberia ocupar 200px");
+    }
+
+    /// `display: grid` con `gap: 20px` añade espacio entre columnas.
+    #[test]
+    fn grid_respects_column_gap() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="grid" style="display: grid; grid-template-columns: 100px 100px; gap: 20px; width: 300px;">
+                <div id="a" style="height: 40px;">A</div>
+                <div id="b" style="height: 40px;">B</div>
+            </div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let a_node = Node::find_by_id(&dom, "a").expect("a node");
+        let b_node = Node::find_by_id(&dom, "b").expect("b node");
+        let a_box = find_box_for_dom_node(&root, &a_node).expect("a box");
+        let b_box = find_box_for_dom_node(&root, &b_node).expect("b box");
+
+        assert_eq!(a_box.dimensions.x, 0.0);
+        assert_eq!(a_box.dimensions.width, 100.0);
+        assert_eq!(b_box.dimensions.x, 120.0, "item B deberia empezar en 100px + 20px de gap");
+        assert_eq!(b_box.dimensions.width, 100.0);
     }
 }
