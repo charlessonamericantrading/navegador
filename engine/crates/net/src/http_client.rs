@@ -267,8 +267,19 @@ impl NetworkEngine {
         // tercero sin que nadie lo haya pedido es justo el ataque que la
         // politica de mismo origen existe para impedir.
         let cross_origin = req.origin.as_ref().is_some_and(|o| *o != crate::cors::origin_of(&req.url));
-        if !cross_origin || req.include_credentials {
+        if !cross_origin {
             if let Some(cookie_header) = self.cookies.lock().ok().and_then(|mut store| store.header_for(&req.url)) {
+                builder = builder.header("Cookie", cookie_header);
+            }
+        } else if req.include_credentials {
+            // Fase 30: `credentials: "include"` pide mandar la sesion a
+            // OTRO origen a proposito, pero eso NO deberia saltarse
+            // `SameSite` - solo las cookies `SameSite=None` (la unica
+            // marca que declara "quiero viajar tambien de tercera parte")
+            // van aqui, `Strict`/`Lax` se quedan en casa aunque el script
+            // haya pedido `include`. Ver el aviso de `cookie.rs` para el
+            // porque de la aproximacion por ORIGEN en vez de SITIO real.
+            if let Some(cookie_header) = self.cookies.lock().ok().and_then(|mut store| store.header_for_cross_site(&req.url)) {
                 builder = builder.header("Cookie", cookie_header);
             }
         }

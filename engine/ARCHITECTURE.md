@@ -3210,6 +3210,53 @@ A fecha de esta limpieza, el motor:
   primeros muestran la franja, el tercero no, exactamente lo esperado a
   ojo.
 
+- **`SameSite` empieza a aplicarse de verdad, para `fetch()`/
+  `XMLHttpRequest` de origen cruzado con `credentials: "include"`**
+  (Fase 30): la doc de `cookie.rs` declaraba que necesitaba distinguir
+  peticion "de primera parte" de "de tercera parte" (concepto ausente,
+  sin `<iframe>`) para aplicarse en absoluto - cierto para NAVEGACION
+  (sigue sin cerrarse, ver mas abajo), pero resulta que NO para
+  `fetch()`/XHR: esos dos YA llevan `origin` (Fase 20) precisamente
+  porque son los que activan CORS, y ese mismo dato basta para saber si
+  una peticion es de origen cruzado sin necesitar nada nuevo. El hueco
+  real, encontrado auditando el motor: `credentials: "include"` (Fase 27,
+  la propia opcion que ACTIVA el envio de cookies a otro origen) se
+  saltaba `SameSite` por completo - una cookie `Strict`/`Lax` (su valor
+  por defecto real) viajaba igual a cualquier sitio que pidiera
+  credenciales, exactamente la proteccion CSRF que `SameSite` existe para
+  dar, anulada por la propia bandera que la activa.
+  `CookieStore::matching_cookies` (el nucleo compartido de
+  `header_for`/`header_for_js` desde la Fase 24) gana un tercer filtro,
+  `only_same_site_none`, y una funcion nueva que lo activa:
+  `header_for_cross_site` - solo cookies `SameSite=None` sobreviven.
+  `NetworkEngine::fetch_once` la llama en el UNICO sitio donde una cookie
+  podia cruzar de origen: `cross_origin && include_credentials` (antes
+  esa combinacion llamaba a `header_for` normal, sin ningun filtro).
+  El resto de combinaciones no cambia: mismo origen sigue mandando TODAS
+  las cookies que apliquen (`SameSite` no restringe nada ahi), y origen
+  cruzado SIN `include_credentials` sigue sin mandar ninguna (ya lo hacia
+  antes, via CORS/Fase 20).
+  3 tests nuevos en `cookie.rs` (`Strict`/`Lax`/por-defecto NUNCA cruzan
+  pero SI viajan en una peticion normal del mismo origen, `SameSite=None`
+  SI cruza, una mezcla de ambas se filtra cookie por cookie). 646 tests
+  en total tras esta fase (643 + 3).
+  **Verificado en vivo**: DOS servidores HTTP locales en puertos
+  distintos (origenes distintos de verdad, no simulados) - el primero
+  pone las tres cookies (`Strict`/`Lax`/`None`) via `Set-Cookie` real; el
+  segundo sirve una pagina que hace `fetch(...,{credentials:'include'})`
+  hacia el primero y refleja en `document.title` la cabecera `Cookie:`
+  que el servidor RECIBIO de verdad. Resultado exacto: `none=1` unicamente
+  - `strict=1`/`lax=1` nunca llegaron a salir del proceso.
+  **Simplificaciones que siguen igual, declaradas**: SIN aplicar a
+  NAVEGACION (`core::server` construye esas peticiones con `origin: None`
+  - sin un origen de pagina que comparar, no hay forma de distinguir
+  `Strict` de `Lax`, que es justo la diferencia que solo importa en
+  navegacion top-level; cerrar esto exige que `core::server` recuerde el
+  origen de la pagina ANTES de navegar, arquitectura aparte); "origen
+  cruzado" se aproxima por ORIGEN exacto, no por SITIO/eTLD+1 real (sin
+  PSL, mismo criterio que el resto del modulo) - mas estricto de lo
+  necesario entre dos subdominios del mismo sitio, nunca menos.
+
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"
 o una cifra de rendimiento), es una mentira que hay que borrar, no una

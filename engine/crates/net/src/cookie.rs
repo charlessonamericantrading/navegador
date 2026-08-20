@@ -33,10 +33,30 @@
 //!   que el `Domain` declarado cubra de verdad al host de la peticion (un
 //!   sitio no puede poner cookies a un dominio ajeno), pero un dominio
 //!   demasiado ancho de su propio arbol si se aceptaria.
-//! - **`SameSite` se parsea y se guarda pero no se aplica todavia**: exige
-//!   distinguir peticion "de primera parte" de "de tercera parte", concepto
-//!   que este motor no tiene (no hay `<iframe>` ni contexto de navegacion
-//!   anidado). Declarado aqui en vez de fingir la defensa CSRF que aporta.
+//! - **`SameSite` SI se aplica, pero SOLO para `fetch()`/`XMLHttpRequest`
+//!   de origen cruzado** (Fase 30): `header_for_cross_site` (usada por
+//!   `NetworkEngine::fetch_once` cuando `req.origin` es de otro origen Y
+//!   `include_credentials` esta activo - la unica combinacion donde una
+//!   cookie viaja a otro origen en absoluto) excluye toda cookie que NO
+//!   sea `SameSite=None` - sin esto, `credentials: "include"` bastaba
+//!   para saltarse `SameSite` entero, anulando la proteccion CSRF que esa
+//!   bandera existe para dar.
+//!   **Sin aplicar a NAVEGACION** (escribir una URL, seguir un enlace,
+//!   enviar un formulario): esos caminos (`core::server`) construyen la
+//!   peticion con `origin: None` (ver `NetworkRequest::origin` - `None`
+//!   significa "no fue un script quien la inicio"), y sin un origen que
+//!   comparar no hay forma de saber si la navegacion es de primera o
+//!   tercera parte. Cerrar ESE caso (la distincion real entre
+//!   `SameSite=Strict` y `Lax`, que solo importa en navegacion top-level)
+//!   exigiria que `core::server` recordara el origen de la pagina ANTES
+//!   de navegar y lo pasara a la peticion siguiente - trabajo de
+//!   arquitectura aparte, no incluido aqui. Tambien SIN lista de sufijos
+//!   publicos (ver el punto de arriba): "origen cruzado" aqui se
+//!   aproxima por ORIGEN exacto (`cors::origin_of`), no por sitio/eTLD+1
+//!   real - mas estricto de lo necesario para dos subdominios del mismo
+//!   sitio (`app.ejemplo.test` y `api.ejemplo.test` se tratan como
+//!   cruzados entre si aunque compartan sitio), nunca menos: el lado
+//!   seguro del error, igual criterio que el resto de este modulo.
 //! - **`HttpOnly` SI protege `document.cookie`** (Fase 24): `header_for_js`
 //!   (usada por `engine_js::cookie`, el accessor de `document.cookie`)
 //!   excluye toda cookie `http_only`, mientras que `header_for` (peticiones
@@ -337,12 +357,16 @@ impl CookieStore {
         self.cookies.push(cookie);
     }
 
-    /// Nucleo compartido de `header_for`/`header_for_js`: que cookies
-    /// aplican a `url`, purgando las caducadas de paso (no hace falta
-    /// ningun temporizador aparte). `include_http_only` es la UNICA
-    /// diferencia entre las dos - `false` es lo que hace que `document.
-    /// cookie` no pueda leer una cookie `HttpOnly` (ver aviso del modulo).
-    fn matching_cookies(&mut self, url: &Url, include_http_only: bool) -> Option<Vec<&Cookie>> {
+    /// Nucleo compartido de `header_for`/`header_for_js`/
+    /// `header_for_cross_site`: que cookies aplican a `url`, purgando las
+    /// caducadas de paso (no hace falta ningun temporizador aparte).
+    /// `include_http_only` es lo que hace que `document.cookie` no pueda
+    /// leer una cookie `HttpOnly` (ver aviso del modulo).
+    /// `only_same_site_none` (Fase 30) es lo que hace que una peticion de
+    /// origen CRUZADO solo vea las cookies `SameSite=None` - descarta
+    /// `Strict`/`Lax` (su valor por defecto real, ver `parse_set_cookie`)
+    /// en vez de mandarlas a un sitio que no las pidio.
+    fn matching_cookies(&mut self, url: &Url, include_http_only: bool, only_same_site_none: bool) -> Option<Vec<&Cookie>> {
         let now = SystemTime::now();
         self.cookies.retain(|c| !c.is_expired(now));
 
@@ -358,6 +382,9 @@ impl CookieStore {
                     return false;
                 }
                 if c.http_only && !include_http_only {
+                    return false;
+                }
+                if only_same_site_none && c.same_site != SameSite::None {
                     return false;
                 }
                 let domain_ok = if c.host_only { host == c.domain } else { domain_matches(&host, &c.domain) };
@@ -378,9 +405,10 @@ impl CookieStore {
     /// El valor de la cabecera `Cookie:` para esta URL, o `None` si no
     /// aplica ninguna - en cuyo caso quien llama no debe mandar la cabecera
     /// vacia, sino omitirla por completo. Incluye cookies `HttpOnly`: esa
-    /// bandera protege de JS, no del servidor que las puso.
+    /// bandera protege de JS, no del servidor que las puso. SIN filtrar por
+    /// `SameSite` - para eso ver `header_for_cross_site`.
     pub fn header_for(&mut self, url: &Url) -> Option<String> {
-        let matching = self.matching_cookies(url, true)?;
+        let matching = self.matching_cookies(url, true, false)?;
         Some(matching.iter().map(|c| format!("{}={}", c.name, c.value)).collect::<Vec<_>>().join("; "))
     }
 
@@ -388,7 +416,20 @@ impl CookieStore {
     /// `header_for` pero SIN las `HttpOnly` (RFC 6265 §8.6) - esa es la
     /// proteccion completa que aporta la bandera.
     pub fn header_for_js(&mut self, url: &Url) -> Option<String> {
-        let matching = self.matching_cookies(url, false)?;
+        let matching = self.matching_cookies(url, false, false)?;
+        Some(matching.iter().map(|c| format!("{}={}", c.name, c.value)).collect::<Vec<_>>().join("; "))
+    }
+
+    /// El valor de `Cookie:` para una peticion de ORIGEN CRUZADO (Fase 30,
+    /// `fetch()`/`XMLHttpRequest` con `credentials: "include"` - ver
+    /// `NetworkEngine::fetch_once`) - la proteccion REAL que `SameSite`
+    /// aporta: solo las cookies `SameSite=None` viajan, `Strict`/`Lax` (su
+    /// valor por defecto real, ver `parse_set_cookie`) se quedan en casa.
+    /// Sin esto, `credentials: "include"` bastaba para saltarse `SameSite`
+    /// por completo - la proteccion contra CSRF que esa bandera existe
+    /// para dar quedaba anulada por la propia opcion que la activa.
+    pub fn header_for_cross_site(&mut self, url: &Url) -> Option<String> {
+        let matching = self.matching_cookies(url, true, true)?;
         Some(matching.iter().map(|c| format!("{}={}", c.name, c.value)).collect::<Vec<_>>().join("; "))
     }
 
@@ -621,5 +662,40 @@ mod tests {
         let mut store = CookieStore::new();
         store.set_from_js("robo=1; Domain=otrositio.test", &url("https://ejemplo.test/"));
         assert!(store.header_for_js(&url("https://ejemplo.test/")).is_none(), "un script tampoco deberia poder poner cookies a un dominio ajeno");
+    }
+
+    /// La proteccion REAL de `SameSite` (Fase 30): una cookie `Strict`/
+    /// `Lax` (el valor por defecto real cuando el servidor no declara
+    /// `SameSite`) NUNCA sale en una peticion de origen cruzado, aunque el
+    /// servidor SI la reciba de vuelta en una peticion normal del mismo
+    /// origen.
+    #[test]
+    fn strict_and_lax_cookies_never_travel_cross_site_but_do_travel_same_site() {
+        let mut store = CookieStore::new();
+        store.store_from_response(&["estricta=1; SameSite=Strict".to_string()], &url("https://ejemplo.test/"));
+        store.store_from_response(&["laxa=1; SameSite=Lax".to_string()], &url("https://ejemplo.test/"));
+        store.store_from_response(&["defecto=1".to_string()], &url("https://ejemplo.test/"));
+
+        assert!(store.header_for_cross_site(&url("https://ejemplo.test/")).is_none(), "Strict/Lax/por-defecto NUNCA deberian viajar de origen cruzado");
+        let normal = store.header_for(&url("https://ejemplo.test/")).expect("deberia haber cabecera en una peticion normal");
+        assert!(normal.contains("estricta=1") && normal.contains("laxa=1") && normal.contains("defecto=1"), "las tres SI deberian viajar en una peticion normal del mismo origen");
+    }
+
+    /// La otra mitad: `SameSite=None` es la marca explicita del servidor
+    /// de "quiero que esta cookie viaje tambien de tercera parte" - esa SI
+    /// deberia sobrevivir a `header_for_cross_site`.
+    #[test]
+    fn same_site_none_cookies_do_travel_cross_site() {
+        let mut store = CookieStore::new();
+        store.store_from_response(&["compartida=1; SameSite=None; Secure".to_string()], &url("https://ejemplo.test/"));
+        assert_eq!(store.header_for_cross_site(&url("https://ejemplo.test/")).as_deref(), Some("compartida=1"));
+    }
+
+    #[test]
+    fn header_for_cross_site_can_mix_none_cookies_with_strict_ones_filtered_out() {
+        let mut store = CookieStore::new();
+        store.store_from_response(&["publica=1; SameSite=None; Secure".to_string(), "privada=1; SameSite=Strict".to_string()], &url("https://ejemplo.test/"));
+        let header = store.header_for_cross_site(&url("https://ejemplo.test/")).expect("deberia quedar al menos la SameSite=None");
+        assert!(header.contains("publica=1") && !header.contains("privada=1"));
     }
 }
