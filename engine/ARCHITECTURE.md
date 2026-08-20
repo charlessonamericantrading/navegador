@@ -3053,6 +3053,75 @@ A fecha de esta limpieza, el motor:
   (`cascade::resolve_style` lee el atributo directamente, no pasa por
   `combined_css`), y conectarlo ahi tambien es trabajo aparte.
 
+- **`fetch(url, options)` real: `method`/`headers`/`body`/`credentials`**
+  (Fase 27): el hallazgo mas impactante de esta racha de auditorias -
+  `fetch()` SIEMPRE hacia GET sin cuerpo, sin importar que `options` se le
+  pasara. `engine-net` dejo de tener esa limitacion en la Fase 16
+  (`Full<Bytes>` en vez de `Empty` - el mismo fix que arreglo el envio de
+  formularios POST), pero nadie volvio a conectar `fetch()` con ella; el
+  doc-comment del modulo seguia citando la razon ORIGINAL de la Fase 4.3
+  como si siguiera vigente. `fetch(url, {method:'POST', body:...})` es
+  el patron mas comun de AJAX moderno - mas que `XMLHttpRequest`, que ya
+  tenia soporte de metodo/cabeceras desde la Fase 9 (aunque el propio
+  `send(body)` de XHR sigue sin enviar cuerpo, ver su aviso - gap
+  simetrico, no cerrado en esta fase).
+  `read_fetch_options` (necesita `Context` de Boa para leer el objeto JS)
+  parsea `method` (mismo mapeo de 7 verbos que `xhr::parse_method`,
+  duplicado a proposito - ~10 lineas, no vale la pena una dependencia
+  entre modulos por esto), `headers` (recorre `own_property_keys` del
+  objeto plano, sin la clase `Headers` real - mismo criterio de
+  simplificacion que ya declaraba `response.headers` al LEER), `body`
+  (convertido a UTF-8 con el `ToString` real de JS: un objeto sin
+  `JSON.stringify` explicito da `"[object Object]"`, igual que un
+  navegador real) y `credentials` (`'include'` activa
+  `NetworkRequest::include_credentials`, cualquier otro valor se queda en
+  el default real del spec, `'same-origin'`). `apply_fetch_options`
+  (logica PURA, sin `Context` ni red, separada a proposito - mismo
+  criterio que `redirect_decision` en `http_client.rs`) vuelca eso sobre
+  la `NetworkRequest` YA construida, y añade `Content-Type:
+  text/plain;charset=UTF-8` solo si hay cuerpo Y `headers` no puso ya uno
+  - el default real del spec para un cuerpo de cadena. Un `GET`/`HEAD` con
+  `body` rechaza la promise con un `TypeError` SINCRONO, sin resolver la
+  URL ni tocar la red - el `Request constructor` real del spec hace
+  exactamente eso.
+  9 tests nuevos en `fetch.rs`: cada campo de `options` parseado por
+  separado (metodo case-insensitive, cuerpo UTF-8, cabeceras multiples,
+  `credentials`), `apply_fetch_options` aplicando todo a una
+  `NetworkRequest` de prueba SIN red, que no pisa un `Content-Type`
+  explicito, y el rechazo sincrono de `GET`+`body`. 628 tests en total
+  tras esta fase (619 + 9).
+  **Verificado en vivo**: un `<script>` real haciendo `fetch('/echo',
+  {method:'POST', headers:{'Content-Type':'application/json','X-Marca':
+  'presente'}, body: JSON.stringify({saludo:'hola'})})` contra un
+  servidor Python que hace eco de metodo/cabeceras/cuerpo recibidos, con
+  el resultado volcado a `document.title` desde el `.then()` - un solo
+  `navigate` (sin esperar a un segundo comando) devolvio el eco COMPLETO
+  y exacto: `RESP:method=POST;ct=application/json;marca=presente;
+  body={"saludo":"hola"}`. Confirma de paso que el bloqueo declarado del
+  modulo (`fetch()` bloquea el hilo hasta que la promise resuelve) sigue
+  siendo cierto: el `.then()` ya habia corrido para cuando `navigate`
+  devolvio la respuesta.
+  **`XMLHttpRequest.send(body)` cerrado en la MISMA fase**: el gap
+  simetrico que dejaba esta entrada mas arriba no llego a otra fase -
+  `send(body)` convierte el valor a UTF-8 con el mismo `ToString` real de
+  JS que `fetch()`, y `attach_send_body` (logica PURA, mismo criterio de
+  extraccion que `apply_fetch_options`) lo vuelca sobre la
+  `NetworkRequest`. La UNICA diferencia real con `fetch()`, y es del spec,
+  no de este motor: XHR con `GET`/`HEAD` IGNORA el cuerpo en silencio
+  ("if data is not null and method is GET or HEAD, then set data to
+  null"), mientras que `fetch` rechaza con `TypeError` - los dos motores
+  reales (Chrome/Firefox) tratan esas dos APIs distinto ahi, y este motor
+  ahora tambien. 4 tests nuevos en `xhr.rs` (`attach_send_body` con
+  POST/GET/HEAD y con/sin `Content-Type` ya puesto, mas un `send('cuerpo')`
+  de verdad que completa el ciclo hasta `DONE` sin lanzar). 632 tests en
+  total tras esta fase (628 + 4). **Verificado en vivo tambien**: el mismo
+  servidor de eco, ahora con un XHR SINCRONO
+  (`x.open('POST', '/echo', false)`) - mismo resultado exacto,
+  `document.title` reflejando el eco completo en la MISMA linea de
+  `navigate`.
+  **Simplificacion que sigue igual, declarada**: sin la clase `Headers`
+  real (ni para leer ni para escribir, en ninguna de las dos APIs).
+
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"
 o una cifra de rendimiento), es una mentira que hay que borrar, no una

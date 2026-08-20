@@ -24,24 +24,134 @@
 //! comando NDJSON a la vez, sin trabajo concurrente que este bloqueo
 //! pudiera interferir.
 //!
-//! Sin `options` (metodo/headers/body de la peticion - `engine-net` mismo
-//! todavia no envia cuerpo de peticion en ninguna forma): solo
-//! `fetch(url)`, siempre GET. Sin la clase `Headers` real
-//! (`response.headers` es un objeto plano nombre-minuscula -> valor, no
-//! `Headers` con `.get()`/`.has()`/iteracion). `response.json()` reusa el
-//! `JSON.parse` REAL de Boa (invocado como si fuera JS) en vez de
-//! reinventar un parser JSON propio.
+//! `fetch(url, options)` **SI soporta `options`** desde la Fase 27
+//! (`method`/`headers`/`body`/`credentials`) - la doc de aqui abajo
+//! afirmaba lo contrario porque, cuando se escribio esto (Fase 4.3),
+//! `engine-net` de verdad no enviaba cuerpo de peticion en ninguna forma;
+//! eso se arreglo en la Fase 16 (`Full<Bytes>` en vez de `Empty`) pero
+//! nadie volvio a conectar `fetch()` con ello - encontrado auditando el
+//! motor: `fetch(url, {method:'POST', body:...})` seguia haciendo SIEMPRE
+//! un GET sin cuerpo, el patron mas comun de AJAX moderno. `method` acepta
+//! cualquiera de los siete verbos que `engine-net` modela (no reconocido
+//! cae a GET, igual que `xhr.rs`); `headers` es un objeto plano
+//! nombre->valor (SIN la clase `Headers` real - ver mas abajo, aplica
+//! igual aqui); `body` se convierte a cadena UTF-8 (`ToString` de JS, asi
+//! que un objeto pasado como cuerpo da `"[object Object]"`, igual que hace
+//! `fetch` real sin `JSON.stringify` explicito) y, si no hay `Content-
+//! Type` ya puesto en `headers`, se añade `text/plain;charset=UTF-8` -
+//! mismo valor por defecto que el spec real para un cuerpo de cadena.
+//! Un `body` con metodo `GET`/`HEAD` rechaza la promise con un
+//! `TypeError` SIN tocar la red, igual que el spec (esos dos metodos no
+//! pueden llevar cuerpo). `credentials: 'include'` activa el envio de
+//! cookies a un origen cruzado (ver `NetworkRequest::include_credentials`,
+//! Fase 20); cualquier otro valor (o ausente) se queda en el default real
+//! del spec (`'same-origin'` - las cookies SI viajan al mismo origen sin
+//! pedirlo, NUNCA a otro sin `'include'`).
+//!
+//! Sin la clase `Headers` real (`response.headers` es un objeto plano
+//! nombre-minuscula -> valor, no `Headers` con `.get()`/`.has()`/
+//! iteracion) - simetrico entre lo que `fetch()` ENVIA y lo que expone al
+//! LEER una respuesta. `response.json()` reusa el `JSON.parse` REAL de Boa
+//! (invocado como si fuera JS) en vez de reinventar un parser JSON propio.
 
 use boa_engine::{
     job::NativeJob,
     js_string,
     object::{builtins::JsPromise, ObjectInitializer},
-    property::Attribute,
+    property::{Attribute, PropertyKey},
     Context, JsArgs, JsError, JsNativeError, JsResult, JsValue, NativeFunction,
 };
 use boa_gc::{Finalize, Trace};
+use engine_net::request::Method;
 use engine_net::{NetworkEngine, NetworkRequest, NetworkResponse};
 use std::sync::Arc;
+
+/// El metodo HTTP que pidio `options.method`, traducido al enum de
+/// `engine-net` - mismo criterio que `xhr::parse_method` (un metodo que
+/// ese enum no contempla cae a GET con un aviso, en vez de fallar en
+/// silencio o inventarse un verbo). Duplicado a proposito en vez de
+/// compartido: es una funcion de ~10 lineas, y `fetch.rs`/`xhr.rs` no
+/// tenian ninguna dependencia entre si que valiera la pena crear solo para
+/// esto.
+fn parse_method(raw: &str) -> Method {
+    match raw.to_ascii_uppercase().as_str() {
+        "GET" => Method::Get,
+        "POST" => Method::Post,
+        "PUT" => Method::Put,
+        "DELETE" => Method::Delete,
+        "HEAD" => Method::Head,
+        "OPTIONS" => Method::Options,
+        "PATCH" => Method::Patch,
+        other => {
+            tracing::warn!("[fetch] metodo HTTP no soportado por engine-net: {other}, se usara GET");
+            Method::Get
+        }
+    }
+}
+
+/// Lo que `options` (segundo argumento de `fetch(url, options)`) le pide a
+/// la peticion - ver el aviso del modulo para el diseño completo.
+struct FetchOptions {
+    method: Method,
+    headers: Vec<(String, String)>,
+    body: Option<Vec<u8>>,
+    include_credentials: bool,
+}
+
+/// Lee `options` de verdad, sin asumir que trae ninguna de las claves -
+/// `fetch(url)` sin segundo argumento (o con `undefined`/algo que no es un
+/// objeto) da exactamente el mismo resultado que antes de esta fase: GET,
+/// sin cuerpo, sin cabeceras extra.
+fn read_fetch_options(options: &JsValue, context: &mut Context) -> JsResult<FetchOptions> {
+    let mut result = FetchOptions { method: Method::Get, headers: Vec::new(), body: None, include_credentials: false };
+    let Some(obj) = options.as_object() else { return Ok(result) };
+
+    let method_value = obj.get(js_string!("method"), context)?;
+    if !method_value.is_undefined() {
+        result.method = parse_method(&method_value.to_string(context)?.to_std_string_escaped());
+    }
+
+    let body_value = obj.get(js_string!("body"), context)?;
+    if !body_value.is_undefined() && !body_value.is_null() {
+        result.body = Some(body_value.to_string(context)?.to_std_string_escaped().into_bytes());
+    }
+
+    let headers_value = obj.get(js_string!("headers"), context)?;
+    if let Some(headers_obj) = headers_value.as_object() {
+        for key in headers_obj.own_property_keys(context)? {
+            let PropertyKey::String(name) = &key else { continue };
+            let value = headers_obj.get(key.clone(), context)?;
+            result.headers.push((name.to_std_string_escaped(), value.to_string(context)?.to_std_string_escaped()));
+        }
+    }
+
+    let credentials_value = obj.get(js_string!("credentials"), context)?;
+    if !credentials_value.is_undefined() {
+        result.include_credentials = credentials_value.to_string(context)?.to_std_string_escaped() == "include";
+    }
+
+    Ok(result)
+}
+
+/// Vuelca `options` YA LEIDAS sobre una `NetworkRequest` recien construida
+/// - logica PURA (sin `Context` de Boa ni red), separada a proposito de
+/// `read_fetch_options` (que si necesita `Context` para leer el objeto JS)
+/// para poder probarla directamente, mismo criterio que `redirect_decision`
+/// en `engine-net::http_client`.
+fn apply_fetch_options(request: &mut NetworkRequest, options: FetchOptions) {
+    request.method = options.method;
+    request.include_credentials = options.include_credentials;
+    let has_content_type = options.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+    for (k, v) in options.headers {
+        request.headers.insert(k, v);
+    }
+    request.body = options.body;
+    // Mismo default que el spec real para un cuerpo de cadena SIN
+    // `Content-Type` explicito en `headers`.
+    if request.body.is_some() && !has_content_type {
+        request.headers.insert("Content-Type".to_string(), "text/plain;charset=UTF-8".to_string());
+    }
+}
 
 /// Envoltorio `Trace`-able sobre `Arc<NetworkEngine>` - las "captures" de
 /// `NativeFunction::from_copy_closure_with_captures` deben implementar
@@ -88,10 +198,23 @@ pub fn register_fetch(context: &mut Context, network: Arc<NetworkEngine>, page_o
             // real. De paso sale el origen, que activa la politica de
             // mismo origen (Fase 20): con el, una respuesta de otro
             // dominio solo se puede leer si trae permiso CORS.
+            let options = read_fetch_options(args.get_or_undefined(1), context)?;
+            // GET/HEAD con cuerpo es un `TypeError` SINCRONO del spec real
+            // (`Request constructor: HEAD or GET Request cannot have a
+            // body`) - se rechaza aqui, antes de resolver siquiera la URL,
+            // sin tocar la red en absoluto.
+            if options.body.is_some() && matches!(options.method, Method::Get | Method::Head) {
+                let js_error: JsError = JsNativeError::typ().with_message("Failed to execute 'fetch': Request with GET/HEAD method cannot have body").into();
+                let opaque = js_error.to_opaque(context);
+                resolvers.reject.call(&JsValue::undefined(), &[opaque], context)?;
+                return Ok(promise.into());
+            }
+
             let resolved = engine_net::request::resolve_against_page(&url, capture.1.as_deref());
             let request = match resolved.map(|(absolute, origin)| {
                 NetworkRequest::new(absolute.as_str()).map(|mut r| {
                     r.origin = origin;
+                    apply_fetch_options(&mut r, options);
                     r
                 })
             }) {
@@ -339,5 +462,100 @@ mod tests {
         let promise = JsPromise::from_object(result.as_object().unwrap().clone()).unwrap();
         context.run_jobs();
         assert!(matches!(promise.state(), PromiseState::Rejected(_)));
+    }
+
+    fn eval_options(context: &mut Context, js_expr: &str) -> FetchOptions {
+        let value = context.eval(Source::from_bytes(js_expr.as_bytes())).expect("el literal de options deberia evaluar");
+        read_fetch_options(&value, context).expect("leer options no deberia fallar")
+    }
+
+    #[test]
+    fn undefined_options_gives_the_pre_fase_27_defaults() {
+        let mut context = Context::default();
+        let options = read_fetch_options(&JsValue::undefined(), &mut context).unwrap();
+        assert!(matches!(options.method, Method::Get));
+        assert!(options.headers.is_empty());
+        assert!(options.body.is_none());
+        assert!(!options.include_credentials);
+    }
+
+    #[test]
+    fn options_method_is_parsed_case_insensitively() {
+        let mut context = Context::default();
+        let options = eval_options(&mut context, "({method: 'post'})");
+        assert!(matches!(options.method, Method::Post));
+    }
+
+    #[test]
+    fn options_body_is_read_as_a_utf8_string() {
+        let mut context = Context::default();
+        let options = eval_options(&mut context, "({method: 'POST', body: 'hola mundo'})");
+        assert_eq!(options.body.as_deref(), Some(b"hola mundo".as_slice()));
+    }
+
+    #[test]
+    fn options_headers_reads_every_own_key_of_a_plain_object() {
+        let mut context = Context::default();
+        let options = eval_options(&mut context, "({headers: {'X-Custom': 'valor', 'Content-Type': 'application/json'}})");
+        assert!(options.headers.contains(&("X-Custom".to_string(), "valor".to_string())));
+        assert!(options.headers.contains(&("Content-Type".to_string(), "application/json".to_string())));
+    }
+
+    #[test]
+    fn credentials_include_turns_on_include_credentials() {
+        let mut context = Context::default();
+        let options = eval_options(&mut context, "({credentials: 'include'})");
+        assert!(options.include_credentials);
+    }
+
+    #[test]
+    fn credentials_omitted_or_anything_else_keeps_the_spec_default_of_false() {
+        let mut context = Context::default();
+        assert!(!eval_options(&mut context, "({})").include_credentials);
+        assert!(!eval_options(&mut context, "({credentials: 'same-origin'})").include_credentials);
+    }
+
+    #[test]
+    fn apply_fetch_options_sets_method_body_and_extra_headers_on_the_request() {
+        let mut request = NetworkRequest::new("https://ejemplo.test/api").unwrap();
+        apply_fetch_options(
+            &mut request,
+            FetchOptions { method: Method::Post, headers: vec![("X-Token".to_string(), "abc".to_string())], body: Some(b"{}".to_vec()), include_credentials: true },
+        );
+        assert!(matches!(request.method, Method::Post));
+        assert_eq!(request.body.as_deref(), Some(b"{}".as_slice()));
+        assert_eq!(request.headers.get("X-Token").map(String::as_str), Some("abc"));
+        assert!(request.include_credentials);
+    }
+
+    /// El default real del spec para un cuerpo de cadena sin `Content-Type`
+    /// explicito - solo cuando quien llama NO puso uno ya.
+    #[test]
+    fn apply_fetch_options_defaults_content_type_only_when_absent() {
+        let mut sin_content_type = NetworkRequest::new("https://ejemplo.test/").unwrap();
+        apply_fetch_options(&mut sin_content_type, FetchOptions { method: Method::Post, headers: Vec::new(), body: Some(b"x".to_vec()), include_credentials: false });
+        assert_eq!(sin_content_type.headers.get("Content-Type").map(String::as_str), Some("text/plain;charset=UTF-8"));
+
+        let mut con_content_type = NetworkRequest::new("https://ejemplo.test/").unwrap();
+        apply_fetch_options(
+            &mut con_content_type,
+            FetchOptions { method: Method::Post, headers: vec![("Content-Type".to_string(), "application/json".to_string())], body: Some(b"{}".to_vec()), include_credentials: false },
+        );
+        assert_eq!(con_content_type.headers.get("Content-Type").map(String::as_str), Some("application/json"), "no deberia pisar un Content-Type que el script ya puso");
+    }
+
+    /// El `TypeError` sincrono real del spec: `GET`/`HEAD` no pueden llevar
+    /// cuerpo. Se usa una URL VALIDA a proposito (`https://ejemplo.test/`,
+    /// nunca resuelta de verdad en el test): si el rechazo viniera de una
+    /// URL invalida en vez del cuerpo, esta prueba no distinguiria las dos
+    /// causas.
+    #[test]
+    fn a_get_request_with_a_body_rejects_synchronously_without_touching_the_network() {
+        let mut context = Context::default();
+        register_fetch(&mut context, Arc::new(NetworkEngine::new()), None).unwrap();
+        let result = context.eval(Source::from_bytes("fetch('https://ejemplo.test/', {method: 'GET', body: 'no deberia llevar cuerpo'})")).unwrap();
+        let promise = JsPromise::from_object(result.as_object().unwrap().clone()).unwrap();
+        context.run_jobs();
+        assert!(matches!(promise.state(), PromiseState::Rejected(_)), "GET con body deberia rechazar de inmediato, sin llegar a encolar ninguna peticion de red");
     }
 }

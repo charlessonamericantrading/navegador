@@ -42,9 +42,15 @@
 //! - Sin `abort()`, `timeout` ni `withCredentials`: los tres solo tienen
 //!   sentido sobre una peticion en vuelo, y aqui nunca hay una (ver arriba).
 //! - Sin eventos `progress`/`loadstart`/`loadend` ni `upload`.
-//! - `send(body)` ignora el cuerpo: `engine-net` todavia no envia cuerpo de
-//!   peticion (misma limitacion ya declarada en `fetch.rs`), asi que un
-//!   `POST` viaja sin el. `setRequestHeader` SI se aplica de verdad.
+//! - **`send(body)` SI envia el cuerpo** (Fase 27): `body` se convierte a
+//!   UTF-8 con el `ToString` real de JS (igual que `fetch()`, ver
+//!   `fetch.rs`) y viaja como cuerpo de la peticion; con `GET`/`HEAD` se
+//!   IGNORA en silencio en vez de rechazar - asi define el spec real de
+//!   XHR esa combinacion (`fetch` en cambio lanza `TypeError`, ver el
+//!   aviso de `fetch.rs`, un contraste deliberado del spec, no una
+//!   inconsistencia de este motor). `setRequestHeader` SI se aplica de
+//!   verdad, incluido un `Content-Type` por defecto cuando hay cuerpo y
+//!   nadie puso uno explicito.
 //! - `addEventListener('load', ...)` sobre el XHR no existe - solo las
 //!   propiedades `on*`. El registro de eventos de este motor esta indexado
 //!   por nodo del DOM (ver `dom_bindings::DocumentBindings`) y un XHR no es
@@ -237,7 +243,18 @@ fn build_xhr_object(network: Arc<NetworkEngine>, page_url: Option<String>, conte
     );
 
     let send = NativeFunction::from_copy_closure_with_captures(
-        |_this, _args, captured: &XhrCapture, context| send_impl(captured, context),
+        |_this, args: &[JsValue], captured: &XhrCapture, context| {
+            let body_value = args.get_or_undefined(0);
+            let body = if body_value.is_undefined() || body_value.is_null() {
+                None
+            } else {
+                // Mismo `ToString` real de JS que usa `fetch()` (Fase 27):
+                // un objeto sin `JSON.stringify` explicito da
+                // `"[object Object]"`, igual que un navegador real.
+                Some(body_value.to_string(context)?.to_std_string_escaped().into_bytes())
+            };
+            send_impl(captured, body, context)
+        },
         capture.clone(),
     );
 
@@ -389,7 +406,29 @@ fn define_handler_accessors(object: &JsObject, capture: &XhrCapture, context: &m
 /// Se llama directamente en vez de pasar por la cola de trabajos porque un
 /// XHR sincrono tiene que tener sus resultados puestos ANTES de que `send()`
 /// devuelva el control, que es justo lo que la cola no garantiza.
-fn send_impl(captured: &XhrCapture, context: &mut Context) -> JsResult<JsValue> {
+/// Aplica `body` (ya leido de JS) a una `NetworkRequest` con `method`/
+/// `headers` YA puestos - logica PURA (sin `Context` de Boa ni red),
+/// separada a proposito de `send_impl` para poder probarla directamente,
+/// mismo criterio que `apply_fetch_options` en `fetch.rs` (Fase 27).
+///
+/// `GET`/`HEAD` con cuerpo: el spec real de XHR lo IGNORA en silencio
+/// ("if data is not null and method is GET or HEAD, then set data to
+/// null") - a diferencia de `fetch`, que rechaza con `TypeError` (ver el
+/// aviso de `fetch.rs`), un contraste deliberado del spec, no una
+/// inconsistencia entre los dos modulos de este motor.
+fn attach_send_body(request: &mut NetworkRequest, body: Option<Vec<u8>>, has_content_type: bool) {
+    if matches!(request.method, Method::Get | Method::Head) {
+        return;
+    }
+    request.body = body;
+    // Mismo default real de `Content-Type` que `fetch()` (Fase 27) cuando
+    // hay cuerpo y `setRequestHeader` no puso ya uno.
+    if request.body.is_some() && !has_content_type {
+        request.headers.insert("Content-Type".to_string(), "text/plain;charset=UTF-8".to_string());
+    }
+}
+
+fn send_impl(captured: &XhrCapture, body: Option<Vec<u8>>, context: &mut Context) -> JsResult<JsValue> {
     let (method, url, headers) = {
         let Ok(state) = captured.state.lock() else {
             return Err(JsNativeError::typ().with_message("estado de XMLHttpRequest corrupto").into());
@@ -412,10 +451,12 @@ fn send_impl(captured: &XhrCapture, context: &mut Context) -> JsResult<JsValue> 
     let request = match resolved.map(|(absolute, origin)| {
         NetworkRequest::new(absolute.as_str()).map(|mut r| {
             r.method = parse_method(&method);
+            let has_content_type = headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
             for (name, value) in headers {
                 r.headers.insert(name, value);
             }
             r.origin = origin;
+            attach_send_body(&mut r, body, has_content_type);
             r
         })
     }) {
@@ -705,5 +746,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, "\"4,1,0\"", "reabrir deberia volver a OPENED y limpiar el estado anterior");
+    }
+
+    fn request_with_method(method: Method) -> NetworkRequest {
+        let mut r = NetworkRequest::new("https://ejemplo.test/api").unwrap();
+        r.method = method;
+        r
+    }
+
+    #[test]
+    fn attach_send_body_sets_the_body_for_a_post_request() {
+        let mut request = request_with_method(Method::Post);
+        attach_send_body(&mut request, Some(b"campo=valor".to_vec()), false);
+        assert_eq!(request.body.as_deref(), Some(b"campo=valor".as_slice()));
+    }
+
+    /// El contraste real con `fetch()`: XHR IGNORA el cuerpo en GET/HEAD en
+    /// vez de lanzar - la peticion sigue adelante, solo que sin cuerpo.
+    #[test]
+    fn attach_send_body_silently_drops_the_body_for_get_and_head() {
+        let mut get_request = request_with_method(Method::Get);
+        attach_send_body(&mut get_request, Some(b"no deberia viajar".to_vec()), false);
+        assert!(get_request.body.is_none());
+
+        let mut head_request = request_with_method(Method::Head);
+        attach_send_body(&mut head_request, Some(b"tampoco".to_vec()), false);
+        assert!(head_request.body.is_none());
+    }
+
+    #[test]
+    fn attach_send_body_defaults_content_type_only_when_absent() {
+        let mut sin_content_type = request_with_method(Method::Post);
+        attach_send_body(&mut sin_content_type, Some(b"x".to_vec()), false);
+        assert_eq!(sin_content_type.headers.get("Content-Type").map(String::as_str), Some("text/plain;charset=UTF-8"));
+
+        let mut con_content_type = request_with_method(Method::Post);
+        attach_send_body(&mut con_content_type, Some(b"{}".to_vec()), true);
+        assert!(!con_content_type.headers.contains_key("Content-Type"), "no deberia añadir un Content-Type cuando setRequestHeader ya puso uno");
+    }
+
+    /// `send()` de verdad envia el cuerpo (Fase 27) - antes de esto un
+    /// `POST` real via XHR viajaba siempre sin el, aunque `engine-net`
+    /// llevara desde la Fase 16 pudiendo enviarlo. Se prueba contra un
+    /// puerto que rechaza la conexion (mismo patron que el resto de este
+    /// archivo): lo que importa aqui no es la respuesta, sino que
+    /// `send('...')` no lance al construir la peticion con cuerpo.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_with_a_body_does_not_throw_building_the_request() {
+        let mut runtime = runtime_with_xhr();
+        let result = runtime
+            .eval(
+                r#"
+                var x = new XMLHttpRequest();
+                x.open('POST', 'http://127.0.0.1:1/enviar');
+                try { x.send('cuerpo=real'); } catch (e) {}
+                x.readyState;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, "4", "send con cuerpo deberia completar el ciclo (DONE), no lanzar al construir la peticion");
     }
 }
