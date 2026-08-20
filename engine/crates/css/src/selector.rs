@@ -76,26 +76,111 @@ impl precomputed_hash::PrecomputedHash for NoNamespace {
     }
 }
 
-/// Enum vacio: no hay pseudo-clases soportadas (`:hover`, `:first-child`...)
-/// todavia. Al no tener variantes, el parser (con la implementacion por
-/// defecto de `Parser::parse_non_ts_pseudo_class`) rechaza cualquier
-/// pseudo-clase como error de sintaxis en vez de fingir que existe.
+/// Pseudo-clases NO estructurales (Fase 18). Las estructurales
+/// (`:first-child`, `:nth-child`, `:not`, `:empty`, `:root`...) NO estan
+/// aqui: las resuelve el propio crate `selectors` recorriendo el arbol con
+/// los metodos que `ElementRef` ya implementa (`prev_sibling_element`,
+/// `is_empty`, `is_root`...), asi que funcionan sin que este enum exista.
+///
+/// Antes esto era un enum VACIO, lo que hacia que el parser rechazara
+/// cualquier pseudo-clase como error de sintaxis - y como una regla con
+/// selector invalido se descarta ENTERA, un `input:checked + label` (el
+/// "checkbox hack", que es como media web sin JavaScript hace menus
+/// desplegables y acordeones) desaparecia por completo.
+///
+/// Se dividen en dos grupos, y la diferencia importa:
+/// - **Derivables del DOM**: `:checked`, `:disabled`/`:enabled`,
+///   `:required`/`:optional`, `:read-only`/`:read-write`, `:link`. Se
+///   resuelven de verdad leyendo atributos - ver
+///   `ElementRef::match_non_ts_pseudo_class`.
+/// - **Estados de interaccion**: `:hover`, `:focus`, `:active`,
+///   `:focus-visible`, `:focus-within`, `:visited`. Se PARSEAN pero nunca
+///   coinciden, porque este motor no recalcula la cascada al mover el raton
+///   ni al enfocar. Parsearlas igualmente es lo correcto: asi una regla
+///   como `.btn, .btn:hover { color: rojo }` conserva su primera mitad en
+///   vez de perderse entera, que es lo que pasaba antes.
+///   (`:visited` ademas nunca deberia coincidir por privacidad: los
+///   navegadores reales restringen severamente que se puede estilar ahi
+///   para no filtrar el historial de navegacion.)
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NoPseudoClass {}
+pub(crate) enum EnginePseudoClass {
+    Checked,
+    Disabled,
+    Enabled,
+    Required,
+    Optional,
+    ReadOnly,
+    ReadWrite,
+    Link,
+    AnyLink,
+    /// Estados de interaccion - se guarda cual era para poder reescribir el
+    /// selector con `to_css` de forma fiel, aunque nunca coincidan.
+    Hover,
+    Focus,
+    FocusVisible,
+    FocusWithin,
+    Active,
+    Visited,
+}
 
-impl ToCss for NoPseudoClass {
-    fn to_css<W: std::fmt::Write>(&self, _dest: &mut W) -> std::fmt::Result {
-        match *self {}
+impl EnginePseudoClass {
+    /// El nombre tal cual se escribe en CSS - usado por `ToCss` (que el
+    /// crate necesita para poder reserializar un selector) y por el parser.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Checked => "checked",
+            Self::Disabled => "disabled",
+            Self::Enabled => "enabled",
+            Self::Required => "required",
+            Self::Optional => "optional",
+            Self::ReadOnly => "read-only",
+            Self::ReadWrite => "read-write",
+            Self::Link => "link",
+            Self::AnyLink => "any-link",
+            Self::Hover => "hover",
+            Self::Focus => "focus",
+            Self::FocusVisible => "focus-visible",
+            Self::FocusWithin => "focus-within",
+            Self::Active => "active",
+            Self::Visited => "visited",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "checked" => Self::Checked,
+            "disabled" => Self::Disabled,
+            "enabled" => Self::Enabled,
+            "required" => Self::Required,
+            "optional" => Self::Optional,
+            "read-only" => Self::ReadOnly,
+            "read-write" => Self::ReadWrite,
+            "link" => Self::Link,
+            "any-link" => Self::AnyLink,
+            "hover" => Self::Hover,
+            "focus" => Self::Focus,
+            "focus-visible" => Self::FocusVisible,
+            "focus-within" => Self::FocusWithin,
+            "active" => Self::Active,
+            "visited" => Self::Visited,
+            _ => return None,
+        })
     }
 }
 
-impl NonTSPseudoClass for NoPseudoClass {
+impl ToCss for EnginePseudoClass {
+    fn to_css<W: std::fmt::Write>(&self, dest: &mut W) -> std::fmt::Result {
+        write!(dest, ":{}", self.name())
+    }
+}
+
+impl NonTSPseudoClass for EnginePseudoClass {
     type Impl = EngineSelectorImpl;
     fn is_active_or_hover(&self) -> bool {
-        match *self {}
+        matches!(self, Self::Active | Self::Hover)
     }
     fn is_user_action_state(&self) -> bool {
-        match *self {}
+        matches!(self, Self::Active | Self::Hover | Self::Focus | Self::FocusVisible | Self::FocusWithin)
     }
 }
 
@@ -125,7 +210,7 @@ impl SelectorImpl for EngineSelectorImpl {
     type NamespacePrefix = CssString;
     type BorrowedNamespaceUrl = NoNamespace;
     type BorrowedLocalName = str;
-    type NonTSPseudoClass = NoPseudoClass;
+    type NonTSPseudoClass = EnginePseudoClass;
     type PseudoElement = NoPseudoElement;
 }
 
@@ -134,8 +219,23 @@ struct EngineSelectorParser;
 impl<'i> selectors::parser::Parser<'i> for EngineSelectorParser {
     type Impl = EngineSelectorImpl;
     type Error = selectors::parser::SelectorParseErrorKind<'i>;
-    // Todo lo demas usa el default: rechaza pseudo-clases, pseudo-elementos,
-    // ::part()/::slotted() y prefijos de namespace como error de parseo.
+
+    /// Acepta las pseudo-clases de `EnginePseudoClass` (ver su
+    /// doc-comment) y rechaza el resto como error de sintaxis, lo que
+    /// descarta esa regla - mismo criterio honesto de siempre: mejor no
+    /// aplicar una regla que aplicarla mal.
+    fn parse_non_ts_pseudo_class(
+        &self,
+        location: cssparser::SourceLocation,
+        name: cssparser::CowRcStr<'i>,
+    ) -> Result<EnginePseudoClass, cssparser::ParseError<'i, Self::Error>> {
+        EnginePseudoClass::from_name(&name).ok_or_else(|| {
+            location.new_custom_error(selectors::parser::SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name))
+        })
+    }
+
+    // Lo demas sigue usando el default: pseudo-elementos (`::before`),
+    // ::part()/::slotted() y prefijos de namespace se rechazan.
 }
 
 /// Especificidad real (spec CSS): el crate la empaqueta en un `u32` que ya
@@ -343,13 +443,120 @@ mod tests {
         assert!(class_only > tag_only, "una clase pesa mas que un tag");
     }
 
-    /// Ninguna pseudo-clase esta soportada todavia (NoPseudoClass esta
-    /// vacio) - un selector que la use debe rechazarse como invalido, no
-    /// fingir que coincide con todo ni con nada por accidente.
+    /// Los estados de interaccion se PARSEAN (para no descartar la regla
+    /// entera) pero nunca coinciden: este motor no recalcula la cascada al
+    /// mover el raton ni al enfocar. Es ademas lo que hace un navegador
+    /// real con `:hover` en un dispositivo sin puntero.
     #[test]
-    fn unsupported_pseudo_classes_are_rejected_not_faked() {
+    fn interaction_pseudo_classes_parse_but_never_match() {
         let div = element("div", &[]);
         assert!(!SelectorMatcher::matches("div:hover", &div));
+        assert!(!SelectorMatcher::matches("div:focus", &div));
+        assert!(!SelectorMatcher::matches("div:active", &div));
+    }
+
+    /// La razon de parsearlas en vez de rechazarlas: una regla con VARIOS
+    /// selectores conserva los que si coinciden, en vez de perderse
+    /// entera. Antes, el `:hover` invalidaba toda la regla.
+    #[test]
+    fn a_selector_list_keeps_its_matchable_half_despite_an_interaction_pseudo_class() {
+        let div = element("div", &[("class", "btn")]);
+        assert!(SelectorMatcher::matches(".btn, .btn:hover", &div), "la mitad sin :hover deberia seguir aplicando");
+    }
+
+    /// Una pseudo-clase que el motor NO conoce si invalida la regla -
+    /// mejor no aplicarla que aplicarla mal.
+    #[test]
+    fn a_genuinely_unknown_pseudo_class_still_invalidates_the_rule() {
+        let div = element("div", &[]);
+        assert!(!SelectorMatcher::matches("div:pseudoinventada", &div));
+    }
+
+    /// El "checkbox hack": la razon principal de implementar `:checked`.
+    /// Es como media web sin JavaScript hace menus desplegables y
+    /// acordeones, y antes la regla entera se descartaba.
+    #[test]
+    fn checked_matches_a_checked_input_and_powers_the_sibling_combinator() {
+        let marcado = element("input", &[("type", "checkbox"), ("checked", "")]);
+        let sin_marcar = element("input", &[("type", "checkbox")]);
+        assert!(SelectorMatcher::matches("input:checked", &marcado));
+        assert!(!SelectorMatcher::matches("input:checked", &sin_marcar));
+
+        // El caso real completo: `#toggle:checked + .menu`.
+        let raiz = element("div", &[]);
+        let toggle = element("input", &[("type", "checkbox"), ("id", "toggle"), ("checked", "")]);
+        let menu = element("div", &[("class", "menu")]);
+        Node::append_child(&raiz, toggle);
+        Node::append_child(&raiz, menu.clone());
+        assert!(SelectorMatcher::matches("#toggle:checked + .menu", &menu), "el checkbox hack completo deberia funcionar");
+    }
+
+    /// Semantica de atributo booleano HTML real: cuenta la PRESENCIA del
+    /// atributo, no su valor - `checked="false"` sigue estando marcado.
+    #[test]
+    fn checked_follows_html_boolean_attribute_semantics() {
+        let raro = element("input", &[("type", "checkbox"), ("checked", "false")]);
+        assert!(SelectorMatcher::matches("input:checked", &raro), "en HTML la presencia es lo que cuenta, no el valor");
+    }
+
+    #[test]
+    fn disabled_and_enabled_are_complementary_and_only_apply_to_form_controls() {
+        let apagado = element("input", &[("disabled", "")]);
+        let encendido = element("input", &[]);
+        assert!(SelectorMatcher::matches("input:disabled", &apagado));
+        assert!(!SelectorMatcher::matches("input:enabled", &apagado));
+        assert!(SelectorMatcher::matches("input:enabled", &encendido));
+
+        // Un `<div disabled>` NO esta deshabilitado en el sentido del spec.
+        let div = element("div", &[("disabled", "")]);
+        assert!(!SelectorMatcher::matches("div:disabled", &div), "solo los controles de formulario pueden estar deshabilitados");
+    }
+
+    #[test]
+    fn required_and_optional_are_complementary() {
+        let obligatorio = element("input", &[("required", "")]);
+        let opcional = element("input", &[]);
+        assert!(SelectorMatcher::matches("input:required", &obligatorio));
+        assert!(SelectorMatcher::matches("input:optional", &opcional));
+        assert!(!SelectorMatcher::matches("input:required", &opcional));
+    }
+
+    #[test]
+    fn link_matches_an_anchor_with_href_but_visited_never_matches() {
+        let enlace = element("a", &[("href", "/x")]);
+        let ancla_sin_href = element("a", &[]);
+        assert!(SelectorMatcher::matches("a:link", &enlace));
+        assert!(SelectorMatcher::matches("a:any-link", &enlace));
+        assert!(!SelectorMatcher::matches("a:link", &ancla_sin_href));
+        assert!(
+            !SelectorMatcher::matches("a:visited", &enlace),
+            ":visited nunca deberia coincidir - estilarlo filtraria el historial de navegacion"
+        );
+    }
+
+    /// Las pseudo-clases ESTRUCTURALES las resuelve el propio crate
+    /// `selectors` con los metodos de arbol que `ElementRef` ya
+    /// implementaba - este test fija que de verdad funcionan, porque nunca
+    /// se habian probado.
+    #[test]
+    fn structural_pseudo_classes_already_work_through_the_selectors_crate() {
+        let raiz = element("ul", &[]);
+        let primero = element("li", &[]);
+        let medio = element("li", &[]);
+        let ultimo = element("li", &[]);
+        Node::append_child(&raiz, primero.clone());
+        Node::append_child(&raiz, medio.clone());
+        Node::append_child(&raiz, ultimo.clone());
+
+        assert!(SelectorMatcher::matches("li:first-child", &primero));
+        assert!(!SelectorMatcher::matches("li:first-child", &medio));
+        assert!(SelectorMatcher::matches("li:last-child", &ultimo));
+        assert!(SelectorMatcher::matches("li:nth-child(2)", &medio));
+        assert!(SelectorMatcher::matches("li:not(.especial)", &primero));
+
+        let vacio = element("div", &[]);
+        assert!(SelectorMatcher::matches("div:empty", &vacio));
+        assert!(!SelectorMatcher::matches("ul:empty", &raiz), "un ul con hijos no esta vacio");
     }
 
     #[test]

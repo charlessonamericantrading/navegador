@@ -44,7 +44,7 @@ pub fn execute_inline_scripts(dom_root: &Arc<RwLock<Node>>, external_scripts: &H
         tracing::warn!("[js] no se pudo enlazar el DOM al runtime: {e}");
     }
 
-    run_scripts(&mut runtime, &scripts, external_scripts)
+    run_scripts(&mut runtime, &scripts, external_scripts, true)
 }
 
 /// Igual que `execute_inline_scripts`, pero TAMBIEN registra
@@ -68,11 +68,11 @@ pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, externa
         Ok(results) => results,
         Err(e) => {
             tracing::warn!("[js] no se pudo registrar el arnes de tests: {e}");
-            return (run_scripts(&mut runtime, &scripts, external_scripts), Vec::new());
+            return (run_scripts(&mut runtime, &scripts, external_scripts, true), Vec::new());
         }
     };
 
-    let script_results = run_scripts(&mut runtime, &scripts, external_scripts);
+    let script_results = run_scripts(&mut runtime, &scripts, external_scripts, true);
     let test_results = test_results.lock().unwrap().clone();
     (script_results, test_results)
 }
@@ -98,21 +98,66 @@ pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, externa
 /// en JS lanza `ReferenceError`, la respuesta honesta cuando de verdad no
 /// hay red disponible en ese contexto - y lo mismo para `new
 /// XMLHttpRequest()`.
-pub fn execute_inline_scripts_keeping_runtime(dom_root: &Arc<RwLock<Node>>, external_scripts: &HashMap<String, String>, network: Option<Arc<NetworkEngine>>) -> (Vec<Result<String, String>>, JsRuntime) {
+///
+/// `storage`: `Some` registra `localStorage`/`sessionStorage` acotados al
+/// origen que se pase (Fase 15, ver `StorageContext` justo debajo).
+
+/// El almacen de Web Storage de la sesion mas el ORIGEN de la pagina que
+/// se esta construyendo - los dos datos que `localStorage`/
+/// `sessionStorage` necesitan y que solo `core::server` conoce a la vez
+/// (el almacen es suyo y vive entre navegaciones; el origen sale de la URL
+/// que se acaba de cargar). Se pasan juntos porque por separado no sirven
+/// de nada: un almacen sin origen no sabria a quien aislar.
+pub struct StorageContext {
+    pub storage: engine_js::storage::SharedWebStorage,
+    pub origin: String,
+    /// La politica de seguridad de contenido de la pagina (Fase 21) -
+    /// decide si sus `<script>` EN LINEA se ejecutan. Los externos ya se
+    /// filtraron antes de descargarse (`core::server::filter_by_csp`), asi
+    /// que aqui solo queda la mitad inline, que es justo el vector
+    /// principal de XSS.
+    pub csp: engine_net::ContentSecurityPolicy,
+    /// La URL COMPLETA de la pagina, no solo su origen (Fase 20.1). Hace
+    /// falta como base para resolver las URLs RELATIVAS de `fetch()`/
+    /// `XMLHttpRequest` (`xhr.open('GET', '/api/datos')`, comunisimo en
+    /// codigo real). El origen solo no basta: una ruta relativa SIN barra
+    /// inicial (`datos.json`) se resuelve contra el directorio de la
+    /// pagina, no contra la raiz del sitio.
+    ///
+    /// Va junto al origen y no por separado a proposito: los dos salen de
+    /// la misma URL, y pasarlos aparte abriria la puerta a que un dia no
+    /// coincidieran y el aislamiento de red dejara de corresponderse con
+    /// el de almacenamiento.
+    pub url: String,
+}
+
+pub fn execute_inline_scripts_keeping_runtime(
+    dom_root: &Arc<RwLock<Node>>,
+    external_scripts: &HashMap<String, String>,
+    network: Option<Arc<NetworkEngine>>,
+    storage: Option<StorageContext>,
+) -> (Vec<Result<String, String>>, JsRuntime) {
     let scripts = Node::find_all_by_tag(dom_root, "script");
 
     let mut runtime = JsRuntime::new();
     if let Err(e) = runtime.bind_dom(dom_root.clone()) {
         tracing::warn!("[js] no se pudo enlazar el DOM al runtime: {e}");
     }
+    // El origen de la pagina (Fase 20) sale del mismo `StorageContext`
+    // que ya trae `core::server` - es literalmente el mismo dato, y
+    // duplicar el parametro solo habria abierto la puerta a que un dia se
+    // pasaran distintos y el aislamiento de red dejara de coincidir con el
+    // de almacenamiento.
+    let page_url = storage.as_ref().map(|ctx| ctx.url.clone());
+    let storage_csp = storage.as_ref().map(|ctx| ctx.csp.clone());
     if let Some(network) = network {
-        if let Err(e) = runtime.register_fetch(network.clone()) {
+        if let Err(e) = runtime.register_fetch(network.clone(), page_url.clone()) {
             tracing::warn!("[js] no se pudo registrar fetch: {e}");
         }
         // Fase 9: mismo `NetworkEngine`, misma condicion. Un motor con
         // `fetch` pero sin `XMLHttpRequest` deja sin red a toda la parte
         // de la web (enorme) que nunca migro - ver `engine_js::xhr`.
-        if let Err(e) = runtime.register_xhr(network) {
+        if let Err(e) = runtime.register_xhr(network, page_url.clone()) {
             tracing::warn!("[js] no se pudo registrar XMLHttpRequest: {e}");
         }
     }
@@ -136,8 +181,36 @@ pub fn execute_inline_scripts_keeping_runtime(dom_root: &Arc<RwLock<Node>>, exte
     if let Err(e) = runtime.register_history() {
         tracing::warn!("[js] no se pudo registrar history: {e}");
     }
+    // Temporizadores (Fase 14) - se registran SIEMPRE, por la misma razon
+    // que `window`: `setTimeout` es de lo que TODA pagina real da por
+    // sentado, y dejarlo sin definir rompe la pagina entera con un
+    // `ReferenceError` en vez de solo perder la funcionalidad diferida.
+    // DESPUES de `register_window` a proposito, para que ademas queden
+    // colgados de `window.setTimeout` (forma que usa muchisimo codigo
+    // real). Que un temporizador vencido llegue a EJECUTARSE depende de
+    // si quien construyo este runtime llama a `run_due_timers`
+    // (`core::server` lo hace tras cada operacion; `core::main` no).
+    if let Err(e) = runtime.register_timers() {
+        tracing::warn!("[js] no se pudieron registrar los temporizadores: {e}");
+    }
+    // `localStorage`/`sessionStorage` (Fase 15) - condicional, a
+    // diferencia de `window`/temporizadores: solo tiene sentido donde hay
+    // un almacen de sesion REAL detras y una URL de la que sacar el
+    // origen, y quien tiene las dos cosas es `core::server`. Sin ellas los
+    // globales no existen, que es la respuesta honesta (mismo criterio
+    // que `fetch` sin red) - un documento construido en memoria no tiene
+    // origen contra el que aislar nada.
+    if let Some(ctx) = storage {
+        if let Err(e) = runtime.register_storage(ctx.storage, ctx.origin) {
+            tracing::warn!("[js] no se pudo registrar el almacenamiento web: {e}");
+        }
+    }
 
-    let script_results = run_scripts(&mut runtime, &scripts, external_scripts);
+    // CSP: si la politica no permite `<script>` en linea, no se
+    // ejecutan (Fase 21). Los EXTERNOS ya vienen filtrados desde
+    // `core::server`, asi que los que sigan en el mapa estan autorizados.
+    let allow_inline = storage_csp.as_ref().is_none_or(|csp| csp.allows_inline("script-src"));
+    let script_results = run_scripts(&mut runtime, &scripts, external_scripts, allow_inline);
     (script_results, runtime)
 }
 
@@ -147,7 +220,12 @@ pub fn execute_inline_scripts_keeping_runtime(dom_root: &Arc<RwLock<Node>>, exte
 /// valor no esta en el mapa se omite con un aviso, en vez de fallar: puede
 /// que la descarga fallara, o que quien llama (los tests de este archivo,
 /// `wpt_runner`) no tenga red en absoluto.
-fn run_scripts(runtime: &mut JsRuntime, scripts: &[Arc<RwLock<Node>>], external_scripts: &HashMap<String, String>) -> Vec<Result<String, String>> {
+/// `allow_inline` a `false` (Fase 21) salta los `<script>` SIN `src`:
+/// la politica de seguridad de la pagina no los permite. Los que tienen
+/// `src` no se comprueban aqui porque ya vienen filtrados de
+/// `core::server::filter_by_csp` - si su contenido esta en el mapa, es que
+/// estaba autorizado y se descargo.
+fn run_scripts(runtime: &mut JsRuntime, scripts: &[Arc<RwLock<Node>>], external_scripts: &HashMap<String, String>, allow_inline: bool) -> Vec<Result<String, String>> {
     let mut results = Vec::new();
     for script_node in scripts {
         let src = match &script_node.read().unwrap().node_type {
@@ -164,6 +242,10 @@ fn run_scripts(runtime: &mut JsRuntime, scripts: &[Arc<RwLock<Node>>], external_
                 }
             },
             None => {
+                if !allow_inline {
+                    tracing::warn!("[csp] bloqueado por 'script-src': un <script> en linea (la politica no incluye 'unsafe-inline')");
+                    continue;
+                }
                 let code = Node::text_content(script_node);
                 if code.trim().is_empty() {
                     continue;
@@ -288,7 +370,7 @@ mod tests {
                 });
             </script></body></html>"#,
         );
-        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None);
+        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None, None);
         assert_eq!(script_results.len(), 1, "el <script> que registra el listener deberia haberse ejecutado");
 
         let target = Node::find_by_id(&dom, "target").expect("target deberia existir");
@@ -301,7 +383,7 @@ mod tests {
     #[test]
     fn execute_inline_scripts_keeping_runtime_returns_a_bound_runtime_even_with_no_scripts() {
         let dom = HtmlParser::parse("<html><body><p>sin scripts</p></body></html>");
-        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None);
+        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None, None);
         assert!(script_results.is_empty());
         // Sin scripts no hay forma de que se haya registrado ningun
         // listener, pero el runtime en si deberia seguir siendo usable

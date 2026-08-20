@@ -45,31 +45,56 @@ use std::sync::{Arc, RwLock};
 /// `resolve_style` para poder invocarse dos veces con el mismo criterio de
 /// orden interno (especificidad) pero en dos momentos distintos (UA antes,
 /// autor despues), sin duplicar la logica de matching+orden entre ambas.
-fn apply_matching_rules(computed: &mut HashMap<String, String>, stylesheet: &StyleSheet, dom_node: &Arc<RwLock<Node>>) {
+fn apply_matching_rules(computed: &mut HashMap<String, String>, stylesheet: &StyleSheet, dom_node: &Arc<RwLock<Node>>, viewport_width: f32) {
     let mut matched: Vec<&Rule> = stylesheet
         .rules
         .iter()
+        // `@media` (Fase 18): una regla que venia dentro de un bloque solo
+        // participa si su condicion se cumple con el viewport ACTUAL. Se
+        // comprueba aqui, en cada resolucion de estilo, y no al parsear,
+        // precisamente para que redimensionar la ventana vuelva a
+        // evaluarla - la hoja se parsea una sola vez por pagina, pero
+        // `resolve_style` corre en cada relayout.
+        .filter(|rule| rule.media.as_ref().is_none_or(|m| m.matches(viewport_width)))
         .filter(|rule| SelectorMatcher::matches(&rule.selector, dom_node))
         .collect();
     matched.sort_by_key(|rule| SelectorMatcher::calculate_specificity(&rule.selector));
 
-    for rule in matched {
+    // DOS pasadas (Fase 22): primero las declaraciones normales por
+    // especificidad, y luego las `!important` - tambien por especificidad
+    // entre ellas. Asi una declaracion importante gana a CUALQUIER normal
+    // sin importar su selector, que es justo lo que `!important` significa
+    // y lo unico que no se puede expresar con un solo orden.
+    for rule in &matched {
         for (prop, val) in &rule.declarations {
-            computed.insert(prop.clone(), val.clone());
+            if !rule.important.contains(prop) {
+                computed.insert(prop.clone(), val.clone());
+            }
+        }
+    }
+    for rule in &matched {
+        for (prop, val) in &rule.declarations {
+            if rule.important.contains(prop) {
+                computed.insert(prop.clone(), val.clone());
+            }
         }
     }
 }
 
-pub fn resolve_style(dom_node: &Arc<RwLock<Node>>, stylesheet: &StyleSheet) -> HashMap<String, String> {
+/// `viewport_width` decide que bloques `@media` aplican (Fase 18). Lo
+/// pasa `engine-layout`, que es quien conoce el tamaño real de la ventana;
+/// como se evalua aqui y no al parsear, redimensionar reevalua las
+/// consultas sin necesidad de volver a parsear la hoja.
+pub fn resolve_style(dom_node: &Arc<RwLock<Node>>, stylesheet: &StyleSheet, viewport_width: f32) -> HashMap<String, String> {
     let mut computed = HashMap::new();
 
     // Origen 1: agente de usuario - SIEMPRE pierde frente a lo que venga
     // despues, sin importar especificidad (ver doc-comment del modulo).
-    apply_matching_rules(&mut computed, user_agent_stylesheet(), dom_node);
+    apply_matching_rules(&mut computed, user_agent_stylesheet(), dom_node, viewport_width);
 
     // Origen 2: autor de la pagina - sobrescribe cualquier declaracion de
     // agente de usuario para la misma propiedad.
-    apply_matching_rules(&mut computed, stylesheet, dom_node);
+    apply_matching_rules(&mut computed, stylesheet, dom_node, viewport_width);
 
     let inline_style = {
         let n = dom_node.read().unwrap();
@@ -108,7 +133,7 @@ mod tests {
         let stylesheet = Parser::parse("p { color: #ff0000; }");
         let p = find_first_element(&dom, "p");
 
-        let computed = resolve_style(&p, &stylesheet);
+        let computed = resolve_style(&p, &stylesheet, 1280.0);
         assert_eq!(computed.get("color").map(String::as_str), Some("#ff0000"));
     }
 
@@ -122,7 +147,7 @@ mod tests {
         let stylesheet = Parser::parse("h1 { color: #ff0000; }");
         let span = find_first_element(&dom, "span");
 
-        assert!(resolve_style(&span, &stylesheet).is_empty(), "una regla para h1 no deberia aplicarse a un <span>, ni tiene la hoja de agente de usuario nada para el");
+        assert!(resolve_style(&span, &stylesheet, 1280.0).is_empty(), "una regla para h1 no deberia aplicarse a un <span>, ni tiene la hoja de agente de usuario nada para el");
     }
 
     #[test]
@@ -131,7 +156,7 @@ mod tests {
         let stylesheet = Parser::parse("#main { color: #00ff00; } p { color: #ff0000; }");
         let p = find_first_element(&dom, "p");
 
-        let computed = resolve_style(&p, &stylesheet);
+        let computed = resolve_style(&p, &stylesheet, 1280.0);
         assert_eq!(computed.get("color").map(String::as_str), Some("#00ff00"), "el selector de mayor especificidad (#main) deberia ganar pese a aparecer antes en la hoja");
     }
 
@@ -141,7 +166,7 @@ mod tests {
         let stylesheet = Parser::parse("#main { color: #00ff00; }");
         let p = find_first_element(&dom, "p");
 
-        let computed = resolve_style(&p, &stylesheet);
+        let computed = resolve_style(&p, &stylesheet, 1280.0);
         assert_eq!(computed.get("color").map(String::as_str), Some("#0000ff"), "el atributo style en linea deberia ganar incluso sobre un selector de id");
     }
 
@@ -155,7 +180,7 @@ mod tests {
         let stylesheet = Parser::parse("");
         let h1 = find_first_element(&dom, "h1");
 
-        let computed = resolve_style(&h1, &stylesheet);
+        let computed = resolve_style(&h1, &stylesheet, 1280.0);
         assert_eq!(computed.get("font-size").map(String::as_str), Some("32px"), "un <h1> sin CSS de autor deberia seguir teniendo el tamaño por defecto de un titular");
         assert_eq!(computed.get("margin").map(String::as_str), Some("21px"));
     }
@@ -173,7 +198,94 @@ mod tests {
         let stylesheet = Parser::parse("h1 { font-size: 10px; }");
         let h1 = find_first_element(&dom, "h1");
 
-        let computed = resolve_style(&h1, &stylesheet);
+        let computed = resolve_style(&h1, &stylesheet, 1280.0);
         assert_eq!(computed.get("font-size").map(String::as_str), Some("10px"), "la regla del autor deberia ganar a la de agente de usuario pese a tener la misma especificidad nominal");
+    }
+
+    /// El punto de la Fase 22: `!important` gana a una regla de MAYOR
+    /// especificidad, que es lo unico que no se puede expresar con un
+    /// solo orden de aplicacion.
+    #[test]
+    fn an_important_declaration_beats_a_more_specific_normal_one() {
+        let dom = HtmlParser::parse(r#"<html><body><p id="main">hola</p></body></html>"#);
+        let stylesheet = Parser::parse("#main { color: #00ff00; } p { color: #ff0000 !important; }");
+        let p = find_first_element(&dom, "p");
+
+        let computed = resolve_style(&p, &stylesheet, 1280.0);
+        assert_eq!(
+            computed.get("color").map(String::as_str),
+            Some("#ff0000"),
+            "el !important de `p` deberia ganar al `#main` normal, pese a tener MENOS especificidad"
+        );
+    }
+
+    /// Y el valor llega LIMPIO, sin el sufijo pegado - que era el bug de
+    /// fondo: antes se guardaba `"#ff0000 !important"`, ganaba la cascada
+    /// y luego no parseaba como color, asi que anulaba a la regla que
+    /// habria ganado sin el.
+    #[test]
+    fn the_important_suffix_is_stripped_from_the_value() {
+        let dom = HtmlParser::parse("<html><body><p>hola</p></body></html>");
+        let stylesheet = Parser::parse("p { color: #ff0000 !important; }");
+        let p = find_first_element(&dom, "p");
+
+        assert_eq!(resolve_style(&p, &stylesheet, 1280.0).get("color").map(String::as_str), Some("#ff0000"));
+    }
+
+    /// Entre DOS declaraciones importantes vuelve a mandar la
+    /// especificidad, como en el spec.
+    #[test]
+    fn specificity_still_decides_between_two_important_declarations() {
+        let dom = HtmlParser::parse(r#"<html><body><p id="main">hola</p></body></html>"#);
+        let stylesheet = Parser::parse("p { color: #ff0000 !important; } #main { color: #00ff00 !important; }");
+        let p = find_first_element(&dom, "p");
+
+        assert_eq!(resolve_style(&p, &stylesheet, 1280.0).get("color").map(String::as_str), Some("#00ff00"));
+    }
+
+    /// Sin `!important`, la especificidad manda como siempre - fija que la
+    /// segunda pasada no altera el comportamiento normal.
+    #[test]
+    fn normal_declarations_are_unaffected_by_the_second_pass() {
+        let dom = HtmlParser::parse(r#"<html><body><p id="main">hola</p></body></html>"#);
+        let stylesheet = Parser::parse("p { color: #ff0000; } #main { color: #00ff00; }");
+        let p = find_first_element(&dom, "p");
+
+        assert_eq!(resolve_style(&p, &stylesheet, 1280.0).get("color").map(String::as_str), Some("#00ff00"));
+    }
+
+    /// Un shorthand importante hace importante tambien al longhand que se
+    /// deriva de el: `background: red !important` debe ganar igual.
+    #[test]
+    fn an_important_shorthand_makes_its_expanded_longhand_important_too() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="caja">x</div></body></html>"#);
+        let stylesheet = Parser::parse("#caja { background-color: #00ff00; } div { background: #ff0000 !important; }");
+        let div = find_first_element(&dom, "div");
+
+        assert_eq!(
+            resolve_style(&div, &stylesheet, 1280.0).get("background-color").map(String::as_str),
+            Some("#ff0000"),
+            "la importancia del shorthand deberia heredarla el longhand derivado"
+        );
+    }
+
+    /// La razon real de expandir `background` a `background-color` en el
+    /// PARSER (`insert_declaration`) en vez de al pintar: aqui, la
+    /// cascada nunca sabe que hubo un shorthand de por medio, asi que una
+    /// regla de mayor especificidad que solo declara el longhand gana
+    /// exactamente igual que con cualquier otro par de reglas normales -
+    /// cero logica especial en `apply_matching_rules`.
+    #[test]
+    fn a_higher_specificity_background_color_rule_wins_over_a_lower_specificity_background_shorthand() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="caja">contenido</div></body></html>"#);
+        let stylesheet = Parser::parse("div { background: #ff0000; } #caja { background-color: #00ff00; }");
+        let div = find_first_element(&dom, "div");
+
+        let computed = resolve_style(&div, &stylesheet, 1280.0);
+        assert_eq!(
+            computed.get("background-color").map(String::as_str),
+            Some("#00ff00"),
+            "el longhand mas especifico deberia ganar sobre el shorthand menos especifico, aunque sean propiedades 'distintas' a nivel de string"
+        );
     }
 }

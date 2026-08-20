@@ -4,7 +4,9 @@ pub mod dom_bindings;
 pub mod event_loop;
 pub mod fetch;
 pub mod history;
+pub mod storage;
 pub mod test_harness;
+pub mod timers;
 pub mod window;
 pub mod xhr;
 

@@ -7,5 +7,6 @@
 pub mod pipeline;
 pub mod scripting;
 pub mod platform;
+pub mod sandbox;
 pub mod protocol;
 pub mod server;

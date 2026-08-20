@@ -97,8 +97,33 @@ impl DisplayList {
     }
 
     fn build_items(layout_box: &LayoutBox, target: &mut Vec<DisplayItem>, images: &ImageMap, z_layers: &mut Vec<(i32, Vec<DisplayItem>)>) {
+        // `visibility: hidden` (a diferencia de `display: none`, ver
+        // `engine-layout::tree::build_node`) SI genera caja - sigue
+        // ocupando su espacio en el layout, solo no se pinta. Es heredable
+        // (`INHERITABLE_PROPERTIES` en engine-layout), y la cascada real ya
+        // resuelve por caja: `computed_style` de ESTE `layout_box` refleja
+        // tanto la herencia como una posible redeclaracion propia
+        // (`visibility: visible` en un descendiente reactiva su pintado,
+        // exactamente como el spec real), asi que basta comprobar el valor
+        // ya resuelto de esta caja - no hace falta propagar un flag aparte
+        // ni recorrer el arbol dos veces. Solo se salta la emision de ESTA
+        // caja (fondo/borde/sombra/texto/imagen); overflow-clip y la
+        // recursion en los hijos siguen igual, porque cada hijo decide su
+        // propio pintado con su propio `computed_style`.
+        let hidden = layout_box.computed_style.get("visibility").map(String::as_str) == Some("hidden");
+        if hidden {
+            return Self::build_clipped_children(layout_box, target, images, z_layers);
+        }
         match &layout_box.box_type {
-            BoxType::Block | BoxType::Inline => {
+            // `BoxType::Replaced` (Fase 11: controles de formulario) se
+            // pinta EXACTAMENTE igual que `Block`/`Inline` - fondo/borde/
+            // sombra resueltos de la misma cascada, misma rama. Lo unico
+            // que lo distingue de un `<div>` cualquiera es que
+            // `engine-layout` nunca recursa en sus hijos de verdad (ver
+            // `place_inline_node::BoxType::Replaced`), asi que aqui no hay
+            // ningun contenido de texto/imagen que pintar dentro - solo la
+            // caja del widget en si.
+            BoxType::Block | BoxType::Inline | BoxType::Replaced => {
                 let radius = parse_css_border_radius(&layout_box.computed_style).unwrap_or(0.0);
                 // `box-shadow` se pinta ANTES que fondo/border (orden real
                 // del spec - ver el doc-comment de `DisplayItem::Shadow`).
@@ -149,14 +174,24 @@ impl DisplayList {
             }
         }
 
-        // `overflow: hidden` (Fase 3.5) envuelve TODO el subarbol de hijos
-        // en un `PushClip`/`PopClip` - ver el doc-comment de
-        // `DisplayItem::PushClip`. Solo `hidden` esta reconocido (`scroll`/
-        // `auto` recortarian igual en un motor con scroll interno por
-        // elemento, que este motor no tiene - solo el scroll de pagina
-        // completa de `window.rs`; `visible`, el valor inicial real, no
-        // recorta nada, que es tambien lo que pasa si la propiedad
-        // simplemente no esta puesta).
+        Self::build_clipped_children(layout_box, target, images, z_layers);
+    }
+
+    /// `overflow: hidden` (Fase 3.5) envuelve TODO el subarbol de hijos
+    /// en un `PushClip`/`PopClip` - ver el doc-comment de
+    /// `DisplayItem::PushClip`. Solo `hidden` esta reconocido (`scroll`/
+    /// `auto` recortarian igual en un motor con scroll interno por
+    /// elemento, que este motor no tiene - solo el scroll de pagina
+    /// completa de `window.rs`; `visible`, el valor inicial real, no
+    /// recorta nada, que es tambien lo que pasa si la propiedad
+    /// simplemente no esta puesta).
+    ///
+    /// Compartido entre el camino normal de `build_items` y su atajo para
+    /// `visibility: hidden`: una caja oculta no pinta nada PROPIO, pero
+    /// sigue recortando y recursando en sus hijos igual que si fuera
+    /// visible (un hijo puede reactivar su propio pintado con `visibility:
+    /// visible`, ver el doc-comment de esa rama).
+    fn build_clipped_children(layout_box: &LayoutBox, target: &mut Vec<DisplayItem>, images: &ImageMap, z_layers: &mut Vec<(i32, Vec<DisplayItem>)>) {
         let clips = layout_box.computed_style.get("overflow").map(String::as_str) == Some("hidden");
         if clips {
             target.push(DisplayItem::PushClip { rect: layout_box.dimensions.clone() });
@@ -191,13 +226,167 @@ fn z_index_for_stacking(computed_style: &HashMap<String, String>) -> Option<i32>
     computed_style.get("z-index").and_then(|v| v.trim().parse::<i32>().ok())
 }
 
-/// Parseo de color CSS deliberadamente minimo: solo hex (#rgb, #rrggbb).
-/// Nombres de color (`red`, `white`...), `rgb()`/`rgba()`/`hsl()` no estan
-/// implementados todavia - devuelve None y la caja se queda sin pintar en
-/// vez de fingir un color por defecto. Ver ARCHITECTURE.md.
+/// Los 16 colores con nombre de CSS1 mas los que de verdad aparecen en
+/// paginas reales. **No es la lista completa** de los ~148 nombres
+/// extendidos de CSS: se eligieron los que cubren la practica totalidad
+/// del uso real, y un nombre fuera de esta tabla resuelve a `None` (la
+/// caja se queda sin pintar) en vez de fingir un color inventado.
+/// Ampliarla es añadir filas, sin ningun cambio de logica.
+const NAMED_COLORS: &[(&str, [u8; 4])] = &[
+    // CSS1: los 16 originales, obligatorios en cualquier motor.
+    ("black", [0, 0, 0, 255]),
+    ("silver", [192, 192, 192, 255]),
+    ("gray", [128, 128, 128, 255]),
+    ("white", [255, 255, 255, 255]),
+    ("maroon", [128, 0, 0, 255]),
+    ("red", [255, 0, 0, 255]),
+    ("purple", [128, 0, 128, 255]),
+    ("fuchsia", [255, 0, 255, 255]),
+    ("green", [0, 128, 0, 255]),
+    ("lime", [0, 255, 0, 255]),
+    ("olive", [128, 128, 0, 255]),
+    ("yellow", [255, 255, 0, 255]),
+    ("navy", [0, 0, 128, 255]),
+    ("blue", [0, 0, 255, 255]),
+    ("teal", [0, 128, 128, 255]),
+    ("aqua", [0, 255, 255, 255]),
+    // Extendidos de uso comun en paginas reales.
+    ("orange", [255, 165, 0, 255]),
+    ("pink", [255, 192, 203, 255]),
+    ("brown", [165, 42, 42, 255]),
+    ("cyan", [0, 255, 255, 255]),
+    ("magenta", [255, 0, 255, 255]),
+    ("gold", [255, 215, 0, 255]),
+    ("indigo", [75, 0, 130, 255]),
+    ("violet", [238, 130, 238, 255]),
+    ("beige", [245, 245, 220, 255]),
+    ("ivory", [255, 255, 240, 255]),
+    ("khaki", [240, 230, 140, 255]),
+    ("salmon", [250, 128, 114, 255]),
+    ("crimson", [220, 20, 60, 255]),
+    ("coral", [255, 127, 80, 255]),
+    ("tomato", [255, 99, 71, 255]),
+    ("orchid", [218, 112, 214, 255]),
+    ("plum", [221, 160, 221, 255]),
+    ("tan", [210, 180, 140, 255]),
+    ("turquoise", [64, 224, 208, 255]),
+    ("lavender", [230, 230, 250, 255]),
+    ("darkgray", [169, 169, 169, 255]),
+    ("darkgrey", [169, 169, 169, 255]),
+    ("lightgray", [211, 211, 211, 255]),
+    ("lightgrey", [211, 211, 211, 255]),
+    ("grey", [128, 128, 128, 255]),
+    ("dimgray", [105, 105, 105, 255]),
+    ("dimgrey", [105, 105, 105, 255]),
+    ("darkred", [139, 0, 0, 255]),
+    ("darkgreen", [0, 100, 0, 255]),
+    ("darkblue", [0, 0, 139, 255]),
+    ("lightblue", [173, 216, 230, 255]),
+    ("lightgreen", [144, 238, 144, 255]),
+    ("skyblue", [135, 206, 235, 255]),
+    ("steelblue", [70, 130, 180, 255]),
+    ("royalblue", [65, 105, 225, 255]),
+    ("midnightblue", [25, 25, 112, 255]),
+    ("whitesmoke", [245, 245, 245, 255]),
+    ("gainsboro", [220, 220, 220, 255]),
+    ("linen", [250, 240, 230, 255]),
+    ("snow", [255, 250, 250, 255]),
+];
+
+/// Un componente `0-255` de `rgb()`/`rgba()`: acepta tanto el numero
+/// directo (`128`) como el porcentaje (`50%`), las dos formas del spec.
+/// Se acota al rango en vez de rechazar, igual que un navegador real ante
+/// un `rgb(300, -5, 0)`.
+fn parse_rgb_component(token: &str) -> Option<u8> {
+    let token = token.trim();
+    let value = match token.strip_suffix('%') {
+        Some(percent) => percent.trim().parse::<f32>().ok()? * 255.0 / 100.0,
+        None => token.parse::<f32>().ok()?,
+    };
+    Some(value.clamp(0.0, 255.0).round() as u8)
+}
+
+/// Parseo de color CSS: hexadecimal (`#rgb`, `#rrggbb`, `#rrggbbaa`),
+/// nombres (`red`, `white`... ver `NAMED_COLORS`), `rgb()`/`rgba()` y las
+/// palabras clave `transparent`/`currentColor`.
+///
+/// Antes de esta fase SOLO entendia hexadecimal, asi que un
+/// `background: red` - de lo mas comun que hay en CSS real - no pintaba
+/// absolutamente nada. Como este es el UNICO parseador de color del motor,
+/// arreglarlo aqui arregla `color`, `background-color`, `border` y
+/// `box-shadow` a la vez.
+///
+/// NO implementado: `hsl()`/`hwb()`/`lab()`/`oklch()` y el resto de
+/// espacios de color modernos - devuelven `None` y la caja se queda sin
+/// pintar, en vez de fingir una conversion. Tampoco los ~90 nombres
+/// extendidos que faltan en la tabla.
 fn parse_css_color(value: &str) -> Option<[u8; 4]> {
-    let hex = value.trim().strip_prefix('#')?;
+    let value = value.trim();
+
+    if let Some(hex) = value.strip_prefix('#') {
+        return parse_hex_color(hex);
+    }
+
+    let lower = value.to_ascii_lowercase();
+
+    // `transparent` es un color de pleno derecho en el spec (negro con
+    // alfa 0), no la ausencia de color - y se usa mucho para "quitar" un
+    // fondo o un borde heredado.
+    if lower == "transparent" {
+        return Some([0, 0, 0, 0]);
+    }
+    // `currentColor` significa "el valor de `color` de este elemento", que
+    // esta funcion no conoce: resolverlo exige el `computed_style`
+    // completo. Devuelve `None` a proposito - quien pinta un borde ya cae
+    // al `color` del elemento por su cuenta (ver `parse_css_border`), que
+    // es exactamente el mismo resultado en el caso que mas importa.
+    if lower == "currentcolor" {
+        return None;
+    }
+
+    if let Some(rest) = lower.strip_prefix("rgba(").or_else(|| lower.strip_prefix("rgb(")) {
+        let inner = rest.strip_suffix(')')?;
+        // Acepta tanto la sintaxis clasica con comas (`rgb(1, 2, 3)`) como
+        // la moderna con espacios (`rgb(1 2 3 / 0.5)`), que ya usan muchas
+        // hojas de estilo reales.
+        let normalised = inner.replace(',', " ").replace('/', " ");
+        let parts: Vec<&str> = normalised.split_whitespace().collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let r = parse_rgb_component(parts[0])?;
+        let g = parse_rgb_component(parts[1])?;
+        let b = parse_rgb_component(parts[2])?;
+        // El alfa va de 0.0 a 1.0 (o en porcentaje), no de 0 a 255 - es la
+        // diferencia que hace que no se pueda reusar `parse_rgb_component`.
+        let a = match parts.get(3) {
+            Some(token) => {
+                let t = token.trim();
+                let alpha = match t.strip_suffix('%') {
+                    Some(percent) => percent.trim().parse::<f32>().ok()? / 100.0,
+                    None => t.parse::<f32>().ok()?,
+                };
+                (alpha.clamp(0.0, 1.0) * 255.0).round() as u8
+            }
+            None => 255,
+        };
+        return Some([r, g, b, a]);
+    }
+
+    NAMED_COLORS.iter().find(|(name, _)| *name == lower).map(|(_, rgba)| *rgba)
+}
+
+/// Hexadecimal en sus tres longitudes reales: `#rgb`, `#rrggbb` y
+/// `#rrggbbaa` (esta ultima con canal alfa, cada vez mas comun).
+fn parse_hex_color(hex: &str) -> Option<[u8; 4]> {
     match hex.len() {
+        8 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
+            Some([r, g, b, a])
+        }
         6 => {
             let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
             let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
@@ -347,6 +536,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_named_colors_case_insensitively() {
+        assert_eq!(parse_css_color("red"), Some([255, 0, 0, 255]));
+        assert_eq!(parse_css_color("WHITE"), Some([255, 255, 255, 255]));
+        assert_eq!(parse_css_color("  Blue  "), Some([0, 0, 255, 255]));
+        assert_eq!(parse_css_color("rebeccapurple"), None, "un nombre fuera de la tabla no deberia inventarse un color");
+    }
+
+    /// Las dos grafias de gris del spec (`gray`/`grey`) deben dar lo
+    /// mismo - el codigo real usa ambas indistintamente.
+    #[test]
+    fn both_spellings_of_gray_resolve_to_the_same_color() {
+        assert_eq!(parse_css_color("gray"), parse_css_color("grey"));
+        assert_eq!(parse_css_color("lightgray"), parse_css_color("lightgrey"));
+    }
+
+    #[test]
+    fn parses_the_three_hex_lengths_including_alpha() {
+        assert_eq!(parse_css_color("#f00"), Some([255, 0, 0, 255]));
+        assert_eq!(parse_css_color("#ff0000"), Some([255, 0, 0, 255]));
+        assert_eq!(parse_css_color("#ff000080"), Some([255, 0, 0, 128]), "#rrggbbaa deberia leer el canal alfa");
+    }
+
+    #[test]
+    fn parses_rgb_and_rgba_in_both_comma_and_space_syntax() {
+        assert_eq!(parse_css_color("rgb(255, 0, 0)"), Some([255, 0, 0, 255]));
+        assert_eq!(parse_css_color("rgb(255 0 0)"), Some([255, 0, 0, 255]), "la sintaxis moderna con espacios tambien es valida");
+        assert_eq!(parse_css_color("rgba(0, 0, 0, 0.5)"), Some([0, 0, 0, 128]), "el alfa va de 0 a 1, no de 0 a 255");
+        assert_eq!(parse_css_color("rgb(0 0 0 / 50%)"), Some([0, 0, 0, 128]), "alfa en porcentaje tras la barra");
+    }
+
+    #[test]
+    fn rgb_accepts_percentage_components() {
+        assert_eq!(parse_css_color("rgb(100%, 0%, 0%)"), Some([255, 0, 0, 255]));
+    }
+
+    /// Un navegador real acota en vez de rechazar un componente fuera de
+    /// rango.
+    #[test]
+    fn out_of_range_rgb_components_are_clamped_not_rejected() {
+        assert_eq!(parse_css_color("rgb(300, -5, 0)"), Some([255, 0, 0, 255]));
+    }
+
+    /// `transparent` es un color de pleno derecho (negro con alfa cero),
+    /// no la ausencia de color - se usa mucho para quitar un fondo o
+    /// borde heredado.
+    #[test]
+    fn transparent_is_a_real_color_with_zero_alpha() {
+        assert_eq!(parse_css_color("transparent"), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn unsupported_color_syntaxes_are_none_instead_of_a_made_up_color() {
+        assert_eq!(parse_css_color("hsl(0, 100%, 50%)"), None, "hsl() no esta implementado");
+        assert_eq!(parse_css_color("currentColor"), None, "currentColor exige el computed_style completo");
+        assert_eq!(parse_css_color("basura"), None);
+        assert_eq!(parse_css_color(""), None);
+    }
+
+    #[test]
     fn parses_pixel_font_size() {
         assert_eq!(parse_css_font_size("32px"), Some(32.0));
         assert_eq!(parse_css_font_size("  18px "), Some(18.0));
@@ -375,6 +623,53 @@ mod tests {
         assert_eq!(z_index_for_stacking(&style(Some("relative"), "5")), Some(5));
         assert_eq!(z_index_for_stacking(&style(Some("static"), "5")), None, "z-index sin position real (static) no deberia tener efecto, igual que el spec real");
         assert_eq!(z_index_for_stacking(&style(None, "5")), None, "sin position en absoluto (static por defecto), z-index se ignora igual");
+    }
+
+    /// `visibility: hidden` no debe emitir ningun item de pintado propio
+    /// (fondo/borde), a diferencia de `display: none` (que ni siquiera
+    /// llega a `DisplayList::build` porque `engine-layout` no le genera
+    /// caja - ver `engine-layout::tree::build_node`). Aqui SI hay caja
+    /// (ocupa espacio), solo no se pinta.
+    #[test]
+    fn visibility_hidden_emits_no_display_items_for_the_box_itself() {
+        let mut hidden = LayoutBox::new(BoxType::Block);
+        hidden.computed_style.insert("visibility".to_string(), "hidden".to_string());
+        hidden.computed_style.insert("background-color".to_string(), "#ff0000".to_string());
+        hidden.dimensions = Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
+
+        let list = DisplayList::build(&hidden, &ImageMap::new());
+
+        assert!(list.items.is_empty(), "una caja con visibility:hidden no deberia producir ningun DisplayItem propio");
+    }
+
+    /// Un hijo con `visibility: visible` explicito dentro de un ancestro
+    /// `hidden` reactiva su propio pintado - la cascada real ya resuelve
+    /// esto (la declaracion propia del hijo gana sobre lo heredado, ver
+    /// `engine-layout::tree::build_node`), asi que basta con que
+    /// `build_items` respete el `computed_style` YA resuelto de cada caja.
+    #[test]
+    fn a_child_with_explicit_visibility_visible_still_paints_inside_a_hidden_ancestor() {
+        let mut visible_child = LayoutBox::new(BoxType::Block);
+        visible_child.computed_style.insert("visibility".to_string(), "visible".to_string());
+        visible_child.computed_style.insert("background-color".to_string(), "#00ff00".to_string());
+        visible_child.dimensions = Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
+
+        let mut hidden_parent = LayoutBox::new(BoxType::Block);
+        hidden_parent.computed_style.insert("visibility".to_string(), "hidden".to_string());
+        hidden_parent.computed_style.insert("background-color".to_string(), "#ff0000".to_string());
+        hidden_parent.dimensions = Rect { x: 0.0, y: 0.0, width: 20.0, height: 20.0 };
+        hidden_parent.children.push(visible_child);
+
+        let list = DisplayList::build(&hidden_parent, &ImageMap::new());
+
+        assert!(
+            list.items.iter().any(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [0, 255, 0, 255])),
+            "el hijo con visibility:visible explicito deberia pintarse pese al ancestro oculto"
+        );
+        assert!(
+            !list.items.iter().any(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [255, 0, 0, 255])),
+            "el ancestro oculto en si no deberia pintar su propio fondo"
+        );
     }
 
     /// El punto real del pintado por z-index: un elemento posicionado con

@@ -15,6 +15,12 @@ pub struct NetworkResponse {
     pub status_code: u16,
     pub status_text: String,
     pub headers: HashMap<String, String>,
+    /// Todas las cabeceras `Set-Cookie` de la respuesta, en orden - aparte
+    /// de `headers` porque es la unica que un servidor repite de forma
+    /// legitima y significativa (un `HashMap` solo guardaria la ultima).
+    /// El almacen de cookies ya las consumio en `NetworkEngine::fetch_once`;
+    /// se exponen aqui para depuracion y para quien necesite inspeccionarlas.
+    pub set_cookie: Vec<String>,
     pub body: Bytes,
 }
 

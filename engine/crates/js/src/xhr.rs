@@ -110,6 +110,11 @@ struct XhrCapture {
     /// pero nunca para `non_root_count`, asi que el colector lo trata como
     /// raiz y lo mantiene vivo en vez de liberarlo bajo los pies.
     handlers: Arc<Mutex<HashMap<String, JsObject>>>,
+    /// La URL COMPLETA de la pagina que creo este XHR - base para
+    /// resolver URLs relativas (Fase 20.1) y de donde sale el origen que
+    /// activa la politica de mismo origen (Fase 20). `None` en un
+    /// documento sin URL propia.
+    page_url: Option<String>,
 }
 
 impl Finalize for XhrCapture {}
@@ -127,10 +132,10 @@ impl JsData for XhrCapture {}
 /// todo `JsRuntime` tiene red disponible. Sin llamar a esto, `new
 /// XMLHttpRequest()` lanza `ReferenceError`, que es la respuesta honesta
 /// donde de verdad no hay red, en vez de un objeto que nunca conecta.
-pub fn register_xhr(context: &mut Context, network: Arc<NetworkEngine>) -> JsResult<()> {
+pub fn register_xhr(context: &mut Context, network: Arc<NetworkEngine>, page_url: Option<String>) -> JsResult<()> {
     let constructor = NativeFunction::from_copy_closure_with_captures(
-        |_this, _args, captured: &NetworkOnlyCapture, context| Ok(build_xhr_object(captured.0.clone(), context).into()),
-        NetworkOnlyCapture(network),
+        |_this, _args, captured: &NetworkOnlyCapture, context| Ok(build_xhr_object(captured.0.clone(), captured.1.clone(), context).into()),
+        NetworkOnlyCapture(network, page_url),
     );
 
     // `.constructor(true)` es lo que hace que `new XMLHttpRequest()`
@@ -169,7 +174,7 @@ fn parse_method(raw: &str) -> Method {
 }
 
 #[derive(Clone)]
-struct NetworkOnlyCapture(Arc<NetworkEngine>);
+struct NetworkOnlyCapture(Arc<NetworkEngine>, Option<String>);
 
 impl Finalize for NetworkOnlyCapture {}
 unsafe impl Trace for NetworkOnlyCapture {
@@ -177,11 +182,12 @@ unsafe impl Trace for NetworkOnlyCapture {
 }
 
 /// Construye UNA instancia de `XMLHttpRequest` con su propio estado.
-fn build_xhr_object(network: Arc<NetworkEngine>, context: &mut Context) -> JsObject {
+fn build_xhr_object(network: Arc<NetworkEngine>, page_url: Option<String>, context: &mut Context) -> JsObject {
     let capture = XhrCapture {
         state: Arc::new(Mutex::new(XhrState::default())),
         network,
         handlers: Arc::new(Mutex::new(HashMap::new())),
+        page_url,
     };
 
     // open(metodo, url, async?): solo prepara. El tercer argumento se
@@ -397,20 +403,32 @@ fn send_impl(captured: &XhrCapture, context: &mut Context) -> JsResult<JsValue> 
         (state.method.clone(), state.url.clone(), state.request_headers.clone())
     };
 
-    let request = match NetworkRequest::new(&url) {
-        Ok(mut request) => {
-            request.method = parse_method(&method);
+    // Fase 20.1: se resuelve contra la URL de la pagina, asi que
+    // `xhr.open('GET', '/api/datos')` funciona. Fase 20: el origen que
+    // sale de ahi activa la politica de mismo origen - `XMLHttpRequest` la
+    // lleva aplicando desde que existe CORS, no es una API "antigua"
+    // exenta.
+    let resolved = engine_net::request::resolve_against_page(&url, captured.page_url.as_deref());
+    let request = match resolved.map(|(absolute, origin)| {
+        NetworkRequest::new(absolute.as_str()).map(|mut r| {
+            r.method = parse_method(&method);
             for (name, value) in headers {
-                request.headers.insert(name, value);
+                r.headers.insert(name, value);
             }
-            request
-        }
-        Err(_) => return finish_with_network_error(captured, context),
+            r.origin = origin;
+            r
+        })
+    }) {
+        Some(Ok(request)) => request,
+        _ => return finish_with_network_error(captured, "URL invalida", context),
     };
 
     let response = match pollster::block_on(captured.network.fetch(&request)) {
         Ok(response) => response,
-        Err(_) => return finish_with_network_error(captured, context),
+        // El motivo REAL se propaga a la excepcion (Fase 20): un bloqueo
+        // por CORS explica que cabecera falta, y sin eso un desarrollador
+        // solo ve "fallo de red" y no tiene por donde empezar.
+        Err(error) => return finish_with_network_error(captured, &error.to_string(), context),
     };
 
     let text = response.text();
@@ -454,7 +472,20 @@ fn send_impl(captured: &XhrCapture, context: &mut Context) -> JsResult<JsValue> 
 /// Fallo de RED (URL invalida, host inalcanzable, conexion caida): se pasa
 /// a `DONE` con `status = 0` - la marca con la que el codigo real reconoce
 /// este caso - y se dispara `onerror`, nunca `onload`.
-fn finish_with_network_error(captured: &XhrCapture, context: &mut Context) -> JsResult<JsValue> {
+/// Cierra el XHR como fallido y **lanza**.
+///
+/// Lanzar (y no solo poner `status = 0`) es lo correcto porque este
+/// `XMLHttpRequest` es SIEMPRE sincrono (limitacion declarada del modulo):
+/// el spec dice que un `send()` sincrono que falla en red debe lanzar un
+/// `NetworkError`. Antes de la Fase 20 se limitaba a devolver
+/// `undefined`, asi que un fallo dejaba `responseText` vacio SIN ninguna
+/// señal capturable con `try`/`catch` - se descubrio verificando CORS en
+/// vivo: la peticion quedaba bloqueada correctamente (bien) pero la
+/// pagina no tenia forma de enterarse (mal).
+///
+/// Los manejadores `onreadystatechange`/`onerror` se disparan igualmente
+/// ANTES de lanzar, para el codigo que los use en vez de `try`/`catch`.
+fn finish_with_network_error(captured: &XhrCapture, reason: &str, context: &mut Context) -> JsResult<JsValue> {
     {
         let Ok(mut state) = captured.state.lock() else { return Ok(JsValue::undefined()) };
         state.ready_state = DONE;
@@ -463,7 +494,7 @@ fn finish_with_network_error(captured: &XhrCapture, context: &mut Context) -> Js
     }
     fire_ready_state_change(captured, context)?;
     invoke_handler(captured, "onerror", context)?;
-    Ok(JsValue::undefined())
+    Err(JsNativeError::error().with_message(format!("NetworkError: {reason}")).into())
 }
 
 fn fire_ready_state_change(captured: &XhrCapture, context: &mut Context) -> JsResult<()> {
@@ -505,7 +536,7 @@ mod tests {
     /// `engine_server.exe` con un servidor local, no aqui.
     fn runtime_with_xhr() -> JsRuntime {
         let mut runtime = JsRuntime::new();
-        runtime.register_xhr(Arc::new(NetworkEngine::new())).expect("XHR deberia registrarse");
+        runtime.register_xhr(Arc::new(NetworkEngine::new()), None).expect("XHR deberia registrarse");
         runtime
     }
 
@@ -624,12 +655,23 @@ mod tests {
                 x.onload = function () { log.push('load'); };
                 x.onerror = function () { log.push('error'); };
                 x.open('GET', 'http://127.0.0.1:1/no-hay-nadie');
-                x.send();
+                // `send()` LANZA en un XHR sincrono que falla (Fase 20) -
+                // los manejadores se disparan igual, antes de lanzar.
+                // Se comprueba tambien el MENSAJE aqui, dentro del test
+                // que ya toca la red, en vez de en uno aparte: cada test
+                // de red hace `pollster::block_on` dentro de un runtime
+                // tokio (limitacion declarada del modulo), y añadir un
+                // tercero en paralelo lo hacia colgarse.
+                try { x.send(); } catch (e) { log.push(String(e).indexOf('NetworkError') >= 0 ? 'lanzo_networkerror' : 'lanzo_otro'); }
                 log.join() + '|' + x.readyState + '|' + x.status;
                 "#,
             )
             .unwrap();
-        assert_eq!(result, "\"error|4|0\"");
+        assert_eq!(
+            result,
+            "\"error,lanzo_networkerror|4|0\"",
+            "deberia disparar onerror Y ADEMAS lanzar un NetworkError capturable, sin llegar nunca a onload"
+        );
     }
 
     #[test]
@@ -655,7 +697,7 @@ mod tests {
                 r#"
                 var x = new XMLHttpRequest();
                 x.open('GET', 'http://127.0.0.1:1/uno');
-                x.send();
+                try { x.send(); } catch (e) {}
                 var tras_fallo = x.readyState;
                 x.open('GET', 'http://127.0.0.1:1/dos');
                 tras_fallo + ',' + x.readyState + ',' + x.status;

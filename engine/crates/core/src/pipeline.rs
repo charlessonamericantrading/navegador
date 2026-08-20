@@ -138,9 +138,9 @@ pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewp
 /// contradice el aviso de mas arriba sobre mantener este archivo libre de
 /// red: ese aviso es sobre LOGICA de red (resolver/descargar), no sobre
 /// reenviar un handle que otra capa mas abajo sabe usar.
-pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap, network: Option<Arc<NetworkEngine>>) -> (PageResult, JsRuntime) {
+pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap, network: Option<Arc<NetworkEngine>>, storage: Option<crate::scripting::StorageContext>) -> (PageResult, JsRuntime) {
     let dom_root = HtmlParser::parse(html);
-    let (script_results, runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network);
+    let (script_results, runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network, storage);
 
     let mut combined_css = String::new();
     for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
@@ -423,6 +423,7 @@ mod tests {
             None,
             &HashMap::new(),
             &ImageMap::new(),
+            None,
             None,
         );
 

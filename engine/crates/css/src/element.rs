@@ -12,7 +12,7 @@
 //! en `Arc`/`RwLock` de std) son locales a este crate - la regla de huerfanos
 //! de Rust lo rechaza. `ElementRef` es un newtype local que sortea eso.
 
-use crate::selector::{CssString, EngineSelectorImpl, NoNamespace, NoPseudoClass, NoPseudoElement};
+use crate::selector::{CssString, EnginePseudoClass, EngineSelectorImpl, NoNamespace, NoPseudoElement};
 use engine_dom::{Node, NodeType};
 use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
 use selectors::bloom::BloomFilter;
@@ -125,8 +125,52 @@ impl Element for ElementRef {
         }
     }
 
-    fn match_non_ts_pseudo_class(&self, pc: &NoPseudoClass, _context: &mut MatchingContext<Self::Impl>) -> bool {
-        match *pc {}
+    /// Resuelve las pseudo-clases no estructurales (Fase 18) - ver
+    /// `EnginePseudoClass` para por que se dividen en dos grupos.
+    ///
+    /// Las derivables del DOM se leen de atributos reales. Las de
+    /// interaccion devuelven `false` SIEMPRE, y eso no es un hueco
+    /// disimulado: este motor no recalcula la cascada al mover el raton ni
+    /// al enfocar, asi que una pagina nunca veria el estado cambiar. Es
+    /// ademas exactamente lo que hace un navegador real en un dispositivo
+    /// sin puntero para `:hover`.
+    fn match_non_ts_pseudo_class(&self, pc: &EnginePseudoClass, _context: &mut MatchingContext<Self::Impl>) -> bool {
+        let node = self.0.read().unwrap();
+        let NodeType::Element { tag_name, attributes } = &node.node_type else { return false };
+
+        // Solo estos tres pueden estar deshabilitados/ser de solo lectura
+        // en el sentido del spec - un `<div disabled>` no cuenta, aunque
+        // lleve el atributo.
+        let is_form_control = matches!(tag_name.as_str(), "input" | "textarea" | "select" | "button" | "option" | "optgroup" | "fieldset");
+        let is_text_entry = matches!(tag_name.as_str(), "input" | "textarea");
+
+        match pc {
+            // Semantica de atributo booleano HTML: PRESENCIA = marcado, sin
+            // importar su valor - el mismo criterio que ya usa
+            // `core::server::toggle_checked` al conmutarlo con un clic, asi
+            // que el "checkbox hack" funciona de punta a punta.
+            EnginePseudoClass::Checked => attributes.contains_key("checked") || attributes.contains_key("selected"),
+            EnginePseudoClass::Disabled => is_form_control && attributes.contains_key("disabled"),
+            EnginePseudoClass::Enabled => is_form_control && !attributes.contains_key("disabled"),
+            EnginePseudoClass::Required => is_form_control && attributes.contains_key("required"),
+            EnginePseudoClass::Optional => is_form_control && !attributes.contains_key("required"),
+            EnginePseudoClass::ReadOnly => !is_text_entry || attributes.contains_key("readonly") || attributes.contains_key("disabled"),
+            EnginePseudoClass::ReadWrite => is_text_entry && !attributes.contains_key("readonly") && !attributes.contains_key("disabled"),
+            // `:link` es un enlace NO visitado y `:any-link` es cualquiera
+            // con `href`. Como no hay historial de visitas consultable
+            // desde aqui, todo enlace cuenta como no visitado - que es
+            // ademas el lado seguro: `:visited` (mas abajo) nunca coincide,
+            // asi que no se puede filtrar el historial por CSS.
+            EnginePseudoClass::Link | EnginePseudoClass::AnyLink => {
+                matches!(tag_name.as_str(), "a" | "area") && attributes.contains_key("href")
+            }
+            EnginePseudoClass::Hover
+            | EnginePseudoClass::Focus
+            | EnginePseudoClass::FocusVisible
+            | EnginePseudoClass::FocusWithin
+            | EnginePseudoClass::Active
+            | EnginePseudoClass::Visited => false,
+        }
     }
 
     fn match_pseudo_element(&self, pe: &NoPseudoElement, _context: &mut MatchingContext<Self::Impl>) -> bool {

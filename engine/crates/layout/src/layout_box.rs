@@ -36,6 +36,24 @@ pub enum BoxType {
     /// de todo lo demas que no sea `span`/`a`/`b`/`i`/`strong`/`em`, que
     /// cae a `Block`.
     Image(String),
+    /// `<input>`/`<select>`/`<textarea>` (Fase 11: controles de
+    /// formulario) - un "elemento reemplazado" generico como `Image`
+    /// (mismo termino del spec real: caja atomica, sin contenido visible
+    /// propio que el motor sepa componer a partir de sus hijos DOM), pero
+    /// SIN ningun bitmap que pintar. Su tamaño viene SIEMPRE de CSS
+    /// (`width`/`height` resueltos, con valores por defecto reales de
+    /// `user_agent_stylesheet.rs` para cada tipo de control - nunca un
+    /// "tamaño natural" descubierto como el de una imagen decodificada).
+    /// Comparte el mismo tratamiento inline-level atomico que `Image`
+    /// (`is_inline_level`, `place_inline_node`) pero se PINTA como
+    /// cualquier caja de bloque normal (fondo/borde - ver
+    /// `engine-gfx::display_list`, misma rama que `Block`/`Inline`), no
+    /// como una imagen. `<button>` NO usa esta variante - a diferencia de
+    /// `input`/`select`/`textarea`, tiene contenido DOM real (su etiqueta
+    /// es texto hijo, no un atributo) y se beneficia de encogerse a su
+    /// contenido siendo `BoxType::Inline` en vez de un tamaño fijo -
+    /// ver `build_node` en tree.rs.
+    Replaced,
 }
 
 #[derive(Debug, Clone)]
