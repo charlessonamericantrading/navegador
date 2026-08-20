@@ -10,9 +10,12 @@
 //! Este motor tiene los ganchos exactos que CSP necesita, y por eso se
 //! puede aplicar de punta a punta:
 //! - `script-src`: `core::scripting` decide si ejecutar cada `<script>`
-//!   (inline y externo).
-//! - `style-src`: `core::server` decide si aplicar cada `<style>` y cada
-//!   `<link rel=stylesheet>`.
+//!   (inline, Fase 21, y externo).
+//! - `style-src`: `core::server` decide si descargar cada `<link
+//!   rel=stylesheet>` externo (Fase 21), y `core::pipeline` si aplicar
+//!   cada `<style>` EN LINEA (Fase 26 - hasta entonces esta linea de aqui
+//!   mismo afirmaba que ya se aplicaba y no era cierto: los `<style>` se
+//!   concatenaban siempre, CSP o no CSP - encontrado auditando el motor).
 //! - `img-src`: `core::server` decide si descargar cada `<img>`.
 //! - `connect-src`: `engine-js` decide si dejar salir cada `fetch`/XHR.
 //! - `default-src`: el respaldo de todas las anteriores.
@@ -40,6 +43,14 @@
 //!   `<base>`; ninguno existe en este motor todavia.
 //! - Coincidencia de host simple: `*.ejemplo.test`, host exacto y `*`. Sin
 //!   comparar puertos ni rutas dentro de la fuente.
+//! - **Sin `style-src-attr`**: el spec real distingue `<style>` (bloque,
+//!   cubierto por `style-src`/`style-src-elem`, ver Fase 26) del atributo
+//!   `style="..."` de un elemento (`style-src-attr`) - aqui SOLO el
+//!   primero esta gateado. El atributo se sigue aplicando siempre: llega
+//!   al layout por un camino totalmente distinto (`cascade::resolve_style`
+//!   lee el atributo directamente del elemento, no pasa por el
+//!   `combined_css` que concatena los `<style>`), y conectar CSP ahi
+//!   tambien es trabajo aparte, no incluido en esta fase.
 
 use std::collections::HashMap;
 use url::Url;

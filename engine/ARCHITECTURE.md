@@ -3013,6 +3013,46 @@ A fecha de esta limpieza, el motor:
   pestañas (este motor no tiene comunicacion entre pestañas, sin cambios
   respecto a la Fase 15).
 
+- **CSP `style-src` gatea de verdad el `<style>` en linea de la pagina**
+  (Fase 26): la doc de `net::csp` (Fase 21) ya afirmaba "`style-src`:
+  `core::server` decide si aplicar cada `<style>`", pero eso era falso -
+  auditado tras la Fase 25: `pipeline::build_page_keeping_runtime`
+  concatenaba TODOS los `<style>` del documento en `combined_css` sin
+  mirar ninguna politica, a diferencia de `<script>` en linea, que si
+  pasaba por `allows_inline("script-src")` desde la Fase 21. Un
+  `<style>` colado por una inyeccion de HTML (la pagina no sanea algun
+  campo) se aplicaba exactamente igual que uno legitimo - lo que CSP
+  existe para impedir.
+  El fix es de una linea de logica real: `build_page_keeping_runtime`
+  calcula `allow_inline_style = storage.as_ref().is_none_or(|ctx|
+  ctx.csp.allows_inline("style-src"))` ANTES de mover `storage` dentro de
+  `scripting::execute_inline_scripts_keeping_runtime` (mismo patron ya
+  usado ahi para `script-src`), y solo recorre los `<style>` del
+  documento si `allow_inline_style` es cierto - `None` (sin
+  `StorageContext`, el camino de `wpt_runner`/tests sin red) se sigue
+  permitiendo, igual que "sin politica" en el spec real. `build_page`/
+  `build_page_with_harness` (las variantes sin red, sin `storage` en su
+  firma) se quedan intactas a proposito - mismo criterio que ya aplicaba a
+  `<script>`: ninguna pagina de test deberia ver bloqueado su CSS por una
+  politica que no existe en ese camino.
+  3 tests nuevos en `pipeline.rs`: `style-src 'none'` bloquea el `<style>`
+  propio de la pagina (el caso que faltaba), `style-src 'unsafe-inline'`
+  lo sigue permitiendo (que el fix no bloquee de mas), y sin
+  `StorageContext` en absoluto tambien se sigue aplicando (que "sin CSP"
+  no se confunda con "CSP que bloquea todo"). 619 tests en total tras esta
+  fase (616 + 3).
+  **Efecto lateral de esta auditoria, sin relacion con CSP**: un `sed`
+  global de la Fase 24 (`document.cookie`) habia renombrado por error tres
+  comentarios PRE-EXISTENTES de `scripting.rs` que documentaban CSP real
+  de la Fase 21 (`script-src`), dejandolos decir "Fase 24" - corregido de
+  vuelta a "Fase 21" en el mismo commit que esta fase, encontrado
+  revisando ese archivo para el fix de arriba.
+  **Simplificacion declarada, sin cambios**: `style-src-attr` (el
+  atributo `style="..."` de un elemento, distinto del bloque `<style>`)
+  sigue sin gatearse - llega al layout por un camino totalmente distinto
+  (`cascade::resolve_style` lee el atributo directamente, no pasa por
+  `combined_css`), y conectarlo ahi tambien es trabajo aparte.
+
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"
 o una cifra de rendimiento), es una mentira que hay que borrar, no una

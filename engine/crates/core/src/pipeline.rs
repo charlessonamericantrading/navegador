@@ -138,14 +138,26 @@ pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewp
 /// contradice el aviso de mas arriba sobre mantener este archivo libre de
 /// red: ese aviso es sobre LOGICA de red (resolver/descargar), no sobre
 /// reenviar un handle que otra capa mas abajo sabe usar.
+///
+/// `storage.csp` (Fase 26) tambien decide si los `<style>` EN LINEA del
+/// documento se aplican - mismo criterio que ya usaba `script-src` para
+/// `<script>` (Fase 24, ver `scripting::execute_inline_scripts_keeping_
+/// runtime`): la doc de `net::csp` ya declaraba `style-src` como aplicado
+/// de verdad, pero nadie llamaba `allows_inline("style-src")` en ningun
+/// sitio - los `<style>` se concatenaban SIEMPRE, con o sin CSP. `None`
+/// (sin `StorageContext`, ver el resto de este archivo) se permite, igual
+/// que "sin politica" en el spec real.
 pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap, network: Option<Arc<NetworkEngine>>, storage: Option<crate::scripting::StorageContext>) -> (PageResult, JsRuntime) {
     let dom_root = HtmlParser::parse(html);
+    let allow_inline_style = storage.as_ref().is_none_or(|ctx| ctx.csp.allows_inline("style-src"));
     let (script_results, runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network, storage);
 
     let mut combined_css = String::new();
-    for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
-        combined_css.push_str(&Node::text_content(style_tag));
-        combined_css.push('\n');
+    if allow_inline_style {
+        for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
+            combined_css.push_str(&Node::text_content(style_tag));
+            combined_css.push('\n');
+        }
     }
     combined_css.push_str(css);
 
@@ -308,6 +320,77 @@ mod tests {
         let styled = find_box_with_style(&page.layout_root, "background-color")
             .expect("el <style> de la pagina deberia haber aplicado background-color");
         assert_eq!(styled.computed_style.get("background-color").map(String::as_str), Some("#dbe9f4"));
+    }
+
+    fn storage_context_with_csp(csp: engine_net::ContentSecurityPolicy) -> crate::scripting::StorageContext {
+        crate::scripting::StorageContext {
+            storage: std::sync::Arc::new(std::sync::Mutex::new(engine_net::storage::WebStorage::new())),
+            origin: "https://ejemplo.test".to_string(),
+            csp,
+            url: "https://ejemplo.test/".to_string(),
+        }
+    }
+
+    /// El fix real de la Fase 26: antes de esto, `build_page_keeping_
+    /// runtime` concatenaba TODOS los `<style>` de la pagina sin mirar CSP
+    /// en absoluto, aunque `net::csp` ya declarara `style-src` como
+    /// aplicado de verdad - un `<style>` inyectado por un atacante (vía
+    /// una inyeccion de HTML que la pagina no sanea) se habria aplicado
+    /// igual que uno legitimo, exactamente lo que CSP existe para impedir.
+    #[test]
+    fn a_style_src_none_policy_blocks_the_pages_own_inline_style_tag() {
+        let (page, _runtime) = build_page_keeping_runtime(
+            "<html><head><style>body { background-color: #ff0000; }</style></head><body><p>hola</p></body></html>",
+            "",
+            800.0,
+            600.0,
+            None,
+            &HashMap::new(),
+            &ImageMap::new(),
+            None,
+            Some(storage_context_with_csp(engine_net::ContentSecurityPolicy::parse("style-src 'none'"))),
+        );
+        assert!(find_box_with_style(&page.layout_root, "background-color").is_none(), "style-src 'none' deberia haber bloqueado el <style> en linea de la propia pagina");
+    }
+
+    /// La otra mitad: una politica que SI declara `'unsafe-inline'` para
+    /// `style-src` no deberia bloquear nada - CSP restringe solo lo que
+    /// prohibe explicitamente.
+    #[test]
+    fn a_style_src_unsafe_inline_policy_still_allows_the_pages_own_inline_style_tag() {
+        let (page, _runtime) = build_page_keeping_runtime(
+            "<html><head><style>body { background-color: #ff0000; }</style></head><body><p>hola</p></body></html>",
+            "",
+            800.0,
+            600.0,
+            None,
+            &HashMap::new(),
+            &ImageMap::new(),
+            None,
+            Some(storage_context_with_csp(engine_net::ContentSecurityPolicy::parse("style-src 'unsafe-inline'"))),
+        );
+        let styled = find_box_with_style(&page.layout_root, "background-color").expect("style-src 'unsafe-inline' deberia seguir permitiendo el <style> en linea");
+        assert_eq!(styled.computed_style.get("background-color").map(String::as_str), Some("#ff0000"));
+    }
+
+    /// Sin `StorageContext` en absoluto (el camino que usa `wpt_runner`/
+    /// tests sin red) el `<style>` deberia seguir aplicandose siempre -
+    /// "sin CSP" no es lo mismo que "CSP que bloquea todo".
+    #[test]
+    fn without_a_storage_context_the_inline_style_tag_still_applies() {
+        let (page, _runtime) = build_page_keeping_runtime(
+            "<html><head><style>body { background-color: #00ff00; }</style></head><body><p>hola</p></body></html>",
+            "",
+            800.0,
+            600.0,
+            None,
+            &HashMap::new(),
+            &ImageMap::new(),
+            None,
+            None,
+        );
+        let styled = find_box_with_style(&page.layout_root, "background-color").expect("sin StorageContext deberia comportarse como sin ninguna politica CSP");
+        assert_eq!(styled.computed_style.get("background-color").map(String::as_str), Some("#00ff00"));
     }
 
     #[test]
