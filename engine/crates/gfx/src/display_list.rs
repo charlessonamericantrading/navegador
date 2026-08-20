@@ -26,7 +26,12 @@ pub enum DisplayItem {
     /// propiedad normal), pero nada la PINTABA hasta esta fase. El valor
     /// por defecto real de `<a>` (hoja de agente de usuario, `a {
     /// text-decoration: underline; }`) es el caso que mas se nota.
-    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool, underline: bool },
+    /// `text_align` (Fase 31) solo tiene efecto cuando esta caja contiene
+    /// VARIAS lineas envueltas internamente (ver el aviso de
+    /// `resolve_text_align` mas abajo) - el resto de `text-align` ya lo
+    /// resolvio `engine-layout` desplazando la caja entera antes de
+    /// llegar aqui.
+    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool, underline: bool, text_align: TextAlign },
     /// `rect` es el border-box COMPLETO (`layout_box.dimensions`, que ya
     /// incluye el propio border - ver `engine_layout::tree::
     /// flow_block_children`); quien pinta esto (`engine-gfx/src/paint.rs`)
@@ -165,6 +170,7 @@ impl DisplayList {
                     bold: resolve_font_weight_is_bold(&layout_box.computed_style),
                     italic: resolve_font_style_is_italic(&layout_box.computed_style),
                     underline: resolve_text_decoration_is_underline(&layout_box.computed_style),
+                    text_align: resolve_text_align(&layout_box.computed_style),
                 });
             }
             BoxType::Image(src) => {
@@ -566,6 +572,34 @@ fn resolve_text_decoration_is_underline(computed_style: &HashMap<String, String>
     raw.split_whitespace().any(|token| token.eq_ignore_ascii_case("underline"))
 }
 
+/// Copia deliberada de `TextAlign`/`resolve_text_align` en
+/// `engine-layout::tree` (Fase 31, misma razon que las copias de arriba:
+/// dos crates que no deben depender entre si) - decide como `paint_text`
+/// centra/alinea cada LINEA de un texto que envuelve DENTRO de una sola
+/// caja (`BoxType::Text` con `width == inner_width`, la rama "ni siquiera
+/// cabe sola" de `place_inline_node`), el UNICO caso de `text-align` que
+/// `engine-layout` deja sin resolver a proposito - ver su aviso en
+/// `apply_text_align`. Fuera de esa rama (una linea que cabe entera en su
+/// caja, la caja YA mide justo lo que su contenido necesita) esta funcion
+/// no tiene nada que desplazar: `rect.width` coincide con el ancho real
+/// del texto, y el offset que calcularia seria cero - la alineacion de
+/// ESE caso ya la resolvio `engine-layout::tree::apply_text_align`
+/// desplazando la caja entera.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+fn resolve_text_align(computed_style: &HashMap<String, String>) -> TextAlign {
+    match computed_style.get("text-align").map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if v == "center" => TextAlign::Center,
+        Some(v) if v == "right" || v == "end" => TextAlign::Right,
+        _ => TextAlign::Left,
+    }
+}
+
 /// Igual que `parse_css_font_size`, pero SI acepta cero (un ancho de
 /// border de 0 es valido) - copia deliberada de `parse_css_length` en
 /// `engine-layout/src/tree.rs`, misma razon que `INITIAL_FONT_SIZE`/
@@ -902,6 +936,18 @@ mod tests {
         assert!(!resolve_text_decoration_is_underline(&style("none")));
         assert!(!resolve_text_decoration_is_underline(&style("line-through")), "line-through no deberia activar el subrayado");
         assert!(!resolve_text_decoration_is_underline(&HashMap::new()), "sin la propiedad puesta, ningun subrayado");
+    }
+
+    #[test]
+    fn resolve_text_align_recognizes_center_right_end_and_defaults_to_left() {
+        let style = |value: &str| { let mut m = HashMap::new(); m.insert("text-align".to_string(), value.to_string()); m };
+
+        assert_eq!(resolve_text_align(&style("center")), TextAlign::Center);
+        assert_eq!(resolve_text_align(&style("right")), TextAlign::Right);
+        assert_eq!(resolve_text_align(&style("end")), TextAlign::Right, "el valor logico 'end' deberia comportarse como 'right' en LTR");
+        assert_eq!(resolve_text_align(&style("left")), TextAlign::Left);
+        assert_eq!(resolve_text_align(&style("justify")), TextAlign::Left, "justify se parsea pero se pinta como left, declarado");
+        assert_eq!(resolve_text_align(&HashMap::new()), TextAlign::Left, "el valor inicial real de text-align es left");
     }
 
     #[test]

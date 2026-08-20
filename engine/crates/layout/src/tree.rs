@@ -408,6 +408,34 @@ fn resolve_font_style_is_italic(computed_style: &HashMap<String, String>) -> boo
     trimmed.eq_ignore_ascii_case("italic") || trimmed.eq_ignore_ascii_case("oblique")
 }
 
+/// `text-align` (Fase 31) - las tres alineaciones que este motor sabe
+/// desplazar de verdad. `justify` se PARSEA (no cae al caso "no
+/// reconocido") pero se pinta como `Left` a proposito: fingir un
+/// justificado real (repartir espacio extra ENTRE palabras) sin
+/// implementarlo se veria peor que dejarlo a la izquierda. `start`/`end`
+/// (los valores logicos del spec moderno) se tratan como `left`/`right`
+/// respectivamente - este motor no modela `direction: rtl`, asi que en
+/// LTR (el unico caso real) son identicos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// `text-align` computado del CONTENEDOR de una racha inline (Fase 31) -
+/// se lee del bloque, no de cada hijo suelto: es una propiedad heredable
+/// (`INHERITABLE_PROPERTIES`) que en la practica se declara una vez en el
+/// padre y se aplica a TODA su racha de contenido inline por igual, igual
+/// que hace un navegador real.
+fn resolve_text_align(computed_style: &HashMap<String, String>) -> TextAlign {
+    match computed_style.get("text-align").map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if v == "center" => TextAlign::Center,
+        Some(v) if v == "right" || v == "end" => TextAlign::Right,
+        _ => TextAlign::Left,
+    }
+}
+
 /// Los atributos HTML `width`/`height` de un `<img>` (numeros sin unidad,
 /// pixeles - `<img width="200" height="100">`, con mucho el caso mas comun
 /// en la web real, mas comun que `style="width: ..."`) SI participan en el
@@ -1157,7 +1185,8 @@ impl LayoutTreeBuilder {
                     .position(|c| !Self::is_inline_level(c))
                     .map(|rel| i + rel)
                     .unwrap_or(container.children.len());
-                cursor_y = Self::flow_inline_run(&mut container.children[i..run_end], eff_origin_x, eff_inner_width, cursor_y, font_set, images);
+                let text_align = resolve_text_align(&container.computed_style);
+                cursor_y = Self::flow_inline_run(&mut container.children[i..run_end], eff_origin_x, eff_inner_width, cursor_y, font_set, images, text_align);
                 i = run_end;
                 continue;
             }
@@ -1683,7 +1712,7 @@ impl LayoutTreeBuilder {
     ///
     /// Devuelve el `cursor_y` final (el tope de una linea nueva lista para
     /// lo que venga despues de la racha).
-    fn flow_inline_run(nodes: &mut [LayoutBox], origin_x: f32, inner_width: f32, start_y: f32, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+    fn flow_inline_run(nodes: &mut [LayoutBox], origin_x: f32, inner_width: f32, start_y: f32, font_set: Option<&FontSet>, images: &ImageMap, text_align: TextAlign) -> f32 {
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
         let text_line_height = match font_set {
@@ -1708,7 +1737,78 @@ impl LayoutTreeBuilder {
         for node in nodes.iter_mut() {
             Self::place_inline_node(node, origin_x, inner_width, text_line_height, &mut line_extent, &mut cursor_x, &mut cursor_y, font_set, images);
         }
+        if text_align != TextAlign::Left {
+            Self::apply_text_align(nodes, origin_x, inner_width, text_align);
+        }
         cursor_y + line_extent
+    }
+
+    /// Desplaza cada LINEA ya posicionada de `nodes` (Fase 31) segun
+    /// `text_align` - agrupa por `dimensions.y` (todos los nodos de una
+    /// misma linea comparten el MISMO `cursor_y` de origen, sin deriva de
+    /// punto flotante entre hermanos: viene siempre del mismo acumulador),
+    /// calcula cuanto ancho REAL ocupo esa linea, y mueve el grupo entero
+    /// (recursivamente, para arrastrar tambien a los hijos de un `<b>`/
+    /// `<i>` ya posicionados dentro) el hueco que sobra.
+    ///
+    /// Cubre el caso mas comun de `text-align` (una racha que cabe en una
+    /// o varias lineas SIN que ningun nodo individual necesite envolverse
+    /// por dentro): un texto tan largo que un SOLO nodo de texto envuelve
+    /// varias lineas dentro de su propia caja (`place_inline_node`, rama
+    /// "ni siquiera cabe sola") queda con `width == inner_width` siempre
+    /// - el desplazamiento que esta funcion calcularia para el ya seria
+    /// cero, asi que no hace falta ni excluirlo aparte; ESE caso se
+    /// centra/alinea por LINEA en `engine-gfx::paint_text`, no aqui (ver
+    /// su aviso). Los nodos fuera de flujo (`position: absolute/fixed`)
+    /// se saltan por completo - `place_inline_node` los deja sin
+    /// posicionar, y agruparlos por su `Rect::default()` compartido
+    /// mezclaria lineas reales entre si.
+    fn apply_text_align(nodes: &mut [LayoutBox], origin_x: f32, inner_width: f32, text_align: TextAlign) {
+        let mut i = 0;
+        while i < nodes.len() {
+            if is_out_of_flow(&nodes[i].computed_style) {
+                i += 1;
+                continue;
+            }
+            let line_y = nodes[i].dimensions.y;
+            let mut j = i + 1;
+            while j < nodes.len() && (is_out_of_flow(&nodes[j].computed_style) || nodes[j].dimensions.y == line_y) {
+                j += 1;
+            }
+
+            let line_right_edge = nodes[i..j]
+                .iter()
+                .filter(|n| !is_out_of_flow(&n.computed_style))
+                .map(|n| n.dimensions.x + n.dimensions.width)
+                .fold(f32::MIN, f32::max);
+            if line_right_edge > f32::MIN {
+                let used_width = line_right_edge - origin_x;
+                let offset = match text_align {
+                    TextAlign::Center => ((inner_width - used_width) / 2.0).max(0.0),
+                    TextAlign::Right => (inner_width - used_width).max(0.0),
+                    TextAlign::Left => 0.0,
+                };
+                if offset > 0.0 {
+                    for node in &mut nodes[i..j] {
+                        if !is_out_of_flow(&node.computed_style) {
+                            Self::shift_subtree_x(node, offset);
+                        }
+                    }
+                }
+            }
+            i = j;
+        }
+    }
+
+    /// Mueve `node` (y TODOS sus descendientes ya posicionados) `offset`
+    /// pixeles en X - lo que hace que desplazar un `<b>`/`<i>` inline
+    /// arrastre tambien el texto que contiene, en vez de mover solo su
+    /// rectangulo delimitador y dejar el contenido real donde estaba.
+    fn shift_subtree_x(node: &mut LayoutBox, offset: f32) {
+        node.dimensions.x += offset;
+        for child in &mut node.children {
+            Self::shift_subtree_x(child, offset);
+        }
     }
 
     /// Busca `font-size`/`font-weight`/`font-style` de la primera hoja de
@@ -2574,6 +2674,113 @@ mod tests {
             }
         }
         root.children.iter().find_map(|c| find_text_box(c, text))
+    }
+
+    /// Sin fuente de sistema (`font_set: None`, ver `LayoutTreeBuilder::
+    /// build` mas abajo), el ancho natural de un texto es determinista:
+    /// `content.len() as f32 * 8.0` (la misma aproximacion de respaldo
+    /// que usa `place_inline_node` en todo el motor) - por eso estas
+    /// pruebas de `text-align` no necesitan saltarse en un entorno sin
+    /// fuentes, a diferencia de las de `engine-gfx::paint`.
+    #[test]
+    fn text_align_center_shifts_a_single_short_text_line_to_the_middle() {
+        let dom = HtmlParser::parse(r#"<html><body><div style="text-align: center;">hi</div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let text_box = find_text_box(&root, "hi").expect("deberia existir la caja de texto 'hi'");
+        assert_eq!(text_box.dimensions.x, 392.0, "16px de texto (2 caracteres * 8px) centrados en 800px deberian dejar 392px de hueco a cada lado");
+    }
+
+    #[test]
+    fn text_align_right_pushes_the_line_to_the_right_edge() {
+        let dom = HtmlParser::parse(r#"<html><body><div style="text-align: right;">hi</div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let text_box = find_text_box(&root, "hi").expect("deberia existir la caja de texto 'hi'");
+        assert_eq!(text_box.dimensions.x, 784.0, "800 - 16px de texto");
+    }
+
+    #[test]
+    fn text_align_left_or_unset_never_shifts_anything() {
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+
+        let dom_left = HtmlParser::parse(r#"<html><body><div style="text-align: left;">hi</div></body></html>"#);
+        let root_left = LayoutTreeBuilder::build(&dom_left, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        assert_eq!(find_text_box(&root_left, "hi").unwrap().dimensions.x, 0.0);
+
+        let dom_unset = HtmlParser::parse("<html><body><div>hi</div></body></html>");
+        let root_unset = LayoutTreeBuilder::build(&dom_unset, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        assert_eq!(find_text_box(&root_unset, "hi").unwrap().dimensions.x, 0.0, "el valor inicial real de text-align es left");
+    }
+
+    /// `justify` se PARSEA (no cae al "no reconocido") pero se pinta como
+    /// `left` a proposito - ver el aviso de `resolve_text_align`.
+    #[test]
+    fn text_align_justify_is_not_shifted() {
+        let dom = HtmlParser::parse(r#"<html><body><div style="text-align: justify;">hi</div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        assert_eq!(find_text_box(&root, "hi").unwrap().dimensions.x, 0.0);
+    }
+
+    /// El desplazamiento tiene que arrastrar tambien al hijo de texto de
+    /// un elemento inline (`<b>`) ya posicionado DENTRO de el - shiftear
+    /// solo el rectangulo delimitador del `<b>` y dejar su texto real
+    /// donde estaba lo desalinearia del propio contenedor que se movio.
+    #[test]
+    fn text_align_center_also_shifts_a_nested_inline_elements_text() {
+        let dom = HtmlParser::parse(r#"<html><body><div style="text-align: center;"><b id="target">hi</b></div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let target_node = Node::find_by_id(&dom, "target").expect("target deberia existir");
+        let b_box = find_box_for_dom_node(&root, &target_node).expect("el <b> deberia tener caja");
+        assert_eq!(b_box.dimensions.x, 392.0);
+
+        let text_box = find_text_box(&root, "hi").expect("deberia existir la caja de texto 'hi'");
+        assert_eq!(text_box.dimensions.x, 392.0, "el texto real dentro del <b> deberia haberse desplazado junto con el");
+    }
+
+    /// El caso que de verdad prueba que el agrupado es POR LINEA y no por
+    /// racha entera: dos elementos de bloque SEPARADOS, cada uno con su
+    /// propio `text-align: center` y su propio ancho de linea usado -
+    /// cada uno deberia centrarse con SU PROPIO hueco sobrante, sin que
+    /// el contenido de uno contamine el calculo del otro. (No se prueba
+    /// con dos hermanos inline en la MISMA racha que se reparten en dos
+    /// lineas - ver la limitacion declarada en el doc-comment de
+    /// `apply_text_align` sobre el rectangulo delimitador de un elemento
+    /// inline que el mismo cruza un salto de linea.)
+    #[test]
+    fn text_align_center_computes_an_independent_offset_per_container() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="text-align: center; width: 90px;">aa</div><div style="text-align: center; width: 90px;">bbbbbbbbbb</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let corto_text = find_text_box(&root, "aa").expect("deberia existir la caja de texto 'aa'");
+        let largo_text = find_text_box(&root, "bbbbbbbbbb").expect("deberia existir la caja de texto 'bbbbbbbbbb'");
+
+        assert_eq!(corto_text.dimensions.x, 37.0, "(90 - 16px de 'aa') / 2");
+        assert_eq!(largo_text.dimensions.x, 5.0, "(90 - 80px de 'bbbbbbbbbb') / 2 - un hueco DISTINTO, calculado sobre SU PROPIO contenido");
+    }
+
+    /// Un hermano fuera de flujo (`position: absolute`) intercalado en la
+    /// racha no deberia romper el agrupado por linea de los que si estan
+    /// en flujo a cada lado - `place_inline_node` lo deja sin posicionar
+    /// (`Rect::default()`), y `apply_text_align` lo salta explicitamente
+    /// en vez de tratar su `y == 0.0` como el limite de una linea nueva.
+    #[test]
+    fn text_align_grouping_skips_an_out_of_flow_sibling_in_the_middle_of_a_line() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="text-align: center;"><span id="a">hi</span><span id="p" style="position: absolute;">xxxx</span></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let a_node = Node::find_by_id(&dom, "a").expect("a deberia existir");
+        let a_box = find_box_for_dom_node(&root, &a_node).expect("a deberia tener caja");
+        assert_eq!(a_box.dimensions.x, 392.0, "el hermano en flujo deberia centrarse igual que si el fuera-de-flujo no estuviera");
     }
 
     #[test]

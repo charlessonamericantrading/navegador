@@ -248,7 +248,8 @@ A fecha de esta limpieza, el motor:
     entre si a espaciado correcto) y con tests dedicados en
     `engine-text`/`engine-layout` (`wrap_text` no tenia NINGUN test
     directo hasta ahora, pese a ser central para layout y pintado).
-  NO implementado: `text-align`, `vertical-align`, alineacion por
+  NO implementado (en el momento de ESTA fase; `text-align` cerrado
+  despues, ver Fase 31): `text-align`, `vertical-align`, alineacion por
   baseline real (todo el texto de una racha usa el mismo `line_height`,
   calculado una vez con el font-size de su primera hoja — el spec real
   usaria el maximo por linea cuando el tamaño varia dentro de ella).
@@ -3256,6 +3257,80 @@ A fecha de esta limpieza, el motor:
   cruzado" se aproxima por ORIGEN exacto, no por SITIO/eTLD+1 real (sin
   PSL, mismo criterio que el resto del modulo) - mas estricto de lo
   necesario entre dos subdominios del mismo sitio, nunca menos.
+
+- **`text-align` se aplica de verdad: `center`/`right`/`left`** (Fase 31):
+  `text-align` ya era heredable (`INHERITABLE_PROPERTIES`) y llegaba
+  intacto a `computed_style` desde antes de esta fase, pero NADA en
+  `engine-layout` ni `engine-gfx` lo leia para desplazar nada - es una de
+  las propiedades CSS mas comunes de la web real (practicamente todo
+  boton/titulo/logo centrado la usa), y hasta ahora se ignoraba en
+  silencio. El fix tiene DOS mitades, en dos crates distintos, para las
+  dos formas en que este motor coloca texto:
+  - **`engine-layout::tree::apply_text_align`** (el caso mas comun:
+    varios hermanos inline-level - texto y/o `<b>`/`<i>`/`<span>` - que
+    caben en una o varias lineas SIN que ninguno necesite envolverse por
+    dentro): tras el posicionado normal de `flow_inline_run`, agrupa los
+    nodos YA posicionados por linea (mismo `dimensions.y` - vienen del
+    MISMO acumulador `cursor_y`, sin deriva de punto flotante entre
+    hermanos), calcula el ancho real que ocupo cada linea, y desplaza el
+    grupo entero (recursivamente via `shift_subtree_x`, para arrastrar
+    tambien el texto ya posicionado DENTRO de un `<b>`/`<i>`) el hueco
+    que sobra. Los nodos fuera de flujo (`position: absolute/fixed`) se
+    saltan al agrupar - `place_inline_node` los deja sin posicionar
+    (`Rect::default()`), y agruparlos por esa `y` compartida mezclaria
+    lineas reales entre si.
+  - **`engine-gfx::paint::paint_text`** (el otro caso: un SOLO nodo de
+    texto tan largo que envuelve varias lineas DENTRO de su propia caja -
+    `place_inline_node`, rama "ni siquiera cabe sola", `width ==
+    inner_width` siempre): el desplazamiento que `apply_text_align`
+    calcularia para esa caja seria cero (ya usa el ancho completo), asi
+    que esa mitad no tiene nada que hacer ahi - se resuelve en el
+    PINTADO, linea por linea (mismo bucle que ya mide cada linea para el
+    subrayado de la Fase 29, reusando `measure_text`), con el ancho REAL
+    de esa linea concreta - igual que un navegador real centra cada
+    linea de un parrafo envuelto por separado, no el parrafo entero como
+    bloque.
+  Las dos mitades son complementarias, no se pisan: una caja con
+  `width == inner_width` (candidata a la mitad de `paint.rs`) siempre
+  produce desplazamiento CERO en `apply_text_align`, asi que no hace
+  falta excluirla aparte en el lado de layout.
+  `TextAlign`/`resolve_text_align` existen DUPLICADOS en `engine-layout`
+  y `engine-gfx` (mismos tres valores, misma logica) - mismo criterio ya
+  establecido para `resolve_font_weight_is_bold`/`resolve_font_style_is_
+  italic`: dos crates que no deben depender entre si por unas pocas
+  lineas. `justify` se PARSEA (no cae al caso "no reconocido") pero se
+  pinta como `left` a proposito - fingir un justificado real (repartir
+  espacio EXTRA entre palabras) sin implementarlo se veria peor que
+  dejarlo a la izquierda. `start`/`end` (los valores logicos del spec
+  moderno) se tratan como `left`/`right` - este motor no modela
+  `direction: rtl`, asi que en LTR (el unico caso real) son identicos.
+  9 tests nuevos (655 en total tras esta fase: 646 + 7 en `engine-layout`
+  + 2 en `engine-gfx`) - en `engine-layout`: centrado/derecha de una linea
+  corta, izquierda/sin-declarar/`justify` sin desplazar, un `<b>` anidado
+  arrastra tambien a su texto interior, dos contenedores SEPARADOS con
+  huecos sobrantes DISTINTOS no se contaminan entre si, y un hermano
+  fuera de flujo intercalado no rompe el agrupado por linea; en
+  `engine-gfx`: `resolve_text_align` reconoce los cinco valores, y una
+  prueba a nivel de PIXEL confirma que los tres alineamientos producen un
+  punto de arranque horizontal distinto y en el orden esperado
+  (izquierda < centro < derecha) para el MISMO texto.
+  **Verificado en vivo**: captura PNG real con tres `<div>` (centro/
+  derecha/izquierda) mas un `<p>` de 300px con un parrafo largo - los
+  tres primeros se ven exactamente alineados como se pidio, y el parrafo
+  envuelve en 6 lineas, cada una centrada por SEPARADO con su propio
+  hueco (visible a ojo: las lineas mas cortas dejan mas margen a los
+  lados que las mas largas).
+  **Limitacion declarada, encontrada auditando el propio fix**: un
+  elemento inline (`<b>`/`<i>`/`<span>`) cuyo UNICO hijo de texto termina
+  en una linea DISTINTA de donde el propio elemento empezo (el salto de
+  linea ocurre DENTRO de la recursion al colocar ese hijo) deja el
+  rectangulo delimitador del elemento con una `y` que no refleja su
+  posicion real - la misma simplificacion de "fragmentacion inline" que
+  este motor ya declaraba (un elemento partido en dos lineas es, en el
+  spec real, DOS fragmentos rectangulares, no uno). `apply_text_align`
+  hereda esa imprecision: puede agrupar ese elemento con la linea
+  ANTERIOR en vez de la suya propia, dando un desplazamiento ligeramente
+  distinto al ideal en ese caso concreto - no cerrado en esta fase.
 
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"

@@ -8,7 +8,7 @@
 //! duplicacion (ver ARCHITECTURE.md). `border-radius`, `box-shadow` y
 //! `overflow: hidden` (Fase 3.5) se añaden aqui, una sola vez.
 
-use crate::display_list::DisplayItem;
+use crate::display_list::{DisplayItem, TextAlign};
 use crate::image_paint::paint_image;
 use engine_layout::Rect;
 use engine_text::{baseline_offset, measure_text, shape_text, underline_metrics, wrap_text, FontSet, SystemFont};
@@ -69,8 +69,8 @@ pub fn paint_display_list(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: 
             DisplayItem::Shadow { rect, color, radius } | DisplayItem::SolidRect { rect, color, radius } => {
                 fill_shape(pixmap, rect, *radius, &paint_of(*color), scroll_offset_y, current_mask.as_ref());
             }
-            DisplayItem::Text { rect, text, color, font_size, bold, italic, underline } => {
-                paint_text(pixmap, rect, text, *color, *font_size, *bold, *italic, *underline, font_set, scroll_offset_y, current_mask.as_ref());
+            DisplayItem::Text { rect, text, color, font_size, bold, italic, underline, text_align } => {
+                paint_text(pixmap, rect, text, *color, *font_size, *bold, *italic, *underline, *text_align, font_set, scroll_offset_y, current_mask.as_ref());
             }
             DisplayItem::Border { rect, width: border_width, color, radius } => {
                 paint_border(pixmap, rect, *border_width, *color, *radius, scroll_offset_y, current_mask.as_ref());
@@ -219,6 +219,7 @@ fn paint_text(
     bold: bool,
     italic: bool,
     underline: bool,
+    text_align: TextAlign,
     font_set: Option<&FontSet>,
     scroll_offset_y: f32,
     mask: Option<&Mask>,
@@ -236,11 +237,25 @@ fn paint_text(
             let line_height = measure_text(font, "", font_size).line_height;
             for (index, line) in lines.iter().enumerate() {
                 let line_y = screen_y + index as f32 * line_height;
-                for glyph in shape_text(font, line, font_size, rect.x, line_y) {
+                // `text-align` (Fase 31) DENTRO de una caja que envuelve
+                // varias lineas por si sola - el unico caso que
+                // `engine-layout` deja sin resolver (ver el aviso de
+                // `resolve_text_align` mas arriba): cada linea se centra/
+                // alinea segun SU PROPIO ancho real (`measure_text` de
+                // ESA linea, no `rect.width` entero), igual que un
+                // navegador real alinea cada linea de un parrafo
+                // envuelto por separado.
+                let line_width = measure_text(font, line, font_size).width;
+                let line_x = match text_align {
+                    TextAlign::Left => rect.x,
+                    TextAlign::Center => rect.x + ((rect.width - line_width) / 2.0).max(0.0),
+                    TextAlign::Right => rect.x + (rect.width - line_width).max(0.0),
+                };
+                for glyph in shape_text(font, line, font_size, line_x, line_y) {
                     pixmap.fill_path(&glyph.path, &paint, FillRule::Winding, Transform::identity(), mask);
                 }
                 if underline && !line.trim().is_empty() {
-                    paint_underline(pixmap, font, line, font_size, rect.x, line_y, &paint, mask);
+                    paint_underline(pixmap, font, line, font_size, line_x, line_y, &paint, mask);
                 }
             }
         }
@@ -537,6 +552,7 @@ mod tests {
                 bold: false,
                 italic: false,
                 underline,
+                text_align: TextAlign::Left,
             }];
             paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
             pixmap
@@ -569,8 +585,48 @@ mod tests {
             bold: false,
             italic: false,
             underline: true,
+            text_align: TextAlign::Left,
         }];
         paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
         assert!(pixmap.pixels().iter().all(|p| p.alpha() == 0), "una linea en blanco no deberia pintar nada, ni siquiera un subrayado");
+    }
+
+    /// La prueba real de `text-align` DENTRO de `paint_text` (Fase 31, el
+    /// unico caso que `engine-layout` deja sin resolver - una caja mucho
+    /// mas ancha que su propio texto, como pintaria un `<div>` cuyo
+    /// UNICO texto envuelve varias lineas internamente): los tres
+    /// valores deberian producir un punto de arranque HORIZONTAL
+    /// distinto para los mismos glifos, en el orden que cabria esperar.
+    #[test]
+    fn text_align_shifts_the_painted_glyphs_left_to_right_across_the_three_values() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            eprintln!("sin fuentes de sistema en este entorno, test omitido");
+            return;
+        }
+
+        let leftmost_painted_x = |text_align: TextAlign| -> u32 {
+            let mut pixmap = Pixmap::new(400, 60).unwrap();
+            let items = vec![DisplayItem::Text {
+                rect: Rect { x: 0.0, y: 5.0, width: 400.0, height: 30.0 },
+                text: "hi".to_string(),
+                color: [0, 0, 0, 255],
+                font_size: 20.0,
+                bold: false,
+                italic: false,
+                underline: false,
+                text_align,
+            }];
+            paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
+            let width = pixmap.width();
+            pixmap.pixels().iter().enumerate().filter(|(_, p)| p.alpha() > 0).map(|(i, _)| (i as u32) % width).min().expect("deberia haber pintado algo")
+        };
+
+        let left_x = leftmost_painted_x(TextAlign::Left);
+        let center_x = leftmost_painted_x(TextAlign::Center);
+        let right_x = leftmost_painted_x(TextAlign::Right);
+
+        assert!(center_x > left_x, "centrado deberia empezar mas a la derecha que alineado a la izquierda ({center_x} vs {left_x})");
+        assert!(right_x > center_x, "alineado a la derecha deberia empezar aun mas a la derecha que centrado ({right_x} vs {center_x})");
     }
 }
