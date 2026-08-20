@@ -31,3 +31,10 @@ serde_json = "1"
 base64 = "0.22"
 flate2 = "1.0"
 brotli = "6.0"
+# Directorio de datos por SO real (`%APPDATA%`/`~/Library/Application
+# Support`/XDG) para `localStorage` en disco (ver `net/src/storage.rs`) -
+# las tres convenciones tienen suficientes bordes (roaming vs local en
+# Windows, XDG_DATA_HOME con fallback en Linux) como para no reinventarlas
+# a mano, mismo criterio que TLS/parseo HTML: no evitar TODA dependencia,
+# evitar reimplementar cosas con superficie de error real.
+dirs = "5"

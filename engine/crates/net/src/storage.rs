@@ -21,16 +21,30 @@
 //!   ambas son diferencias observables que el codigo real comprueba.
 //!
 //! Simplificaciones declaradas:
-//! - **Sin persistencia a disco todavia**: `localStorage` deberia
-//!   sobrevivir a cerrar la aplicacion y aqui no lo hace, asi que hoy se
-//!   comporta como un `sessionStorage` de vida larga. La diferencia entre
-//!   ambos SI esta modelada (son dos areas distintas que no se ven entre
-//!   si), que es lo que nota una pagina en una misma sesion; lo que falta
-//!   es solo el volcado a disco.
+//! - **`localStorage` SI persiste a disco** (Fase 25): `WebStorage::
+//!   load_from_disk` (la que usa `core::server` en produccion) carga el
+//!   area `local` de una sesion anterior desde
+//!   `dirs::data_dir()/navegador-ia/local_storage.json` (via el crate
+//!   `dirs`, que ya sabe las tres convenciones de SO - `%APPDATA%` en
+//!   Windows, `~/Library/Application Support` en macOS, XDG en Linux -
+//!   ninguna de las tres vale la pena reimplementar a mano). Cada
+//!   `set_item`/`remove_item`/`clear` sobre el area `local` (NUNCA
+//!   `session` - esa es justo la diferencia entre las dos areas que el
+//!   spec exige, y persistirla la convertiria en local) vuelca el mapa
+//!   ENTERO de vuelta al mismo fichero de forma sincrona - sin
+//!   `debounce`/traduccion incremental, mismo criterio de simplicidad que
+//!   el resto del motor (cada mutacion de DOM/cookie/CSS ya se aplica de
+//!   inmediato, no en lote). `WebStorage::new()` (sin persistencia,
+//!   `persist_path: None`) sigue existiendo aparte y es la que usan TODOS
+//!   los tests de este modulo: cargar/escribir el `%APPDATA%` REAL del
+//!   usuario en cada `cargo test`, con tests corriendo en paralelo sobre
+//!   el MISMO fichero, seria tan peligroso como lento.
 //! - Sin evento `storage` (el que avisa a OTRAS pestañas del mismo origen
 //!   de un cambio): este motor no tiene comunicacion entre pestañas.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use url::Url;
 
 /// Cuota por origen y por area. Los navegadores reales rondan los 5 MiB;
@@ -54,7 +68,10 @@ pub fn origin_of(url: &Url) -> String {
 /// Un area de almacenamiento de UN origen. `Vec` y no `HashMap` a
 /// proposito: `key(n)` y `length` exigen un orden estable, y el orden de
 /// insercion es el que usan los navegadores reales en la practica.
-#[derive(Debug, Clone, Default)]
+/// `Serialize`/`Deserialize` (Fase 25): es exactamente lo que se vuelca a
+/// disco para `localStorage` - un `Vec<(String, String)>` serializa como
+/// un array de pares, que conserva el mismo orden al releerlo.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StorageArea {
     items: Vec<(String, String)>,
 }
@@ -87,11 +104,80 @@ pub enum StorageKind {
 pub struct WebStorage {
     local: HashMap<String, StorageArea>,
     session: HashMap<String, StorageArea>,
+    /// Ruta donde volcar `local` tras cada mutacion (Fase 25), o `None`
+    /// para quedarse solo en memoria. Solo `load_from_disk` la rellena -
+    /// ver su aviso y el del modulo para el porque.
+    persist_path: Option<PathBuf>,
 }
 
 impl WebStorage {
+    /// Version en memoria pura, SIN persistencia - la que usan `wpt_runner`
+    /// y todos los tests de este modulo.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// El directorio de datos del perfil segun el SO (Fase 25) - `None` si
+    /// `dirs` no logra determinarlo (un entorno sin `HOME`/`APPDATA`, poco
+    /// realista fuera de un contenedor roto), tratado como "sin
+    /// persistencia disponible" en vez de un error fatal.
+    fn default_persist_path() -> Option<PathBuf> {
+        Some(dirs::data_dir()?.join("navegador-ia").join("local_storage.json"))
+    }
+
+    /// La version que usa `core::server` en produccion: carga `local` de
+    /// una sesion anterior si el fichero ya existia, y deja `persist_path`
+    /// listo para que las mutaciones siguientes se vuelquen ahi solas.
+    /// `session` NUNCA se carga de disco - ver el aviso del modulo. Un
+    /// fichero ausente, ilegible o con JSON invalido no es un error: se
+    /// trata igual que "sin datos previos" (un perfil corrupto no deberia
+    /// impedir arrancar el navegador, solo perder lo que tuviera
+    /// guardado - lo mismo que hace un navegador real).
+    pub fn load_from_disk() -> Self {
+        match Self::default_persist_path() {
+            Some(path) => Self::load_from_path(path),
+            None => {
+                tracing::warn!("[storage] no se pudo determinar el directorio de datos del sistema operativo; localStorage no persistira a disco esta sesion");
+                Self::new()
+            }
+        }
+    }
+
+    /// Nucleo de `load_from_disk`, separado para poder probarlo contra una
+    /// ruta de prueba en vez del `%APPDATA%` REAL del usuario (ver el
+    /// aviso del modulo). Un fichero ausente, ilegible o con JSON invalido
+    /// se trata igual que "sin datos previos", nunca como un error fatal.
+    fn load_from_path(path: PathBuf) -> Self {
+        let local = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<HashMap<String, StorageArea>>(&bytes).ok())
+            .unwrap_or_default();
+        Self { local, session: HashMap::new(), persist_path: Some(path) }
+    }
+
+    /// Vuelca `local` ENTERO a disco - no incremental, el volumen tipico de
+    /// `localStorage` (unos pocos MiB por origen como mucho) no justifica
+    /// la complejidad de un formato append-only. No-op silencioso sin
+    /// `persist_path` (todos los tests, ver el aviso del modulo) o si algo
+    /// falla escribiendo (disco lleno, permisos): un fallo de persistencia
+    /// no deberia tirar abajo la pagina que disparo el `setItem`, solo
+    /// perder esa escritura - se avisa por `tracing`, no se propaga.
+    fn persist(&self) {
+        let Some(path) = &self.persist_path else { return };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!("[storage] no se pudo crear el directorio de persistencia {parent:?}: {e}");
+                return;
+            }
+        }
+        match serde_json::to_vec(&self.local) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, bytes) {
+                    tracing::warn!("[storage] no se pudo escribir localStorage en disco: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("[storage] no se pudo serializar localStorage: {e}"),
+        }
     }
 
     fn area(&self, kind: StorageKind) -> &HashMap<String, StorageArea> {
@@ -141,6 +227,9 @@ impl WebStorage {
             Some(slot) => slot.1 = value.to_string(),
             None => area.items.push((key.to_string(), value.to_string())),
         }
+        if kind == StorageKind::Local {
+            self.persist();
+        }
         Ok(())
     }
 
@@ -150,11 +239,17 @@ impl WebStorage {
         if let Some(area) = self.area_mut(kind).get_mut(origin) {
             area.items.retain(|(k, _)| k != key);
         }
+        if kind == StorageKind::Local {
+            self.persist();
+        }
     }
 
     pub fn clear(&mut self, kind: StorageKind, origin: &str) {
         if let Some(area) = self.area_mut(kind).get_mut(origin) {
             area.items.clear();
+        }
+        if kind == StorageKind::Local {
+            self.persist();
         }
     }
 
@@ -297,5 +392,78 @@ mod tests {
         s.set_item(StorageKind::Local, "o", "k", &casi_todo).unwrap();
         s.set_item(StorageKind::Local, "o", "k", "pequeño").expect("reescribir mas pequeño deberia caber");
         assert_eq!(s.get_item(StorageKind::Local, "o", "k"), Some("pequeño".to_string()));
+    }
+
+    /// Ruta de prueba UNICA por test bajo el directorio temporal del SO -
+    /// nunca el `%APPDATA%` real del usuario (ver el aviso del modulo:
+    /// tests en paralelo pisandose el mismo fichero real serian tan
+    /// peligrosos como lentos). Se borra antes de usarla por si un test
+    /// anterior dejo un fichero de una ejecucion previa a medias.
+    fn test_path(nombre: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("navegador-ia-storage-test-{nombre}.json"));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn persisting_a_local_item_and_reloading_from_disk_round_trips() {
+        let path = test_path("round-trip");
+        let mut s = WebStorage::load_from_path(path.clone());
+        s.set_item(StorageKind::Local, "https://a.test", "tema", "oscuro").unwrap();
+
+        let reloaded = WebStorage::load_from_path(path.clone());
+        assert_eq!(reloaded.get_item(StorageKind::Local, "https://a.test", "tema"), Some("oscuro".to_string()), "una sesion nueva deberia recuperar lo que la anterior guardo");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// La mitad que hace que `sessionStorage` siga siendo `sessionStorage`:
+    /// si sus mutaciones tambien se volcaran a disco, dejaria de haber
+    /// ninguna diferencia observable entre las dos areas.
+    #[test]
+    fn session_storage_mutations_are_never_written_to_disk() {
+        let path = test_path("session-no-persist");
+        let mut s = WebStorage::load_from_path(path.clone());
+        s.set_item(StorageKind::Session, "https://a.test", "temporal", "1").unwrap();
+
+        assert!(!path.exists(), "una mutacion de sessionStorage no deberia haber tocado el disco en absoluto");
+    }
+
+    #[test]
+    fn loading_from_a_path_that_does_not_exist_yet_is_empty_not_an_error() {
+        let path = test_path("no-existe-todavia");
+        let s = WebStorage::load_from_path(path);
+        assert_eq!(s.get_item(StorageKind::Local, "https://a.test", "cualquiera"), None);
+    }
+
+    #[test]
+    fn loading_a_corrupt_file_is_treated_as_no_previous_data() {
+        let path = test_path("corrupto");
+        std::fs::write(&path, b"esto no es JSON valido en absoluto {{{").unwrap();
+
+        let s = WebStorage::load_from_path(path.clone());
+        assert_eq!(s.get_item(StorageKind::Local, "https://a.test", "x"), None, "un cache corrupto no deberia impedir arrancar, solo perder lo guardado");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn removing_the_last_local_item_persists_the_now_empty_area() {
+        let path = test_path("borrar-todo");
+        let mut s = WebStorage::load_from_path(path.clone());
+        s.set_item(StorageKind::Local, "https://a.test", "k", "v").unwrap();
+        s.remove_item(StorageKind::Local, "https://a.test", "k");
+
+        let reloaded = WebStorage::load_from_path(path.clone());
+        assert_eq!(reloaded.length(StorageKind::Local, "https://a.test"), 0, "el remove_item deberia haberse persistido tambien, no solo el set_item");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_web_storage_without_a_persist_path_never_touches_disk() {
+        // `WebStorage::new()` (persist_path: None) es lo que usan el resto
+        // de tests de este modulo - esta prueba fija que de verdad no hay
+        // ningun efecto secundario de disco escondido en `set_item`.
+        let mut s = WebStorage::new();
+        s.set_item(StorageKind::Local, "o", "k", "v").unwrap();
+        assert!(s.persist_path.is_none());
     }
 }

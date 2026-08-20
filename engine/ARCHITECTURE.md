@@ -2963,7 +2963,55 @@ A fecha de esta limpieza, el motor:
   **Simplificaciones que siguen igual, declaradas**: `SameSite` sigue sin
   aplicarse (exige distinguir peticion de primera parte de tercera parte,
   que este motor no modela todavia - sin cambios respecto a la Fase 16);
-  sin lista de sufijos publicos (PSL); sin persistencia a disco.
+  sin lista de sufijos publicos (PSL); las COOKIES (a diferencia de
+  `localStorage` desde esta Fase) siguen sin persistir a disco.
+
+- **`localStorage` persiste a disco entre sesiones** (Fase 25): antes de
+  esto `localStorage` sobrevivia solo mientras el proceso `engine_server`
+  seguia vivo - cerrar la app lo borraba todo, asi que en la practica se
+  comportaba como un `sessionStorage` de vida mas larga. Encontrado
+  auditando el motor tras la Fase 24: la doc de `net/src/storage.rs`
+  declaraba la limitacion explicitamente.
+  `WebStorage` gana un campo `persist_path: Option<PathBuf>` - `None` para
+  `WebStorage::new()` (la version en memoria pura, la que siguen usando
+  TODOS los tests de este modulo y `wpt_runner`) y `Some(ruta)` solo para
+  `WebStorage::load_from_disk()`, la que usa `core::server` en produccion.
+  La ruta sale de `dirs::data_dir()` (crate nuevo, minimo: 3 dependencias
+  transitivas) - `%APPDATA%\navegador-ia\local_storage.json` en Windows,
+  `~/Library/Application Support/navegador-ia/local_storage.json` en
+  macOS, `$XDG_DATA_HOME` (o su fallback `~/.local/share`) en Linux; las
+  tres convenciones tienen bordes reales (roaming vs local en Windows,
+  fallback de XDG) que no valia la pena reimplementar a mano, mismo
+  criterio de dependencias que TLS/parseo HTML. `load_from_disk` carga el
+  area `local` guardada (JSON invalido o fichero ausente se tratan igual
+  que "sin datos previos" - un perfil corrupto no deberia impedir
+  arrancar el navegador). Cada `set_item`/`remove_item`/`clear` sobre
+  `local` (nunca sobre `session` - persistirla la convertiria en `local`,
+  que es justo la diferencia entre las dos areas que exige el spec)
+  vuelca el mapa ENTERO de vuelta al mismo fichero de forma SINCRONA, sin
+  `debounce` - simplificacion deliberada, mismo criterio que el resto del
+  motor (cada mutacion de DOM/cookie ya se aplica de inmediato).
+  `serde`/`serde_json` (ya eran dependencias de workspace, usadas por
+  `core` para NDJSON) se extendieron a `engine-net` para esto - no entra
+  ningun crate nuevo de serializacion en el arbol.
+  6 tests nuevos en `storage.rs` sobre `WebStorage::load_from_path`
+  (el nucleo interno de `load_from_disk`, parametrizado por ruta para
+  poder probarlo sin tocar el `%APPDATA%` REAL del usuario): ida y vuelta
+  completa (escribir, releer desde una instancia nueva), que
+  `sessionStorage` JAMAS toca disco, fichero ausente y fichero corrupto
+  tratados como "sin datos", y que `remove_item` tambien persiste (no solo
+  `set_item`). 616 tests en total tras esta fase (610 + 6).
+  **Verificado en vivo, no solo con tests**: dos procesos SEPARADOS de
+  `engine_server.exe` (no dos pestañas del mismo proceso) contra un
+  servidor HTTP local real - el primero, sin datos previos, lee
+  `localStorage.getItem('marca')` como `null` y guarda un valor; el
+  segundo, un binario arrancado de cero, lo recupera del disco y lo
+  refleja en `document.title`. El fichero resultante en disco se inspecciono
+  directamente (`{"http://127.0.0.1:8765":{"items":[["marca","valor-
+  persistente"]]}}`) antes de limpiarlo.
+  **Simplificacion que sigue igual, declarada**: sin evento `storage` entre
+  pestañas (este motor no tiene comunicacion entre pestañas, sin cambios
+  respecto a la Fase 15).
 
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"

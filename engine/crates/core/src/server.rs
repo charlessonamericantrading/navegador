@@ -256,7 +256,10 @@ impl EngineServer {
             width: 1280,
             height: 720,
             network: std::sync::Arc::new(NetworkEngine::new()),
-            storage: std::sync::Arc::new(std::sync::Mutex::new(engine_net::storage::WebStorage::new())),
+            // Fase 25: `load_from_disk`, no `new()` - recupera el `local`
+            // de una sesion anterior del mismo perfil. `session` sigue
+            // vacio siempre (ver el aviso de `WebStorage::load_from_disk`).
+            storage: std::sync::Arc::new(std::sync::Mutex::new(engine_net::storage::WebStorage::load_from_disk())),
             tabs: vec![Tab::new(0)],
             active_tab: 0,
             next_tab_id: 1,

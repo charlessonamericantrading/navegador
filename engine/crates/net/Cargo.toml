@@ -18,3 +18,9 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 http-body-util = "0.1"
 flate2.workspace = true
 brotli.workspace = true
+# Persistencia a disco de `localStorage` (ver storage.rs) - el mismo
+# serde/serde_json que ya usa `engine-core` para el protocolo NDJSON, no
+# entra ningun crate nuevo en el arbol de dependencias.
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
