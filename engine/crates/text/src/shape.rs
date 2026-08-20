@@ -103,6 +103,55 @@ pub fn measure_text(font: &SystemFont, text: &str, font_size: f32) -> TextMetric
     TextMetrics { width, line_height }
 }
 
+/// El desplazamiento vertical desde la parte SUPERIOR de una linea (el
+/// mismo `line_top_y` que recibe `shape_text`) hasta su BASELINE - el
+/// mismo calculo que `shape_text` hace internamente (`ascender * scale`),
+/// expuesto aparte para quien necesite el baseline SIN construir ningun
+/// glifo (`engine-gfx::paint_text`, para posicionar el subrayado de
+/// `text-decoration: underline`, Fase 29). `None` en los mismos dos casos
+/// de respaldo que `measure_text` (fuente no reconstruible, o 0 unidades
+/// por em).
+pub fn baseline_offset(font: &SystemFont, font_size: f32) -> Option<f32> {
+    let face = font.rustybuzz_face()?;
+    let units_per_em = face.units_per_em() as f32;
+    if units_per_em <= 0.0 {
+        return None;
+    }
+    let scale = font_size / units_per_em;
+    Some(face.ascender() as f32 * scale)
+}
+
+/// Posicion y grosor REALES del subrayado (`text-decoration: underline`,
+/// Fase 29), leidos de la propia tabla de metricas de la fuente
+/// (`post`/`OS-2` via `ttf_parser::Face::underline_metrics`) en vez de una
+/// fraccion inventada de `font_size` - cada fuente declara su propia
+/// posicion/grosor de subrayado, y usar el valor real es lo que hace que
+/// quede pegado al texto igual que en un navegador real, no flotando a
+/// una distancia arbitraria.
+///
+/// Devuelve `(desplazamiento_bajo_baseline_px, grosor_px)`, los DOS ya
+/// escalados a `font_size` y en coordenadas de PANTALLA (desplazamiento
+/// POSITIVO = hacia ABAJO desde el baseline - la convencion de la propia
+/// fuente es la contraria, `position` viene NEGATIVO porque su eje Y
+/// apunta hacia arriba, de ahi el signo invertido de mas abajo).
+///
+/// `None` si la fuente no se pudo reconstruir, tiene 0 unidades por em, o
+/// no declara metricas de subrayado (fuentes incompletas/sinteticas) -
+/// quien llama cae entonces a una aproximacion basada solo en
+/// `font_size`, igual criterio de respaldo que el resto de este modulo.
+pub fn underline_metrics(font: &SystemFont, font_size: f32) -> Option<(f32, f32)> {
+    let face = font.rustybuzz_face()?;
+    let units_per_em = face.units_per_em() as f32;
+    if units_per_em <= 0.0 {
+        return None;
+    }
+    let scale = font_size / units_per_em;
+    let metrics = face.underline_metrics()?;
+    let offset_below_baseline = -(metrics.position as f32) * scale;
+    let thickness = (metrics.thickness as f32 * scale).max(1.0);
+    Some((offset_below_baseline, thickness))
+}
+
 /// Parte `text` en lineas reales que quepan en `max_width` (px), rompiendo
 /// solo en limites de palabra (espacios) - nunca dentro de una palabra, no
 /// hay hifenacion. Una palabra sola mas ancha que `max_width` ocupa su
@@ -326,6 +375,49 @@ mod tests {
         let metrics = measure_text(&font, "", 16.0);
         assert_eq!(metrics.width, 0.0);
         assert!(metrics.line_height > 0.0, "una linea vacia sigue teniendo alto (el de la fuente), no colapsa a 0");
+    }
+
+    #[test]
+    fn baseline_offset_is_positive_and_scales_with_font_size() {
+        let Some(font) = SystemFont::load_default_sans_serif() else {
+            eprintln!("sin fuentes de sistema en este entorno, test omitido");
+            return;
+        };
+        let small = baseline_offset(&font, 16.0).expect("deberia haber metricas de fuente");
+        let big = baseline_offset(&font, 32.0).expect("deberia haber metricas de fuente");
+        assert!(small > 0.0, "el baseline deberia quedar POR DEBAJO de la parte superior de la linea");
+        assert!(big > small, "a mayor font-size, mayor distancia hasta el baseline");
+    }
+
+    #[test]
+    fn underline_metrics_returns_a_positive_offset_and_thickness_that_scale_with_font_size() {
+        let Some(font) = SystemFont::load_default_sans_serif() else {
+            eprintln!("sin fuentes de sistema en este entorno, test omitido");
+            return;
+        };
+        let (offset_16, thickness_16) = underline_metrics(&font, 16.0).expect("deberia haber metricas de subrayado");
+        assert!(offset_16 > 0.0, "el subrayado deberia quedar POR DEBAJO del baseline, no encima");
+        assert!(thickness_16 >= 1.0, "un grosor menor de 1px no seria visible");
+
+        let (offset_32, thickness_32) = underline_metrics(&font, 32.0).expect("deberia haber metricas de subrayado");
+        assert!(offset_32 > offset_16, "a mayor font-size, mayor distancia del subrayado al baseline");
+        assert!(thickness_32 > thickness_16, "a mayor font-size, mayor grosor de subrayado");
+    }
+
+    /// El subrayado real siempre deberia quedar por debajo del baseline
+    /// pero, para un texto normal (sin descendentes exagerados), tambien
+    /// por encima del final visual de la linea - si no, se pintaria fuera
+    /// de la caja que el layout reservo.
+    #[test]
+    fn underline_sits_below_the_baseline_but_within_a_reasonable_line_height() {
+        let Some(font) = SystemFont::load_default_sans_serif() else {
+            eprintln!("sin fuentes de sistema en este entorno, test omitido");
+            return;
+        };
+        let baseline = baseline_offset(&font, 16.0).expect("deberia haber metricas de fuente");
+        let (underline_offset, _) = underline_metrics(&font, 16.0).expect("deberia haber metricas de subrayado");
+        let metrics = measure_text(&font, "", 16.0);
+        assert!(baseline + underline_offset < metrics.line_height, "el subrayado no deberia caer fuera del alto de linea reservado");
     }
 
     #[test]

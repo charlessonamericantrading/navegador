@@ -11,7 +11,7 @@
 use crate::display_list::DisplayItem;
 use crate::image_paint::paint_image;
 use engine_layout::Rect;
-use engine_text::{measure_text, shape_text, wrap_text, FontSet};
+use engine_text::{baseline_offset, measure_text, shape_text, underline_metrics, wrap_text, FontSet, SystemFont};
 use tiny_skia::{FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Rect as SkiaRect, Stroke, Transform};
 
 /// Pinta cada `DisplayItem` de `items`, EN ORDEN, sobre `pixmap`.
@@ -69,8 +69,8 @@ pub fn paint_display_list(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: 
             DisplayItem::Shadow { rect, color, radius } | DisplayItem::SolidRect { rect, color, radius } => {
                 fill_shape(pixmap, rect, *radius, &paint_of(*color), scroll_offset_y, current_mask.as_ref());
             }
-            DisplayItem::Text { rect, text, color, font_size, bold, italic } => {
-                paint_text(pixmap, rect, text, *color, *font_size, *bold, *italic, font_set, scroll_offset_y, current_mask.as_ref());
+            DisplayItem::Text { rect, text, color, font_size, bold, italic, underline } => {
+                paint_text(pixmap, rect, text, *color, *font_size, *bold, *italic, *underline, font_set, scroll_offset_y, current_mask.as_ref());
             }
             DisplayItem::Border { rect, width: border_width, color, radius } => {
                 paint_border(pixmap, rect, *border_width, *color, *radius, scroll_offset_y, current_mask.as_ref());
@@ -218,6 +218,7 @@ fn paint_text(
     font_size: f32,
     bold: bool,
     italic: bool,
+    underline: bool,
     font_set: Option<&FontSet>,
     scroll_offset_y: f32,
     mask: Option<&Mask>,
@@ -238,6 +239,9 @@ fn paint_text(
                 for glyph in shape_text(font, line, font_size, rect.x, line_y) {
                     pixmap.fill_path(&glyph.path, &paint, FillRule::Winding, Transform::identity(), mask);
                 }
+                if underline && !line.trim().is_empty() {
+                    paint_underline(pixmap, font, line, font_size, rect.x, line_y, &paint, mask);
+                }
             }
         }
         None => {
@@ -247,6 +251,30 @@ fn paint_text(
                 pixmap.fill_rect(sk_rect, &paint, Transform::identity(), mask);
             }
         }
+    }
+}
+
+/// La franja de `text-decoration: underline` (Fase 29) de UNA linea ya
+/// shapeada - ancho real de esa linea (`measure_text`, no `rect.width`
+/// entero: una linea mas corta que su caja, la ultima de un parrafo
+/// envuelto, no deberia subrayarse hasta el borde derecho de la caja) y
+/// posicion/grosor reales de la propia fuente (`underline_metrics`,
+/// mismas metricas que declara para el resto de sus glifos) - con
+/// respaldo a una fraccion de `font_size` (~8% bajo el baseline, ~6% de
+/// grosor, valores tipograficos tipicos) si la fuente no las declara.
+/// `line_top_y` es la MISMA coordenada de pantalla que ya recibio
+/// `shape_text` para esta linea, asi que el subrayado queda alineado con
+/// los glifos que acaba de pintar, no con un calculo aparte.
+fn paint_underline(pixmap: &mut Pixmap, font: &SystemFont, line: &str, font_size: f32, origin_x: f32, line_top_y: f32, paint: &Paint<'static>, mask: Option<&Mask>) {
+    let width = measure_text(font, line, font_size).width;
+    if width <= 0.0 {
+        return;
+    }
+    let baseline_y = line_top_y + baseline_offset(font, font_size).unwrap_or(font_size * 0.8);
+    let (offset_below_baseline, thickness) = underline_metrics(font, font_size).unwrap_or((font_size * 0.08, (font_size * 0.06).max(1.0)));
+
+    if let Some(sk_rect) = SkiaRect::from_xywh(origin_x, baseline_y + offset_below_baseline, width, thickness) {
+        pixmap.fill_rect(sk_rect, paint, Transform::identity(), mask);
     }
 }
 
@@ -482,5 +510,67 @@ mod tests {
         // un estado valido tras pintar.
         paint_display_list(&mut pixmap, &items, None, 0.0);
         assert!(pixmap.encode_png().is_ok());
+    }
+
+    /// La prueba real de `text-decoration: underline` (Fase 29): con una
+    /// fuente de sistema de verdad cargada (sin ella, `paint_text` cae al
+    /// bloque de relleno de respaldo y esta prueba no ejercitaria
+    /// `paint_underline` en absoluto), activar `underline` deberia pintar
+    /// MAS pixeles no transparentes que desactivarlo - la franja extra del
+    /// subrayado, cuya posicion/grosor exactos ya prueba
+    /// `engine-text::shape` por separado.
+    #[test]
+    fn underline_paints_more_pixels_than_the_same_text_without_it() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            eprintln!("sin fuentes de sistema en este entorno, test omitido");
+            return;
+        }
+
+        let paint_with = |underline: bool| {
+            let mut pixmap = Pixmap::new(200, 60).unwrap();
+            let items = vec![DisplayItem::Text {
+                rect: Rect { x: 5.0, y: 5.0, width: 190.0, height: 30.0 },
+                text: "hola".to_string(),
+                color: [0, 0, 0, 255],
+                font_size: 20.0,
+                bold: false,
+                italic: false,
+                underline,
+            }];
+            paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
+            pixmap
+        };
+
+        let painted_pixels = |pixmap: &Pixmap| -> usize { pixmap.pixels().iter().filter(|p| p.alpha() > 0).count() };
+
+        let with_underline = painted_pixels(&paint_with(true));
+        let without_underline = painted_pixels(&paint_with(false));
+        assert!(with_underline > without_underline, "activar el subrayado deberia pintar mas pixeles (la franja extra), no los mismos");
+    }
+
+    /// Un texto en blanco (solo espacios, o vacio tras `wrap_text`) no
+    /// deberia dejar una franja de subrayado flotando sin ningun glifo
+    /// encima - `paint_text` la salta a proposito para esas lineas.
+    #[test]
+    fn underline_is_not_painted_for_a_blank_line() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            eprintln!("sin fuentes de sistema en este entorno, test omitido");
+            return;
+        }
+
+        let mut pixmap = Pixmap::new(200, 60).unwrap();
+        let items = vec![DisplayItem::Text {
+            rect: Rect { x: 5.0, y: 5.0, width: 190.0, height: 30.0 },
+            text: "   ".to_string(),
+            color: [0, 0, 0, 255],
+            font_size: 20.0,
+            bold: false,
+            italic: false,
+            underline: true,
+        }];
+        paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
+        assert!(pixmap.pixels().iter().all(|p| p.alpha() == 0), "una linea en blanco no deberia pintar nada, ni siquiera un subrayado");
     }
 }

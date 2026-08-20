@@ -132,9 +132,11 @@ A fecha de esta limpieza, el motor:
   en el spec (arriba/abajo, horizontal en cero) pero aqui el motor de
   layout solo soporta un unico valor a los 4 lados (`resolve_margin`), asi
   que tambien empuja los lados; `font-weight`/`font-style`/
-  `text-decoration` quedan en el `computed_style` (cascada correcta) pero
-  `engine-gfx` todavia no los lee al pintar (negrita/cursiva/subrayado no
-  se ven todavia - Fase 2.4); sin viñetas ni sangria de listas.
+  `text-decoration` quedan en el `computed_style` (cascada correcta) y
+  `engine-gfx` los lee los tres al pintar desde la Fase 2.4 (negrita/
+  cursiva) y la Fase 29 (subrayado, ver su entrada mas abajo - en el
+  momento de ESTA fase todavia no se veian); sin viñetas ni sangria de
+  listas.
   - **Bug real encontrado al añadir esto, no solo teorico**: dar a `<body>`
     un `margin` real por primera vez expuso que `flow_block_children`
     calculaba la altura de un contenedor sumando solo `dimensions.height`
@@ -1418,7 +1420,8 @@ A fecha de esta limpieza, el motor:
   `INHERITABLE_PROPERTIES`, ver Fase 2.5, para no quedarse solo en
   elementos con la propiedad puesta directamente); `text-decoration`
   (subrayado de `<a>`, que la cascada ya resuelve igual que negrita/cursiva
-  pero nada pinta todavia); pesos intermedios reales (100/200/300...) mas
+  pero en el momento de ESTA fase nada lo pintaba todavia - cerrado en la
+  Fase 29, ver su entrada); pesos intermedios reales (100/200/300...) mas
   alla del binario negrita-si/no; `font-weight: bolder/lighter` RELATIVOS
   al peso heredado (se tratan igual que `bold`/`normal` absolutos, sin
   sumar/restar sobre el peso del padre).
@@ -3159,6 +3162,53 @@ A fecha de esta limpieza, el motor:
   `oklab()`/`oklch()` y el resto de espacios de color modernos del spec
   siguen sin implementarse - devuelven `None` y la caja se queda sin
   pintar, en vez de fingir una conversion.
+
+- **`text-decoration: underline` se PINTA de verdad** (Fase 29): la
+  cascada ya resolvia esta propiedad desde que existe - no esta en
+  `BACKGROUND_NON_COLOR_KEYWORDS` ni necesita estarlo, es una propiedad
+  CSS normal que `resolve_style` copia igual que cualquier otra - pero
+  nada la pintaba, ni siquiera el caso mas comun de todos: la hoja de
+  agente de usuario ya declara `a { text-decoration: underline; }`
+  (ver `user_agent_stylesheet.rs`) desde antes de esta fase, asi que
+  TODO enlace de TODA pagina real se pintaba sin subrayado.
+  `DisplayItem::Text` gana un campo `underline: bool`
+  (`resolve_text_decoration_is_underline` en `display_list.rs`, mismo
+  patron que `resolve_font_weight_is_bold`/`resolve_font_style_is_italic`
+  - busca el token `underline` entre los valores separados por espacio,
+  asi que reconoce tanto `text-decoration: underline` como el shorthand
+  compuesto `underline dotted red`; `line-through`/`overline` se
+  reconocen igual como candidatos pero ninguno de los dos esta conectado
+  a nada que pinte, declarado).
+  `engine-text` gana dos funciones nuevas (`baseline_offset`,
+  `underline_metrics`) que leen las metricas REALES de la propia fuente
+  via `ttf_parser::Face` (`ascender()` y `underline_metrics()` - la
+  tabla `post`/`OS-2` que cada fuente declara) en vez de una fraccion
+  inventada de `font_size` - asi el subrayado queda pegado al texto con
+  la misma posicion/grosor que usaria un navegador real para esa MISMA
+  fuente, no una aproximacion generica. Con respaldo a una fraccion de
+  `font_size` (~8% bajo el baseline, ~6% de grosor) SOLO si la fuente no
+  declara esas metricas (fuentes incompletas/sinteticas).
+  `paint_text` (en `engine-gfx::paint`) dibuja la franja POR LINEA (una
+  caja de texto envuelta en varias lineas por `wrap_text` subraya cada
+  una con SU propio ancho real, via `measure_text` de esa linea - no la
+  caja entera, que dejaria una franja de mas en la ultima linea mas corta
+  de un parrafo), y la salta por completo en una linea en blanco (sin
+  glifos que subrayar, ninguna franja flotando sola).
+  9 tests nuevos (643 en total tras esta fase): 3 en `engine-text`
+  (`baseline_offset` positivo y creciente con `font_size`, metricas de
+  subrayado positivas y crecientes, el subrayado cae dentro del alto de
+  linea reservado - los tres contra una fuente de sistema REAL, no
+  simulada), 1 en `display_list.rs` (el token se reconoce solo/compuesto/
+  sin distinguir mayusculas, `line-through` no lo activa), y 2 en
+  `paint.rs` a nivel de PIXEL (activar `underline` pinta mas pixeles no
+  transparentes que sin el, una linea en blanco no pinta nada) - los tres
+  ultimos, igual que los de `engine-text`, corren contra una fuente de
+  sistema real cuando hay una disponible, no un mock.
+  **Verificado en vivo ademas**: captura PNG real de una pagina con un
+  `<a>` (subrayado por la hoja de agente de usuario), un `<span>` con
+  `text-decoration: underline` explicito, y un `<span>` normal - los dos
+  primeros muestran la franja, el tercero no, exactamente lo esperado a
+  ojo.
 
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"

@@ -20,7 +20,13 @@ pub enum DisplayItem {
     /// doc-comments en `engine-layout::tree`), no las 4 esquinas
     /// independientes del spec real.
     SolidRect { rect: Rect, color: [u8; 4], radius: f32 },
-    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool },
+    /// `underline` (Fase 29, `text-decoration: underline`) - la cascada ya
+    /// resolvia esta propiedad desde que existe (`text-decoration` no esta
+    /// en `BACKGROUND_NON_COLOR_KEYWORDS` ni necesita estarlo, es una
+    /// propiedad normal), pero nada la PINTABA hasta esta fase. El valor
+    /// por defecto real de `<a>` (hoja de agente de usuario, `a {
+    /// text-decoration: underline; }`) es el caso que mas se nota.
+    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool, underline: bool },
     /// `rect` es el border-box COMPLETO (`layout_box.dimensions`, que ya
     /// incluye el propio border - ver `engine_layout::tree::
     /// flow_block_children`); quien pinta esto (`engine-gfx/src/paint.rs`)
@@ -158,6 +164,7 @@ impl DisplayList {
                     font_size,
                     bold: resolve_font_weight_is_bold(&layout_box.computed_style),
                     italic: resolve_font_style_is_italic(&layout_box.computed_style),
+                    underline: resolve_text_decoration_is_underline(&layout_box.computed_style),
                 });
             }
             BoxType::Image(src) => {
@@ -546,6 +553,19 @@ fn resolve_font_style_is_italic(computed_style: &HashMap<String, String>) -> boo
     trimmed.eq_ignore_ascii_case("italic") || trimmed.eq_ignore_ascii_case("oblique")
 }
 
+/// `text-decoration: underline` (Fase 29) - decide si `paint_text` dibuja
+/// la franja de subrayado. Busca el token `underline` entre los valores
+/// separados por espacio (el shorthand real admite ademas estilo/color,
+/// `text-decoration: underline dotted red`) en vez de comparar el valor
+/// entero, para no fallar ante esa forma compuesta. `line-through`/
+/// `overline` se PARSEAN igual (no se descartan como candidatos), pero
+/// solo `underline` esta conectado a algo que pinte - los otros dos
+/// siguen sin implementarse, declarado.
+fn resolve_text_decoration_is_underline(computed_style: &HashMap<String, String>) -> bool {
+    let Some(raw) = computed_style.get("text-decoration") else { return false };
+    raw.split_whitespace().any(|token| token.eq_ignore_ascii_case("underline"))
+}
+
 /// Igual que `parse_css_font_size`, pero SI acepta cero (un ancho de
 /// border de 0 es valido) - copia deliberada de `parse_css_length` en
 /// `engine-layout/src/tree.rs`, misma razon que `INITIAL_FONT_SIZE`/
@@ -870,6 +890,18 @@ mod tests {
         assert!(resolve_font_style_is_italic(&style("italic")));
         assert!(resolve_font_style_is_italic(&style("oblique")));
         assert!(!resolve_font_style_is_italic(&HashMap::new()));
+    }
+
+    #[test]
+    fn resolve_text_decoration_is_underline_recognizes_the_token_alone_or_in_the_compound_shorthand() {
+        let style = |value: &str| { let mut m = HashMap::new(); m.insert("text-decoration".to_string(), value.to_string()); m };
+
+        assert!(resolve_text_decoration_is_underline(&style("underline")));
+        assert!(resolve_text_decoration_is_underline(&style("underline dotted red")), "el shorthand compuesto (estilo/color) tambien deberia reconocerse");
+        assert!(resolve_text_decoration_is_underline(&style("UNDERLINE")), "sin distinguir mayusculas/minusculas, igual que el resto de palabras clave CSS");
+        assert!(!resolve_text_decoration_is_underline(&style("none")));
+        assert!(!resolve_text_decoration_is_underline(&style("line-through")), "line-through no deberia activar el subrayado");
+        assert!(!resolve_text_decoration_is_underline(&HashMap::new()), "sin la propiedad puesta, ningun subrayado");
     }
 
     #[test]
