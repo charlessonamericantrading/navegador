@@ -882,7 +882,30 @@ impl LayoutTreeBuilder {
                 // "head", "script" y "style" no tienen representacion visual;
                 // sin esto, su contenido de texto se pintaria como si fuera
                 // parrafo visible.
-                if matches!(tag_name.as_str(), "head" | "script" | "style" | "meta" | "link" | "title") {
+                //
+                // "noscript" (Fase 32) faltaba en esta lista - encontrado en
+                // vivo con una pagina real (el fragmento de respaldo de
+                // Google Tag Manager, `<noscript><iframe src="...">
+                // </iframe></noscript>`, presente en una cantidad enorme de
+                // sitios reales). `html5ever` parsea `<noscript>` como
+                // RAWTEXT cuando el scripting esta activado
+                // (`ParseOpts::default().tree_builder.scripting_enabled ==
+                // true`, ver `dom::parser`) - EXACTAMENTE lo que exige el
+                // spec real: en un navegador CON JavaScript, el contenido de
+                // `<noscript>` nunca debe ejecutarse ni parsearse como
+                // markup real, asi que su interior queda como UN SOLO nodo
+                // de texto con el HTML crudo tal cual (aqui, literalmente
+                // `<iframe src="...">...</iframe>` como cadena). Un
+                // navegador real lo esconde con `noscript { display: none }`
+                // en su hoja de agente de usuario; este motor, en cambio, no
+                // tenia ninguna regla asi NI este atajo - el resultado
+                // exacto que aparecio en pantalla: el marcado del iframe de
+                // respaldo pintado como texto plano visible. Se resuelve
+                // aqui, no con una regla CSS, por la misma razon que
+                // "script"/"style" ya se resuelven aqui: es mas simple y
+                // mas robusto que depender de que ninguna hoja de autor
+                // sobreescriba `display` por accidente.
+                if matches!(tag_name.as_str(), "head" | "script" | "style" | "meta" | "link" | "title" | "noscript") {
                     return;
                 }
                 // `strong`/`em` faltaban aqui desde que existen como reglas
@@ -3507,6 +3530,40 @@ mod tests {
 
         assert_eq!(text_box.dimensions.y, strong_box.dimensions.y, "<strong> deberia compartir linea con el texto anterior, no caer a BoxType::Block");
         assert_eq!(strong_box.dimensions.y, em_box.dimensions.y, "<em> deberia seguir en la misma linea que <strong>");
+    }
+
+    /// Regresion encontrada en vivo (Fase 32) con una pagina real que
+    /// usaba el fragmento de respaldo de Google Tag Manager
+    /// (`<noscript><iframe src="...">...</iframe></noscript>`, presente
+    /// en una cantidad enorme de sitios reales): `html5ever` parsea el
+    /// interior de `<noscript>` como RAWTEXT cuando el scripting esta
+    /// activado (el caso real de este motor - `ParseOpts::default()` ya
+    /// activa `scripting_enabled`), asi que su DOM real es un SOLO nodo
+    /// de texto con el HTML crudo tal cual, no markup anidado real. Sin
+    /// excluir el elemento del layout (igual que ya se excluye
+    /// `<script>`/`<style>`), ese marcado se pintaba como texto plano
+    /// visible - exactamente lo que aparecio en pantalla.
+    #[test]
+    fn noscript_content_never_gets_a_visual_representation() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-TEST" height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript><p id="real">contenido real</p></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        fn collect_text(node: &LayoutBox, out: &mut String) {
+            if let BoxType::Text(content) = &node.box_type {
+                out.push_str(content);
+            }
+            for child in &node.children {
+                collect_text(child, out);
+            }
+        }
+        let mut all_text = String::new();
+        collect_text(&root, &mut all_text);
+
+        assert!(!all_text.contains("iframe"), "el marcado crudo de <noscript> nunca deberia aparecer como texto visible: {all_text:?}");
+        assert!(all_text.contains("contenido real"), "el contenido normal de la pagina deberia seguir renderizando");
     }
 
     /// Regresion encontrada en vivo al verificar la Fase 3.1 con una imagen

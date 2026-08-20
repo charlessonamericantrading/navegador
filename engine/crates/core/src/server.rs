@@ -15,7 +15,7 @@ use engine_dom::{Node, NodeType};
 use engine_gfx::render_layout_to_png;
 use engine_image::decode_image;
 use engine_js::{BoxMetrics, JsRuntime};
-use engine_layout::{ImageMap, LayoutBox, LayoutTreeBuilder};
+use engine_layout::{BoxType, ImageMap, LayoutBox, LayoutTreeBuilder};
 use engine_net::{NetworkEngine, NetworkRequest};
 use engine_text::FontSet;
 use std::collections::HashMap;
@@ -1921,6 +1921,35 @@ fn collect_interactive_elements(layout_root: &engine_layout::LayoutBox) -> Vec<I
     elements
 }
 
+/// El texto VISIBLE de un elemento para la lista `elements` del protocolo
+/// NDJSON (Fase 32) - camina el arbol de LAYOUT (ya filtrado por
+/// `LayoutTreeBuilder::build_node`), no el DOM crudo. Antes de esto, este
+/// campo usaba `Node::text_content` (el mismo que implementa el
+/// `.textContent` real de JS), que camina el DOM SIN filtrar - correcto
+/// para `.textContent` (que si debe incluir literalmente el codigo fuente
+/// de un `<script>`/`<style>` como texto, es el comportamiento real del
+/// spec) pero equivocado aqui: un `<noscript>` (RAWTEXT cuando el
+/// scripting esta activado, ver el aviso de `build_node`) o un `<script>`
+/// dejaba su marcado/codigo crudo colandose en el campo `text` de
+/// `<body>`, visible para quien consuma este protocolo (la capa de IA/
+/// interaccion) aunque nunca se pintara en pantalla. Reusar el arbol de
+/// layout en vez de duplicar la lista de tags excluidos aqui: una sola
+/// fuente de verdad sobre que cuenta como "visible".
+fn collect_visible_text(layout_box: &LayoutBox) -> String {
+    let mut text = String::new();
+    collect_visible_text_recursive(layout_box, &mut text);
+    text
+}
+
+fn collect_visible_text_recursive(layout_box: &LayoutBox, out: &mut String) {
+    if let BoxType::Text(content) = &layout_box.box_type {
+        out.push_str(content);
+    }
+    for child in &layout_box.children {
+        collect_visible_text_recursive(child, out);
+    }
+}
+
 fn collect_elements_recursive(
     layout_box: &engine_layout::LayoutBox,
     elements: &mut Vec<InteractiveElement>,
@@ -1940,7 +1969,7 @@ fn collect_elements_recursive(
             elements.push(InteractiveElement {
                 id,
                 tag_name: tag_name.clone(),
-                text: Node::text_content(node),
+                text: collect_visible_text(layout_box),
                 rect: ElementRect {
                     x: layout_box.dimensions.x,
                     y: layout_box.dimensions.y,
@@ -1970,6 +1999,28 @@ fn collect_elements_recursive(
 mod tests {
     use super::*;
     use crate::protocol::EngineRequest;
+
+    /// Regresion encontrada en vivo (Fase 32) junto con el fix de
+    /// `noscript` en `engine-layout`: el campo `text` de la lista
+    /// `elements` del protocolo NDJSON usaba `Node::text_content` (el
+    /// mismo que implementa `.textContent` real de JS, que camina el DOM
+    /// SIN filtrar - correcto para JS, pero no aqui), asi que el marcado
+    /// crudo de un `<noscript>` (o el codigo fuente de un `<script>`) se
+    /// colaba en el texto de `<body>` aunque nunca se pintara. Camina el
+    /// arbol de LAYOUT (ya filtrado) en vez del DOM crudo.
+    #[test]
+    fn collect_visible_text_excludes_noscript_and_script_content() {
+        let dom = engine_dom::HtmlParser::parse(
+            r#"<html><body><noscript><iframe src="https://example.test/"></iframe></noscript><script>var x = 1;</script><p>contenido real</p></body></html>"#,
+        );
+        let stylesheet = engine_css::CssParser::parse("body { margin: 0px; }");
+        let layout_root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let text = collect_visible_text(&layout_root);
+        assert!(!text.contains("iframe"), "el marcado de <noscript> no deberia colarse en el texto visible: {text:?}");
+        assert!(!text.contains("var x"), "el codigo fuente de <script> no deberia colarse en el texto visible: {text:?}");
+        assert!(text.contains("contenido real"), "el contenido normal de la pagina si deberia aparecer");
+    }
 
     #[tokio::test]
     async fn server_starts_with_a_ready_native_renderer() {

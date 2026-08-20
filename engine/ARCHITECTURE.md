@@ -3332,6 +3332,59 @@ A fecha de esta limpieza, el motor:
   ANTERIOR en vez de la suya propia, dando un desplazamiento ligeramente
   distinto al ideal en ese caso concreto - no cerrado en esta fase.
 
+- **`<noscript>` ya no se pinta como texto plano visible** (Fase 32):
+  encontrado en vivo probando la app instalada contra un sitio real
+  (Ignis Love) - el fragmento de respaldo de Google Tag Manager
+  (`<noscript><iframe src="...">...</iframe></noscript>`, presente en una
+  cantidad enorme de sitios reales) aparecia como texto crudo visible en
+  la pantalla. Causa raiz exacta: `html5ever` parsea `<noscript>` como
+  RAWTEXT cuando el scripting esta activado (`ParseOpts::default()` ya
+  activa `scripting_enabled`, el valor por defecto real de la libreria) -
+  EXACTAMENTE lo que exige el spec: en un navegador CON JavaScript (el
+  caso de este motor), el interior de `<noscript>` nunca debe parsearse
+  como markup real, asi que su DOM real es un SOLO nodo de texto con el
+  HTML crudo tal cual. Un navegador real lo esconde con `noscript {
+  display: none }` en su hoja de agente de usuario; `build_node` en
+  `engine-layout::tree` en cambio ya tenia una lista de tags SIN
+  representacion visual (`head`/`script`/`style`/`meta`/`link`/`title`) y
+  `noscript` faltaba en ella - el mismo patron exacto que el bug de
+  `strong`/`em` faltando en la lista de tags inline (Fase 2.4). Cerrado
+  añadiendo `noscript` a esa lista, mismo mecanismo que ya usan `script`/
+  `style` (excluir del layout por completo, no depender de una regla CSS
+  que una hoja de autor pudiera sobreescribir).
+  **Segundo hallazgo, mismo hilo**: la lista `elements` del protocolo
+  NDJSON (la que consume la capa de IA/interaccion) tenia el MISMO
+  problema por una via distinta - su campo `text` usaba `Node::
+  text_content` (el mismo que implementa el `.textContent` REAL de JS,
+  que camina el DOM entero SIN filtrar - correcto ahi, el spec real
+  exige que `.textContent` incluya literalmente el codigo fuente de un
+  `<script>`/`<style>` como texto) para describir el texto VISIBLE de
+  `<body>`, asi que el marcado crudo se colaba igual, por un camino
+  paralelo al de pintado. `collect_visible_text` (nueva, en
+  `core::server`) camina el arbol de LAYOUT en vez del DOM crudo - ya
+  filtrado por el fix de arriba, asi que no hace falta duplicar la lista
+  de tags excluidos: una sola fuente de verdad sobre que cuenta como
+  "visible".
+  2 tests nuevos (657 en total tras esta fase): uno en `engine-layout`
+  reproduciendo el fragmento real de GTM y confirmando que su marcado
+  nunca aparece como texto en el arbol de layout, y uno en `core::server`
+  confirmando que `collect_visible_text` excluye tanto `<noscript>` como
+  `<script>`.
+  **Verificado en vivo, de punta a punta**: instalador reinstalado sobre
+  la instalacion existente y app abierta de verdad en el escritorio -
+  ahi fue donde se encontro el bug originalmente (captura de pantalla del
+  usuario). Confirmado el arreglo navegando el binario corregido contra
+  la MISMA URL real (`https://www.ignislove.com/`): la captura PNG queda
+  sin el texto del iframe (la pagina en si queda en blanco, porque el
+  sitio depende de un framework JS que este motor no ejecuta completo -
+  limitacion ya declarada, sin relacion con este fix) y la lista
+  `elements` ya no contiene "iframe" en ningun campo `text`. De paso se
+  investigo y se DESCARTO un tercer sintoma que parecia un bug
+  (`Ignis Love | Tienda... Bienestar ntimo en Espaa...` con caracteres
+  raros en el titulo): los bytes UTF-8 reales son correctos
+  (`Íntimo`/`España`/`Envío`) - era solo la consola del script de prueba
+  mostrando mal el Unicode, no el motor.
+
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"
 o una cifra de rendimiento), es una mentira que hay que borrar, no una
