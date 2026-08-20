@@ -30,6 +30,28 @@
 //!   solo declara `font-weight: bold` (que si se pinta, igual que `b`/
 //!   `strong`), sin el `text-align: center` que un navegador real tambien
 //!   le da (esa propiedad todavia no se PINTA - ver `INHERITABLE_PROPERTIES`).
+//! - `input`/`select`/`textarea` (Fase 11: controles de formulario, ver
+//!   `BoxType::Replaced` en `engine-layout`) reciben aqui un TAMAÑO FIJO,
+//!   no shrink-to-fit real (este motor no mide min/max-content en ningun
+//!   sitio todavia, misma limitacion ya declarada para items flex/cajas
+//!   fuera de flujo) - una aproximacion honesta al ancho por defecto real
+//!   de un `<input>` sin CSS de autor (`size=20` del spec HTML), no el
+//!   tamaño exacto que daria un navegador real. `input[type=hidden]` usa
+//!   `display: none` (Fase 10.5, ya real) en vez de cualquier tamaño -
+//!   asi es el comportamiento verdadero de un campo oculto. Sin
+//!   `text-align`/aspecto nativo por plataforma (flechas de `<select>`,
+//!   radios circulares reales - el `border-radius` de abajo es una
+//!   aproximacion visual, no una forma geometrica distinta).
+//! - `button` (y solo `button` - `input[type=submit/button/...]` sigue
+//!   siendo `BoxType::Replaced`, con tamaño fijo, NO `Inline`) se trata
+//!   como `span`/`a`/etc: se encoge a su contenido real en vez de un
+//!   tamaño fijo, PERO `padding`/`border` de elementos inline no se
+//!   resuelven todavia en el layout (limitacion ya declarada en
+//!   `place_inline_node`, "caso raro para span/a/b/i" - deja de serlo
+//!   para `button`, pero sigue sin resolverse) - el fondo/borde de abajo
+//!   SI se pinta (misma cascada, ver `engine-gfx::display_list`), solo
+//!   queda pegado al texto sin aire alrededor, no con el respiro que
+//!   `padding` le daria en un navegador real.
 
 use crate::parser::CssParser;
 use crate::stylesheet::StyleSheet;
@@ -55,6 +77,14 @@ table { display: table; }
 tr { display: table-row; }
 td { display: table-cell; padding: 1px; }
 th { display: table-cell; padding: 1px; font-weight: bold; }
+input { width: 170px; height: 21px; border: 1px solid #767676; background-color: #ffffff; }
+input[type="checkbox"], input[type="radio"] { width: 13px; height: 13px; border: 1px solid #767676; background-color: #ffffff; }
+input[type="radio"] { border-radius: 7px; }
+input[type="submit"], input[type="button"], input[type="reset"], input[type="image"] { background-color: #efefef; }
+input[type="hidden"] { display: none; }
+select { width: 170px; height: 21px; border: 1px solid #767676; background-color: #ffffff; }
+textarea { width: 200px; height: 60px; border: 1px solid #767676; background-color: #ffffff; }
+button { border: 1px solid #767676; background-color: #efefef; }
 "#;
 
 /// Devuelve la hoja de agente de usuario, parseada UNA sola vez con el

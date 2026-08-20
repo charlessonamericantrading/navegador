@@ -110,6 +110,52 @@ fn is_out_of_flow(computed_style: &HashMap<String, String>) -> bool {
     matches!(computed_style.get("position").map(String::as_str), Some("absolute") | Some("fixed"))
 }
 
+/// `float: left`/`right` (Fase 12) - `None` para `none` (el valor inicial
+/// real) o cualquier otro valor no reconocido. A diferencia de
+/// `is_out_of_flow`, un float SI reserva espacio (horizontal, para el
+/// contenido que fluye a su lado - ver `flow_block_children`), asi que no
+/// comparte la misma comprobacion ni el mismo camino de codigo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloatSide {
+    Left,
+    Right,
+}
+
+fn float_side(computed_style: &HashMap<String, String>) -> Option<FloatSide> {
+    match computed_style.get("float").map(|v| v.trim()) {
+        Some("left") => Some(FloatSide::Left),
+        Some("right") => Some(FloatSide::Right),
+        _ => None,
+    }
+}
+
+/// Un float TODAVIA activo en la posicion vertical actual del flujo
+/// (Fase 12) - `flow_block_children` mantiene como mucho UNO por lado
+/// (simplificacion declarada, ver `LayoutTreeBuilder::place_float_child`)
+/// y lo usa para estrechar el `origin_x`/ancho disponible de cualquier
+/// contenido normal que caiga dentro de `[.., bottom_y)`, y para saber
+/// contra que borde ancla un float NUEVO del mismo lado.
+///
+/// `edge` es la coordenada X (absoluta, mismo sistema que
+/// `LayoutBox::dimensions`) desde la que el contenido normal debe
+/// empezar (para un float IZQUIERDO, el borde DERECHO del float, margen
+/// incluido) o terminar (para uno DERECHO, su borde IZQUIERDO) - un solo
+/// campo basta para los dos lados porque cada `ActiveFloat` vive en su
+/// propio `Option` (`float_left`/`float_right`), nunca mezclados.
+struct ActiveFloat {
+    edge: f32,
+    bottom_y: f32,
+}
+
+/// Ancho de respaldo para un float SIN `width` explicito (Fase 12) - el
+/// spec real le daria shrink-to-fit (encogerse a su contenido), que este
+/// motor no mide en NINGUN sitio todavia (misma limitacion ya declarada
+/// para items flex y cajas fuera de flujo, ver `measure_flex_item`/
+/// `resolve_positioned_boxes`) - en la practica, un float sin `width`
+/// propio es raro: casi cualquier uso real de `float` ya trae su propio
+/// ancho (una imagen, una barra lateral de tamaño fijo).
+const DEFAULT_FLOAT_WIDTH: f32 = 200.0;
+
 /// Desplaza `node.dimensions.x`/`.y` segun `top`/`right`/`bottom`/`left`
 /// (Fase 3.3, `position: relative`) - se llama DESPUES de que `node` ya
 /// ocupo su lugar normal en el flujo (sigue reservando su espacio de
@@ -410,6 +456,28 @@ fn resolve_image_dimensions(explicit_width: Option<f32>, explicit_height: Option
     }
 }
 
+/// Tamaño de respaldo de un `BoxType::Replaced` (Fase 11: controles de
+/// formulario) cuando NINGUNA CSS lo fija - en la practica esto nunca
+/// deberia alcanzarse, porque la hoja de agente de usuario
+/// (`user_agent_stylesheet.rs`) siempre declara `width`/`height` para
+/// `input`/`select`/`textarea`; es una red de seguridad honesta (un
+/// tamaño fijo declarado, no un panic ni una caja invisible) por si
+/// algun dia un selector de esa hoja no matcheara un tag nuevo. El valor
+/// aproxima el ancho por defecto real de un `<input>` sin CSS de autor en
+/// un navegador real (`size=20` del spec HTML, unos 170px en la mayoria).
+const DEFAULT_REPLACED_WIDTH: f32 = 170.0;
+const DEFAULT_REPLACED_HEIGHT: f32 = 21.0;
+
+/// A diferencia de `resolve_image_dimensions`, no hay ningun bitmap
+/// "natural" del que partir - un control de formulario no es una imagen
+/// decodificada, su tamaño SIEMPRE sale de CSS.
+fn resolve_replaced_dimensions(explicit_width: Option<f32>, explicit_height: Option<f32>) -> (f32, f32) {
+    (
+        explicit_width.unwrap_or(DEFAULT_REPLACED_WIDTH),
+        explicit_height.unwrap_or(DEFAULT_REPLACED_HEIGHT),
+    )
+}
+
 /// Traduce las propiedades CSS de un CONTENEDOR flex (`flex-direction`,
 /// `justify-content`, `align-items`) al `taffy::Style` que taffy necesita -
 /// puente honesto: cada valor de la cascada ya resuelto que el motor
@@ -554,6 +622,20 @@ fn measure_flex_item(
             height: known_dimensions.height.unwrap_or(height),
         };
     }
+    // `<input>`/`<select>`/`<textarea>` (Fase 11) dentro de un contenedor
+    // flex - patron real MUY comun (una barra de busqueda es casi siempre
+    // `display: flex` con un input y un boton). Mismo criterio que
+    // `Image` arriba: caja atomica, sin contenido que medir mas alla de
+    // su `width`/`height` de CSS.
+    if let BoxType::Replaced = &child.box_type {
+        let explicit_width = child.computed_style.get("width").and_then(|v| parse_css_length(v));
+        let explicit_height = child.computed_style.get("height").and_then(|v| parse_css_length(v));
+        let (width, height) = resolve_replaced_dimensions(explicit_width, explicit_height);
+        return taffy::geometry::Size {
+            width: known_dimensions.width.unwrap_or(width),
+            height: known_dimensions.height.unwrap_or(height),
+        };
+    }
 
     let width = known_dimensions.width.unwrap_or(match available_space.width {
         taffy::AvailableSpace::Definite(w) => w,
@@ -589,7 +671,7 @@ fn measure_flex_item(
 /// `align-items: stretch` o `flex-grow` en el eje transversal), no se
 /// recalcula aqui.
 fn finalize_flex_item_children(child: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) {
-    if matches!(child.box_type, BoxType::Image(_)) {
+    if matches!(child.box_type, BoxType::Image(_) | BoxType::Replaced) {
         return;
     }
     LayoutTreeBuilder::flow_block_children(child, font_set, images);
@@ -637,7 +719,7 @@ impl LayoutTreeBuilder {
             height: viewport_height,
         };
 
-        Self::build_node(dom_root, &mut root_box, stylesheet, &HashMap::new());
+        Self::build_node(dom_root, &mut root_box, stylesheet, &HashMap::new(), viewport_width);
         Self::flow_block_children(&mut root_box, font_set, images);
         // Segunda pasada (Fase 3.3): `flow_block_children`/`flow_inline_run`/
         // `flow_flex_children`, arriba, ya dejaron cada `position: absolute`/
@@ -754,12 +836,18 @@ impl LayoutTreeBuilder {
     /// ya resueltas por los ancestros - se propaga hacia abajo y cada
     /// elemento la actualiza con lo que el mismo redefina antes de pasarla a
     /// sus hijos, igual que la herencia CSS real.
-    fn build_node(dom_node: &Arc<RwLock<Node>>, parent_layout_box: &mut LayoutBox, stylesheet: &StyleSheet, inherited: &HashMap<String, String>) {
+    /// `viewport_width` solo se usa para evaluar los bloques `@media`
+    /// (Fase 18, ver `engine_css::resolve_style`) - se pasa a traves de
+    /// toda la recursion sin tocarse porque una consulta de medios se
+    /// resuelve contra la VENTANA, no contra el contenedor de cada
+    /// elemento (eso serian container queries, que son otra cosa y no
+    /// estan implementadas).
+    fn build_node(dom_node: &Arc<RwLock<Node>>, parent_layout_box: &mut LayoutBox, stylesheet: &StyleSheet, inherited: &HashMap<String, String>, viewport_width: f32) {
         let r = dom_node.read().unwrap();
         match &r.node_type {
             NodeType::Document => {
                 for child in &r.children {
-                    Self::build_node(child, parent_layout_box, stylesheet, inherited);
+                    Self::build_node(child, parent_layout_box, stylesheet, inherited, viewport_width);
                 }
             }
             NodeType::Element { tag_name, attributes } => {
@@ -787,9 +875,21 @@ impl LayoutTreeBuilder {
                 // resuelve aparte porque, a diferencia de span/a/b/i/strong/
                 // em (que envuelven MAS marcado), un `<img>` es una hoja sin
                 // hijos cuyo `BoxType` lleva su propio `src` (Fase 3.1).
+                // `<input>`/`<select>`/`<textarea>` (Fase 11: controles de
+                // formulario) son TAMBIEN "elementos reemplazados" del spec
+                // real, mismo concepto que `<img>` pero sin bitmap que
+                // pintar - `BoxType::Replaced`, ver su doc-comment en
+                // layout_box.rs para el porque no comparten variante con
+                // `Image`. `<button>` es el UNICO control que se trata como
+                // `span`/`a`/etc (`Inline`, no `Replaced`): a diferencia de
+                // los otros tres, su etiqueta es contenido DOM real (un
+                // nodo de texto hijo, no un atributo `value`/`placeholder`)
+                // y se beneficia de encogerse a ese contenido en vez de un
+                // tamaño fijo - ver el doc-comment de `BoxType::Replaced`.
                 let box_type = match tag_name.as_str() {
-                    "span" | "a" | "b" | "i" | "strong" | "em" => BoxType::Inline,
+                    "span" | "a" | "b" | "i" | "strong" | "em" | "button" => BoxType::Inline,
                     "img" => BoxType::Image(attributes.get("src").cloned().unwrap_or_default()),
+                    "input" | "select" | "textarea" => BoxType::Replaced,
                     _ => BoxType::Block,
                 };
                 let mut current_box = LayoutBox::new(box_type);
@@ -800,7 +900,21 @@ impl LayoutTreeBuilder {
                 // (`getComputedStyle`, en construccion) tambien pueda
                 // reusarla sin depender de `layout` solo para esto. Misma
                 // logica exacta, cero cambio de comportamiento.
-                current_box.computed_style = engine_css::resolve_style(dom_node, stylesheet);
+                current_box.computed_style = engine_css::resolve_style(dom_node, stylesheet, viewport_width);
+
+                // `display: none` (no confundir con `visibility: hidden`,
+                // que SI genera caja - ver `engine-gfx::display_list`): el
+                // spec real saca al elemento y a TODO su subarbol del arbol
+                // de render por completo, como si no existieran - de ahi
+                // que se corte aqui, ANTES de recursar en los hijos, en vez
+                // de generar la caja y filtrarla despues. `display` no es
+                // heredable (no esta en `INHERITABLE_PROPERTIES`), asi que
+                // esto es una comprobacion puramente local al propio
+                // elemento, correcto segun el spec real.
+                if current_box.computed_style.get("display").map(String::as_str) == Some("none") {
+                    return;
+                }
+
                 if tag_name == "img" {
                     apply_image_size_attributes(&mut current_box.computed_style, attributes);
                 }
@@ -848,7 +962,7 @@ impl LayoutTreeBuilder {
                 }
 
                 for child in &r.children {
-                    Self::build_node(child, &mut current_box, stylesheet, &child_inherited);
+                    Self::build_node(child, &mut current_box, stylesheet, &child_inherited, viewport_width);
                 }
                 parent_layout_box.children.push(current_box);
             }
@@ -941,6 +1055,16 @@ impl LayoutTreeBuilder {
         let content_top = container.dimensions.y + inset_top;
         let mut cursor_y = content_top;
 
+        // `float: left`/`right` (Fase 12) - a lo sumo UN float activo por
+        // lado a la vez (simplificacion declarada, ver el doc-comment de
+        // `place_float_child`). Se declaran aqui, no dentro del bucle,
+        // porque tienen que sobrevivir entre iteraciones: un float
+        // colocado en la iteracion N sigue estrechando el contenido de
+        // las iteraciones N+1, N+2... hasta que `cursor_y` supere su
+        // borde inferior.
+        let mut float_left: Option<ActiveFloat> = None;
+        let mut float_right: Option<ActiveFloat> = None;
+
         let mut i = 0;
         while i < container.children.len() {
             // `position: absolute`/`fixed` (Fase 3.3) se saca del flujo por
@@ -952,6 +1076,78 @@ impl LayoutTreeBuilder {
                 i += 1;
                 continue;
             }
+
+            // Un float cuyo borde inferior ya quedo atras deja de
+            // estrechar nada - se comprueba con el `cursor_y` de ESTE
+            // momento, antes de decidir nada sobre el hijo actual.
+            if float_left.as_ref().is_some_and(|f| cursor_y >= f.bottom_y) {
+                float_left = None;
+            }
+            if float_right.as_ref().is_some_and(|f| cursor_y >= f.bottom_y) {
+                float_right = None;
+            }
+
+            // `clear: left`/`right`/`both` (Fase 12) - salta por debajo de
+            // los floats activos del lado indicado ANTES de colocar este
+            // hijo, en vez de dejar que se solape con ellos. Es lo que
+            // hace funcionar el patron real "clearfix" (un `<div
+            // style="clear: both">` vacio para 'cerrar' una seccion
+            // flotada) y cualquier contenido que deba volver a ocupar el
+            // ancho completo despues de un float.
+            if let Some(clear) = container.children[i].computed_style.get("clear").map(|v| v.trim().to_ascii_lowercase()) {
+                if matches!(clear.as_str(), "left" | "both") {
+                    if let Some(f) = float_left.take() {
+                        cursor_y = cursor_y.max(f.bottom_y);
+                    }
+                }
+                if matches!(clear.as_str(), "right" | "both") {
+                    if let Some(f) = float_right.take() {
+                        cursor_y = cursor_y.max(f.bottom_y);
+                    }
+                }
+            }
+
+            // El float en si (Fase 12) se resuelve ANTES de la
+            // agrupacion en rachas inline: `is_inline_level` no distingue
+            // floats, y un `<div class="float">` (el caso mas comun) ni
+            // siquiera es inline-level, asi que sin este corte caeria
+            // directamente en el camino de "hijo de bloque normal" de mas
+            // abajo, apilandose verticalmente como si `float` no
+            // existiera - exactamente el bug que esta tarea corrige.
+            if let Some(side) = float_side(&container.children[i].computed_style) {
+                Self::place_float_child(&mut container.children[i], side, origin_x, inner_width, cursor_y, &mut float_left, &mut float_right, font_set, images);
+                i += 1;
+                continue;
+            }
+
+            // Ancho/origen REALES disponibles para contenido NORMAL en
+            // esta posicion vertical (Fase 12) - estrechados por
+            // cualquier float activo a cada lado. Granularidad de CAJA
+            // COMPLETA, no por linea: un hijo que arranca dentro del
+            // rango vertical de un float usa este ancho estrechado para
+            // TODA su caja, aunque su contenido termine mas abajo del
+            // borde inferior del float (el spec real reajustaria linea a
+            // linea dentro de un mismo parrafo, ensanchando las lineas
+            // que ya quedan por debajo del float - este motor no hace
+            // reflow de texto por linea segun obstaculos, simplificacion
+            // declarada). El caso real mas comun - un float con una o dos
+            // lineas de texto al lado, o un contenedor completo que
+            // deliberadamente se queda mas angosto mientras dura el
+            // float - se ve correcto; un parrafo mucho mas alto que el
+            // float seguira angosto en toda su altura en vez de
+            // ensancharse al pasar por debajo.
+            let mut eff_origin_x = origin_x;
+            let mut eff_inner_width = inner_width;
+            if let Some(f) = &float_left {
+                let taken = (f.edge - eff_origin_x).max(0.0);
+                eff_origin_x += taken;
+                eff_inner_width = (eff_inner_width - taken).max(0.0);
+            }
+            if let Some(f) = &float_right {
+                let taken = ((eff_origin_x + eff_inner_width) - f.edge).max(0.0);
+                eff_inner_width = (eff_inner_width - taken).max(0.0);
+            }
+
             if Self::is_inline_level(&container.children[i]) {
                 // Racha de hijos inline-level (texto y/o span/a/b/i)
                 // consecutivos: fluyen juntos en la(s) misma(s) linea(s) en
@@ -961,7 +1157,7 @@ impl LayoutTreeBuilder {
                     .position(|c| !Self::is_inline_level(c))
                     .map(|rel| i + rel)
                     .unwrap_or(container.children.len());
-                cursor_y = Self::flow_inline_run(&mut container.children[i..run_end], origin_x, inner_width, cursor_y, font_set, images);
+                cursor_y = Self::flow_inline_run(&mut container.children[i..run_end], eff_origin_x, eff_inner_width, cursor_y, font_set, images);
                 i = run_end;
                 continue;
             }
@@ -976,13 +1172,13 @@ impl LayoutTreeBuilder {
             child.box_dimensions.margin = margin;
 
             cursor_y += margin.top;
-            child.dimensions.x = origin_x + margin.left;
+            child.dimensions.x = eff_origin_x + margin.left;
             child.dimensions.y = cursor_y;
             // `width`/`max-width`/`min-width` (si estan puestas) sustituyen
             // o acotan el ancho "llenar el espacio disponible" que era el
             // unico comportamiento antes de esta tarea - ver
             // `resolve_block_width`.
-            let auto_width = (inner_width - margin.left - margin.right).max(0.0);
+            let auto_width = (eff_inner_width - margin.left - margin.right).max(0.0);
             child.dimensions.width = resolve_block_width(&child.computed_style, auto_width);
             let child_width = child.dimensions.width;
             // `position: relative` (Fase 3.3): `child` YA ocupo su lugar
@@ -1033,7 +1229,98 @@ impl LayoutTreeBuilder {
             i += 1;
         }
 
-        (cursor_y - content_top).max(0.0)
+        // El alto final INCLUYE cualquier float todavia activo al
+        // terminar el bucle (Fase 12) - a diferencia del spec real (donde
+        // un contenedor con SOLO floats dentro colapsa a alto CERO salvo
+        // que "los contenga" explicitamente, el famoso problema del
+        // "clearfix" que tantas paginas reales trabajan para evitar), este
+        // motor SI cuenta el alto de los floats en el auto-height de su
+        // contenedor. Eleccion deliberada, no un descuido: es el
+        // comportamiento que la mayoria de autores esperan/quieren de
+        // todas formas (que el contenedor "abrace" a sus floats), y evitar
+        // la sorpresa real del spec aqui no le cuesta nada a ninguna
+        // pagina que SI dependiera de ella (ese patron exige un
+        // `overflow`/clearfix explicito precisamente para conseguir este
+        // mismo resultado).
+        let floats_bottom = [float_left, float_right]
+            .into_iter()
+            .flatten()
+            .fold(cursor_y, |max_y, f| max_y.max(f.bottom_y));
+
+        (floats_bottom - content_top).max(0.0)
+    }
+
+    /// Coloca un hijo `float: left`/`right` (Fase 12) - anclado al borde
+    /// del lado indicado, SIN avanzar `cursor_y` (un float no empuja a
+    /// sus hermanos hacia abajo por su propia altura, a diferencia de un
+    /// hijo de bloque normal - solo reserva espacio HORIZONTAL para el
+    /// contenido que venga despues, ver donde se llama esto en
+    /// `flow_block_children`).
+    ///
+    /// Ancho: `resolve_block_width` de siempre (respeta `width`/
+    /// `max-width`/`min-width` si estan puestas), pero con
+    /// `DEFAULT_FLOAT_WIDTH` como valor "auto" en vez de "llenar el
+    /// contenedor" - ver su doc-comment para el porque (sin shrink-to-fit
+    /// real en este motor).
+    ///
+    /// Simplificacion declarada: solo UN float activo por lado a la vez
+    /// (`float_left`/`float_right` son `&mut Option<ActiveFloat>`, no una
+    /// pila) - dos `float: left` consecutivos, sin que el primero haya
+    /// quedado atras verticalmente, se SOLAPAN en vez de colocarse uno al
+    /// lado del otro (el spec real los apila horizontalmente hasta que no
+    /// caben, y entonces baja a la siguiente "linea de floats"). El caso
+    /// mas comun en paginas reales - un float por lado, con texto normal
+    /// fluyendo alrededor - funciona correctamente; una galeria de varias
+    /// imagenes flotadas seguidas del mismo lado, no.
+    fn place_float_child(
+        child: &mut LayoutBox,
+        side: FloatSide,
+        origin_x: f32,
+        inner_width: f32,
+        cursor_y: f32,
+        float_left: &mut Option<ActiveFloat>,
+        float_right: &mut Option<ActiveFloat>,
+        font_set: Option<&FontSet>,
+        images: &ImageMap,
+    ) {
+        const LINE_HEIGHT_FALLBACK: f32 = 22.0;
+
+        let margin = resolve_margin(&child.computed_style);
+        child.box_dimensions.margin = margin;
+
+        let width = resolve_block_width(&child.computed_style, DEFAULT_FLOAT_WIDTH);
+        child.dimensions.x = match side {
+            FloatSide::Left => origin_x + margin.left,
+            FloatSide::Right => origin_x + inner_width - width - margin.right,
+        };
+        child.dimensions.y = cursor_y + margin.top;
+        child.dimensions.width = width;
+        apply_relative_offset(child);
+
+        let content_height = Self::flow_block_children(child, font_set, images);
+        let child_padding = child.box_dimensions.padding;
+        let child_border = child.box_dimensions.border;
+        let explicit_content_height = child.computed_style.get("height").and_then(|v| parse_css_length(v));
+        let resolved_content_height = explicit_content_height.unwrap_or(content_height.max(LINE_HEIGHT_FALLBACK));
+        child.dimensions.height = resolved_content_height + child_padding.top + child_padding.bottom + child_border.top + child_border.bottom;
+        child.box_dimensions.content = Rect {
+            x: child.dimensions.x + child_border.left + child_padding.left,
+            y: child.dimensions.y + child_border.top + child_padding.top,
+            width: width - child_border.left - child_border.right - child_padding.left - child_padding.right,
+            height: resolved_content_height,
+        };
+
+        let active = ActiveFloat {
+            edge: match side {
+                FloatSide::Left => child.dimensions.x + child.dimensions.width + margin.right,
+                FloatSide::Right => child.dimensions.x - margin.left,
+            },
+            bottom_y: child.dimensions.y + child.dimensions.height + margin.bottom,
+        };
+        match side {
+            FloatSide::Left => *float_left = Some(active),
+            FloatSide::Right => *float_right = Some(active),
+        }
     }
 
     /// Layout real de `display: flex` (Fase 3.2) - EL ALGORITMO en si (como
@@ -1359,7 +1646,7 @@ impl LayoutTreeBuilder {
     }
 
     fn is_inline_level(b: &LayoutBox) -> bool {
-        matches!(b.box_type, BoxType::Text(_) | BoxType::Inline | BoxType::Image(_))
+        matches!(b.box_type, BoxType::Text(_) | BoxType::Inline | BoxType::Image(_) | BoxType::Replaced)
     }
 
     /// Coloca una RACHA de hijos inline-level (`BoxType::Text`/
@@ -1447,7 +1734,7 @@ impl LayoutTreeBuilder {
                         return Some(info);
                     }
                 }
-                BoxType::Block | BoxType::Image(_) => {}
+                BoxType::Block | BoxType::Image(_) | BoxType::Replaced => {}
             }
         }
         None
@@ -1576,6 +1863,34 @@ impl LayoutTreeBuilder {
                 *cursor_x += width;
                 *line_extent = line_extent.max(height);
             }
+            BoxType::Replaced => {
+                // `<input>`/`<select>`/`<textarea>` (Fase 11) - mismo
+                // criterio ATOMICO que `BoxType::Image` justo arriba (no
+                // se parte en trozos mas pequeños), pero el tamaño sale
+                // SIEMPRE de CSS (`resolve_replaced_dimensions`, sin
+                // ningun bitmap "natural" del que partir). NO recursa en
+                // `node.children` a proposito: un `<select>` SI tiene
+                // cajas hijas reales para cada `<option>` (`build_node`
+                // las crea igual que para cualquier otro elemento, ver
+                // tree.rs), pero aqui se dejan sin posicionar (se quedan
+                // en `Rect::default()`) - un desplegable no expone sus
+                // opciones como contenido normal de la pagina, ni un
+                // navegador real las pinta ahi.
+                let explicit_width = node.computed_style.get("width").and_then(|v| parse_css_length(v));
+                let explicit_height = node.computed_style.get("height").and_then(|v| parse_css_length(v));
+                let (width, height) = resolve_replaced_dimensions(explicit_width, explicit_height);
+
+                let remaining = origin_x + inner_width - *cursor_x;
+                if width > remaining && *cursor_x > origin_x {
+                    *cursor_y += *line_extent;
+                    *cursor_x = origin_x;
+                    *line_extent = text_line_height;
+                }
+
+                node.dimensions = Rect { x: *cursor_x, y: *cursor_y, width, height };
+                *cursor_x += width;
+                *line_extent = line_extent.max(height);
+            }
             BoxType::Block => {
                 // En HTML5 moderno (como en Google o Wikipedia), un elemento inline (ej. <a>)
                 // puede contener elementos de bloque (ej. <div> o <p>).
@@ -1651,6 +1966,276 @@ mod tests {
         assert_eq!(a_box.dimensions.width, 50.0);
         assert_eq!(b_box.dimensions.x, 50.0, "b deberia empezar justo donde termina a (eje principal), no en su propia linea");
         assert_eq!(a_box.dimensions.y, b_box.dimensions.y, "ambos items deberian compartir la misma coordenada y (una sola fila)");
+    }
+
+    /// `display: none` no debe generar caja para el elemento en si.
+    #[test]
+    fn display_none_produces_no_box_for_the_element() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="oculto" style="display: none;">texto</div><div id="visible">otro</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let oculto_node = Node::find_by_id(&dom, "oculto").expect("oculto deberia existir en el DOM");
+        let visible_node = Node::find_by_id(&dom, "visible").expect("visible deberia existir en el DOM");
+
+        assert!(find_box_for_dom_node(&root, &oculto_node).is_none(), "un elemento con display:none no deberia tener ninguna caja de layout");
+        assert!(find_box_for_dom_node(&root, &visible_node).is_some(), "un hermano sin display:none deberia seguir teniendo su caja normal");
+    }
+
+    /// `display: none` debe sacar TAMBIEN a los descendientes del arbol de
+    /// render, no solo al elemento que lo declara - asi es el spec real.
+    #[test]
+    fn display_none_removes_the_whole_subtree_not_just_the_element() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="display: none;"><span id="nieto">deberia desaparecer</span></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let nieto_node = Node::find_by_id(&dom, "nieto").expect("nieto deberia existir en el DOM");
+        assert!(find_box_for_dom_node(&root, &nieto_node).is_none(), "un descendiente de display:none no deberia tener caja aunque el no declare display:none el mismo");
+    }
+
+    /// A diferencia de `display: none`, un elemento SOLO con `height`
+    /// declarado sigue generando caja y ocupando su espacio en el layout -
+    /// distingue el corte real de `display:none` de un falso positivo por
+    /// "cualquier caja con computed_style no vacio se filtra".
+    #[test]
+    fn an_element_without_display_none_keeps_occupying_its_layout_space() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="normal" style="height: 40px;">contenido</div></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let normal_node = Node::find_by_id(&dom, "normal").expect("normal deberia existir en el DOM");
+        let normal_box = find_box_for_dom_node(&root, &normal_node).expect("un elemento sin display:none deberia tener caja");
+        assert_eq!(normal_box.dimensions.height, 40.0);
+    }
+
+    /// El punto real de la Fase 11: antes de esto, un `<input>` sin CSS de
+    /// autor ocupaba el ANCHO COMPLETO del contenedor (800px aqui) - el
+    /// mismo bug exacto que la auditoria encontro ejecutando el motor en
+    /// vivo. Ahora deberia tener el tamaño fijo que declara la hoja de
+    /// agente de usuario, sin importar cuanto mida su contenedor.
+    #[test]
+    fn a_plain_input_gets_a_fixed_size_box_instead_of_filling_the_container() {
+        let dom = HtmlParser::parse(r#"<html><body><input id="q"></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let input_node = Node::find_by_id(&dom, "q").expect("deberia existir");
+        let input_box = find_box_for_dom_node(&root, &input_node).expect("un input deberia tener caja propia");
+        assert_eq!(input_box.dimensions.width, 170.0, "no deberia ocupar el ancho completo del contenedor (800px)");
+        assert_eq!(input_box.dimensions.height, 21.0);
+    }
+
+    /// Un checkbox/radio es un control mucho mas pequeño que un input de
+    /// texto - sin esto, el centro que calcularia un agente de IA para
+    /// clicarlo estaria completamente fuera del control real.
+    #[test]
+    fn a_checkbox_gets_a_small_box_not_the_text_input_size() {
+        let dom = HtmlParser::parse(r#"<html><body><input id="c" type="checkbox"></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let checkbox_node = Node::find_by_id(&dom, "c").expect("deberia existir");
+        let checkbox_box = find_box_for_dom_node(&root, &checkbox_node).expect("deberia tener caja");
+        assert_eq!(checkbox_box.dimensions.width, 13.0);
+        assert_eq!(checkbox_box.dimensions.height, 13.0);
+    }
+
+    /// `input[type=hidden]` usa `display: none` real en la hoja de agente
+    /// de usuario (Fase 10.5 ya implementada) - un campo oculto no deberia
+    /// tener NINGUNA caja, ni siquiera una de tamaño cero.
+    #[test]
+    fn a_hidden_input_produces_no_box_at_all() {
+        let dom = HtmlParser::parse(r#"<html><body><input id="csrf" type="hidden" value="abc"></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let hidden_node = Node::find_by_id(&dom, "csrf").expect("deberia existir en el DOM");
+        assert!(find_box_for_dom_node(&root, &hidden_node).is_none(), "un input hidden no deberia generar ninguna caja de layout");
+    }
+
+    /// `<button>` es el UNICO control que se encoge a su contenido en vez
+    /// de un tamaño fijo (`BoxType::Inline`, no `Replaced` - ver el
+    /// doc-comment en `build_node`) - su etiqueta real ("Enviar") deberia
+    /// seguir siendo visible/medible, a diferencia de `input`/`select`.
+    #[test]
+    fn a_button_shrinks_to_its_text_content_instead_of_a_fixed_size() {
+        let dom = HtmlParser::parse(r#"<html><body><button id="btn">Enviar</button></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let btn_node = Node::find_by_id(&dom, "btn").expect("deberia existir");
+        let btn_box = find_box_for_dom_node(&root, &btn_node).expect("deberia tener caja");
+        assert!(btn_box.dimensions.width < 100.0, "un boton con 'Enviar' no deberia acercarse al ancho del contenedor (800px), deberia encogerse a su texto");
+        assert!(btn_box.dimensions.width > 0.0, "deberia medir ALGO a partir de su texto, no colapsar a cero");
+    }
+
+    /// Patron real muy comun: una barra de busqueda `display: flex` con un
+    /// input y un boton - `measure_flex_item`/`finalize_flex_item_children`
+    /// necesitan su propio camino para `BoxType::Replaced`, igual que ya
+    /// tenian para `Image` (ver su doc-comment), o taffy mediria el input
+    /// como si no tuviera contenido intrinseco.
+    #[test]
+    fn a_replaced_control_inside_a_flex_container_keeps_its_own_size() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="barra" style="display: flex;"><input id="q"><button id="btn">Ir</button></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } #barra input, #barra button { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let input_node = Node::find_by_id(&dom, "q").expect("deberia existir");
+        let input_box = find_box_for_dom_node(&root, &input_node).expect("deberia tener caja dentro del flex");
+        assert_eq!(input_box.dimensions.width, 170.0, "un input dentro de flex deberia conservar su tamaño de CSS, no llenar el eje principal");
+        assert_eq!(input_box.dimensions.height, 21.0);
+    }
+
+    /// El punto real de la Fase 12: antes de esto, un `float: left` era
+    /// indistinguible de un `<div>` normal - se apilaba verticalmente como
+    /// cualquier otro hijo de bloque, empujando a su hermano hacia abajo
+    /// por su propia altura. Un float NO deberia avanzar el cursor
+    /// vertical del flujo: el hermano siguiente deberia arrancar en la
+    /// MISMA `y` que el float, no debajo de el.
+    #[test]
+    fn a_float_does_not_push_the_next_sibling_down() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="f" style="float: left; width: 100px; height: 80px;"></div><p id="texto">hola</p></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let texto_node = Node::find_by_id(&dom, "texto").expect("deberia existir");
+        let texto_box = find_box_for_dom_node(&root, &texto_node).expect("deberia tener caja");
+        assert_eq!(texto_box.dimensions.y, 0.0, "el parrafo deberia arrancar donde arranca el float, no debajo de su altura completa");
+    }
+
+    /// El float SI reserva espacio horizontal para lo que venga despues,
+    /// mientras siga activo verticalmente - un parrafo que arranca dentro
+    /// del rango vertical del float deberia usar un ancho mas angosto,
+    /// desplazado desde el borde izquierdo.
+    #[test]
+    fn content_next_to_an_active_float_left_is_narrower_and_shifted_right() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="f" style="float: left; width: 100px; height: 80px;"></div><p id="texto">hola</p></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let texto_node = Node::find_by_id(&dom, "texto").expect("deberia existir");
+        let texto_box = find_box_for_dom_node(&root, &texto_node).expect("deberia tener caja");
+        assert_eq!(texto_box.dimensions.x, 100.0, "deberia empezar justo donde termina el float (100px de ancho)");
+        assert_eq!(texto_box.dimensions.width, 700.0, "deberia perder exactamente el ancho que ocupa el float (800 - 100)");
+    }
+
+    /// Una vez que el flujo ya paso por debajo del borde inferior del
+    /// float, el contenido siguiente vuelve a usar el ancho completo - un
+    /// float no deberia estrechar TODA la pagina para siempre.
+    #[test]
+    fn content_starting_below_the_float_uses_the_full_width_again() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="f" style="float: left; width: 100px; height: 30px;"></div><p id="antes" style="height: 50px;">antes</p><p id="despues">despues</p></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        // "antes" arranca en y=0 (dentro del rango del float, 0..30) y por
+        // tanto SI se estrecha; "despues" arranca en y=50 (el float ya
+        // quedo atras, su borde inferior es 30) y deberia usar el ancho
+        // completo otra vez.
+        let despues_node = Node::find_by_id(&dom, "despues").expect("deberia existir");
+        let despues_box = find_box_for_dom_node(&root, &despues_node).expect("deberia tener caja");
+        assert_eq!(despues_box.dimensions.x, 0.0);
+        assert_eq!(despues_box.dimensions.width, 800.0, "el float ya quedo atras verticalmente, no deberia estrechar nada aqui");
+    }
+
+    /// Simetrico a la izquierda: un `float: right` se ancla al borde
+    /// DERECHO del contenedor, y el contenido siguiente pierde ancho por
+    /// ESE lado.
+    #[test]
+    fn a_float_right_anchors_to_the_right_edge_and_narrows_from_that_side() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="f" style="float: right; width: 100px; height: 80px;"></div><p id="texto">hola</p></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let f_node = Node::find_by_id(&dom, "f").expect("deberia existir");
+        let f_box = find_box_for_dom_node(&root, &f_node).expect("deberia tener caja");
+        assert_eq!(f_box.dimensions.x, 700.0, "un float:right de 100px en un contenedor de 800px deberia empezar en x=700");
+
+        let texto_node = Node::find_by_id(&dom, "texto").expect("deberia existir");
+        let texto_box = find_box_for_dom_node(&root, &texto_node).expect("deberia tener caja");
+        assert_eq!(texto_box.dimensions.x, 0.0, "el lado izquierdo no deberia verse afectado por un float:right");
+        assert_eq!(texto_box.dimensions.width, 700.0);
+    }
+
+    /// Dos floats en lados OPUESTOS a la vez - patron real comun (una
+    /// imagen a la izquierda, una caja de "relacionados" a la derecha,
+    /// texto principal en medio) - ambos deberian estrechar el contenido
+    /// simultaneamente, cada uno desde su propio lado.
+    #[test]
+    fn floats_on_both_sides_at_once_both_narrow_the_content_between_them() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="izq" style="float: left; width: 100px; height: 50px;"></div><div id="der" style="float: right; width: 150px; height: 50px;"></div><p id="texto">hola</p></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let texto_node = Node::find_by_id(&dom, "texto").expect("deberia existir");
+        let texto_box = find_box_for_dom_node(&root, &texto_node).expect("deberia tener caja");
+        assert_eq!(texto_box.dimensions.x, 100.0);
+        assert_eq!(texto_box.dimensions.width, 550.0, "800 menos 100 (float izquierdo) menos 150 (float derecho)");
+    }
+
+    /// El patron real "clearfix": un elemento con `clear: both` deberia
+    /// saltar por debajo de CUALQUIER float activo, en vez de solaparse
+    /// con el o seguir estrechado por el.
+    #[test]
+    fn clear_both_drops_below_every_active_float() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="f" style="float: left; width: 100px; height: 80px;"></div><div id="c" style="clear: both;">limpio</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let c_node = Node::find_by_id(&dom, "c").expect("deberia existir");
+        let c_box = find_box_for_dom_node(&root, &c_node).expect("deberia tener caja");
+        assert_eq!(c_box.dimensions.y, 80.0, "deberia saltar hasta el borde inferior del float (80px), no quedarse en y=0");
+        assert_eq!(c_box.dimensions.x, 0.0, "una vez que limpia el float, deberia volver al borde izquierdo real");
+        assert_eq!(c_box.dimensions.width, 800.0, "y al ancho completo, ya no estrechado");
+    }
+
+    /// Un contenedor cuyo UNICO contenido es un float no deberia colapsar
+    /// a alto cero - a diferencia del spec real (donde esto exige un
+    /// clearfix explicito), este motor cuenta el float en el auto-height
+    /// de su padre a proposito (ver el doc-comment al final de
+    /// `flow_block_children`).
+    #[test]
+    fn a_container_with_only_a_float_child_still_grows_to_contain_it() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="contenedor"><div style="float: left; width: 50px; height: 120px;"></div></div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let contenedor_node = Node::find_by_id(&dom, "contenedor").expect("deberia existir");
+        let contenedor_box = find_box_for_dom_node(&root, &contenedor_node).expect("deberia tener caja");
+        assert_eq!(contenedor_box.dimensions.height, 120.0, "el contenedor deberia abrazar la altura completa del float que contiene");
+    }
+
+    /// Un float SIN `width` explicito cae al ancho de respaldo
+    /// (`DEFAULT_FLOAT_WIDTH`) en vez de llenar el contenedor entero - lo
+    /// segundo anularia por completo el proposito de flotar.
+    #[test]
+    fn a_float_without_an_explicit_width_falls_back_to_the_default_instead_of_filling_the_container() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="f" style="float: left; height: 40px;"></div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let f_node = Node::find_by_id(&dom, "f").expect("deberia existir");
+        let f_box = find_box_for_dom_node(&root, &f_node).expect("deberia tener caja");
+        assert_eq!(f_box.dimensions.width, 200.0, "deberia usar DEFAULT_FLOAT_WIDTH, no los 800px del contenedor");
     }
 
     /// `flex-direction: column` cambia el eje principal a vertical - los

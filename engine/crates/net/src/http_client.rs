@@ -1,13 +1,15 @@
+use crate::cookie::CookieStore;
 use crate::request::{Method, NetworkRequest};
 use crate::response::NetworkResponse;
 use thiserror::Error;
 use std::collections::HashMap;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes as HyperBytes;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use hyper_rustls::HttpsConnector;
+use std::sync::Mutex;
 
 #[derive(Error, Debug)]
 pub enum NetworkError {
@@ -25,6 +27,13 @@ pub enum NetworkError {
     TooManyRedirects(u8),
     #[error("failed to decompress response body ({0}): {1}")]
     Decompress(String, String),
+    /// La respuesta llego bien pero el origen que la pidio no puede LEERLA
+    /// (Fase 20, ver `crate::cors`). Es un error distinto de un fallo de
+    /// red a proposito: la peticion si se hizo, el servidor si contesto, y
+    /// el mensaje explica exactamente que cabecera falta - que es lo que
+    /// un desarrollador necesita para arreglarlo en su servidor.
+    #[error("{0}")]
+    Cors(String),
 }
 
 /// Descomprime el cuerpo de la respuesta segun `Content-Encoding` - casi
@@ -118,7 +127,20 @@ fn redirect_decision(current: &NetworkRequest, response: &NetworkResponse) -> Re
 /// en crudo, que no hacia TLS y por tanto no podia cargar ningun sitio
 /// https:// (que es la inmensa mayoria de la web real).
 pub struct NetworkEngine {
-    client: Client<HttpsConnector<HttpConnector>, Empty<HyperBytes>>,
+    /// `Full<Bytes>` y no `Empty` (Fase 16): el cuerpo de la peticion
+    /// antes era SIEMPRE vacio por tipo, asi que ningun POST podia enviar
+    /// datos aunque `NetworkRequest::body` los llevara - el campo existia
+    /// y se ignoraba en silencio. `Full` con bytes vacios se comporta
+    /// igual que `Empty` para GET/HEAD, asi que el cambio no altera nada
+    /// de lo que ya funcionaba.
+    client: Client<HttpsConnector<HttpConnector>, Full<HyperBytes>>,
+    /// Almacen de cookies COMPARTIDO por todas las peticiones de esta
+    /// sesion - es lo que hace que una sesion iniciada en una peticion
+    /// siga viva en la siguiente (y a traves de redirecciones, ver
+    /// `fetch`). `Mutex` y no `RwLock` porque casi todo acceso escribe
+    /// (`header_for` purga caducadas de paso), asi que no habria lecturas
+    /// concurrentes reales que ganar.
+    cookies: Mutex<CookieStore>,
 }
 
 /// rustls 0.23 exige un CryptoProvider de proceso instalado explicitamente
@@ -141,7 +163,7 @@ impl NetworkEngine {
             .enable_http1()
             .build();
         let client = Client::builder(TokioExecutor::new()).build(https);
-        Self { client }
+        Self { client, cookies: Mutex::new(CookieStore::new()) }
     }
 
     /// Sigue redirecciones 301/302/303/307/308 de verdad en vez de devolver
@@ -157,6 +179,55 @@ impl NetworkEngine {
     /// y 308 preservan metodo y cuerpo exactos, que es su unica razon de
     /// existir frente a 301/302.
     pub async fn fetch(&self, req: &NetworkRequest) -> Result<NetworkResponse, NetworkError> {
+        // Politica de mismo origen (Fase 20). Solo se aplica a peticiones
+        // que trae un origen adjunto, es decir las que inicio un script
+        // (`fetch`/XHR) - la navegacion y los subrecursos pasan de largo,
+        // ver `crate::cors` para por que esa frontera es la correcta.
+        let target_origin = crate::cors::origin_of(&req.url);
+        let cross_origin = req.origin.as_ref().is_some_and(|o| *o != target_origin);
+
+        if cross_origin {
+            let origin = req.origin.clone().unwrap_or_default();
+
+            // Preflight: una peticion que no es "simple" necesita permiso
+            // ANTES de mandarse de verdad. Se hace asi y no despues
+            // porque el objetivo del preflight es no ejecutar en el
+            // servidor algo que quiza no estaba autorizado (un DELETE, por
+            // ejemplo) - comprobar a posteriori no evitaria el daño.
+            if crate::cors::needs_preflight(req) {
+                let mut preflight = req.clone();
+                preflight.method = Method::Options;
+                preflight.body = None;
+                preflight.headers.insert("Access-Control-Request-Method".to_string(), req.method.as_str().to_string());
+                let author_headers: Vec<String> = req
+                    .headers
+                    .keys()
+                    .map(|k| k.to_ascii_lowercase())
+                    .filter(|k| !matches!(k.as_str(), "user-agent" | "accept-encoding" | "cookie" | "origin" | "content-length" | "referer" | "accept" | "accept-language"))
+                    .collect();
+                if !author_headers.is_empty() {
+                    preflight.headers.insert("Access-Control-Request-Headers".to_string(), author_headers.join(", "));
+                }
+
+                let preflight_response = self.fetch_once(&preflight).await?;
+                crate::cors::check_preflight(&preflight_response, req, &origin, req.include_credentials)
+                    .map_err(|rejection| NetworkError::Cors(rejection.message(&origin)))?;
+            }
+
+            let response = self.fetch_redirect_chain(req).await?;
+            crate::cors::check_response(&response, &origin, req.include_credentials)
+                .map_err(|rejection| NetworkError::Cors(rejection.message(&origin)))?;
+            return Ok(response);
+        }
+
+        self.fetch_redirect_chain(req).await
+    }
+
+    /// El bucle de redirecciones de siempre, sin ninguna comprobacion de
+    /// origen - separado de `fetch` para que la politica de mismo origen
+    /// quede en un solo sitio, envolviendo a esto, en vez de mezclada con
+    /// la logica de saltos.
+    async fn fetch_redirect_chain(&self, req: &NetworkRequest) -> Result<NetworkResponse, NetworkError> {
         let mut current = req.clone();
         for redirects_followed in 0..=MAX_REDIRECTS {
             let response = self.fetch_once(&current).await?;
@@ -182,8 +253,41 @@ impl NetworkEngine {
         for (k, v) in &req.headers {
             builder = builder.header(k.as_str(), v.as_str());
         }
+        // Cookies que aplican a ESTA URL (dominio/ruta/`Secure` ya
+        // filtrados por el almacen). Se añade aqui, en `fetch_once`, y no
+        // una sola vez en `fetch`, precisamente para que cada salto de una
+        // redireccion recalcule sus propias cookies: un login real casi
+        // siempre es POST -> 302 -> GET, y la cookie de sesion la pone la
+        // respuesta del POST para que viaje ya en el GET siguiente.
+        //
+        // Fase 20: a otro origen NO viajan salvo que se pidan
+        // explicitamente (`credentials: "same-origin"` es el valor por
+        // defecto real del fetch spec). Mandar la sesion del usuario a un
+        // tercero sin que nadie lo haya pedido es justo el ataque que la
+        // politica de mismo origen existe para impedir.
+        let cross_origin = req.origin.as_ref().is_some_and(|o| *o != crate::cors::origin_of(&req.url));
+        if !cross_origin || req.include_credentials {
+            if let Some(cookie_header) = self.cookies.lock().ok().and_then(|mut store| store.header_for(&req.url)) {
+                builder = builder.header("Cookie", cookie_header);
+            }
+        }
+        // La cabecera `Origin` le dice al servidor quien pregunta, para
+        // que pueda decidir si le responde con permiso CORS.
+        if cross_origin {
+            if let Some(origin) = &req.origin {
+                builder = builder.header("Origin", origin.as_str());
+            }
+        }
+        // `Content-Length` explicito: hyper lo pondria solo para un
+        // `Full`, pero un servidor real que reciba un POST sin el puede
+        // rechazarlo, y dejarlo escrito aqui hace evidente que el cuerpo
+        // viaja de verdad.
+        let body_bytes = req.body.clone().unwrap_or_default();
+        if !body_bytes.is_empty() {
+            builder = builder.header("Content-Length", body_bytes.len().to_string());
+        }
         let hyper_req = builder
-            .body(Empty::<HyperBytes>::new())
+            .body(Full::new(HyperBytes::from(body_bytes)))
             .map_err(|e| NetworkError::RequestBuild(e.to_string()))?;
 
         let res = self
@@ -196,9 +300,24 @@ impl NetworkEngine {
         let status_text = res.status().to_string();
 
         let mut headers = HashMap::new();
+        // `Set-Cookie` es la unica cabecera que se recoge APARTE, en un
+        // `Vec`: es la unica que un servidor real repite de forma
+        // legitima y con significado (una respuesta de login deja varias
+        // a la vez), y el `HashMap` de abajo solo puede guardar la
+        // ultima. Antes de esto se perdian todas menos una - un bug que
+        // no se veia porque nadie leia cookies todavia.
+        let mut set_cookie = Vec::new();
         for (name, value) in res.headers() {
             if let Ok(val) = value.to_str() {
+                if name.as_str().eq_ignore_ascii_case("set-cookie") {
+                    set_cookie.push(val.to_string());
+                }
                 headers.insert(name.as_str().to_lowercase(), val.to_string());
+            }
+        }
+        if !set_cookie.is_empty() {
+            if let Ok(mut store) = self.cookies.lock() {
+                store.store_from_response(&set_cookie, &req.url);
             }
         }
 
@@ -216,6 +335,7 @@ impl NetworkEngine {
             status_code,
             status_text,
             headers,
+            set_cookie,
             body: bytes::Bytes::from(decompressed),
         })
     }
@@ -289,6 +409,7 @@ mod tests {
             status_code,
             status_text: status_code.to_string(),
             headers,
+            set_cookie: Vec::new(),
             body: bytes::Bytes::new(),
         }
     }

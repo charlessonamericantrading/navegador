@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ARCHITECTURE.md), no el camino real del producto - `server.rs` (el
     // proceso NDJSON que si habla con el backend) es quien descarga
     // recursos externos de verdad.
-    let (page, mut runtime) = build_page_keeping_runtime(&html, "", VIEWPORT_WIDTH, VIEWPORT_HEIGHT, Some(&font_set), &std::collections::HashMap::new(), &engine_layout::ImageMap::new(), None);
+    let (page, mut runtime) = build_page_keeping_runtime(&html, "", VIEWPORT_WIDTH, VIEWPORT_HEIGHT, Some(&font_set), &std::collections::HashMap::new(), &engine_layout::ImageMap::new(), None, None);
 
     for result in &page.script_results {
         match result {

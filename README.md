@@ -1,90 +1,158 @@
-# 🚀 Navegador IA - Motor Nativo 100% Rust & Browser Engine
+# Navegador IA
 
-[![Rust Engine](https://img.shields.io/badge/Motor_Nativo-Rust_100%25-orange.svg)](file:///c:/Users/repre/Desktop/navegador%20ia/engine)
-[![Graphics Pipeline](https://img.shields.io/badge/Graphics-WebGPU_%2F_Vulkan_%2F_Metal-blue.svg)](file:///c:/Users/repre/Desktop/navegador%20ia/engine/crates/gfx)
-[![Platforms](https://img.shields.io/badge/Plataformas-Windows_%7C_macOS_%7C_Linux-green.svg)](file:///c:/Users/repre/Desktop/navegador%20ia/desktop)
-[![UI Theme](https://img.shields.io/badge/UI_Theme-Light_Glassmorphism-violet.svg)](file:///c:/Users/repre/Desktop/navegador%20ia/frontend)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+Un navegador de escritorio con un **motor de renderizado propio escrito desde cero en Rust** — sin Chromium, sin WebKit, sin Gecko.
 
-Un navegador web de próxima generación impulsado por un **motor de renderizado nativo escrito desde cero en Rust**, diseñado para ofrecer consumo de memoria ultra-bajo (<30MB por pestaña), aceleración GPU por hardware directa y ejecución paralela multihilo.
-
----
-
-## 🌟 Ventajas Competitivas de Arquitectura
-
-1. **Gobernador de Recursos de Memoria Ultra-Baja (`ResourceGovernor`)**:
-   - Consumo tope de **<30MB por pestaña** (ahorro del 70% de memoria RAM frente a los 200MB+ por pestaña de Chromium/Edge).
-2. **Filtro Anti-Manifest V3 en Sockets Nativos (`AntiManifestV3Filter`)**:
-   - Filtrado a nivel de socket en Rust que cancela publicidad y rastreadores con **0ms de latencia**.
-3. **Layout Concurrente Multihilo (`ConcurrencyOptimizer`)**:
-   - Reflow de árboles de cajas Flexbox distribuido entre todos los núcleos de la CPU con `rayon` sin bloqueos del hilo principal.
-4. **Parsers Nativos 100% Propios sin Dependencias Externas**:
-   - **`CustomNativeHtmlParser`**: Tokenizador y constructor de árbol DOM nativo sin dependencias de `html5ever`.
-   - **`CustomNativeCssParser`**: Lexer CSS3 para procesamiento directo de selectores, especificidad y Container Queries CSS4.
-   - **`NetworkEngine`**: Cliente de transporte HTTP/1.1 sobre sockets TCP nativos de `tokio`.
-5. **Aceleración Gráfica GPU Nactiva (`engine-gfx`)**:
-   - Pipeline 3D WebGPU conectado por hardware a **Vulkan** (Windows/Linux), **DirectX 12** y **Metal** (macOS).
+> **Estado: en desarrollo, no apto para uso general todavía.**
+> El motor renderiza páginas reales por HTTPS, pero le faltan piezas de
+> seguridad imprescindibles (política de mismo origen, aislamiento de
+> procesos). Ver [Qué falta](#qué-falta) antes de usarlo con sitios en los
+> que no confíes.
 
 ---
 
-## 📁 Estructura del Proyecto
+## Qué hace de verdad hoy
+
+Todo lo de esta lista está implementado y verificado ejecutando el motor, no
+solo compilándolo. Las cifras salen de correr la suite de tests el
+2026-08-20.
+
+| | |
+|---|---|
+| **Motor** | 20.719 líneas de Rust, 9 crates |
+| **Tests** | 558 pasando, 0 fallando |
+| **Red** | HTTP/1.1 + HTTPS real (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies RFC 6265 |
+| **HTML** | Parseo con `html5ever` (el de Servo), DOM mutable |
+| **CSS** | Cascada con especificidad real, selectores con combinadores (`selectors`, el de Firefox), pseudo-clases, `@media` |
+| **Layout** | Bloque, inline, flexbox, CSS Grid, tablas, `float`, `position` + `z-index` |
+| **JavaScript** | Motor `boa`, DOM bindings, eventos con burbujeo, `fetch`, `XMLHttpRequest`, `setTimeout`, `localStorage` |
+| **Pintado** | Rasterizado con `tiny-skia`, texto con glifos reales, imágenes, `border-radius`, sombras, `overflow: hidden` |
+
+**Lo que se puede hacer con él ahora mismo:** cargar una página real por
+HTTPS, navegar por enlaces, usar el historial, abrir pestañas, rellenar y
+**enviar formularios** (GET y POST), e **iniciar sesión** en un sitio con
+autenticación por cookies.
+
+---
+
+## Qué falta
+
+Esto es la parte importante de este README, y está aquí arriba a propósito.
+
+### Seguridad — antes de distribuirlo a nadie
+
+| Pieza | Estado |
+|---|---|
+| Validación TLS de certificados | ✅ Real (`webpki-roots`) |
+| Seguridad de memoria | ✅ Rust elimina de raíz ~70% de los CVE críticos de un navegador |
+| **Política de mismo origen** | ❌ No existe |
+| **Sandbox de proceso** | ❌ No existe |
+| **CORS** | ❌ Es un stub que devuelve `true` |
+| **CSP** | ❌ No existe |
+
+Sin política de mismo origen ni sandbox, una página maliciosa no tiene
+barreras. **Úsalo con sitios de confianza o en desarrollo, no como
+navegador diario.**
+
+### Plataforma
+
+Compilado y probado **solo en Windows**. `winit`/`wgpu` soportan macOS y
+Linux en teoría, pero nunca se ha verificado aquí. Sin versión móvil.
+
+### Web moderna
+
+Sin `<canvas>`, `<video>`, `<audio>`, `<iframe>`, `<svg>`. Sin WebGL,
+IndexedDB, Service Workers, WebSockets ni Web Workers. Sin HTTP/2 ni caché
+HTTP. El JavaScript es interpretado (sin JIT), así que es bastante más
+lento que un navegador comercial.
+
+### Compatibilidad
+
+La métrica honesta de un motor de navegador es cuántos tests de
+[Web Platform Tests](https://github.com/web-platform-tests/wpt) pasa. Este
+motor **no ejecuta la suite oficial todavía**: los 21 tests estilo-WPT que
+corre están escritos a mano. Hasta que ese número exista, cualquier
+afirmación sobre "compatibilidad" —incluida la de este README— es una
+impresión, no un dato.
+
+---
+
+## Cómo está montado
 
 ```text
 navegador-ia/
-├── engine/                      # Motor Nativo en Rust (Workspace 7 Crates)
-│   ├── crates/dom/              # Parser HTML5, EventTarget, DOM Node Tree
-│   ├── crates/css/              # Lexer CSS3, Specificity, Container Queries
-│   ├── crates/layout/           # Motor Flexbox Concurrente Multihilo (Rayon)
-│   ├── crates/gfx/              # Pipeline GPU WebGPU / WebGL 2.0 (wgpu / Vulkan)
-│   ├── crates/js/               # Runtime ECMAScript (boa), JIT x86_64 & WASM SIMD
-│   ├── crates/net/              # Sockets TCP HTTP/1.1, Anti-Manifest V3 Filter
-│   └── crates/core/             # Kernel Sandboxing (AppContainer), Site Isolation
-├── frontend/                    # Interfaz de Usuario React + Vite (Light Theme)
-│   ├── src/core/                # Componentes Principales y App.css
-│   └── src/domains/browser/     # Barra de URL Superior & Nueva Pestaña (NTP)
-├── backend/                     # Servidor de Orquestación FastAPI & WebSocket
-└── desktop/                     # Wrapper Electron & Configuración electron-builder
+├── engine/           Motor de renderizado en Rust (9 crates)
+│   ├── crates/net/       HTTP/HTTPS, cookies, almacenamiento web
+│   ├── crates/dom/       Parseo HTML y árbol DOM
+│   ├── crates/css/       Parseo, selectores y cascada
+│   ├── crates/layout/    Cajas: bloque, inline, flex, grid, tabla, float
+│   ├── crates/text/      Medición y shaping de texto
+│   ├── crates/image/     Decodificación de imágenes
+│   ├── crates/js/        Runtime JavaScript y bindings del DOM
+│   ├── crates/gfx/       Display list, rasterizado y ventana
+│   └── crates/core/      Pipeline y servidor NDJSON (engine_server)
+├── frontend/         Interfaz en React + Vite
+├── desktop/          Envoltorio Electron
+└── backend/          Servidor Python (FastAPI) — ver nota abajo
 ```
+
+El motor corre como un proceso aparte (`engine_server`) que habla **NDJSON
+por stdin/stdout**. Electron se comunica con él directamente por IPC.
+
+> **Nota sobre el backend de Python:** hoy la aplicación arranca *dos*
+> instancias del motor —una desde Electron y otra desde Python— y la
+> interfaz solo usa la primera. Es deuda técnica conocida, pendiente de
+> resolver: hay que elegir una de las dos rutas y borrar la otra.
+
+`engine/ARCHITECTURE.md` documenta el estado real de cada capacidad, con
+sus simplificaciones declaradas una por una. Es la fuente de verdad de este
+proyecto; si algo de este README lo contradice, gana `ARCHITECTURE.md`.
 
 ---
 
-## 🛠️ Instalación y Compilación
+## Compilar y ejecutar
 
-### Requisitos Previos
-* **Node.js**: v18+ y `npm`
-* **Rust**: v1.75+ (`cargo`)
-* **Python**: v3.11+ con Virtual Environment (`.venv`)
+### Requisitos
+* **Rust** 1.75+ (`cargo`)
+* **Node.js** 18+ y `npm`
+* **Python** 3.11+ (solo si usas el backend)
 
-### 1. Iniciar en Modo Desarrollo (Dev Mode)
+### Desarrollo
+
 ```bash
-# Instalar dependencias globales
 npm install
-
-# Iniciar frontend, backend y wrapper desktop en paralelo
-npm run start
+npm run start          # frontend (Vite) + aplicación Electron
 ```
-O simplemente haciendo doble clic en el ejecutable [`iniciar.bat`](file:///c:/Users/repre/Desktop/navegador%20ia/iniciar.bat).
 
-### 2. Compilar el Instalador de Producción (`.exe`)
+### Solo el motor
+
+```bash
+cd engine
+cargo test --workspace          # los 558 tests
+cargo run -p engine-core --bin engine_server   # servidor NDJSON por stdin/stdout
+```
+
+### Instalador
+
 ```bash
 npm run build:app
 ```
-El instalador gráfico autoejecutable de producción se generará en la raíz del proyecto:
-- **Ruta**: [`Navegador IA Setup.exe`](file:///c:/Users/repre/Desktop/navegador%20ia/Navegador%20IA%20Setup.exe)
+
+Genera `Navegador IA Setup.exe` en la raíz. **Sin firmar**: Windows
+SmartScreen mostrará un aviso a quien lo descargue. Ver
+`desktop/DISTRIBUCION.md` para las opciones de firma de código.
 
 ---
 
-## 💻 Distribución Multiplataforma
+## Sobre la IA
 
-El empaquetador `desktop/package.json` está configurado para generar instaladores nativos en:
-* **Windows**: `.exe` (NSIS)
-* **macOS (Apple)**: `.dmg` / `.zip` (soporte M1/M2/M3/M4 e Intel)
-* **Linux**: `.AppImage` / `.deb`
-
-Para publicar y servir el instalador a los usuarios con detección automática del sistema operativo, utiliza la plantilla lista en [`landing_download_page.html`](file:///C:/Users/repre/.gemini/antigravity/brain/4e753eac-e626-43bc-b26e-c862bb33161d/landing_download_page.html).
+El proyecto se llama Navegador IA porque su objetivo es un agente que
+navegue por ti. **Ese agente todavía no está conectado a la interfaz**:
+existe el código de orquestación (en TypeScript y en Python) pero no hay
+forma de usarlo desde la aplicación de escritorio. Es el siguiente trabajo
+de producto pendiente.
 
 ---
 
-## 📄 Licencia
+## Licencia
 
-Este proyecto está bajo la Licencia MIT.
+MIT — ver [LICENSE](LICENSE).

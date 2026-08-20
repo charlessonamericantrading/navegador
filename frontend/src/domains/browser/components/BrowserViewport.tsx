@@ -34,6 +34,19 @@ interface BrowserViewportProps {
   onManualResize: (width: number, height: number) => void;
   onManualScroll: (dy: number) => void;
   loading: boolean;
+  /// Historial y pestañas (el motor ya los soportaba; la interfaz no los
+  /// exponia). `canGoBack`/`canGoForward` vienen del propio motor en cada
+  /// `state`, asi que los botones reflejan el historial REAL en vez de una
+  /// cuenta paralela que podria desincronizarse.
+  canGoBack: boolean;
+  canGoForward: boolean;
+  onBack: () => void;
+  onForward: () => void;
+  tabs: { id: number; title: string; url: string }[];
+  activeTabId: number | null;
+  onNewTab: () => void;
+  onSwitchTab: (tabId: number) => void;
+  onCloseTab: (tabId: number) => void;
 }
 
 export const BrowserViewport: React.FC<BrowserViewportProps> = ({
@@ -45,7 +58,16 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   onManualType,
   onManualResize,
   onManualScroll,
-  loading
+  loading,
+  canGoBack,
+  canGoForward,
+  onBack,
+  onForward,
+  tabs,
+  activeTabId,
+  onNewTab,
+  onSwitchTab,
+  onCloseTab
 }) => {
   const [addressInput, setAddressInput] = useState(url || 'https://www.google.com');
   const [inputTextPopup, setInputTextPopup] = useState<{
@@ -259,16 +281,74 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   return (
     <div className="browser-frame">
       {/* Barra de Navegación del Navegador (Nivel Superior Prominente) */}
+      {/* Barra de pestañas - solo si hay mas de una, para no gastar
+          espacio vertical cuando no aporta nada. */}
+      {tabs.length > 1 && (
+        <div className="tab-bar" role="tablist">
+          {tabs.map((tab) => (
+            <div
+              key={tab.id}
+              role="tab"
+              aria-selected={tab.id === activeTabId}
+              className={`tab${tab.id === activeTabId ? ' tab-active' : ''}`}
+              onClick={() => onSwitchTab(tab.id)}
+              title={tab.url || 'Pestaña nueva'}
+            >
+              <span className="tab-title">{tab.title || tab.url || 'Pestaña nueva'}</span>
+              <button
+                className="tab-close"
+                aria-label={`Cerrar ${tab.title || 'pestaña'}`}
+                onClick={(e) => {
+                  // Sin esto, cerrar tambien cambiaria a esa pestaña
+                  // (el clic llegaria al contenedor de arriba).
+                  e.stopPropagation();
+                  onCloseTab(tab.id);
+                }}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+          <button className="tab-new" onClick={onNewTab} aria-label="Pestaña nueva" title="Pestaña nueva">
+            +
+          </button>
+        </div>
+      )}
+
       <div className="browser-bar">
         {/* Botones de control de navegación */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
           <button
+            onClick={onBack}
+            disabled={!canGoBack}
+            className="btn icon-btn"
+            title="Atrás"
+            aria-label="Atrás"
+          >
+            ←
+          </button>
+          <button
+            onClick={onForward}
+            disabled={!canGoForward}
+            className="btn icon-btn"
+            title="Adelante"
+            aria-label="Adelante"
+          >
+            →
+          </button>
+          <button
             onClick={() => onManualNavigate(url || 'https://www.google.com')}
             className="btn icon-btn"
             title="Recargar página"
+            aria-label="Recargar página"
           >
             ↻
           </button>
+          {tabs.length <= 1 && (
+            <button onClick={onNewTab} className="btn icon-btn" title="Pestaña nueva" aria-label="Pestaña nueva">
+              +
+            </button>
+          )}
         </div>
 
         {/* Input de dirección URL Prominente */}

@@ -447,11 +447,72 @@ impl DomBindings {
                     None => JsValue::null(),
                 })
             },
-            capture,
+            capture.clone(),
         );
         let body_getter_fn = FunctionObjectBuilder::new(context.realm(), body_getter)
             .name(js_string!("get body"))
             .length(0)
+            .constructor(false)
+            .build();
+
+        // `document.title` (Fase 14.1) - accessor con getter Y setter
+        // reales sobre el `<title>` del documento. Antes de esto, `document
+        // .title = "x"` creaba una propiedad JS normal en el objeto
+        // `document` que no tocaba el DOM: la asignacion parecia funcionar
+        // desde JS (`document.title` devolvia lo asignado) pero el titulo
+        // real de la pagina no cambiaba nunca - encontrado al verificar los
+        // temporizadores en vivo, con una pagina que se retitula desde un
+        // `setTimeout`. Es un patron universal en aplicaciones web (marcar
+        // mensajes sin leer, reflejar la seccion actual).
+        //
+        // El setter escribe sobre el nodo de TEXTO hijo del `<title>`, que
+        // es donde vive de verdad; si el `<title>` esta vacio se le crea
+        // uno. Un documento SIN `<title>` en absoluto no se inventa el
+        // elemento (haria falta crear tambien el `<head>` si falta): la
+        // asignacion se ignora, mismo criterio honesto que el resto del
+        // modulo. Leerlo entonces devuelve la cadena vacia, igual que un
+        // navegador real ante un documento sin titulo.
+        let title_getter = NativeFunction::from_copy_closure_with_captures(
+            |_this, _args, capture: &DomRootCapture, _context| {
+                let title = Node::find_all_by_tag(&capture.0, "title")
+                    .first()
+                    .map(Node::text_content)
+                    .unwrap_or_default();
+                Ok(js_string!(title).into())
+            },
+            capture.clone(),
+        );
+        let title_getter_fn = FunctionObjectBuilder::new(context.realm(), title_getter)
+            .name(js_string!("get title"))
+            .length(0)
+            .constructor(false)
+            .build();
+
+        let title_setter = NativeFunction::from_copy_closure_with_captures(
+            |_this, args: &[JsValue], capture: &DomRootCapture, context| {
+                let nuevo = args.first().cloned().unwrap_or_default().to_string(context)?.to_std_string_escaped();
+                let Some(title_node) = Node::find_all_by_tag(&capture.0, "title").into_iter().next() else {
+                    return Ok(JsValue::undefined());
+                };
+                {
+                    let mut guard = title_node.write().unwrap();
+                    // Reutiliza el nodo de texto existente si lo hay (lo
+                    // normal); si el `<title>` estaba vacio, se descarta
+                    // cualquier hijo que no sea texto y se pone uno nuevo.
+                    if let Some(existing) = guard.children.iter().find(|c| matches!(c.read().unwrap().node_type, NodeType::Text(_))) {
+                        existing.write().unwrap().node_type = NodeType::Text(nuevo);
+                        return Ok(JsValue::undefined());
+                    }
+                    guard.children.clear();
+                }
+                Node::append_child(&title_node, Node::new(NodeType::Text(nuevo)));
+                Ok(JsValue::undefined())
+            },
+            capture.clone(),
+        );
+        let title_setter_fn = FunctionObjectBuilder::new(context.realm(), title_setter)
+            .name(js_string!("set title"))
+            .length(1)
             .constructor(false)
             .build();
 
@@ -462,6 +523,7 @@ impl DomBindings {
             .function(create_element, js_string!("createElement"), 1)
             .accessor(js_string!("documentElement"), Some(document_element_getter_fn), None, Attribute::all())
             .accessor(js_string!("body"), Some(body_getter_fn), None, Attribute::all())
+            .accessor(js_string!("title"), Some(title_getter_fn), Some(title_setter_fn), Attribute::all())
             .build();
 
         context.register_global_property(js_string!("document"), document, Attribute::all())?;
@@ -1660,6 +1722,40 @@ mod tests {
     /// (el unico camino real para teclado, ver `core::server::press_key`)
     /// llegaba SIEMPRE con `event.key === undefined`, sin importar que
     /// tecla fuera.
+    /// `document.title` tiene que MUTAR el DOM real, no crear una
+    /// propiedad JS suelta - el bug exacto que tenia antes, encontrado
+    /// verificando los temporizadores en vivo con una pagina que se
+    /// retitula desde un `setTimeout`.
+    #[test]
+    fn document_title_setter_mutates_the_real_title_element_in_the_dom() {
+        let dom = HtmlParser::parse("<html><head><title>viejo</title></head><body></body></html>");
+        let mut runtime = crate::runtime::JsRuntime::new();
+        runtime.bind_dom(dom.clone()).expect("bind_dom deberia funcionar");
+        runtime.eval("document.title = 'nuevo'").expect("no deberia lanzar");
+
+        let title_node = Node::find_all_by_tag(&dom, "title").into_iter().next().expect("deberia existir <title>");
+        assert_eq!(Node::text_content(&title_node), "nuevo", "el titulo real del DOM deberia haber cambiado, no solo la propiedad JS");
+    }
+
+    #[test]
+    fn document_title_getter_reads_the_real_title_element() {
+        let dom = HtmlParser::parse("<html><head><title>Mi pagina</title></head><body></body></html>");
+        let mut runtime = crate::runtime::JsRuntime::new();
+        runtime.bind_dom(dom).expect("bind_dom deberia funcionar");
+        assert_eq!(runtime.eval("document.title").unwrap(), "\"Mi pagina\"");
+    }
+
+    /// Un documento sin `<title>` no se inventa el elemento (haria falta
+    /// crear tambien el `<head>` si falta): la asignacion se ignora sin
+    /// romper nada, y leerlo da cadena vacia.
+    #[test]
+    fn setting_the_title_on_a_document_without_one_is_a_harmless_no_op() {
+        let dom = HtmlParser::parse("<html><body></body></html>");
+        let mut runtime = crate::runtime::JsRuntime::new();
+        runtime.bind_dom(dom).expect("bind_dom deberia funcionar");
+        assert_eq!(runtime.eval("document.title = 'x'; document.title").unwrap(), "\"\"");
+    }
+
     #[test]
     fn dispatch_keyboard_event_populates_the_real_key_property() {
         let dom = HtmlParser::parse(r#"<html><body><input id="target"></body></html>"#);

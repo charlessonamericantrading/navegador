@@ -29,13 +29,18 @@ pub struct JsRuntime {
     /// Igual que `pending_window_opens` pero para `history.pushState`/
     /// `history.replaceState` (Fase 7) - ver `crate::history`.
     pending_history_ops: Option<crate::history::PendingHistoryOps>,
+    /// `Some` una vez que `register_timers` haya corrido (Fase 14) - la
+    /// cola de `setTimeout`/`setInterval` pendientes. `None` en un runtime
+    /// sin temporizadores registrados, donde `setTimeout` ni siquiera
+    /// existe como global.
+    timers: Option<crate::timers::TimerQueue>,
 }
 
 impl JsRuntime {
     pub fn new() -> Self {
         let mut context = Context::default();
         let _ = AsyncEventLoop::register_microtasks(&mut context);
-        Self { context, document_bindings: None, pending_window_opens: None, pending_history_ops: None }
+        Self { context, document_bindings: None, pending_window_opens: None, pending_history_ops: None, timers: None }
     }
 
     pub fn bind_dom(&mut self, dom_root: Arc<RwLock<Node>>) -> Result<(), JsError> {
@@ -54,8 +59,11 @@ impl JsRuntime {
     /// esto, `fetch(...)` en JS lanza `ReferenceError: fetch is not
     /// defined`, la respuesta honesta cuando de verdad no hay red
     /// disponible, en vez de fingir un `fetch` que nunca conecta a nada.
-    pub fn register_fetch(&mut self, network: Arc<NetworkEngine>) -> Result<(), JsError> {
-        fetch::register_fetch(&mut self.context, network).map_err(|e| JsError::Execution(e.to_string()))
+    /// `page_origin` (Fase 20) activa la politica de mismo origen sobre
+    /// las peticiones que haga este `fetch`. `None` en un documento sin
+    /// URL propia, donde no hay origen contra el que comparar nada.
+    pub fn register_fetch(&mut self, network: Arc<NetworkEngine>, page_url: Option<String>) -> Result<(), JsError> {
+        fetch::register_fetch(&mut self.context, network, page_url).map_err(|e| JsError::Execution(e.to_string()))
     }
 
     /// Registra el constructor global `XMLHttpRequest` (Fase 9),
@@ -64,8 +72,10 @@ impl JsRuntime {
     /// siempre. Mismo criterio de separacion que `register_fetch`: sin
     /// llamar a esto, `new XMLHttpRequest()` lanza `ReferenceError`, que es
     /// la respuesta honesta donde no hay red disponible.
-    pub fn register_xhr(&mut self, network: Arc<NetworkEngine>) -> Result<(), JsError> {
-        crate::xhr::register_xhr(&mut self.context, network).map_err(|e| JsError::Execution(e.to_string()))
+    /// Mismo `page_origin` que `register_fetch`, por la misma razon:
+    /// `XMLHttpRequest` esta sujeto a CORS igual que `fetch`.
+    pub fn register_xhr(&mut self, network: Arc<NetworkEngine>, page_url: Option<String>) -> Result<(), JsError> {
+        crate::xhr::register_xhr(&mut self.context, network, page_url).map_err(|e| JsError::Execution(e.to_string()))
     }
 
     /// Registra el global `window` con `open(url)` real (Fase 6.4). Igual
@@ -90,6 +100,53 @@ impl JsRuntime {
         let Some(pending) = &self.pending_window_opens else { return Vec::new() };
         let Ok(mut queue) = pending.lock() else { return Vec::new() };
         std::mem::take(&mut *queue)
+    }
+
+    /// Registra `setTimeout`/`setInterval`/`clearTimeout`/`clearInterval`
+    /// (Fase 14). Mismo criterio de separacion que `register_fetch`/
+    /// `register_window`: sin llamar a esto los globales no existen
+    /// (`typeof setTimeout === "undefined"`), que es la respuesta honesta
+    /// donde nadie va a llamar a `run_due_timers` para hacerlos avanzar.
+    ///
+    /// Conviene llamarlo DESPUES de `register_window` para que ademas
+    /// queden colgados de `window.*` (muchisimo codigo real escribe
+    /// `window.setTimeout`); si `window` no existe todavia, se registran
+    /// igual como globales sueltos.
+    pub fn register_timers(&mut self) -> Result<(), JsError> {
+        let queue = crate::timers::register_timers(&mut self.context).map_err(|e| JsError::Execution(e.to_string()))?;
+        self.timers = Some(queue);
+        Ok(())
+    }
+
+    /// Ejecuta los temporizadores YA vencidos y devuelve cuantos callbacks
+    /// se invocaron - cero si no hay ninguno vencido o si
+    /// `register_timers` nunca corrio.
+    ///
+    /// Este motor no tiene un reloj de fondo propio: es esta llamada la
+    /// que hace avanzar el tiempo de los temporizadores, y quien la hace
+    /// es `core::server` tras cada operacion real (cargar, clic, escribir,
+    /// tecla). Ver el doc-comment de `crate::timers` para la consecuencia
+    /// exacta de esa simplificacion.
+    ///
+    /// El valor devuelto le sirve a quien llama para saber si merece la
+    /// pena rehacer el layout: si no disparo ningun callback, nada pudo
+    /// haber tocado el DOM.
+    pub fn run_due_timers(&mut self) -> usize {
+        let Some(queue) = self.timers.clone() else { return 0 };
+        crate::timers::run_due_timers(&queue, &mut self.context)
+    }
+
+    /// Registra `localStorage`/`sessionStorage` para el origen de ESTA
+    /// pagina (Fase 15). El almacen en si es de toda la sesion y lo
+    /// conserva `core::server`; aqui solo se expone a JS, ya acotado al
+    /// origen que se pase - un script no puede pedir el de otro origen
+    /// porque no hay ningun parametro con el que hacerlo.
+    ///
+    /// Mismo criterio de separacion que `register_fetch`: sin llamar a
+    /// esto los globales no existen, que es la respuesta honesta donde no
+    /// hay ningun almacen que respalde nada.
+    pub fn register_storage(&mut self, storage: crate::storage::SharedWebStorage, origin: String) -> Result<(), JsError> {
+        crate::storage::register_storage(&mut self.context, storage, origin).map_err(|e| JsError::Execution(e.to_string()))
     }
 
     /// Registra el global `history` con `pushState`/`replaceState` reales

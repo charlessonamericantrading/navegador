@@ -45,6 +45,21 @@ impl LoadedPage {
     /// necesite reajustarlo (porque el contenido encogio) llama despues a
     /// `publish_scroll_offset` con el valor ya acotado.
     fn relayout(&mut self, width: f32, height: f32) {
+        // Temporizadores vencidos ANTES de medir (Fase 14). Este es el
+        // punto donde el tiempo avanza para el JS de la pagina: este motor
+        // no tiene un reloj de fondo propio, asi que un `setTimeout` corre
+        // cuando el servidor procesa algo (cargar, clic, escribir, tecla,
+        // redimensionar) - todas esas operaciones pasan por aqui, que es
+        // justo por lo que se engancha en `relayout` y no en cada una por
+        // separado.
+        //
+        // ANTES de reconstruir el arbol, no despues, porque el trabajo
+        // tipico de un callback de temporizador es MUTAR el DOM (mostrar
+        // un menu, insertar contenido diferido): hacerlo despues dejaria
+        // esos cambios sin medir hasta la siguiente operacion, y el
+        // usuario veria la pagina un paso por detras.
+        self.run_due_timers_before_layout();
+
         self.page.layout_root = LayoutTreeBuilder::build(
             &self.page.dom_root,
             &self.page.stylesheet,
@@ -54,6 +69,34 @@ impl LoadedPage {
             &self.images,
         );
         self.publish_layout_snapshot();
+    }
+
+    /// Ejecuta los temporizadores vencidos, si los hay. Separado de
+    /// `relayout` solo para que ese comentario largo no lo parta por la
+    /// mitad; no tiene mas logica que la de registrar cuantos corrieron.
+    fn run_due_timers_before_layout(&mut self) {
+        let fired = self.runtime.run_due_timers();
+        if fired > 0 {
+            tracing::debug!("[server] {fired} callback(s) de temporizador ejecutados antes del layout");
+        }
+    }
+
+    /// El titulo VIVO del documento, leido del `<title>` real en cada
+    /// llamada en vez del que se capturo al cargar (Fase 14.1). Hace falta
+    /// porque `document.title = "..."` desde JS - patron universal en
+    /// aplicaciones web, para marcar mensajes sin leer o reflejar la
+    /// seccion actual - muta el DOM despues de la carga, y el valor
+    /// congelado en `LoadedPage::title` se quedaba obsoleto para siempre.
+    ///
+    /// Se conserva `self.title` como respaldo: un documento sin `<title>`
+    /// devuelve cadena vacia aqui, y en ese caso es mejor seguir mostrando
+    /// lo que hubiera (normalmente tambien vacio) que no cambiar nada.
+    fn current_title(&self) -> String {
+        let live = Node::find_all_by_tag(&self.page.dom_root, "title")
+            .first()
+            .map(Node::text_content)
+            .unwrap_or_default();
+        if live.is_empty() { self.title.clone() } else { live }
     }
 
     /// Copia la geometria y el estilo resuelto de cada caja al buzon que
@@ -178,6 +221,13 @@ struct EngineServer {
     // fuera del `&self`/`&mut self` normal de este struct - de ahi la
     // necesidad de un handle compartido en vez de un prestamo.
     network: std::sync::Arc<NetworkEngine>,
+    /// Web Storage de TODA la sesion (Fase 15) - vive aqui y no en la
+    /// pagina precisamente porque su razon de ser es sobrevivir a navegar
+    /// a otra. Cada pagina que se carga recibe un puntero a este mismo
+    /// almacen mas su propio origen, y solo puede ver el suyo (ver
+    /// `engine_net::storage`). Mismo criterio que las cookies, que por la
+    /// misma razon viven dentro de `NetworkEngine`.
+    storage: engine_js::storage::SharedWebStorage,
     /// Pestañas (Fase 4.5) - siempre tiene AL MENOS una (invariante
     /// mantenida por `close_tab`, que rechaza cerrar la ultima). `tabs`
     /// nunca se reordena por id, solo se inserta al final (`open_new_tab`)
@@ -206,6 +256,7 @@ impl EngineServer {
             width: 1280,
             height: 720,
             network: std::sync::Arc::new(NetworkEngine::new()),
+            storage: std::sync::Arc::new(std::sync::Mutex::new(engine_net::storage::WebStorage::new())),
             tabs: vec![Tab::new(0)],
             active_tab: 0,
             next_tab_id: 1,
@@ -284,8 +335,8 @@ impl EngineServer {
                 y,
                 text,
                 press_enter,
-            } => (self.type_text(id, x, y, text, press_enter), false),
-            EngineRequest::PressKey { id, key } => (self.press_key(id, key), false),
+            } => (self.type_text(id, x, y, text, press_enter).await, false),
+            EngineRequest::PressKey { id, key } => (self.press_key(id, key).await, false),
             EngineRequest::Back { .. } => (self.back(id).await, false),
             EngineRequest::Forward { .. } => (self.forward(id).await, false),
             EngineRequest::NewTab { url, .. } => (self.open_new_tab(id, url).await, false),
@@ -311,8 +362,36 @@ impl EngineServer {
     /// autodestruiria el historial "adelante" al que deberia poder volver
     /// despues.
     async fn navigate(&mut self, id: Option<String>, url: String, record_history: bool) -> EngineResponse {
+        self.navigate_with_body(id, url, record_history, None).await
+    }
+
+    /// Navega enviando un cuerpo `application/x-www-form-urlencoded` por
+    /// POST (Fase 16) - el envio de un `<form method="post">`. Siempre
+    /// registra historial: un POST es una navegacion de pleno derecho.
+    ///
+    /// Aviso real que este motor NO da todavia: volver ATRAS a una entrada
+    /// que se creo con un POST deberia re-enviar el formulario (y un
+    /// navegador de verdad pregunta antes de hacerlo). Aqui `back` la
+    /// repetira como GET, que es distinto - declarado en ARCHITECTURE.md.
+    async fn navigate_post(&mut self, id: Option<String>, url: String, body: Vec<u8>) -> EngineResponse {
+        self.navigate_with_body(id, url, true, Some(body)).await
+    }
+
+    /// El cuerpo comun de las dos: `body` a `None` hace un GET normal,
+    /// `Some` hace un POST con ese contenido. Se unifican aqui en vez de
+    /// duplicar la funcion entera porque TODO lo que viene despues de la
+    /// peticion (seguir redirecciones, descubrir sub-recursos, construir
+    /// la pagina, historial, temporizadores de carga) es identico.
+    async fn navigate_with_body(&mut self, id: Option<String>, url: String, record_history: bool, body: Option<Vec<u8>>) -> EngineResponse {
         let request = match NetworkRequest::new(&url) {
-            Ok(request) => request,
+            Ok(mut request) => {
+                if let Some(body) = body {
+                    request.method = engine_net::request::Method::Post;
+                    request.headers.insert("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string());
+                    request.body = Some(body);
+                }
+                request
+            }
             Err(error) => return Self::error(id, format!("invalid_url: {error}")),
         };
 
@@ -348,9 +427,32 @@ impl EngineServer {
         // `pipeline.rs` siga sin depender de `url`/`engine-net` para nada -
         // ver el doc-comment de `find_external_stylesheet_hrefs`.
         let discovery_dom = engine_dom::HtmlParser::parse(&html);
+
+        // Content Security Policy (Fase 21). Se toma de la cabecera y del
+        // `<meta http-equiv>`, y si vienen las dos se COMBINAN de forma
+        // restrictiva: hay que pasar ambas. Combinarlas relajando seria un
+        // agujero - quien pudiera inyectar un `<meta>` desactivaria la
+        // politica del servidor, justo lo que CSP existe para impedir.
+        let mut csp = response
+            .headers
+            .get("content-security-policy")
+            .map(|h| engine_net::ContentSecurityPolicy::parse(h))
+            .unwrap_or_default();
+        if let Some(meta_policy) = find_meta_csp(&discovery_dom) {
+            csp.merge(&engine_net::ContentSecurityPolicy::parse(&meta_policy));
+        }
+        let page_origin = engine_net::storage::origin_of(&page_url);
+
         let stylesheet_hrefs = find_external_stylesheet_hrefs(&discovery_dom);
         let script_srcs = find_external_script_srcs(&discovery_dom);
         let image_srcs = find_image_srcs(&discovery_dom);
+
+        // CSP se aplica ANTES de descargar, no despues: el objetivo es no
+        // pedirle nada a un origen no autorizado, no descartar lo que ya
+        // llego (que ya habria filtrado que la pagina visito ese sitio).
+        let stylesheet_hrefs = filter_by_csp(stylesheet_hrefs, "style-src", &csp, &page_url, &page_origin);
+        let script_srcs = filter_by_csp(script_srcs, "script-src", &csp, &page_url, &page_origin);
+        let image_srcs = filter_by_csp(image_srcs, "img-src", &csp, &page_url, &page_origin);
 
         let external_css = self.fetch_external_stylesheets(stylesheet_hrefs, &page_url).await;
         let external_scripts = self.fetch_external_scripts(script_srcs, &page_url).await;
@@ -366,6 +468,17 @@ impl EngineServer {
             &external_scripts,
             &images,
             Some(self.network.clone()),
+            // Fase 15: el origen sale de la URL FINAL (`page_url`, tras
+            // seguir redirecciones), no de la pedida - si `http://a.test`
+            // redirige a `https://a.test`, el almacenamiento que toca es
+            // el del origen donde de verdad se aterrizo, igual que en un
+            // navegador real.
+            Some(crate::scripting::StorageContext {
+                storage: self.storage.clone(),
+                origin: page_origin.clone(),
+                url: page_url.to_string(),
+                csp: csp.clone(),
+            }),
         );
         // Fase 6.4: un `window.open()` llamado durante la CARGA de la pagina
         // (no desde un clic real del usuario) se descarta - mismo criterio
@@ -432,6 +545,26 @@ impl EngineServer {
         if let Some(page) = &tab.current_page {
             page.publish_layout_snapshot();
             page.publish_scroll_offset(0.0);
+        }
+        // Temporizadores de la CARGA (Fase 14). El patron mas comun de
+        // todos - `setTimeout(inicializar, 0)` para diferir el arranque
+        // hasta despues de que el documento este montado - vence de
+        // inmediato, asi que tiene que correr aqui: si se dejara para la
+        // primera interaccion del usuario, la pagina se mostraria en su
+        // estado sin inicializar hasta que alguien la tocara.
+        //
+        // Va DESPUES de publicar el primer snapshot a proposito: un
+        // callback que lea `getBoundingClientRect` durante la
+        // inicializacion debe ver geometria real, no el snapshot vacio.
+        // Y solo se rehace el layout si algun callback llego a correr -
+        // sin temporizadores vencidos no hay nada que pudiera haber
+        // cambiado el DOM, y `build_page_keeping_runtime` ya dejo el
+        // arbol construido.
+        let (width, height) = (self.width, self.height);
+        if let Some(page) = self.active_tab_mut().current_page.as_mut() {
+            if page.runtime.run_due_timers() > 0 {
+                page.relayout(width as f32, height as f32);
+            }
         }
         // Fase 7: un `history.replaceState` en un script de CARGA (patron
         // habitual en SPAs para normalizar la ruta inicial) se aplica aqui,
@@ -674,7 +807,7 @@ impl EngineServer {
             .iter()
             .map(|tab| TabInfo {
                 id: tab.id,
-                title: tab.current_page.as_ref().map(|page| page.title.clone()).unwrap_or_default(),
+                title: tab.current_page.as_ref().map(LoadedPage::current_title).unwrap_or_default(),
                 url: tab.current_page.as_ref().map(|page| page.url.clone()).unwrap_or_default(),
             })
             .collect();
@@ -832,6 +965,12 @@ impl EngineServer {
         let mut window_opens: Vec<String> = Vec::new();
         // Fase 7: idem para `history.pushState`/`replaceState`.
         let mut history_ops: Vec<engine_js::history::HistoryOp> = Vec::new();
+        // Envio de formulario (Fase 10): clic en un boton submit dentro de
+        // un `<form>` - mismo criterio que `link_target` arriba (se decide
+        // AQUI, dentro del prestamo de `page`, pero se ejecuta DESPUES,
+        // porque `submit_form` necesita `&mut self` completo).
+        let mut submit_form_target: Option<std::sync::Arc<std::sync::RwLock<Node>>> = None;
+        let mut submit_control_target: Option<std::sync::Arc<std::sync::RwLock<Node>>> = None;
         let scroll_offset_y = self.active_tab().scroll_offset_y;
         let (width, height) = (self.width, self.height);
         {
@@ -910,7 +1049,20 @@ impl EngineServer {
                         Some(LinkAction::ScrollToFragment(fragment)) => {
                             fragment_target = Some(fragment);
                         }
-                        None => {}
+                        // Sin `<a href>` navegable: la OTRA accion por
+                        // defecto real de un clic es enviar un `<form>`,
+                        // si el nodo (o un ancestro, ver
+                        // `find_submit_control`) es un boton submit -
+                        // `<button>` sin `type` cuenta, es submit por
+                        // defecto en el spec real.
+                        None => {
+                            if let Some(submit_control) = find_submit_control(&node) {
+                                if let Some(form) = find_form_ancestor(&submit_control) {
+                                    submit_control_target = Some(submit_control);
+                                    submit_form_target = Some(form);
+                                }
+                            }
+                        }
                     }
                 }
                 page.relayout(width as f32, height as f32);
@@ -952,7 +1104,10 @@ impl EngineServer {
             // real.
             Some(target_url) if opens_new_tab => self.open_new_tab(id.clone(), Some(target_url)).await,
             Some(target_url) => self.navigate(id.clone(), target_url, true).await,
-            None => self.state_response(id.clone()),
+            None => match submit_form_target {
+                Some(form) => self.submit_form(id.clone(), form, submit_control_target).await,
+                None => self.state_response(id.clone()),
+            },
         };
         for url in window_opens {
             response = self.open_new_tab(id.clone(), Some(url)).await;
@@ -960,7 +1115,7 @@ impl EngineServer {
         response
     }
 
-    fn type_text(
+    async fn type_text(
         &mut self,
         id: Option<String>,
         x: f32,
@@ -970,38 +1125,63 @@ impl EngineServer {
     ) -> EngineResponse {
         let scroll_offset_y = self.active_tab().scroll_offset_y;
         let (width, height) = (self.width, self.height);
-        let Some(page) = &mut self.active_tab_mut().current_page else {
-            return Self::error(id, "no hay ninguna página cargada".to_string());
-        };
-        let Some(node) = page
-            .page
-            .layout_root
-            .hit_test(x, y + scroll_offset_y)
-        else {
-            return Self::error(id, "no hay ningún control bajo esas coordenadas".to_string());
-        };
-        if !is_text_control(&node) {
-            return Self::error(
-                id,
-                "el elemento bajo esas coordenadas no es un control de texto".to_string(),
-            );
-        }
-
-        page.focused_node = Some(node.clone());
-        append_control_value(&node, &text);
-        for event_type in ["focus", "input"] {
-            if let Err(error) = page.runtime.dispatch_event(&node, event_type) {
-                return Self::error(id, format!("{event_type}_error: {error}"));
+        // Envio de formulario (Fase 10): Enter en un input de texto de una
+        // sola linea dentro de un <form> lo envia, igual que un navegador
+        // real - pero `submit_form` (mas abajo) necesita `&mut self`
+        // completo para poder navegar, y `page` (prestado de `self` aqui
+        // debajo) todavia esta vivo en ese punto. Mismo patron que
+        // `link_target` en `click`: el nodo implicado sale del bloque como
+        // valor propio, la navegacion real ocurre DESPUES de que el
+        // prestamo de `page` termine.
+        let mut submit_form_target: Option<std::sync::Arc<std::sync::RwLock<Node>>> = None;
+        {
+            let Some(page) = &mut self.active_tab_mut().current_page else {
+                return Self::error(id, "no hay ninguna página cargada".to_string());
+            };
+            let Some(node) = page
+                .page
+                .layout_root
+                .hit_test(x, y + scroll_offset_y)
+            else {
+                return Self::error(id, "no hay ningún control bajo esas coordenadas".to_string());
+            };
+            if !is_text_control(&node) {
+                return Self::error(
+                    id,
+                    "el elemento bajo esas coordenadas no es un control de texto".to_string(),
+                );
             }
-        }
-        if press_enter {
-            for event_type in ["keydown", "keyup"] {
-                if let Err(error) = page.runtime.dispatch_keyboard_event(&node, event_type, "Enter") {
+
+            page.focused_node = Some(node.clone());
+            append_control_value(&node, &text);
+            for event_type in ["focus", "input"] {
+                if let Err(error) = page.runtime.dispatch_event(&node, event_type) {
                     return Self::error(id, format!("{event_type}_error: {error}"));
                 }
             }
+            if press_enter {
+                let mut enter_prevented = false;
+                for event_type in ["keydown", "keyup"] {
+                    match page.runtime.dispatch_keyboard_event(&node, event_type, "Enter") {
+                        Ok(prevented) if event_type == "keydown" => enter_prevented = prevented,
+                        Ok(_) => {}
+                        Err(error) => return Self::error(id, format!("{event_type}_error: {error}")),
+                    }
+                }
+                // `<textarea>` tambien es un control de texto
+                // (`is_text_control`), pero Enter ahi inserta una linea
+                // nueva en vez de enviar - un navegador real nunca envia
+                // un formulario por Enter dentro de un textarea.
+                if !enter_prevented && !is_textarea(&node) {
+                    submit_form_target = find_form_ancestor(&node);
+                }
+            }
+            page.relayout(width as f32, height as f32);
         }
-        page.relayout(width as f32, height as f32);
+
+        if let Some(form) = submit_form_target {
+            return self.submit_form(id, form, None).await;
+        }
         self.state_response(id)
     }
 
@@ -1017,31 +1197,118 @@ impl EngineServer {
     /// cuenta - escribir texto de verdad sigue siendo trabajo de
     /// `type_text` (la fuente real de "el usuario tecleo estos
     /// caracteres"), `press_key` es para teclas de control sueltas.
-    fn press_key(&mut self, id: Option<String>, key: String) -> EngineResponse {
+    async fn press_key(&mut self, id: Option<String>, key: String) -> EngineResponse {
         let (width, height) = (self.width, self.height);
-        let Some(page) = &mut self.active_tab_mut().current_page else {
-            return Self::error(id, "no hay ninguna página cargada".to_string());
-        };
-        let Some(node) = &page.focused_node else {
-            return Self::error(id, format!("no hay un control enfocado para la tecla {key}"));
-        };
-        let node = node.clone();
-        let mutates_value = matches!(key.as_str(), "Backspace" | "Delete") && is_text_control(&node);
-        if mutates_value {
-            backspace_control_value(&node);
-        }
-        for event_type in ["keydown", "keyup"] {
-            if let Err(error) = page.runtime.dispatch_keyboard_event(&node, event_type, &key) {
-                return Self::error(id, format!("{event_type}_error: {error}"));
+        // Mismo patron que `type_text`: el envio de formulario (si Enter lo
+        // dispara) necesita `&mut self` completo, asi que el `<form>`
+        // implicado sale del prestamo de `page` como valor propio.
+        let mut submit_form_target: Option<std::sync::Arc<std::sync::RwLock<Node>>> = None;
+        {
+            let Some(page) = &mut self.active_tab_mut().current_page else {
+                return Self::error(id, "no hay ninguna página cargada".to_string());
+            };
+            let Some(node) = &page.focused_node else {
+                return Self::error(id, format!("no hay un control enfocado para la tecla {key}"));
+            };
+            let node = node.clone();
+            let mutates_value = matches!(key.as_str(), "Backspace" | "Delete") && is_text_control(&node);
+            if mutates_value {
+                backspace_control_value(&node);
+            }
+            let mut enter_prevented = false;
+            for event_type in ["keydown", "keyup"] {
+                match page.runtime.dispatch_keyboard_event(&node, event_type, &key) {
+                    Ok(prevented) if event_type == "keydown" => enter_prevented = prevented,
+                    Ok(_) => {}
+                    Err(error) => return Self::error(id, format!("{event_type}_error: {error}")),
+                }
+            }
+            if mutates_value {
+                if let Err(error) = page.runtime.dispatch_event(&node, "input") {
+                    return Self::error(id, format!("input_error: {error}"));
+                }
+                page.relayout(width as f32, height as f32);
+            }
+            // Enter en un input de texto de una sola linea enfocado
+            // (nunca un `<textarea>`, ver el mismo criterio en
+            // `type_text`) dispara el envio del `<form>` ancestro - este
+            // es el camino que toma un Enter mandado SIN texto nuevo en
+            // el mismo golpe (`press_key` suelto, a diferencia de
+            // `type_text` con `press_enter: true`).
+            if key == "Enter" && !enter_prevented && is_text_control(&node) && !is_textarea(&node) {
+                submit_form_target = find_form_ancestor(&node);
             }
         }
-        if mutates_value {
-            if let Err(error) = page.runtime.dispatch_event(&node, "input") {
-                return Self::error(id, format!("input_error: {error}"));
-            }
-            page.relayout(width as f32, height as f32);
+
+        if let Some(form) = submit_form_target {
+            return self.submit_form(id, form, None).await;
         }
         self.state_response(id)
+    }
+
+    /// Envia el `<form>` ancestro de quien disparo el envio: Enter en un
+    /// input de texto (`submit_control: None`, ver `type_text`/
+    /// `press_key`) o clic en un boton submit (`submit_control: Some`, ver
+    /// `click`/`find_submit_control`). Solo `method="get"` (el valor por
+    /// defecto real cuando el atributo falta) esta implementado: la query
+    /// string se construye con `url::Url::query_pairs_mut` (el mismo
+    /// crate `url` que ya resuelve el resto de URLs del motor - doctrina
+    /// de dependencias en ARCHITECTURE.md, nunca a mano) y navega como
+    /// cualquier otro enlace.
+    ///
+    /// `method="post"` (o cualquier otro valor) devuelve un error
+    /// explicito en vez de fingir un envio que este motor no hace de
+    /// verdad: no hay forma de mandar un cuerpo en una peticion desde
+    /// aqui todavia, y tratar un POST como si fuera GET filtraria datos
+    /// de formulario (credenciales incluidas) por la URL - un fallo de
+    /// seguridad real, no solo una imprecision.
+    async fn submit_form(
+        &mut self,
+        id: Option<String>,
+        form: std::sync::Arc<std::sync::RwLock<Node>>,
+        submit_control: Option<std::sync::Arc<std::sync::RwLock<Node>>>,
+    ) -> EngineResponse {
+        let (action_attr, method) = {
+            let guard = form.read().unwrap();
+            let NodeType::Element { attributes, .. } = &guard.node_type else {
+                return Self::error(id, "el envio de formulario no encontro un <form> real".to_string());
+            };
+            (
+                attributes.get("action").cloned(),
+                attributes
+                    .get("method")
+                    .map(|m| m.trim().to_ascii_lowercase())
+                    .unwrap_or_else(|| "get".to_string()),
+            )
+        };
+
+        // Cualquier metodo que no sea `post` se trata como GET, igual que
+        // el spec real: `method` solo reconoce `get`, `post` y `dialog`, y
+        // un valor invalido cae al valor por defecto (GET) en vez de
+        // rechazar el envio.
+        let is_post = method == "post";
+
+        let Some(page_url_str) = self.active_tab().current_page.as_ref().map(|p| p.url.clone()) else {
+            return Self::error(id, "no hay ninguna página cargada".to_string());
+        };
+        let data = collect_form_data(&form, submit_control.as_ref());
+
+        if is_post {
+            // El `action` de un POST se resuelve igual que el de un GET
+            // pero SIN tocar su query string: los datos van en el cuerpo,
+            // asi que un `action="/buscar?pagina=2"` conserva ese `pagina=2`
+            // (a diferencia del GET, donde la query se reemplaza entera).
+            let target_url = match resolve_submit_action(&page_url_str, action_attr.as_deref()) {
+                Ok(url) => url,
+                Err(message) => return Self::error(id, message),
+            };
+            return self.navigate_post(id, target_url.to_string(), encode_form_body(&data)).await;
+        }
+
+        match build_get_submit_url(&page_url_str, action_attr.as_deref(), &data) {
+            Ok(target_url) => self.navigate(id, target_url.to_string(), true).await,
+            Err(message) => Self::error(id, message),
+        }
     }
 
     fn state_response(&self, id: Option<String>) -> EngineResponse {
@@ -1087,7 +1354,7 @@ impl EngineServer {
             tab_id: tab.id,
             scroll_offset_y: tab.scroll_offset_y,
             url: page.url.clone(),
-            title: page.title.clone(),
+            title: page.current_title(),
             screenshot,
             elements: collect_interactive_elements(&page.page.layout_root),
             can_go_back,
@@ -1098,6 +1365,53 @@ impl EngineServer {
     fn error(id: Option<String>, message: String) -> EngineResponse {
         EngineResponse::Error { id, message }
     }
+}
+
+/// La politica declarada con `<meta http-equiv="Content-Security-Policy"
+/// content="...">` (Fase 21). Muchas paginas la ponen asi en vez de por
+/// cabecera, sobre todo las servidas desde un sitio estatico donde no se
+/// controlan las cabeceras HTTP.
+fn find_meta_csp(dom_root: &std::sync::Arc<std::sync::RwLock<Node>>) -> Option<String> {
+    Node::find_all_by_tag(dom_root, "meta").into_iter().find_map(|meta| {
+        let guard = meta.read().unwrap();
+        let NodeType::Element { attributes, .. } = &guard.node_type else { return None };
+        let is_csp = attributes
+            .get("http-equiv")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("content-security-policy"));
+        if is_csp { attributes.get("content").cloned() } else { None }
+    })
+}
+
+/// Quita de la lista los subrecursos que la politica no permite, ANTES de
+/// descargarlos (Fase 21) - pedirle algo a un origen no autorizado ya
+/// filtraria que la pagina lo visito, aunque luego se descartara.
+///
+/// Un `src`/`href` que no resuelve contra la URL de la pagina se deja
+/// pasar: no es CSP quien debe decidir sobre una URL invalida, y quien la
+/// descargue ya fallara por su cuenta con un aviso.
+fn filter_by_csp(
+    sources: Vec<String>,
+    directive: &str,
+    csp: &engine_net::ContentSecurityPolicy,
+    page_url: &url::Url,
+    page_origin: &str,
+) -> Vec<String> {
+    if csp.is_empty() {
+        return sources;
+    }
+    sources
+        .into_iter()
+        .filter(|src| match page_url.join(src) {
+            Ok(resolved) => {
+                let allowed = csp.allows_url(directive, &resolved, page_origin);
+                if !allowed {
+                    tracing::warn!("[csp] bloqueado por '{directive}': {resolved}");
+                }
+                allowed
+            }
+            Err(_) => true,
+        })
+        .collect()
 }
 
 fn clamp_scroll_offset(offset: f32, content_extent: f32, viewport_height: f32) -> f32 {
@@ -1359,6 +1673,198 @@ fn find_link_target(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> Option<Li
         current = parent;
     }
     None
+}
+
+/// El `<form>` ancestro mas cercano de `node` (el propio `node` incluido) -
+/// mismo patron de recorrido que `find_link_target`, pero buscando `<form>`
+/// en vez de `<a>`. Necesario tanto para Enter en un input de texto
+/// (`EngineServer::press_key`/`type_text`) como para un clic en un boton
+/// submit (`EngineServer::click`/`find_submit_control`) - ninguno de los
+/// dos sabe de antemano si esta dentro de un formulario ni cual, solo el
+/// propio DOM lo sabe.
+fn find_form_ancestor(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> Option<std::sync::Arc<std::sync::RwLock<Node>>> {
+    let mut current = Some(node.clone());
+    while let Some(n) = current {
+        let is_form = {
+            let guard = n.read().unwrap();
+            matches!(&guard.node_type, NodeType::Element { tag_name, .. } if tag_name == "form")
+        };
+        if is_form {
+            return Some(n);
+        }
+        let parent = n.read().unwrap().parent.as_ref().and_then(std::sync::Weak::upgrade);
+        current = parent;
+    }
+    None
+}
+
+/// El boton submit real mas cercano en los ANCESTROS de `node` (el clic
+/// puede aterrizar en un `<span>`/texto anidado dentro del boton, igual
+/// que `find_link_target` con un `<b>` dentro de un `<a>`) - `<button>`
+/// SIN `type` es submit por defecto en el spec real (solo `type="button"`/
+/// `"reset"` lo desactivan), e `<input type="submit"|"image">` tambien
+/// dispara un envio.
+fn find_submit_control(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> Option<std::sync::Arc<std::sync::RwLock<Node>>> {
+    let mut current = Some(node.clone());
+    while let Some(n) = current {
+        let is_submit = {
+            let guard = n.read().unwrap();
+            match &guard.node_type {
+                NodeType::Element { tag_name, attributes } if tag_name == "button" => !matches!(
+                    attributes.get("type").map(|t| t.trim().to_ascii_lowercase()).as_deref(),
+                    Some("button" | "reset")
+                ),
+                NodeType::Element { tag_name, attributes } if tag_name == "input" => matches!(
+                    attributes.get("type").map(|t| t.trim().to_ascii_lowercase()).as_deref(),
+                    Some("submit" | "image")
+                ),
+                _ => false,
+            }
+        };
+        if is_submit {
+            return Some(n);
+        }
+        let parent = n.read().unwrap().parent.as_ref().and_then(std::sync::Weak::upgrade);
+        current = parent;
+    }
+    None
+}
+
+fn is_textarea(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> bool {
+    matches!(&node.read().unwrap().node_type, NodeType::Element { tag_name, .. } if tag_name == "textarea")
+}
+
+/// Los pares nombre=valor de TODOS los controles con `name` dentro de
+/// `form` (recorrido de TODO su subarbol, no solo hijos directos - un
+/// `<input>` casi siempre esta envuelto en `<label>`/`<div>` intermedios),
+/// en el mismo orden de documento que un envio real. `submit_control` es
+/// el boton que disparo el envio (`None` si fue por Enter en un input de
+/// texto, ver `EngineServer::submit_form`) - solo SU par entra si tiene
+/// `name`, igual que el spec real: un envio por Enter no incluye ningun
+/// boton, y de los varios botones submit que puede tener un formulario
+/// solo el clicado cuenta.
+///
+/// Simplificaciones declaradas: sin asociacion `form="id"` (solo cuenta
+/// ser DESCENDIENTE del `<form>`, no el atributo que asocia un control de
+/// fuera); `<input type="file">` se omite (no hay datos de fichero que
+/// enviar); un `<select>` sin ningun `<option selected>` usa el PRIMER
+/// `<option>` (asi es el valor por defecto real); deshabilitados
+/// (`disabled` presente) se omiten por completo, igual que el spec real.
+fn collect_form_data(
+    form: &std::sync::Arc<std::sync::RwLock<Node>>,
+    submit_control: Option<&std::sync::Arc<std::sync::RwLock<Node>>>,
+) -> Vec<(String, String)> {
+    let mut data = Vec::new();
+    for tag in ["input", "select", "textarea"] {
+        for control in Node::find_all_by_tag(form, tag) {
+            let (tag_name, attributes) = {
+                let guard = control.read().unwrap();
+                let NodeType::Element { tag_name, attributes } = &guard.node_type else {
+                    continue;
+                };
+                (tag_name.clone(), attributes.clone())
+            };
+            if attributes.contains_key("disabled") {
+                continue;
+            }
+            let Some(name) = attributes.get("name").map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) else {
+                continue;
+            };
+
+            match tag_name.as_str() {
+                "input" => {
+                    let input_type = attributes.get("type").map(|t| t.trim().to_ascii_lowercase());
+                    match input_type.as_deref() {
+                        Some("checkbox" | "radio") => {
+                            if attributes.contains_key("checked") {
+                                data.push((name, attributes.get("value").cloned().unwrap_or_else(|| "on".to_string())));
+                            }
+                        }
+                        Some("submit" | "button" | "reset" | "image") => {
+                            if submit_control.is_some_and(|s| std::sync::Arc::ptr_eq(s, &control)) {
+                                data.push((name, attributes.get("value").cloned().unwrap_or_default()));
+                            }
+                        }
+                        Some("file") => {}
+                        _ => data.push((name, attributes.get("value").cloned().unwrap_or_default())),
+                    }
+                }
+                "textarea" => {
+                    let value = attributes.get("value").cloned().unwrap_or_else(|| Node::text_content(&control));
+                    data.push((name, value));
+                }
+                "select" => {
+                    let options = Node::find_all_by_tag(&control, "option");
+                    let selected = options
+                        .iter()
+                        .find(|opt| {
+                            let g = opt.read().unwrap();
+                            matches!(&g.node_type, NodeType::Element { attributes, .. } if attributes.contains_key("selected"))
+                        })
+                        .or_else(|| options.first());
+                    if let Some(opt) = selected {
+                        let value_attr = {
+                            let g = opt.read().unwrap();
+                            match &g.node_type {
+                                NodeType::Element { attributes, .. } => attributes.get("value").cloned(),
+                                _ => None,
+                            }
+                        };
+                        let value = value_attr.unwrap_or_else(|| Node::text_content(opt));
+                        data.push((name, value));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    data
+}
+
+/// Construye la URL final de un envio GET - resuelve `action` (o la propia
+/// pagina si esta vacio/ausente, ya que el atributo se puede omitir)
+/// contra la URL de la pagina actual, y REEMPLAZA su query string con los
+/// datos del formulario (nunca la anexa - asi es el spec real). Separada
+/// de `EngineServer::submit_form` (que SI navega de verdad) a proposito:
+/// es logica pura sobre strings/URLs, sin tocar `self` ni la red, y por
+/// tanto se puede probar sin levantar ninguna pagina.
+fn build_get_submit_url(page_url_str: &str, action_attr: Option<&str>, data: &[(String, String)]) -> Result<url::Url, String> {
+    let mut target_url = resolve_submit_action(page_url_str, action_attr)?;
+    target_url
+        .query_pairs_mut()
+        .clear()
+        .extend_pairs(data.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    Ok(target_url)
+}
+
+/// Resuelve el `action` de un formulario contra la URL de la pagina SIN
+/// tocar su query string - la mitad compartida entre el envio GET (que
+/// luego la reemplaza, ver `build_get_submit_url`) y el POST (que la deja
+/// como este, porque sus datos van en el cuerpo: un
+/// `action="/buscar?pagina=2"` conserva ese `pagina=2`).
+///
+/// `action` ausente o vacio envia al documento actual, ya que el atributo
+/// se puede omitir.
+fn resolve_submit_action(page_url_str: &str, action_attr: Option<&str>) -> Result<url::Url, String> {
+    let page_url = url::Url::parse(page_url_str).map_err(|_| "la URL de la página actual no es válida".to_string())?;
+    let action = action_attr.filter(|a| !a.trim().is_empty()).unwrap_or(page_url_str);
+    page_url.join(action).map_err(|_| format!("action de formulario inválida: {action}"))
+}
+
+/// Codifica los pares del formulario como
+/// `application/x-www-form-urlencoded`, el tipo por defecto real de un
+/// `<form method="post">` sin `enctype`.
+///
+/// Se construye con `url::form_urlencoded` (el mismo crate `url` que ya
+/// resuelve el resto de URLs del motor) y NO a mano: el escapado
+/// percent-encoding tiene reglas propias en este contexto - el espacio se
+/// codifica como `+`, no como `%20` - y equivocarse ahi corrompe
+/// silenciosamente cualquier dato con espacios o acentos.
+fn encode_form_body(data: &[(String, String)]) -> Vec<u8> {
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(data.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .finish()
+        .into_bytes()
 }
 
 pub async fn run_stdio() -> io::Result<()> {
@@ -1736,6 +2242,205 @@ mod tests {
         assert!(!blank("notarget"));
     }
 
+    #[test]
+    fn find_form_ancestor_climbs_from_a_descendant_input_to_the_form() {
+        let dom = r#"<html><body><form id="f"><div><input id="q" name="q"></div></form></body></html>"#;
+        let form = find_form_ancestor(&find(dom, "q")).expect("deberia encontrar el form ancestro");
+        let guard = form.read().unwrap();
+        assert!(matches!(&guard.node_type, NodeType::Element { tag_name, .. } if tag_name == "form"));
+    }
+
+    #[test]
+    fn find_form_ancestor_is_none_outside_any_form() {
+        let dom = r#"<html><body><input id="suelto" name="q"></body></html>"#;
+        assert!(find_form_ancestor(&find(dom, "suelto")).is_none());
+    }
+
+    #[test]
+    fn find_submit_control_recognizes_a_button_without_an_explicit_type_as_submit() {
+        let dom = r#"<html><body><form><button id="btn">Enviar</button></form></body></html>"#;
+        assert!(find_submit_control(&find(dom, "btn")).is_some(), "un <button> sin type es submit por defecto, igual que el spec real");
+    }
+
+    #[test]
+    fn find_submit_control_excludes_button_and_reset_types() {
+        let dom = r#"<html><body>
+            <form>
+                <button id="normal" type="button">no envia</button>
+                <button id="reset" type="reset">resetear</button>
+            </form>
+        </body></html>"#;
+        assert!(find_submit_control(&find(dom, "normal")).is_none());
+        assert!(find_submit_control(&find(dom, "reset")).is_none());
+    }
+
+    #[test]
+    fn find_submit_control_climbs_from_nested_content_up_to_the_button() {
+        let dom = r#"<html><body><form><button id="btn"><span id="etiqueta">Enviar</span></button></form></body></html>"#;
+        // Mismo arbol para los dos nodos (`root_of` + `find_by_id`, no dos
+        // llamadas a `find()`) - `find()` reparsea desde cero cada vez, asi
+        // que comparar `Arc::ptr_eq` entre dos llamadas distintas siempre
+        // daria falso aunque el contenido sea identico, ver `root_of`.
+        let root = root_of(dom);
+        let etiqueta = Node::find_by_id(&root, "etiqueta").expect("deberia existir");
+        let btn = Node::find_by_id(&root, "btn").expect("deberia existir");
+        let found = find_submit_control(&etiqueta).expect("deberia subir hasta el boton");
+        assert!(std::sync::Arc::ptr_eq(&found, &btn));
+    }
+
+    #[test]
+    fn find_submit_control_recognizes_input_type_submit_and_image() {
+        let dom = r#"<html><body><form>
+            <input id="s" type="submit" value="Enviar">
+            <input id="i" type="image" src="go.png">
+            <input id="txt" type="text">
+        </form></body></html>"#;
+        assert!(find_submit_control(&find(dom, "s")).is_some());
+        assert!(find_submit_control(&find(dom, "i")).is_some());
+        assert!(find_submit_control(&find(dom, "txt")).is_none(), "un input de texto normal no es un boton submit");
+    }
+
+    /// El punto real del envio de formularios: recoge nombre=valor de
+    /// texto/checkbox marcado/select/textarea, EXCLUYE al checkbox sin
+    /// marcar, al input sin `name`, y al boton submit cuando nadie lo
+    /// clico (`submit_control: None`, el caso de Enter en un input).
+    #[test]
+    fn collect_form_data_gathers_named_controls_and_skips_the_rest() {
+        let dom = r#"<html><body><form id="f">
+            <input name="q" value="rust">
+            <input name="sin_valor">
+            <input type="hidden" name="csrf" value="abc123">
+            <input type="checkbox" name="marcado" checked value="si">
+            <input type="checkbox" name="sin_marcar">
+            <input type="radio" name="opcion" value="a" checked>
+            <input type="radio" name="opcion" value="b">
+            <input name="deshabilitado" value="oculto" disabled>
+            <input type="file" name="archivo">
+            <input type="submit" name="boton" value="Enviar">
+            <textarea name="comentario">hola mundo</textarea>
+            <select name="pais"><option value="es">España</option><option value="fr" selected>Francia</option></select>
+        </form></body></html>"#;
+        let form = find_form_ancestor(&find(dom, "f")).expect("el propio <form> deberia ser su propio ancestro");
+        let data = collect_form_data(&form, None);
+
+        let get = |key: &str| data.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+        assert_eq!(get("q"), Some("rust"));
+        assert_eq!(get("sin_valor"), Some(""), "sin value explicito, un input de texto envia cadena vacia, no se omite");
+        assert_eq!(get("csrf"), Some("abc123"), "hidden se envia igual que cualquier otro campo de texto");
+        assert_eq!(get("marcado"), Some("si"));
+        assert_eq!(get("sin_marcar"), None, "un checkbox sin marcar no envia nada, ni vacio");
+        assert_eq!(get("opcion"), Some("a"), "solo el radio marcado del grupo entra");
+        assert_eq!(get("deshabilitado"), None, "disabled se omite por completo");
+        assert_eq!(get("archivo"), None, "sin datos de fichero que enviar, se omite");
+        assert_eq!(get("boton"), None, "sin submit_control (envio por Enter), ningun boton entra");
+        assert_eq!(get("comentario"), Some("hola mundo"), "un textarea sin edicion usa su contenido de texto inicial");
+        assert_eq!(get("pais"), Some("fr"), "el <option selected> gana sobre el primero");
+    }
+
+    #[test]
+    fn collect_form_data_includes_only_the_clicked_submit_buttons_pair() {
+        let dom = r#"<html><body><form id="f">
+            <input type="submit" id="s1" name="accion" value="guardar">
+            <input type="submit" id="s2" name="accion" value="borrar">
+        </form></body></html>"#;
+        // Mismo arbol para `form` y `clicked` - ver el mismo comentario en
+        // `find_submit_control_climbs_from_nested_content_up_to_the_button`.
+        let root = root_of(dom);
+        let form = Node::find_by_id(&root, "f").expect("deberia existir");
+        let clicked = Node::find_by_id(&root, "s1").expect("deberia existir");
+        let data = collect_form_data(&form, Some(&clicked));
+        let accion_values: Vec<&str> = data.iter().filter(|(k, _)| k == "accion").map(|(_, v)| v.as_str()).collect();
+        assert_eq!(accion_values, vec!["guardar"], "solo el boton clicado (s1) deberia aportar su par, no s2 ni ambos");
+    }
+
+    #[test]
+    fn collect_form_data_a_select_without_any_selected_option_defaults_to_the_first() {
+        let dom = r#"<html><body><form id="f"><select name="talla"><option>S</option><option>M</option></select></form></body></html>"#;
+        let form = find_form_ancestor(&find(dom, "f")).unwrap();
+        let data = collect_form_data(&form, None);
+        assert_eq!(data.iter().find(|(k, _)| k == "talla").map(|(_, v)| v.as_str()), Some("S"), "sin ningun option con selected, el primero es el valor por defecto real");
+    }
+
+    /// El punto real de `build_get_submit_url`: reemplaza la query de
+    /// `action` (si tenia una) con los datos del formulario, en vez de
+    /// anexarla - asi es el spec real de un envio GET.
+    #[test]
+    fn build_get_submit_url_replaces_any_existing_query_on_the_action() {
+        let data = vec![("q".to_string(), "rust lang".to_string())];
+        let url = build_get_submit_url("http://ejemplo.test/pagina", Some("/buscar?viejo=1"), &data).expect("deberia construir la URL");
+        assert_eq!(url.as_str(), "http://ejemplo.test/buscar?q=rust+lang", "el query viejo de action deberia desaparecer, sustituido por los datos del formulario");
+    }
+
+    #[test]
+    fn build_get_submit_url_without_an_action_submits_to_the_current_page() {
+        let data = vec![("q".to_string(), "x".to_string())];
+        let url = build_get_submit_url("http://ejemplo.test/pagina", None, &data).expect("deberia construir la URL");
+        assert_eq!(url.as_str(), "http://ejemplo.test/pagina?q=x", "action ausente deberia enviar al documento actual, no fallar");
+    }
+
+    #[test]
+    fn build_get_submit_url_resolves_a_relative_action_against_the_page_url() {
+        let data: Vec<(String, String)> = vec![];
+        let url = build_get_submit_url("http://ejemplo.test/carpeta/pagina.html", Some("buscar"), &data).expect("deberia construir la URL");
+        assert_eq!(url.as_str(), "http://ejemplo.test/carpeta/buscar?", "una action relativa deberia resolverse contra el directorio de la pagina actual");
+    }
+
+    /// `application/x-www-form-urlencoded` tiene una regla propia que es
+    /// facil de equivocar escribiendola a mano: el espacio se codifica
+    /// como `+`, no como `%20`. Por eso se usa `url::form_urlencoded` y
+    /// no un escapado casero.
+    #[test]
+    fn encode_form_body_uses_form_urlencoded_rules_not_plain_percent_encoding() {
+        let data = vec![("q".to_string(), "rust lang".to_string()), ("año".to_string(), "2026".to_string())];
+        let body = String::from_utf8(encode_form_body(&data)).expect("deberia ser UTF-8 valido");
+        assert!(body.contains("q=rust+lang"), "el espacio deberia ser '+', no '%20': {body}");
+        assert!(body.contains("a%C3%B1o=2026"), "los no-ASCII deberian ir percent-encoded en UTF-8: {body}");
+        assert!(body.contains('&'), "los pares se separan con '&': {body}");
+    }
+
+    #[test]
+    fn encode_form_body_of_no_fields_is_empty() {
+        assert!(encode_form_body(&[]).is_empty());
+    }
+
+    /// A diferencia del GET (que REEMPLAZA la query con los datos), un
+    /// POST deja intacta la que traiga el `action` - sus datos van en el
+    /// cuerpo, asi que un `action="/buscar?pagina=2"` conserva ese
+    /// parametro.
+    #[test]
+    fn resolve_submit_action_keeps_an_existing_query_unlike_the_get_path() {
+        let url = resolve_submit_action("http://ejemplo.test/pagina", Some("/buscar?pagina=2")).expect("deberia resolver");
+        assert_eq!(url.as_str(), "http://ejemplo.test/buscar?pagina=2");
+
+        let get_url = build_get_submit_url("http://ejemplo.test/pagina", Some("/buscar?pagina=2"), &[("q".to_string(), "x".to_string())]).unwrap();
+        assert_eq!(get_url.as_str(), "http://ejemplo.test/buscar?q=x", "el GET si deberia reemplazarla");
+    }
+
+    #[test]
+    fn resolve_submit_action_without_an_action_targets_the_current_page() {
+        let url = resolve_submit_action("http://ejemplo.test/pagina?ya=1", None).expect("deberia resolver");
+        assert_eq!(url.as_str(), "http://ejemplo.test/pagina?ya=1");
+    }
+
+    /// Cualquier `method` que no sea `post` cae a GET, igual que el spec
+    /// real (que solo reconoce `get`/`post`/`dialog` y trata lo invalido
+    /// como el valor por defecto) - en vez de rechazar el envio, que era
+    /// el comportamiento anterior para TODO lo que no fuera GET.
+    #[tokio::test]
+    async fn an_unrecognised_method_falls_back_to_get_instead_of_refusing_to_submit() {
+        let mut server = server_with_page("http://ejemplo.test/pagina");
+        let dom = r#"<html><body><form id="f" method="basura" action="/destino"><input name="a" value="1"></form></body></html>"#;
+        let form = find_form_ancestor(&find(dom, "f")).unwrap();
+        // Sin red real la navegacion fallara, pero el error debe ser de RED
+        // (llego a intentarlo) y no el de "metodo no implementado" de antes.
+        let response = server.submit_form(Some("sf1".to_string()), form, None).await;
+        let json = serde_json::to_string(&response).expect("response should serialize");
+        assert!(
+            !json.contains("no está implementado"),
+            "un method desconocido deberia degradar a GET y ENVIARSE, no rechazarse: {json}"
+        );
+    }
+
     /// Fase 6.3: la diferencia real entre checkbox y radio. Un checkbox se
     /// conmuta; un radio se MARCA (nunca se desmarca clicandolo) y ademas
     /// desmarca a su grupo.
@@ -1819,6 +2524,7 @@ mod tests {
             None,
             &HashMap::new(),
             &ImageMap::new(),
+            None,
             None,
         );
         LoadedPage {

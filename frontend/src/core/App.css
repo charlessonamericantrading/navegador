@@ -424,3 +424,72 @@ input:focus {
   box-shadow: 0 8px 30px rgba(15, 23, 42, 0.15);
   font-size: 0.85rem;
 }
+
+/* ---------------------------------------------------------------
+   Barra de pestañas e historial (el motor ya los soportaba; la
+   interfaz no los exponia hasta ahora).
+   --------------------------------------------------------------- */
+.tab-bar {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 6px 8px 0;
+  background: var(--surface, #eef1f6);
+  overflow-x: auto;
+  /* Las pestañas nunca deben empujar el viewport fuera de la ventana:
+     la barra scrollea por dentro en vez de crecer sin fin. */
+  flex: 0 0 auto;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 220px;
+  padding: 7px 10px;
+  border-radius: 8px 8px 0 0;
+  background: rgba(0, 0, 0, 0.05);
+  cursor: pointer;
+  font-size: 0.82rem;
+  user-select: none;
+}
+
+.tab:hover { background: rgba(0, 0, 0, 0.09); }
+
+.tab-active {
+  background: var(--bg, #fff);
+  font-weight: 600;
+}
+
+.tab-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-close,
+.tab-new {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-dim, #667);
+  font-size: 0.8rem;
+  line-height: 1;
+  padding: 3px 5px;
+  border-radius: 4px;
+  flex: 0 0 auto;
+}
+
+.tab-close:hover,
+.tab-new:hover { background: rgba(0, 0, 0, 0.12); }
+
+.tab-new { font-size: 1rem; align-self: center; }
+
+/* Un boton de navegacion deshabilitado debe PARECER deshabilitado: sin
+   esto, "atras" al principio del historial se veia igual que activo y
+   el usuario no entendia por que no pasaba nada al pulsarlo. */
+.icon-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}

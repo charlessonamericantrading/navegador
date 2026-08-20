@@ -51,7 +51,7 @@ use std::sync::Arc;
 /// completo al heap de Boa. `empty_trace!()` declara "nada que recorrer
 /// aqui", que es la verdad, no un atajo inseguro.
 #[derive(Clone)]
-struct NetworkCapture(Arc<NetworkEngine>);
+struct NetworkCapture(Arc<NetworkEngine>, Option<String>);
 
 impl Finalize for NetworkCapture {}
 unsafe impl Trace for NetworkCapture {
@@ -76,17 +76,28 @@ unsafe impl Trace for BodyCapture {
 /// (el mismo `NetworkEngine` que usa el resto del motor - reusa su cliente
 /// HTTP/pool de conexiones ya construido, no crea uno nuevo). Ver el
 /// doc-comment del modulo para las simplificaciones declaradas.
-pub fn register_fetch(context: &mut Context, network: Arc<NetworkEngine>) -> JsResult<()> {
-    let capture = NetworkCapture(network);
+pub fn register_fetch(context: &mut Context, network: Arc<NetworkEngine>, page_origin: Option<String>) -> JsResult<()> {
+    let capture = NetworkCapture(network, page_origin);
     let fetch_fn = NativeFunction::from_copy_closure_with_captures(
         |_this, args, capture, context| {
             let url = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
             let (promise, resolvers) = JsPromise::new_pending(context);
 
-            let request = match NetworkRequest::new(&url) {
-                Ok(request) => request,
-                Err(error) => {
-                    let js_error: JsError = JsNativeError::typ().with_message(format!("Failed to fetch '{url}': {error}")).into();
+            // Se resuelve contra la URL de la pagina (Fase 20.1), asi que
+            // `fetch('/api/datos')` funciona igual que en un navegador
+            // real. De paso sale el origen, que activa la politica de
+            // mismo origen (Fase 20): con el, una respuesta de otro
+            // dominio solo se puede leer si trae permiso CORS.
+            let resolved = engine_net::request::resolve_against_page(&url, capture.1.as_deref());
+            let request = match resolved.map(|(absolute, origin)| {
+                NetworkRequest::new(absolute.as_str()).map(|mut r| {
+                    r.origin = origin;
+                    r
+                })
+            }) {
+                Some(Ok(request)) => request,
+                _ => {
+                    let js_error: JsError = JsNativeError::typ().with_message(format!("Failed to fetch '{url}': URL invalida")).into();
                     let opaque = js_error.to_opaque(context);
                     resolvers.reject.call(&JsValue::undefined(), &[opaque], context)?;
                     return Ok(promise.into());
@@ -218,6 +229,7 @@ mod tests {
             status_code: status,
             status_text: "OK".to_string(),
             headers,
+            set_cookie: Vec::new(),
             body: Bytes::from(body.to_string()),
         }
     }
@@ -311,7 +323,7 @@ mod tests {
     #[test]
     fn fetch_is_registered_as_a_real_global_function() {
         let mut context = Context::default();
-        register_fetch(&mut context, Arc::new(NetworkEngine::new())).unwrap();
+        register_fetch(&mut context, Arc::new(NetworkEngine::new()), None).unwrap();
         let result = context.eval(Source::from_bytes("typeof fetch")).unwrap();
         assert_eq!(result.to_string(&mut context).unwrap().to_std_string_escaped(), "function");
     }
@@ -322,7 +334,7 @@ mod tests {
     #[test]
     fn fetch_with_an_invalid_url_rejects_without_touching_the_network() {
         let mut context = Context::default();
-        register_fetch(&mut context, Arc::new(NetworkEngine::new())).unwrap();
+        register_fetch(&mut context, Arc::new(NetworkEngine::new()), None).unwrap();
         let result = context.eval(Source::from_bytes("fetch('esto no es una url')")).unwrap();
         let promise = JsPromise::from_object(result.as_object().unwrap().clone()).unwrap();
         context.run_jobs();

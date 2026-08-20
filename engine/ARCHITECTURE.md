@@ -2027,6 +2027,59 @@ A fecha de esta limpieza, el motor:
   `getComputedStyle` puede pedirse sobre cualquier elemento suelto, no
   sobre el arbol entero como hace el recorrido top-down de `build_node`.
   Ninguno de esos dos pasos existe todavia - esta tarea es solo la base.
+- **`display: none` y `visibility: hidden` reales**: hasta ahora ninguna
+  de las dos tenia efecto - un elemento oculto generaba caja, ocupaba
+  espacio y se pintaba igual que uno visible, encontrado auditando el
+  motor en vivo (no leyendo el codigo: una pagina de control con 4 divs
+  ocultos de formas distintas los mostraba los 4). `display: none` se
+  corta en `layout::tree::build_node`, justo despues de resolver
+  `computed_style` y ANTES de recursar en los hijos: el elemento no entra
+  al arbol de layout en absoluto, ni el ni su subarbol entero (asi es el
+  spec real - `display` no esta en `INHERITABLE_PROPERTIES`, la
+  comprobacion es local a cada elemento, pero cortar antes de recursar ya
+  saca a todos los descendientes sin que ellos necesiten declarar nada).
+  `visibility: hidden` es distinto a proposito: SI genera caja (sigue
+  ocupando su espacio, un hueco en blanco donde estaria) y SI hereda a
+  sus descendientes (ya estaba en `INHERITABLE_PROPERTIES` desde la Fase
+  2.5, pero sin consumidor hasta ahora) - solo deja de pintarse. Se
+  resuelve en `engine-gfx::display_list::build_items`: si el
+  `computed_style` YA resuelto de la caja dice `hidden`, se salta la
+  emision de sus propios `DisplayItem` (fondo/borde/sombra/texto/imagen)
+  pero se sigue recortando (`overflow: hidden`) y recursando en los hijos
+  con normalidad - un hijo con `visibility: visible` declarado el mismo
+  reactiva su propio pintado sin ningun caso especial nuevo, porque la
+  cascada ya resuelve esa redeclaracion antes de que `display_list` la
+  lea (`entry().or_insert_with()` en `build_node`: lo propio del elemento
+  siempre gana sobre lo heredado).
+  Tests reales: `display:none` no genera caja para el elemento, saca a un
+  descendiente aunque el mismo no declare `display:none`, un hermano sin
+  la propiedad conserva su caja y su espacio; `visibility:hidden` no
+  emite ningun `DisplayItem` propio, un hijo con `visibility:visible`
+  explicito pinta pese al ancestro oculto.
+  Verificado en vivo con una pagina de control: antes del fix, 4 divs
+  ocultos de 4 formas distintas (`display:none` en hoja de estilo,
+  `display:none` inline, `visibility:hidden`) se pintaban los 4 igual que
+  el contenido visible; despues, los dos `display:none` desaparecen sin
+  dejar hueco y el `visibility:hidden` deja su hueco en blanco sin
+  pintarse - captura de pantalla revisada, comportamiento correcto.
+  Probado tambien contra un articulo real de Wikipedia por HTTPS: el
+  PNG resultante salio byte-identico al de antes del fix. Investigado, no
+  descartado como sospechoso: la hoja de estilo real de Wikipedia SI trae
+  reglas `display:none` con selectores simples de una sola clase
+  (`.error`, `.printonly`, `.mw-empty-elt`...) que este motor ya sabria
+  aplicar, pero el colapsado real de su barra lateral/tabla de contenidos
+  (lo que mas cambiaria visualmente) depende de un patron de "checkbox
+  hack" (`:checked` + combinadores de hermanos) y de media queries -
+  ninguno de los dos esta implementado en `engine-css::selector` todavia,
+  hueco preexistente y separado de esta tarea. El fix es correcto y esta
+  verificado; que una pagina real tan compleja como Wikipedia no cambie
+  visualmente todavia es honesto de declarar aqui, no un fallo silencioso.
+  NO implementado: `display: none` via JS en caliente sin pasar por
+  `resolve_style` de nuevo (cualquier cambio de `style`/`class` que
+  dispare `display:none` despues de la carga inicial depende de que algo
+  ya llame a relayout, mismo criterio que el resto de mutaciones de
+  estilo), y ningun otro valor de `visibility` (`collapse`, pensado para
+  filas de tabla, no reconocido).
   **Epilogo (Fase 8): ninguno de esos dos pasos hizo falta.** El diagnostico
   del bloqueo era correcto (cuando un script corre, el `StyleSheet` aun no
   existe) pero la salida propuesta era mas cara de lo necesario: en vez de
@@ -2038,6 +2091,821 @@ A fecha de esta limpieza, el motor:
   duplicar la resolucion de cascada en dos caminos que podrian
   divergir. Este traslado de `resolve_style` sigue siendo util - es lo que
   `layout::tree::build_node` llama - pero `engine-js` acabo sin usarlo.
+- **Envio de formularios real**: hasta ahora `press_enter` en `type_text`
+  solo disparaba `keydown`/`keyup` con `"Enter"` - ningun formulario se
+  enviaba nunca, encontrado auditando el motor en vivo (no era una
+  suposicion: buscar en cualquier sitio real, Google incluido, no hacia
+  literalmente nada). Dos caminos disparan un envio ahora, los dos reales
+  del spec:
+  1. **Enter en un input de texto de una sola linea** (`server::type_text`
+     con `press_enter: true`, y tambien `server::press_key` cuando el
+     Enter llega SUELTO, sin texto nuevo en el mismo golpe) - nunca en un
+     `<textarea>` (`is_textarea`), donde Enter inserta una linea nueva en
+     un navegador real, no envia nada.
+  2. **Clic en un boton submit** (`server::click`, rama `None` de
+     `find_link_target` - un boton submit y un `<a href>` nunca coinciden
+     en el mismo nodo en la practica, asi que se comprueban en el mismo
+     punto sin pisarse). `find_submit_control` sube por los ANCESTROS del
+     nodo clicado (mismo patron que `find_link_target` con un `<b>` dentro
+     de un `<a>`) buscando `<button>` SIN `type="button"|"reset"` (submit
+     por defecto, asi es el spec real) o `<input type="submit"|"image">`.
+  Ambos caminos respetan `preventDefault()` en el `keydown`/`click` real
+  (mismo criterio que la navegacion por `<a href>` de la Fase 4.2) antes
+  de disparar nada.
+  `find_form_ancestor` sube por los ANCESTROS hasta el `<form>` mas
+  cercano (mismo patron de nuevo). `collect_form_data` recoge nombre=valor
+  de TODO el subarbol del `<form>` (`Node::find_all_by_tag`, no solo hijos
+  directos - un input casi siempre esta envuelto en `<label>`/`<div>`
+  intermedios): texto/hidden con su `value` (cadena vacia si no tiene),
+  checkbox/radio marcado con su `value` o `"on"` por defecto (el valor
+  real cuando no se declara ninguno), `<select>` con el `<option selected>`
+  o el PRIMERO si ninguno lo esta (valor por defecto real), `<textarea>`
+  con su `value` si ya se edito o su contenido de texto inicial si no.
+  `disabled` se omite por completo. De los botones submit del formulario
+  SOLO el que disparo el envio aporta su par (`submit_control: None` para
+  el camino de Enter, que no incluye ningun boton - igual que el spec
+  real).
+  `build_get_submit_url` (funcion libre, sin tocar `self` ni la red a
+  proposito - asi se puede probar sin levantar ninguna pagina) resuelve
+  `action` (o el documento actual si esta vacio/ausente) contra la URL de
+  la pagina, y REEMPLAZA su query string entera con los datos del
+  formulario via `url::Url::query_pairs_mut().clear().extend_pairs(...)`
+  - el mismo crate `url` que ya resuelve el resto de URLs del motor
+  (doctrina de dependencias mas abajo: la codificacion percent-encoding
+  de `application/x-www-form-urlencoded` NUNCA se escribe a mano). El
+  resultado navega exactamente igual que un clic en un enlace
+  (`EngineServer::navigate`).
+  **Solo `method="get"` (el valor por defecto real sin el atributo) esta
+  implementado.** `method="post"` (o cualquier otro valor) devuelve un
+  error explicito en vez de fingir un envio que este motor no hace de
+  verdad: no hay forma de mandar un cuerpo en una peticion desde aqui
+  todavia, y tratar un POST como si fuera GET filtraria datos de
+  formulario (credenciales incluidas) por la URL - un fallo de seguridad
+  real, no solo una imprecision. Un formulario de login real (casi
+  siempre POST) reporta ese error en vez de navegar en silencio con la
+  contraseña en la barra de direcciones.
+  14 tests nuevos (deteccion de ancestro `<form>`/boton submit, recogida
+  de datos por tipo de control, construccion de la URL, el error
+  explicito de POST). Verificado en vivo contra un servidor HTTP local
+  con un formulario real (`<input name="q">`, un checkbox, un `<select>`,
+  un boton submit): escribir "rust lang" en el campo y pulsar Enter
+  navego a `/buscar?q=rust+lang&s=uno` y cargo la pagina de resultados;
+  marcar el checkbox y clicar "Enviar" (con las coordenadas exactas que
+  el propio motor reporto para cada control) navego a
+  `/buscar?q=&c=on&s=uno` - el checkbox marcado aporto `c=on`, el campo
+  vacio aporto `q=` (no se omitio), el select sin tocar aporto su primera
+  opcion. Los dos caminos de disparo probados por separado, ambos
+  correctos.
+  Simplificaciones declaradas: sin asociacion `form="id"` (un control
+  fuera del `<form>` pero asociado por ese atributo no se recoge - solo
+  cuenta ser descendiente); `<input type="file">` se omite (no hay datos
+  de fichero que enviar); sin `<button>`/`<input>` con `formaction`/
+  `formmethod` (siempre se usa el `action`/`method` del propio `<form>`,
+  nunca la sobreescritura por boton).
+- **Expansion del shorthand `background`**: hasta ahora `background:
+  #ff0000` no pintaba NADA - solo el longhand `background-color`
+  funcionaba (`engine-gfx::display_list` solo lee esa clave), encontrado
+  auditando el motor en vivo con una pagina de control (dos cajas
+  identicas salvo por usar shorthand vs longhand: una se pintaba, la otra
+  no). La mayoria de CSS real escribe `background: <color>`, no
+  `background-color: <color>` directamente, asi que este hueco afectaba a
+  practicamente cualquier pagina con fondo de color.
+  Resuelto en `engine-css::parser::insert_declaration` - el UNICO punto
+  por el que pasan TANTO las reglas de una hoja de estilos (`parse_block`)
+  COMO un atributo `style="..."` inline (`CssParser::parse_inline_style`,
+  misma gramatica, mismo bucle `parse_declaration_list`), asi que expandir
+  ahi cubre los dos casos con un solo cambio. `background: <valor>` deja
+  TAMBIEN `background-color` en las declaraciones si `<valor>` trae un
+  token que empiece por `#` (un color hexadecimal) - el resto del
+  shorthand (posicion/repeticion/una imagen) se ignora sin error, igual
+  que cualquier propiedad no soportada en este motor.
+  **Por que en el parser y no al pintar** (la alternativa obvia, y la
+  que NO se eligio): la cascada real (`cascade::apply_matching_rules`)
+  fusiona declaracion a declaracion con un `insert` plano por clave, sin
+  ningun concepto de que `background`/`background-color` esten
+  relacionados. Expandir en el parser hace que, para cuando la cascada
+  corre, YA NO EXISTE diferencia entre shorthand y longhand - son la
+  misma clave `background-color`, y el orden normal de insercion
+  (especificidad entre reglas, orden de declaracion dentro de la misma
+  regla) decide quien gana SIN NINGUN caso especial nuevo en
+  `cascade.rs`. Expandir al pintar en cambio habria exigido enseñarle a
+  la cascada (o a `engine-gfx`) a comparar shorthand contra longhand por
+  separado, con su propio criterio de desempate - logica que ya viene
+  gratis del modelo de datos elegido aqui.
+  **Los nombres de color CSS siguen sin soportarse** (`background: red`
+  no pinta nada, declarado a proposito, no un descuido): `parse_css_color`
+  en `engine-gfx` solo reconoce hex (`#rgb`/`#rrggbb`) en NINGUN sitio del
+  motor, shorthand incluido - expandir el shorthand no inventa soporte de
+  color que no existe rio abajo, `insert_declaration` simplemente no
+  extrae nada si no encuentra un token que empiece por `#`.
+  7 tests nuevos en `parser.rs` (extraccion de color, ausencia de color
+  no fabrica nada, nombres de color ignorados, orden de declaracion
+  dentro de la misma regla en los dos sentidos, tambien en `style="..."`)
+  y 1 en `cascade.rs` (una regla mas especifica que solo toca el longhand
+  gana sobre una menos especifica que usa el shorthand - el caso real que
+  motiva hacerlo en el parser). Verificado en vivo con la misma pagina de
+  control de la auditoria: el div que usaba `background: #ff0000` pasa de
+  no pintarse en absoluto a un rectangulo rojo solido identico al que ya
+  usaba `background-color` - captura de pantalla revisada, antes/despues.
+- **Controles de formulario con caja propia** (Fase 11): hasta ahora
+  `input`/`select`/`textarea`/`button` no tenian ningun tratamiento
+  propio - caian al `_ => BoxType::Block` generico, lo que significaba
+  ocupar el ANCHO COMPLETO del contenedor (un `<input>` en una pagina de
+  1280px de ancho media 1280px) sin fondo ni borde visible, encontrado
+  auditando el motor en vivo. Ademas de verse mal, esto rompia el calculo
+  de "centro del elemento" que hace un agente de IA para clicar: el
+  centro de una caja de 1280px de ancho no tiene nada que ver con donde
+  esta el control real.
+  Dos tratamientos distintos, segun si el control tiene contenido DOM
+  real que pintar:
+  - **`BoxType::Replaced`** (variante nueva en `engine-layout::layout_box`,
+    para `input`/`select`/`textarea`): mismo concepto de "elemento
+    reemplazado" del spec real que ya tenia `BoxType::Image` (Fase 3.1),
+    pero sin ningun bitmap - su tamaño sale SIEMPRE de CSS
+    (`resolve_replaced_dimensions`, sin ningun "tamaño natural" del que
+    partir, a diferencia de una imagen decodificada). Atomico: NO recursa
+    en sus hijos DOM al posicionar (`place_inline_node::BoxType::Replaced`)
+    - un `<select>` SI tiene cajas hijas reales para cada `<option>`
+      (`build_node` las crea igual que para cualquier otro elemento), pero
+      se quedan sin posicionar a proposito, igual que un navegador real no
+      pinta las opciones de un desplegable como contenido normal de la
+      pagina.
+    `is_inline_level` incluye `Replaced` (participa en el flujo inline
+    como texto/span/imagen, no fuerza una linea propia), y tanto
+    `measure_flex_item` como `finalize_flex_item_children` tienen su
+    propio camino para esta variante (mismo criterio ya existente para
+    `Image`) - sin esto, un `<input>` dentro de una barra de busqueda
+    `display: flex` (patron real MUY comun) mediria como si no tuviera
+    contenido intrinseco.
+  - **`BoxType::Inline`** (no una variante nueva - `button` se sumo a la
+    lista existente de `span`/`a`/`b`/`i`/`strong`/`em`): a diferencia de
+    `input`/`select`/`textarea`, la etiqueta de un `<button>` es contenido
+    DOM real (un nodo de texto hijo, no un atributo `value`/`placeholder`
+    que el motor no pinta), asi que se beneficia de ENCOGERSE a su
+    contenido en vez de un tamaño fijo - que es exactamente lo que
+    `BoxType::Inline` ya hacia gratis (su caja es el rectangulo delimitador
+    de sus hijos, ver `place_inline_node::BoxType::Inline`). Limitacion ya
+    declarada que se hereda sin cambios: `padding`/`border` de elementos
+    inline no se resuelven en el layout, asi que el fondo/borde de un
+    boton queda pegado al texto sin aire alrededor.
+  La hoja de agente de usuario (`user_agent_stylesheet.rs`) da el tamaño y
+  aspecto por tipo: `input` de texto 170x21 con borde y fondo blanco
+  (aproximacion al `size=20` por defecto real de HTML - sin shrink-to-fit
+  real, este motor no mide min/max-content en ningun sitio todavia, misma
+  limitacion ya declarada para flex/fuera de flujo); `input[type=checkbox]`/
+  `[type=radio]` 13x13 (el segundo con `border-radius: 7px`, una
+  aproximacion visual a un circulo, no una forma geometrica distinta -
+  `border-radius` no soporta porcentaje, solo `px`); `input[type=submit]`/
+  `[type=button]`/`[type=reset]`/`[type=image]` con fondo gris de boton;
+  **`input[type=hidden]` usa `display: none` real** (Fase 10.5, ya
+  implementada) en vez de cualquier tamaño - un campo oculto no genera
+  NINGUNA caja, correcto; `select`/`textarea` con su propio tamaño y
+  aspecto.
+  **Deliberadamente NO implementado en esta tarea**: el `value`/
+  `placeholder` de un `input`/`textarea` no se PINTA como texto dentro de
+  la caja (solo se reporta en el JSON de `elements` para el frontend/
+  agente, igual que antes) - el motor no tiene ninguna infraestructura de
+  "materializar el atributo como una caja de texto sintetica" todavia;
+  las opciones de un `<select>` no se pueden desplegar/elegir por clic
+  (sigue sin haber ninguna interaccion de desplegable); sin aspecto nativo
+  por plataforma real (flechas, sombreados).
+  6 tests nuevos en `tree.rs` (tamaño fijo de un input, checkbox pequeño,
+  hidden sin caja, boton que se encoge a su texto, control reemplazado
+  dentro de flex conservando su tamaño). Verificado en vivo con la misma
+  pagina de control de la auditoria: `input[type=text]` paso de
+  `[0,342,1280,22]` a `[0,342,170,21]`; el checkbox paso (antes del mismo
+  tamaño que el input de texto) a `[170,342,13,13]`; el boton "Enviar" de
+  `[0,452,1280,22]` a `[170,385,45,21]` - encogido de verdad a su texto,
+  no un tamaño fijo inventado - captura de pantalla revisada, antes/
+  despues.
+- **`float: left`/`right` real** (Fase 12, el ultimo hueco P0 del punch
+  list original): hasta ahora `float` no tenia NINGUN tratamiento propio
+  (cero referencias en todo el motor) - un `<div style="float:left">` se
+  apilaba verticalmente como cualquier otro hijo de bloque, empujando a
+  sus hermanos hacia abajo por su propia altura completa en vez de
+  quedarse a un lado con el contenido fluyendo junto a el. Cualquier pagina
+  anterior a flexbox (foros, prensa, WordPress clasico) colapsaba a una
+  sola columna por esto.
+  Implementado en `LayoutTreeBuilder::flow_block_children`, que ahora
+  mantiene HASTA UN float activo por lado (`float_left`/`float_right:
+  Option<ActiveFloat>`, declaradas fuera del bucle principal porque tienen
+  que sobrevivir entre iteraciones) mientras recorre los hijos del
+  contenedor:
+  - Un hijo `float: left`/`right` (`float_side`, nuevo `BoxType`-agnostico -
+    aplica igual a un `<div>` de bloque que a cualquier otro elemento) se
+    intercepta ANTES de la agrupacion en rachas inline (`is_inline_level`
+    no distingue floats) y se resuelve en `place_float_child`: se ancla al
+    borde izquierdo/derecho del contenedor, y a diferencia de un hijo de
+    bloque normal, NO avanza `cursor_y` - un float no empuja a sus
+    hermanos hacia abajo por su propia altura, solo reserva espacio
+    HORIZONTAL mientras dura. Su ancho usa `resolve_block_width` de
+    siempre pero con un valor de respaldo fijo (`DEFAULT_FLOAT_WIDTH =
+    200px`) en vez de "llenar el contenedor" como "auto" - sin esto,
+    cualquier `float` sin `width` explicito ocuparia el ancho completo,
+    anulando el proposito de flotar (sin shrink-to-fit real, este motor
+    no mide min/max-content en ningun sitio todavia, misma limitacion ya
+    declarada para items flex/cajas fuera de flujo).
+  - CUALQUIER contenido normal (racha inline o hijo de bloque) que
+    arranque dentro del rango vertical de un float activo usa un
+    `origin_x`/ancho ESTRECHADO (calculado en cada iteracion del bucle,
+    antes de decidir si es una racha inline o un hijo de bloque), en vez
+    del ancho completo del contenedor - esto es lo que hace que el texto
+    "fluya alrededor" del float en vez de solaparse con el o ignorarlo.
+    **Granularidad de CAJA COMPLETA, no por linea**: un hijo que arranca
+    dentro del rango del float usa el ancho estrechado para TODA su caja,
+    aunque su contenido real termine mas abajo del borde inferior del
+    float - el spec real reajustaria linea a linea DENTRO de un mismo
+    parrafo (las lineas que ya caen por debajo del float se ensancharian
+    solas); este motor no hace reflow de texto por linea segun obstaculos,
+    simplificacion declarada. El caso mas comun en paginas reales - un
+    float con un parrafo corto al lado, o un contenedor completo que se
+    queda deliberadamente angosto mientras dura el float - se ve correcto.
+  - Un float cuyo borde inferior ya quedo atras (`cursor_y >=
+    float.bottom_y`, comprobado al INICIO de cada iteracion) deja de
+    estrechar nada automaticamente.
+  - **`clear: left`/`right`/`both`** tambien implementado: salta
+    `cursor_y` por debajo del borde inferior de los floats activos del
+    lado indicado ANTES de colocar ese hijo - es lo que hace funcionar el
+    patron real "clearfix" (un `<div style="clear:both">` vacio para
+    'cerrar' una seccion flotada).
+  - El alto AUTO final del contenedor incluye cualquier float TODAVIA
+    activo al terminar el bucle - deliberadamente DISTINTO del spec real
+    (donde un contenedor con SOLO floats dentro colapsa a alto CERO salvo
+    que los "contenga" explicitamente, el famoso problema que tantas
+    paginas reales trabajan para evitar con un clearfix) - eleccion
+    consciente: es el comportamiento que la mayoria de autores esperan de
+    todas formas, y no le cuesta nada a ninguna pagina que SI dependiera
+    de la sorpresa real del spec (ese patron ya exige un
+    `overflow`/clearfix explicito para conseguir precisamente este mismo
+    resultado).
+  Simplificacion declarada mas importante: SOLO un float activo por lado a
+  la vez (`Option<ActiveFloat>`, no una pila/cola) - dos `float: left`
+  consecutivos sin que el primero haya quedado atras verticalmente se
+  SOLAPAN en vez de colocarse uno al lado del otro (el spec real los
+  apila horizontalmente hasta que no caben y baja a la siguiente "linea
+  de floats"). El caso real mas comun - un float por lado, con contenido
+  normal fluyendo entre ellos - funciona correctamente; una galeria de
+  varias imagenes flotadas seguidas del mismo lado, no. Los floats
+  siempre se anclan contra los bordes VERDADEROS del contenedor (nunca
+  anidados dentro de la zona ya estrechada por OTRO float activo del lado
+  opuesto) - dos floats en lados opuestos a la vez SI funcionan
+  correctamente entre si (verificado con test dedicado), solo la
+  combinacion "float + float del MISMO lado ya activo" tiene este hueco.
+  8 tests nuevos (el float no avanza el cursor vertical, estrecha el
+  contenido siguiente mientras esta activo, deja de estrechar una vez
+  atras, `float:right` simetrico, dos floats en lados opuestos a la vez,
+  `clear:both`, un contenedor con solo un float dentro abraza su altura,
+  ancho de respaldo sin `width` explicito). Verificado en vivo con una
+  pagina de control nueva (barra lateral flotada a la izquierda con texto
+  propio, caja "Relacionados" flotada a la derecha, un parrafo fluyendo
+  entre ambas, un `clear:both` al final) - resultado visual identico al
+  patron real de un foro/blog clasico pre-flexbox: el parrafo se angosta
+  correctamente entre los dos floats, y el `clear:both` cae limpio debajo
+  de ambos sin solaparse - y con la misma pagina de control de la
+  auditoria original, donde el div `.float` (antes apilado como fila
+  completa) ahora flota de verdad junto al parrafo siguiente.
+
+- **Cookies HTTP reales (RFC 6265)** (Fase 13): hasta ahora
+  `net/src/cookie.rs` era un `HashMap<String, String>` sin ninguna
+  semantica de cookie que ademas nadie instanciaba - **ninguna peticion
+  enviaba ni recibia cookies**. La consecuencia real, encontrada auditando
+  el motor, era que **no se podia iniciar sesion en ningun sitio web**:
+  toda sesion HTTP se sostiene sobre una cookie. Era el bloqueante mas
+  grave del motor, por encima de cualquier fallo visual.
+  Implementado de verdad: parseo completo de `Set-Cookie` (`Domain`,
+  `Path`, `Expires`, `Max-Age`, `Secure`, `HttpOnly`, `SameSite`), con
+  `Max-Age` ganando sobre `Expires` sin importar el orden (§5.2.2) y
+  `Max-Age<=0` borrando la cookie - que es exactamente como un servidor
+  real cierra una sesion. Alcance por dominio (§5.1.3) con separador de
+  etiqueta real: `ejemplo.test` cubre `www.ejemplo.test` pero NUNCA
+  `malejemplo.test` (el ataque obvio si se comparase solo el sufijo
+  textual); cookies sin `Domain` son host-only. Alcance por ruta
+  (§5.1.4) con la ruta por defecto derivada de la URL. Expiracion real
+  con purga al consultar. `Secure` solo por `https:`. Identidad
+  `(name, domain, path)` (§5.3.11): un `Set-Cookie` repetido SUSTITUYE
+  en vez de acumularse.
+  **Dos bugs de infraestructura corregidos de paso**, ambos invisibles
+  mientras nadie leia cookies: (1) `fetch_once` recogia las cabeceras en
+  un `HashMap`, asi que de las VARIAS `Set-Cookie` que una respuesta real
+  trae (un login tipico deja la de sesion y alguna de estado en la misma
+  respuesta) **solo sobrevivia la ultima** - ahora se recogen aparte en
+  un `Vec` (nuevo campo `NetworkResponse::set_cookie`); (2) la cabecera
+  `Cookie` se añade en `fetch_once` y no en `fetch`, para que **cada
+  salto de una redireccion recalcule sus propias cookies** - un login
+  real es POST/GET -> 302 -> GET, y la cookie de sesion la pone la
+  respuesta de la redireccion para que viaje ya en el salto siguiente.
+  El almacen (`CookieStore`) vive en `NetworkEngine` tras un `Mutex`,
+  compartido por todas las peticiones de la sesion.
+  Simplificaciones declaradas: **sin lista de sufijos publicos (PSL)** -
+  no se rechaza un `Domain=.co.uk`, aunque si se exige que el `Domain`
+  declarado cubra al host que lo pone (un sitio no puede poner cookies a
+  un dominio ajeno); **`SameSite` se parsea y guarda pero no se aplica**
+  (exige distinguir peticion de primera/tercera parte, concepto que este
+  motor no tiene sin `<iframe>`) - declarado asi en vez de fingir la
+  defensa CSRF que aportaria; **`HttpOnly` idem**, solo tendria efecto
+  ante un `document.cookie` que aun no existe; **sin persistencia a
+  disco**, las sesiones no sobreviven a cerrar la app.
+  19 tests nuevos (parseo de los tres formatos de fecha HTTP, cada
+  atributo, rechazo de dominio ajeno, limites de etiqueta y de segmento,
+  host-only, `Secure`, borrado por `Max-Age=0`, sustitucion por terna,
+  varias `Set-Cookie` en una respuesta, orden por especificidad de ruta).
+  **Verificado en vivo con un servidor de sesiones real**: navegar al
+  formulario, escribir el usuario y pulsar Enter llevo a `/privado` con
+  titulo "Panel de ana" y el texto "Bienvenido, ana. Tema: oscuro" - las
+  DOS cookies de la respuesta 302 sobrevivieron; volver a navegar
+  mantuvo la sesion; `/salir` (que reenvia la cookie con `Max-Age=0`)
+  la cerro de verdad, y `/privado` paso a "Acceso denegado". Ciclo
+  completo de autenticacion, de punta a punta.
+
+- **`setTimeout`/`setInterval`/`clearTimeout`/`clearInterval`** (Fase 14):
+  antes no existia NINGUN temporizador (cero referencias en todo
+  `engine-js`), y practicamente todo JavaScript real los usa - carruseles,
+  menus, `debounce`, reintentos, sondeo, y sobre todo el patron
+  omnipresente `setTimeout(inicializar, 0)` para diferir el arranque hasta
+  despues de que el documento este montado. Sin ellos la mayoria de
+  paginas con JS se quedaban a medio inicializar, sin ningun error visible.
+  **Como avanza el tiempo aqui, la simplificacion que mas importa**: un
+  navegador real tiene un bucle de eventos con reloj propio y dispara un
+  temporizador vencido aunque nadie toque nada. Este motor NO tiene ese
+  reloj: los vencidos corren cuando alguien llama a
+  `JsRuntime::run_due_timers`, y quien lo hace es `core::server` en
+  `LoadedPage::relayout` (por donde pasan clic, escritura, tecla y
+  redimension) mas una llamada explicita al final de `navigate` para los
+  de la CARGA. Consecuencia honesta: un `setTimeout(fn, 100)` puesto al
+  cargar SI se ejecuta, pero un reloj que se actualice solo cada segundo
+  con la pagina quieta NO avanza hasta que el usuario haga algo. Cubre el
+  uso dominante real (diferir inicializacion, reaccionar a una
+  interaccion), no la animacion continua.
+  Los vencidos corren por vencimiento ascendente y, a igualdad, por orden
+  de creacion - el orden real del spec. Entre uno y otro se DRENAN los
+  microtasks, porque cada callback es una TAREA del bucle de eventos
+  (misma razon por la que `eval`/`dispatch_event` ya drenaban).
+  `run_due_timers` ademas BUCLEA: un `setTimeout(fn, 0)` encolado desde
+  otro temporizador tambien esta vencido ya y corre en el mismo ciclo.
+  **Dos limites que existen por casos reales, no teoricos**: (1) los
+  `setInterval` se acotan a un minimo de 4ms (regla de HTML spec 8.6 para
+  temporizadores anidados) - sin eso, un `setInterval(fn, 0)` vuelve a
+  estar vencido en el instante en que termina y un SOLO drenado lo
+  dispararia cientos de veces; se descubrio con un test que fallo al
+  escribir esta fase, no razonando. `setTimeout` NO se acota: dispara una
+  vez, y un retardo cero ahi es exactamente lo que el autor pidio. (2)
+  `MAX_TIMERS_PER_DRAIN = 1000` corta el bucle, porque un temporizador que
+  se reencola sin condicion de parada colgaria el motor entero sin error.
+  Los datos del temporizador viven en Rust pero la FUNCION de callback
+  vive en un objeto JS oculto (`__engineTimerCallbacks`), no en la
+  captura: capturar un `JsObject` dentro de un `NativeFunction` obliga a
+  implementar `Trace` del recolector de Boa sobre una estructura que
+  ademas contiene `Instant`/`Duration` (no rastreables), mientras que un
+  objeto JS normal ya lo gestiona el recolector solo. El coste declarado
+  es que ese objeto es alcanzable desde la pagina si lo busca por nombre.
+  Un error dentro de un callback no aborta a los demas.
+  Deliberadamente NO soportado: `setTimeout("codigo como cadena")`, un
+  vector de inyeccion clasico que ya casi nadie usa.
+  21 tests nuevos. Verificado en vivo con una pagina que difiere su
+  inicializacion y encadena cinco `setTimeout`: ambos patrones corrieron
+  enteros durante la propia carga.
+- **`document.title` con getter Y setter reales** (Fase 14.1): descubierto
+  verificando los temporizadores en vivo - la pagina de prueba se
+  retitulaba desde un `setTimeout` y el titulo no cambiaba nunca.
+  `document.title` no existia en `dom_bindings`, asi que `document.title =
+  "x"` creaba una propiedad JS normal en el objeto `document`: la
+  asignacion parecia funcionar desde JS (leerla devolvia lo asignado) pero
+  el DOM real no se tocaba. Es un patron universal en aplicaciones web
+  (marcar mensajes sin leer, reflejar la seccion actual).
+  Ahora es un accessor sobre el `<title>` real: el setter escribe en su
+  nodo de TEXTO (reutilizandolo si existe, creandolo si el elemento estaba
+  vacio). Un documento SIN `<title>` no se inventa el elemento - haria
+  falta crear tambien el `<head>` si falta - y la asignacion se ignora sin
+  romper nada, mismo criterio honesto que el resto del modulo.
+  Ademas, `core::server` dejo de reportar el titulo CONGELADO en la carga:
+  `LoadedPage::current_title` lo relee del DOM en cada estado, porque si
+  no, cualquier cambio posterior de JS quedaba invisible para la interfaz
+  por muy bien que hubiera mutado el DOM. 3 tests nuevos.
+
+- **`localStorage`/`sessionStorage` reales** (Fase 15): antes
+  `net/src/storage.rs` era un `HashMap` suelto que nadie instanciaba y que
+  no estaba conectado a JS - `localStorage` no existia como global, asi que
+  cualquier pagina que lo usara moria con `ReferenceError`. Practicamente
+  toda aplicacion web moderna lo usa para estado de sesion, preferencias y
+  cache de cliente.
+  Reescrito con **alcance por ORIGEN** (`esquema://host:puerto`), que es la
+  parte que de verdad importa: `https://a.test` y `https://b.test` no se
+  ven el almacenamiento entre si, ni siquiera `http://a.test` y
+  `https://a.test` (esquema distinto = origen distinto, igual que el spec).
+  El puerto por defecto del esquema NO forma parte del origen, para que
+  `https://a.test` y `https://a.test:443` compartan almacenamiento como
+  deben. Orden de insercion estable para `key(n)`/`length`; cuota de 5 MiB
+  por origen con `QuotaExceededError` capturable de verdad en vez de
+  crecer sin limite; valores SIEMPRE cadenas (`setItem('n', 42)` guarda
+  `"42"`); `getItem` de una clave inexistente devuelve **`null`, no
+  `undefined`** - las tres son diferencias observables que el codigo real
+  comprueba.
+  **Donde vive**: el almacen es de toda la SESION y lo conserva
+  `EngineServer`, no la pagina - misma razon que las cookies, que por eso
+  viven en `NetworkEngine`: su proposito entero es sobrevivir a navegar a
+  otra pagina. Cada pagina recibe un puntero al mismo almacen mas SU
+  origen, sacado de la URL FINAL tras redirecciones (si `http://a.test`
+  redirige a `https://a.test`, el almacenamiento que toca es el del origen
+  donde de verdad se aterrizo). Un script no puede pedir el de otro origen
+  porque no hay ningun parametro con el que hacerlo.
+  **Lo que NO soporta, declarado**: el acceso por PROPIEDAD. En un
+  navegador real `localStorage.tema` y `localStorage.getItem('tema')` son
+  equivalentes porque `Storage` es un objeto "exotico" que atrapa todo
+  acceso a propiedad; aqui solo funcionan los metodos (`getItem`/
+  `setItem`/`removeItem`/`clear`/`key`) y `length`. Implementar la forma
+  con punto exigiria manejadores propios de `[[Get]]`/`[[Set]]`/
+  `[[Delete]]`/`[[OwnPropertyKeys]]` en Boa - trabajo aparte y de bastante
+  mas superficie; la forma con metodos es la que recomienda MDN y la que
+  usa la mayoria del codigo real, asi que la perdida es acotada.
+  **Sin persistencia a disco todavia**: `localStorage` deberia sobrevivir
+  a cerrar la aplicacion y hoy no lo hace, asi que se comporta como un
+  `sessionStorage` de vida larga. La diferencia ENTRE ambas areas SI esta
+  modelada (son almacenes distintos que no se ven), que es lo que nota una
+  pagina dentro de una misma sesion; lo que falta es solo el volcado a
+  disco. Tampoco hay evento `storage` (avisar a otras pestañas del mismo
+  origen): este motor no tiene comunicacion entre pestañas.
+  23 tests nuevos (13 del almacen, 10 del binding JS). Verificado en vivo
+  con dos servidores en puertos distintos: un contador subio de 1 a 2 al
+  recargar, una segunda pagina del MISMO origen leyo lo que dejo la
+  primera, `localStorage` y `sessionStorage` devolvieron valores distintos
+  para la misma clave, una clave inexistente dio `null`, y el otro puerto
+  (otro origen) no vio absolutamente nada.
+
+- **Envio de formularios por POST** (Fase 16): la Fase 10 dejo el envio
+  GET funcionando y POST devolviendo un error explicito, porque el motor
+  no tenia forma de mandar un cuerpo en una peticion. La causa raiz estaba
+  en el tipo del cliente HTTP: `Client<..., Empty<Bytes>>` hacia el cuerpo
+  vacio POR TIPO, asi que `NetworkRequest::body` existia como campo y se
+  ignoraba en silencio. Cambiado a `Full<Bytes>` (que se comporta igual
+  que `Empty` cuando los bytes son cero, asi que no altera nada de lo que
+  ya funcionaba) mas `Content-Length` explicito.
+  Como casi todo formulario de LOGIN real es POST, esto y las cookies
+  (Fase 13) son las dos piezas que juntas hacen posible autenticarse.
+  El cuerpo se codifica como `application/x-www-form-urlencoded` (el tipo
+  por defecto real sin `enctype`) con `url::form_urlencoded`, NO a mano:
+  ese formato tiene una regla propia facil de equivocar - el espacio se
+  codifica como `+`, no como `%20` - y un `&` sin escapar dentro de un
+  valor partiria el campo en dos silenciosamente.
+  El `action` de un POST se resuelve SIN tocar su query string
+  (`resolve_submit_action`, compartida con el camino GET), a diferencia
+  del GET que la reemplaza entera: los datos del POST van en el cuerpo,
+  asi que un `action="/buscar?pagina=2"` conserva ese `pagina=2`.
+  `navigate` se refactorizo a `navigate_with_body` con el cuerpo opcional
+  en vez de duplicar la funcion: todo lo que viene despues de la peticion
+  (redirecciones, sub-recursos, construccion de pagina, historial,
+  temporizadores de carga) es identico para los dos metodos.
+  **Cambio de criterio respecto a la Fase 10**: cualquier `method` que no
+  sea `post` ahora degrada a GET y SE ENVIA, en vez de rechazarse. Es lo
+  que hace el spec real, que solo reconoce `get`/`post`/`dialog` y trata
+  cualquier valor invalido como el valor por defecto.
+  **Limitacion declarada**: volver ATRAS a una entrada de historial creada
+  por un POST deberia re-enviar el formulario (y un navegador real
+  pregunta antes de hacerlo); aqui `back` la repite como GET, que es
+  distinto. Sin `enctype="multipart/form-data"` tampoco, que es lo que
+  exige subir ficheros - coherente con que `<input type="file">` ya se
+  omite al recoger los datos (Fase 10).
+  5 tests nuevos (reglas de codificacion con espacio/acentos/separador,
+  cuerpo vacio, la query preservada frente al GET que la reemplaza, y el
+  method desconocido que ahora degrada a GET). Verificado en vivo contra
+  un servidor de login por POST: se rellenaron tres campos con un espacio
+  (`ana lopez`), acentos y un `&` (`año & cía`) - las tres trampas
+  clasicas de codificacion - y el clic en Enviar mando el POST, el
+  servidor respondio 302 con `Set-Cookie`, y el panel privado mostro
+  `usuario=ana lopez comentario=año & cía` intacto. Flujo de
+  autenticacion real completo: POST + cookie + redireccion.
+
+- **Colores CSS completos: nombres, `rgb()`/`rgba()`, hex con alfa**
+  (Fase 17): `parse_css_color` solo entendia hexadecimal, asi que un
+  `background: red` - de lo mas comun que existe en CSS real - no pintaba
+  absolutamente nada. Como es el UNICO parseador de color del motor,
+  arreglarlo aqui arreglo `color`, `background-color`, `border` y
+  `box-shadow` a la vez.
+  Ahora reconoce: los 16 nombres de CSS1 mas ~40 extendidos de uso comun
+  (`NAMED_COLORS`, con las dos grafias de `gray`/`grey`), hex en sus tres
+  longitudes reales (`#rgb`, `#rrggbb` y `#rrggbbaa` con canal alfa),
+  `rgb()`/`rgba()` tanto en sintaxis clasica con comas como en la moderna
+  con espacios y barra (`rgb(0 128 128 / 50%)`), componentes en numero o
+  porcentaje, y la palabra clave `transparent` (que es un color de pleno
+  derecho - negro con alfa cero - no la ausencia de color). Los
+  componentes fuera de rango se ACOTAN en vez de rechazarse, igual que un
+  navegador real ante `rgb(300, -5, 0)`.
+  **La tabla NO es la lista completa** de los ~148 nombres extendidos: se
+  eligieron los que cubren la practica totalidad del uso real, y un nombre
+  fuera de ella resuelve a `None` (la caja se queda sin pintar) en vez de
+  fingir un color inventado. Ampliarla es añadir filas, sin cambio de
+  logica. NO implementado: `hsl()`/`hwb()`/`lab()`/`oklch()` y el resto de
+  espacios de color modernos. `currentColor` devuelve `None` a proposito:
+  resolverlo exige el `computed_style` completo, que esta funcion no
+  recibe - y en el caso que mas importa (un borde) `parse_css_border` ya
+  cae al `color` del elemento por su cuenta, que da el mismo resultado.
+  **Reparto de responsabilidades entre crates**, que es la parte de diseño
+  que importa: la expansion del shorthand `background` vive en
+  `engine-css` y la tabla de colores en `engine-gfx`, que son crates
+  HERMANOS (gfx no depende de css). En vez de duplicar la tabla, el
+  reparto es: `engine-css` IDENTIFICA el token candidato a color
+  (`background_color_candidate`) y `engine-gfx` decide si de verdad lo es.
+  Un candidato que no sea un color simplemente no se pinta - la misma
+  degradacion honesta de siempre, sin duplicar nada.
+  Ese identificador trata aparte el caso dominante (`background: <color>` a
+  secas) devolviendo el valor ENTERO sin trocear, que es lo que hace que
+  `rgb(1, 2, 3)` funcione: partirlo por espacios lo romperia en pedazos
+  inservibles. Solo cuando el valor trae ademas imagen o posicion se cae a
+  buscar un token hexadecimal suelto - sin la tabla de nombres no hay
+  forma fiable de distinguir ahi un nombre de color de una palabra clave
+  de posicion, y pintar un fondo que el autor no pidio seria peor que no
+  pintarlo.
+  12 tests nuevos (8 en gfx sobre cada sintaxis, 4 en css sobre la
+  expansion). Verificado en vivo con una pagina que ejercita las diez
+  formas a la vez: los cuatro nombres, `rgb()` con comas, `rgba()` con
+  alfa, `rgb()` con espacios, hex de 6 y de 8 digitos, y un `border: 3px
+  solid crimson` - todos correctos, y la mezcla alfa real funcionando
+  (`rgba(0,0,0,0.5)` sale gris sobre blanco, `#0088ff80` sale azul claro).
+
+- **Pseudo-clases y `@media` reales** (Fase 18): dos huecos del motor de
+  selectores que compartian una misma consecuencia grave - una regla con
+  selector no soportado se descarta ENTERA, asi que un
+  `input:checked + label` o cualquier bloque `@media` desaparecian sin
+  dejar rastro.
+  - **Pseudo-clases**: `NoPseudoClass` era un enum VACIO, lo que hacia que
+    el parser rechazara cualquiera como error de sintaxis. Sustituido por
+    `EnginePseudoClass`, dividido en dos grupos con criterios distintos:
+    las **derivables del DOM** (`:checked`, `:disabled`/`:enabled`,
+    `:required`/`:optional`, `:read-only`/`:read-write`, `:link`/
+    `:any-link`) se resuelven de verdad leyendo atributos - `:checked` usa
+    la misma semantica de atributo booleano HTML (presencia, no valor) que
+    ya usaba `core::server::toggle_checked` al conmutarlo con un clic, asi
+    que el "checkbox hack" funciona de punta a punta; y los **estados de
+    interaccion** (`:hover`, `:focus`, `:active`, `:focus-visible`,
+    `:focus-within`, `:visited`) se PARSEAN pero nunca coinciden, porque
+    este motor no recalcula la cascada al mover el raton ni al enfocar.
+    Parsearlos igualmente es la parte que importa: asi
+    `.btn, .btn:hover` conserva su primera mitad en vez de perderse
+    entera. `:visited` ademas no deberia coincidir NUNCA por privacidad -
+    estilarlo permitiria filtrar el historial de navegacion por CSS, y los
+    navegadores reales lo restringen severamente por eso. Una pseudo-clase
+    que el motor no conoce SI sigue invalidando la regla: mejor no
+    aplicarla que aplicarla mal.
+    Descubrimiento de paso: las pseudo-clases ESTRUCTURALES
+    (`:first-child`, `:last-child`, `:nth-child`, `:not`, `:empty`,
+    `:root`) **ya funcionaban** - las resuelve el propio crate `selectors`
+    recorriendo el arbol con metodos que `ElementRef` implementaba desde
+    siempre. Nunca se habian probado; ahora hay un test que lo fija.
+  - **`@media`**: antes las arroba-reglas se saltaban enteras. Ahora
+    `AtRuleParser` parsea el preludio a un `MediaCondition` y recorre el
+    bloque con OTRO `StyleSheetParser` anidado (el mismo codigo que la
+    hoja de nivel superior, sin duplicar nada), estampando la condicion en
+    cada regla de dentro. `StyleSheetParser` exige el mismo tipo de salida
+    para reglas normales y arroba-reglas, de ahi que ambos produzcan
+    `Vec<Rule>` - una regla normal devuelve un vector de un elemento.
+    La condicion se guarda POR REGLA en vez de crear un nodo "bloque
+    media": asi la cascada sigue siendo una lista plana ordenada por
+    especificidad, y las reglas de dentro y fuera de un `@media` compiten
+    entre si exactamente como en el spec.
+    **Se evalua en la CASCADA, no al parsear**, y esa es la decision de
+    diseño que importa: la hoja se parsea una sola vez por pagina pero
+    `resolve_style` corre en cada relayout, asi que redimensionar la
+    ventana REEVALUA las consultas sin reparsear nada. Para ello
+    `resolve_style` recibe ahora `viewport_width`, enhebrado desde
+    `LayoutTreeBuilder::build` (que ya lo tenia) a traves de `build_node`.
+    Verificado en vivo: el mismo div pasa de teal a naranja y vuelve a
+    teal al redimensionar 1280 -> 500 -> 1000 px.
+    Solo se interpretan `min-width`/`max-width` en pixeles y el tipo de
+    medio - lo que usa la practica totalidad del CSS responsive real.
+    `max-width` es INCLUSIVO (asi lo define el spec: `max-width: 600px` SI
+    aplica exactamente a 600px). Una consulta que el motor no sepa evaluar
+    (`orientation`, `prefers-color-scheme`, unidades `em`) se marca
+    `never_matches`: sus reglas se CONSERVAN pero no se aplican, que es
+    mas honesto que aplicarlas siempre (meteria estilos de impresion o de
+    movil en una ventana de escritorio) y que descartar el bloque. Las
+    demas arroba-reglas (`@font-face`, `@keyframes`, `@supports`) se
+    siguen saltando enteras sin corromper la hoja.
+  23 tests nuevos. Verificado en vivo con una pagina que ejercita el
+  checkbox hack completo (`#toggle:checked + .menu` sobre un menu con
+  `display: none`, es decir tres piezas de fases distintas trabajando
+  juntas), `:first-child`/`:last-child`, `:disabled`, `:required` y dos
+  bloques `@media` complementarios - todo correcto.
+
+- **Historial y pestañas expuestos en la interfaz** (Fase 19): el motor
+  soportaba `back`/`forward`/`new_tab`/`close_tab`/`switch_tab`/`list_tabs`
+  desde la Fase 4.4-4.5, y su `state` ya reportaba `can_go_back`/
+  `can_go_forward`/`tab_id` en cada respuesta - pero la interfaz solo tenia
+  UN boton (recargar) y una barra de direcciones, asi que nada de eso era
+  alcanzable para el usuario. Era el hueco mas grande entre lo que el
+  motor sabe hacer y lo que el producto deja hacer.
+  Añadido en `frontend/`: botones atras/adelante que se habilitan con los
+  flags REALES del motor (no con una cuenta paralela que podria
+  desincronizarse), boton de pestaña nueva, y una barra de pestañas que
+  solo aparece cuando hay mas de una - para no gastar espacio vertical
+  cuando no aporta nada.
+  De paso se corrigio una duplicacion que causaba el problema de fondo:
+  el estado del motor se aplicaba en TRES sitios distintos (respuesta
+  inicial IPC, evento `engine:state`, respuesta a un comando) y cada copia
+  leia un subconjunto distinto de campos - por eso `can_go_back` y
+  `tab_id` se perdian por el camino aunque el motor los enviara. Ahora hay
+  una sola funcion (`applyEngineState`) que los aplica todos.
+  `list_tabs` es la unica peticion que NO devuelve un `state` sino su
+  propia respuesta, asi que se pide aparte (`refreshTabs`) tras cualquier
+  accion que pueda cambiar el conjunto de pestañas - incluida `navigate`,
+  porque el titulo de la pestaña activa cambia con la pagina.
+  Verificado contra el motor real, comando a comando: `back`/`forward` con
+  sus flags correctos, `new_tab` creando y activando la pestaña 1,
+  `list_tabs` mostrando ambas con titulo, `switch_tab` volviendo a la 0
+  **con su propio historial intacto** (`can_go_back: true`, mientras que
+  la 1 lo tenia en `false` - el historial es por pestaña, como debe ser), y
+  `close_tab` dejando solo una. La aplicacion empaquetada arranco con esta
+  interfaz y el motor nuevo, y cerro sin dejar procesos huerfanos.
+
+- **Politica de mismo origen y CORS reales** (Fase 20): `net/src/cors.rs`
+  era un stub que devolvia `true` siempre y que ademas **nadie llamaba** -
+  `NetworkEngine::fetch` no lo invocaba, asi que un `fetch()` desde
+  JavaScript podia leer la respuesta de CUALQUIER dominio. Sin politica de
+  mismo origen no hay modelo de seguridad web: es la primitiva sobre la que
+  descansa todo lo demas.
+  **Donde se aplica y donde no**, que es la parte de diseño que importa:
+  CORS solo gobierna las peticiones que un SCRIPT inicia y cuya respuesta
+  quiere LEER (`fetch`/`XMLHttpRequest`). NO se aplica a la navegacion
+  (escribir una URL en la barra no es una peticion de origen cruzado, es
+  cambiar de origen) ni a los subrecursos (`<link>`/`<script src>`/`<img>`,
+  que van en modo "no-cors": se descargan de otro dominio pero su
+  contenido no se expone a JS - y este motor tampoco lo expone). Esa
+  frontera coincide EXACTAMENTE con la que ya separaba `engine-js` de
+  `core::server`, asi que el modelo se activa simplemente pasando `origin`
+  o no en `NetworkRequest`.
+  Implementado de verdad: comparacion de origen real, cabecera `Origin` en
+  peticiones cruzadas, comprobacion de `Access-Control-Allow-Origin` (`*` o
+  coincidencia EXACTA - nada de sufijos ni comodines de subdominio, que es
+  justo el agujero que CORS existe para tapar), distincion entre peticion
+  simple y con **preflight** (con las listas seguras de metodos y
+  cabeceras del spec), y comprobacion de `Access-Control-Allow-Methods` en
+  la respuesta al OPTIONS. El preflight se manda ANTES que la peticion
+  real, no despues: su proposito es no ejecutar en el servidor algo que
+  quiza no estaba autorizado (un DELETE), y comprobar a posteriori no
+  evitaria el daño.
+  **Credenciales**: las cookies dejan de viajar a otro origen salvo que se
+  pidan explicitamente - `credentials: "same-origin"` es el valor por
+  defecto real del fetch spec, y mandar la sesion del usuario a un tercero
+  sin que nadie lo pida es justo el ataque que esto existe para impedir. Y
+  con credenciales, `*` NO vale como `Access-Control-Allow-Origin` y hace
+  falta ademas `Access-Control-Allow-Credentials: true`: las dos reglas
+  que impiden que un servidor abra su API a todo el mundo por accidente.
+  **Dos huecos preexistentes que esta verificacion destapo**, ninguno
+  causado por CORS pero los dos invisibles hasta ahora:
+  1. `XMLHttpRequest` no LANZABA al fallar: se limitaba a poner
+     `status = 0` y disparar `onerror`. Eso es correcto para un XHR
+     asincrono, pero este es SIEMPRE sincrono (limitacion declarada del
+     modulo) y el spec exige que un `send()` sincrono fallido lance un
+     `NetworkError`. Sin ello, un bloqueo por CORS dejaba `responseText`
+     vacio sin ninguna señal capturable con `try`/`catch`: la pagina no
+     podia distinguir "bloqueado" de "el servidor devolvio vacio". Ahora
+     lanza, con el motivo REAL en el mensaje (que cabecera falta), y los
+     manejadores se siguen disparando antes.
+  2. `fetch`/XHR no resolvian URLs RELATIVAS: `Url::parse` exige una
+     absoluta, asi que `fetch('/api/datos')` - comunisimo en codigo real -
+     fallaba. Ahora se resuelven contra la URL de la pagina
+     (`request::resolve_against_page`), que ademas es de donde sale el
+     origen. De ahi que `StorageContext` lleve la URL COMPLETA y no solo
+     el origen: los dos salen del mismo sitio, y pasarlos por separado
+     abriria la puerta a que un dia no coincidieran y el aislamiento de
+     red dejara de corresponderse con el de almacenamiento.
+  NO implementado, declarado: cache de preflight
+  (`Access-Control-Max-Age`) - cada peticion no simple manda su OPTIONS;
+  y `Access-Control-Expose-Headers` - este motor no filtra que cabeceras
+  de respuesta ve el script, asi que las expone todas (mas permisivo que
+  el spec).
+  14 tests nuevos. Verificado en vivo con DOS servidores en origenes
+  distintos: mismo origen se lee (con URL relativa), origen cruzado con
+  `*` se lee, con origen nombrado se lee, **sin cabecera CORS se BLOQUEA**
+  (el secreto de la API nunca llego a la pagina), un DELETE con preflight
+  autorizado se ejecuta, y un DELETE sin autorizar se bloquea.
+
+- **Content Security Policy** (Fase 21): CSP es la defensa principal
+  contra XSS - deja que un servidor declare de DONDE puede venir el codigo
+  y los recursos de su pagina, de modo que un script inyectado por un
+  atacante no se ejecute aunque llegue a colarse en el HTML. No existia
+  nada de esto.
+  Se aplica de punta a punta porque el motor tiene los ganchos exactos:
+  `script-src` gobierna la ejecucion de cada `<script>` en
+  `core::scripting`; `style-src` y `img-src` filtran los subrecursos en
+  `core::server` ANTES de descargarlos (pedirle algo a un origen no
+  autorizado ya filtraria que la pagina lo visito, aunque luego se
+  descartara); `default-src` es el respaldo de todas.
+  La politica se toma de la cabecera `Content-Security-Policy` Y del
+  `<meta http-equiv>` (muchas paginas la ponen asi, sobre todo las
+  servidas desde sitios estaticos donde no se controlan las cabeceras). Si
+  vienen las dos se COMBINAN de forma restrictiva - hay que pasar ambas.
+  Combinarlas relajando seria un agujero: quien pudiera inyectar un
+  `<meta>` desactivaria la politica del servidor, justo lo que CSP existe
+  para impedir.
+  **La regla que mas se malinterpreta, implementada tal cual**: CSP solo
+  restringe lo que MENCIONA. Sin `script-src` ni `default-src`, los
+  scripts se permiten - una politica que solo diga `img-src 'self'` no
+  bloquea JavaScript. Es asi en el spec y es lo que hace que añadir CSP a
+  un sitio existente no lo rompa entero.
+  Fuentes soportadas: `'none'`, `'self'`, `'unsafe-inline'`, `*`, esquema
+  (`https:`), host exacto y comodin de subdominio (`*.cdn.test`, que cubre
+  subdominios pero NO el dominio desnudo, y exige separador de etiqueta
+  real - mismo criterio que las cookies y por la misma razon: sin el,
+  `malcdn.test` colaria).
+  **Sin nonces ni hashes** (`'nonce-...'`, `'sha256-...'`): son la forma
+  moderna de permitir scripts inline concretos. Se PARSEAN (para no
+  confundirlos con un host) pero no habilitan nada, asi que una politica
+  basada solo en nonce bloqueara sus scripts - el lado seguro del error:
+  bloquear de mas, nunca de menos. Sin `report-uri`/`report-to` ni
+  `Content-Security-Policy-Report-Only` (esta ultima se ignora entera, que
+  es exactamente lo que debe hacer: por definicion no bloquea nada). Sin
+  `frame-ancestors`/`form-action`/`base-uri`, que exigen `<iframe>`/
+  `<base>`, inexistentes aqui.
+  **Hueco declarado**: el `<style>` EN LINEA no se bloquea todavia (solo
+  el `<script>` inline y las hojas externas). Bloquearlo exigiria filtrar
+  los `<style>` antes de concatenarlos en `pipeline::build_page`, que hoy
+  no recibe la politica.
+  17 tests nuevos. Verificado en vivo sirviendo LA MISMA pagina con y sin
+  cabecera, para que la unica variable fuera la politica: sin CSP, el
+  script inline corrio (cambio el titulo y el texto) y la hoja de estilos
+  de OTRO origen se aplico (fondo rojo); con `default-src 'self'`, el
+  script inline quedo bloqueado (titulo y texto intactos) y la hoja
+  externa tambien (el fondo verde del `<style>` propio sobrevivio).
+- **`!important` real** (Fase 22): se descubrio verificando CSP, porque
+  la primera version del CSS de prueba lo usaba y no pintaba.
+  `background: #ff0000 !important` se guardaba con el sufijo PEGADO al
+  valor, y `parse_css_color` no lo reconocia - asi que la declaracion
+  ganaba la cascada (sobrescribia a las anteriores) pero luego no pintaba
+  nada. **Era peor que ignorarlo**: una regla con `!important` no solo no
+  se aplicaba, ademas ANULABA la que habria ganado sin ella.
+  Arreglado en dos sitios. En el PARSER (`split_important`), el sufijo se
+  separa del valor - asi todo lo que consume un valor CSS (parseo de
+  color, de longitud...) lo recibe limpio, sin tener que saber nada de la
+  cascada; tolera espacios y mayusculas (`! IMPORTANT` es valido). El dato
+  se guarda aparte, como un conjunto de NOMBRES de propiedad en
+  `Rule::important`, para no cambiar el tipo de `declarations`, que
+  consumen media docena de sitios. Un shorthand importante contagia su
+  importancia al longhand que se deriva de el (`background: red
+  !important` hace importante tambien al `background-color` expandido).
+  En la CASCADA (`apply_matching_rules`), DOS pasadas: primero las
+  declaraciones normales por especificidad, luego las importantes -
+  tambien por especificidad entre ellas. Asi una declaracion importante
+  gana a CUALQUIER normal sin importar su selector, que es justo lo que
+  `!important` significa y lo unico que no se puede expresar con un solo
+  orden de aplicacion.
+  NO modelado: `!important` dentro del atributo `style="..."` - ese ya
+  gana a cualquier selector de todas formas (ver `resolve_style`), asi que
+  solo importaria frente a OTRO `!important` de una hoja, caso raro. Se
+  descarta su marca y se queda el valor limpio, que es lo que arregla el
+  bug de parseo. Tampoco el orden de origenes completo del spec
+  (author-important pierde frente a user-agent-important), irrelevante
+  aqui porque la hoja de agente de usuario no usa `!important`.
+  5 tests nuevos (importante gana a mayor especificidad, el sufijo se
+  quita del valor, entre dos importantes vuelve a mandar la
+  especificidad, las normales no cambian de comportamiento, y el
+  contagio shorthand -> longhand). Verificado en vivo: un
+  `div { background: #ff0000 !important }` ahora se pinta rojo de verdad
+  ganando a un `#caja { background: #00aa00 }` mas especifico - antes no
+  se pintaba nada.
+
+- **Mitigaciones de proceso** (Fase 23): **esto NO es un sandbox, y decirlo
+  claro es parte del cambio.** Un sandbox de verdad separa el proceso que
+  interpreta contenido hostil del que tiene permisos: el renderizador corre
+  con un token restringido que no puede leer los ficheros del usuario, y un
+  proceso "broker" hace por el las operaciones privilegiadas. Aqui
+  `engine_server` hace su propia red y su propio disco, asi que restringir
+  su token lo romperia; separarlos es un refactor arquitectonico grande, no
+  una bandera que activar. Una mitigacion presentada como sandbox da una
+  falsa sensacion de seguridad, que es peor que no tener nada.
+  Lo que SI se aplica, al arrancar `engine_server` y antes de tocar la red
+  o parsear nada (las politicas de Windows solo se pueden endurecer, nunca
+  aflojar, asi que cuanto antes mejor):
+  - **Prohibir codigo dinamico** (`ProcessDynamicCodePolicy`): impide crear
+    o modificar paginas de memoria ejecutables, bloqueando de raiz la
+    tecnica clasica de "escribir shellcode y saltar a el". **Este motor
+    puede permitirselo y un navegador comercial no**: su JavaScript corre
+    en `boa`, un INTERPRETE sin JIT - y un JIT necesita exactamente eso que
+    aqui se prohibe. Es una ventaja de seguridad real que sale de una
+    decision de diseño previa, no un extra; Chromium no puede activarla
+    porque V8 compila en caliente.
+  - **Prohibir procesos hijo** (`ProcessChildProcessPolicy`): casi toda
+    cadena de explotacion termina lanzando `cmd.exe`/`powershell.exe`.
+    `engine_server` no lanza procesos nunca, asi que prohibirlo no le
+    cuesta nada y corta ese final.
+  - **Desactivar puntos de extension**
+    (`ProcessExtensionPointDisablePolicy`): bloquea mecanismos heredados de
+    inyeccion de DLL (AppInit_DLLs, ganchos de SetWindowsHookEx, capas de
+    proveedor Winsock).
+  Cada una se intenta por separado y un fallo no impide las demas: una
+  version de Windows puede no soportar una politica concreta, y perder las
+  otras dos por eso seria absurdo. Deliberadamente NO se aplica
+  `ProcessSignaturePolicy` (solo-DLL-firmadas-por-Microsoft): romperia la
+  carga de controladores graficos de terceros, y ahi seria adivinar en vez
+  de saber. En plataformas que no son Windows es un no-op que lo DECLARA en
+  su informe, en vez de fingir que aplico algo.
+  El informe sale por stderr y nunca por stdout, que es el canal NDJSON -
+  una linea que no fuera JSON romperia el protocolo.
+  4 tests, uno de ellos comprobando el EFECTO real y no el valor
+  devuelto: tras aplicar la mitigacion, lanzar un proceso hijo tiene que
+  fallar de verdad. Verificado ademas que el motor sigue funcionando
+  entero con las tres puestas - carga local con JavaScript ejecutandose
+  (`[JS OK]` en el titulo, 34 elementos, PNG de 63KB) y Wikipedia por
+  HTTPS real (2.024 elementos): ni el interprete de JS ni TLS ni el
+  rasterizado se ven afectados.
 
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"
