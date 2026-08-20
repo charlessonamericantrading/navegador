@@ -37,9 +37,16 @@
 //!   distinguir peticion "de primera parte" de "de tercera parte", concepto
 //!   que este motor no tiene (no hay `<iframe>` ni contexto de navegacion
 //!   anidado). Declarado aqui en vez de fingir la defensa CSRF que aporta.
-//! - **`HttpOnly` se parsea y se guarda pero no protege nada todavia**: solo
-//!   tendria efecto ante un `document.cookie` en JS, que no existe aun.
-//!   Cuando se implemente, esta bandera ya esta lista para filtrarlo.
+//! - **`HttpOnly` SI protege `document.cookie`** (Fase 24): `header_for_js`
+//!   (usada por `engine_js::cookie`, el accessor de `document.cookie`)
+//!   excluye toda cookie `http_only`, mientras que `header_for` (peticiones
+//!   de red reales) las sigue enviando siempre - la bandera solo esconde la
+//!   cookie de JS, nunca del servidor que la puso. `set_from_js` (el
+//!   SETTER de `document.cookie`) usa la misma gramatica de atributos que
+//!   un `Set-Cookie` real pero IGNORA `HttpOnly` si el script la escribe -
+//!   un script no puede crear una cookie a la que el mismo no pueda acceder
+//!   despues, igual que un navegador real (Chrome/Firefox no rechazan la
+//!   cookie entera, simplemente no la marcan `HttpOnly`).
 //! - Sin persistencia a disco: el almacen vive en memoria, asi que las
 //!   sesiones no sobreviven a cerrar la aplicacion.
 
@@ -330,13 +337,12 @@ impl CookieStore {
         self.cookies.push(cookie);
     }
 
-    /// El valor de la cabecera `Cookie:` para esta URL, o `None` si no
-    /// aplica ninguna - en cuyo caso quien llama no debe mandar la cabecera
-    /// vacia, sino omitirla por completo.
-    ///
-    /// De paso purga las caducadas, que es el momento natural de hacerlo
-    /// (no hace falta ningun temporizador aparte).
-    pub fn header_for(&mut self, url: &Url) -> Option<String> {
+    /// Nucleo compartido de `header_for`/`header_for_js`: que cookies
+    /// aplican a `url`, purgando las caducadas de paso (no hace falta
+    /// ningun temporizador aparte). `include_http_only` es la UNICA
+    /// diferencia entre las dos - `false` es lo que hace que `document.
+    /// cookie` no pueda leer una cookie `HttpOnly` (ver aviso del modulo).
+    fn matching_cookies(&mut self, url: &Url, include_http_only: bool) -> Option<Vec<&Cookie>> {
         let now = SystemTime::now();
         self.cookies.retain(|c| !c.is_expired(now));
 
@@ -351,6 +357,9 @@ impl CookieStore {
                 if c.secure && !is_secure {
                     return false;
                 }
+                if c.http_only && !include_http_only {
+                    return false;
+                }
                 let domain_ok = if c.host_only { host == c.domain } else { domain_matches(&host, &c.domain) };
                 domain_ok && path_matches(request_path, &c.path)
             })
@@ -363,8 +372,38 @@ impl CookieStore {
         // servidores reales leen solo el primer valor de un nombre repetido,
         // asi que el orden importa de verdad, no es cosmetico.
         matching.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        Some(matching)
+    }
 
+    /// El valor de la cabecera `Cookie:` para esta URL, o `None` si no
+    /// aplica ninguna - en cuyo caso quien llama no debe mandar la cabecera
+    /// vacia, sino omitirla por completo. Incluye cookies `HttpOnly`: esa
+    /// bandera protege de JS, no del servidor que las puso.
+    pub fn header_for(&mut self, url: &Url) -> Option<String> {
+        let matching = self.matching_cookies(url, true)?;
         Some(matching.iter().map(|c| format!("{}={}", c.name, c.value)).collect::<Vec<_>>().join("; "))
+    }
+
+    /// El valor real de `document.cookie` para esta URL: igual que
+    /// `header_for` pero SIN las `HttpOnly` (RFC 6265 §8.6) - esa es la
+    /// proteccion completa que aporta la bandera.
+    pub fn header_for_js(&mut self, url: &Url) -> Option<String> {
+        let matching = self.matching_cookies(url, false)?;
+        Some(matching.iter().map(|c| format!("{}={}", c.name, c.value)).collect::<Vec<_>>().join("; "))
+    }
+
+    /// Escribe una cookie desde `document.cookie = "..."` (JS), reusando el
+    /// parseo de un `Set-Cookie` real (misma gramatica de atributos y
+    /// mismas comprobaciones de dominio - un script tampoco puede poner
+    /// cookies a un dominio ajeno). `HttpOnly`, si el script la escribe, se
+    /// IGNORA a proposito: ver el aviso del modulo. Una cadena inservible
+    /// (sin `=`, nombre vacio, `Domain` ajeno...) es un no-op silencioso,
+    /// igual que en un navegador real.
+    pub fn set_from_js(&mut self, raw: &str, url: &Url) {
+        if let Some(mut cookie) = parse_set_cookie(raw, url) {
+            cookie.http_only = false;
+            self.insert(cookie);
+        }
     }
 }
 
@@ -539,5 +578,48 @@ mod tests {
     fn no_matching_cookies_yields_no_header_at_all_instead_of_an_empty_one() {
         let mut store = CookieStore::new();
         assert!(store.header_for(&url("https://ejemplo.test/")).is_none());
+    }
+
+    /// La proteccion REAL de `HttpOnly` (RFC 6265 §8.6): visible para el
+    /// servidor (`header_for`, lo que manda una peticion de red real),
+    /// invisible para `document.cookie` (`header_for_js`).
+    #[test]
+    fn http_only_cookies_are_sent_over_the_network_but_hidden_from_document_cookie() {
+        let mut store = CookieStore::new();
+        store.store_from_response(&["sesion=secreta; HttpOnly".to_string()], &url("https://ejemplo.test/"));
+
+        assert_eq!(store.header_for(&url("https://ejemplo.test/")).as_deref(), Some("sesion=secreta"), "el servidor SI debe recibirla de vuelta");
+        assert!(store.header_for_js(&url("https://ejemplo.test/")).is_none(), "un XSS leyendo document.cookie no deberia verla");
+    }
+
+    #[test]
+    fn a_non_http_only_cookie_is_visible_to_document_cookie_too() {
+        let mut store = CookieStore::new();
+        store.store_from_response(&["tema=oscuro".to_string()], &url("https://ejemplo.test/"));
+        assert_eq!(store.header_for_js(&url("https://ejemplo.test/")).as_deref(), Some("tema=oscuro"));
+    }
+
+    #[test]
+    fn document_cookie_setter_stores_a_cookie_that_a_later_request_sends() {
+        let mut store = CookieStore::new();
+        store.set_from_js("consentimiento=si; Path=/", &url("https://ejemplo.test/pagina"));
+        assert_eq!(store.header_for(&url("https://ejemplo.test/")).as_deref(), Some("consentimiento=si"));
+    }
+
+    /// La otra mitad de la proteccion: un script NO puede crear una cookie
+    /// `HttpOnly` para escondersela a si mismo despues - esa bandera solo
+    /// la pone un servidor real via cabecera `Set-Cookie`.
+    #[test]
+    fn document_cookie_setter_cannot_create_an_http_only_cookie() {
+        let mut store = CookieStore::new();
+        store.set_from_js("a=1; HttpOnly", &url("https://ejemplo.test/"));
+        assert_eq!(store.header_for_js(&url("https://ejemplo.test/")).as_deref(), Some("a=1"), "HttpOnly escrita desde JS deberia ignorarse, no rechazar la cookie entera");
+    }
+
+    #[test]
+    fn document_cookie_setter_still_rejects_a_domain_it_does_not_own() {
+        let mut store = CookieStore::new();
+        store.set_from_js("robo=1; Domain=otrositio.test", &url("https://ejemplo.test/"));
+        assert!(store.header_for_js(&url("https://ejemplo.test/")).is_none(), "un script tampoco deberia poder poner cookies a un dominio ajeno");
     }
 }

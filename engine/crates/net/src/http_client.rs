@@ -3,6 +3,7 @@ use crate::request::{Method, NetworkRequest};
 use crate::response::NetworkResponse;
 use thiserror::Error;
 use std::collections::HashMap;
+use url::Url;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes as HyperBytes;
 use hyper_util::client::legacy::Client;
@@ -339,6 +340,31 @@ impl NetworkEngine {
             body: bytes::Bytes::from(decompressed),
         })
     }
+
+    /// El valor real de `document.cookie` para `page_url` (Fase 24, ver
+    /// `engine_js::cookie`) - SIN las cookies `HttpOnly` (esa es su
+    /// proteccion, ver `cookie::CookieStore::header_for_js`). Cadena vacia
+    /// (nunca `None`, a diferencia de `header_for`) porque eso es lo que
+    /// devuelve `document.cookie` en un documento sin cookies: no hay
+    /// cabecera HTTP que omitir, es una propiedad de JS que siempre existe.
+    /// `page_url` ilegible (documento sin URL propia) tambien da cadena
+    /// vacia, no un error - no hay origen contra el que mirar nada.
+    pub fn cookie_header_for_js(&self, page_url: &str) -> String {
+        let Ok(url) = Url::parse(page_url) else { return String::new() };
+        self.cookies.lock().ok().and_then(|mut store| store.header_for_js(&url)).unwrap_or_default()
+    }
+
+    /// Escribe una cookie desde `document.cookie = "..."` (Fase 24) contra
+    /// `page_url`, en el MISMO almacen que ya usan las peticiones de red -
+    /// una cookie puesta por JS viaja despues en el `Cookie:` de un
+    /// `fetch()`/navegacion, igual que en un navegador real. No-op
+    /// silencioso si `page_url` no es una URL valida.
+    pub fn set_cookie_from_js(&self, raw: &str, page_url: &str) {
+        let Ok(url) = Url::parse(page_url) else { return };
+        if let Ok(mut store) = self.cookies.lock() {
+            store.set_from_js(raw, &url);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -515,5 +541,30 @@ mod tests {
             RedirectDecision::Follow(next) => assert!(matches!(next.method, Method::Head)),
             RedirectDecision::Done => panic!("deberia seguir la redireccion"),
         }
+    }
+
+    #[test]
+    fn document_cookie_write_then_read_round_trips_through_the_same_store() {
+        let engine = NetworkEngine::new();
+        assert_eq!(engine.cookie_header_for_js("https://ejemplo.test/"), "", "sin cookies deberia ser cadena vacia, no un error");
+
+        engine.set_cookie_from_js("tema=oscuro; Path=/", "https://ejemplo.test/pagina");
+        assert_eq!(engine.cookie_header_for_js("https://ejemplo.test/"), "tema=oscuro");
+    }
+
+    #[test]
+    fn document_cookie_never_exposes_an_http_only_cookie_set_by_a_server() {
+        let engine = NetworkEngine::new();
+        if let Ok(mut store) = engine.cookies.lock() {
+            store.store_from_response(&["sesion=secreta; HttpOnly".to_string()], &Url::parse("https://ejemplo.test/").unwrap());
+        }
+        assert_eq!(engine.cookie_header_for_js("https://ejemplo.test/"), "", "una cookie HttpOnly no deberia llegar nunca a JS");
+    }
+
+    #[test]
+    fn an_unparseable_page_url_is_a_silent_no_op_not_a_panic() {
+        let engine = NetworkEngine::new();
+        engine.set_cookie_from_js("a=1", "no-es-una-url");
+        assert_eq!(engine.cookie_header_for_js("tampoco-una-url"), "");
     }
 }

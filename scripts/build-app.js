@@ -94,16 +94,18 @@ try {
 
   // 3. Compilar Backend a binario con PyInstaller
   console.log('\n[Paso 3/4] Compilando Backend (PyInstaller)...');
-  const pyinstallerPath = isWin
-    ? path.join(backendDir, '.venv', 'Scripts', 'pyinstaller.exe')
-    : path.join(backendDir, '.venv', 'bin', 'pyinstaller');
+  const pythonPath = isWin
+    ? path.join(backendDir, '.venv', 'Scripts', 'python.exe')
+    : path.join(backendDir, '.venv', 'bin', 'python');
 
-  if (!fs.existsSync(pyinstallerPath)) {
-    throw new Error(`No se encontró PyInstaller en: ${pyinstallerPath}. Por favor ejecuta la instalación primero.`);
+  if (!fs.existsSync(pythonPath)) {
+    throw new Error(`No se encontró el Python del entorno virtual en: ${pythonPath}. Por favor ejecuta la instalación primero.`);
   }
 
-  // Ejecutamos pyinstaller con recopilación de todas las librerías dinámicas necesarias
-  const pyinstallerCmd = `"${pyinstallerPath}" --onedir --noconfirm --clean --name backend-server --distpath dist --workpath build --paths . --collect-all uvicorn --collect-all fastapi --collect-all websockets --collect-all google --collect-all pydantic app/core/main.py`;
+  // Invocamos PyInstaller como módulo de Python (`python -m PyInstaller`) en vez del
+  // ejecutable "pyinstaller.exe" generado por pip: ese stub quedó roto (sale con código 1
+  // sin imprimir nada), mientras que el módulo importa y funciona con normalidad.
+  const pyinstallerCmd = `"${pythonPath}" -m PyInstaller --onedir --noconfirm --clean --name backend-server --distpath dist --workpath build --paths . --collect-all uvicorn --collect-all fastapi --collect-all websockets --collect-all google --collect-all pydantic app/core/main.py`;
   runCmd(pyinstallerCmd, backendDir);
 
   // 4. Limpiar y recrear directorio de recursos temporales de Electron

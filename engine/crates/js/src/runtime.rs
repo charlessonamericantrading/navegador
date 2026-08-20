@@ -78,6 +78,21 @@ impl JsRuntime {
         crate::xhr::register_xhr(&mut self.context, network, page_url).map_err(|e| JsError::Execution(e.to_string()))
     }
 
+    /// Registra el accessor `document.cookie` (Fase 24, ver `crate::cookie`
+    /// para el diseño completo: `HttpOnly` real, misma gramatica de
+    /// atributos que un `Set-Cookie` de servidor). Mismo `NetworkEngine` y
+    /// mismo `page_url` que `register_fetch`/`register_xhr` - las tres
+    /// comparten el mismo `CookieStore` de sesion, asi que una cookie
+    /// puesta por `document.cookie` viaja despues en el `Cookie:` de un
+    /// `fetch()` posterior, igual que en un navegador real.
+    ///
+    /// Requiere que `bind_dom` ya haya corrido - sin `document` en el
+    /// `Context`, es un no-op honesto (ver `cookie::register_cookie`), no
+    /// un error.
+    pub fn register_cookie(&mut self, network: Arc<NetworkEngine>, page_url: Option<String>) -> Result<(), JsError> {
+        crate::cookie::register_cookie(&mut self.context, network, page_url).map_err(|e| JsError::Execution(e.to_string()))
+    }
+
     /// Registra el global `window` con `open(url)` real (Fase 6.4). Igual
     /// criterio que `register_fetch`: separado del resto porque solo tiene
     /// sentido donde hay alguien capaz de ATENDER lo que se encole -

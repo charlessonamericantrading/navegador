@@ -1,4 +1,5 @@
 pub mod runtime;
+pub mod cookie;
 pub mod cssom;
 pub mod dom_bindings;
 pub mod event_loop;

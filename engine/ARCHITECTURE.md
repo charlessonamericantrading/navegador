@@ -2907,6 +2907,64 @@ A fecha de esta limpieza, el motor:
   HTTPS real (2.024 elementos): ni el interprete de JS ni TLS ni el
   rasterizado se ven afectados.
 
+- **`document.cookie` real, con `HttpOnly` protegiendo por fin de verdad**
+  (Fase 24): antes de esto `HttpOnly` se parseaba y se guardaba (Fase 16)
+  pero no protegia nada, por la razon mas simple posible - no habia ningun
+  `document.cookie` del que protegerla. Encontrado auditando el motor tras
+  cerrar la Fase 23: la doc de `cookie.rs` declaraba la limitacion
+  explicitamente, y seguia sin cerrarse.
+  `net/src/cookie.rs::CookieStore` gana `header_for_js` (la mitad LECTURA
+  de `document.cookie`: MISMO filtrado por dominio/ruta/`Secure` que
+  `header_for`, la funcion que ya usan las peticiones de red reales, mas UN
+  filtro extra - descarta toda cookie `http_only`) y `set_from_js` (la
+  mitad ESCRITURA: reusa `parse_set_cookie`, la misma gramatica de
+  atributos que un `Set-Cookie` de servidor, pero fuerza `http_only =
+  false` pase lo que el script haya escrito - un script no puede crearse
+  una cookie a la que el mismo no pueda acceder despues, igual que hace un
+  navegador real, que ignora el atributo en vez de rechazar la cookie
+  entera). Las dos comparten el mismo `Vec<Cookie>` que ya usaba
+  `header_for`, via una funcion privada `matching_cookies(url,
+  include_http_only)` de la que `header_for`/`header_for_js` son ahora dos
+  finales distintos - no hay dos almacenes que pudieran desincronizarse.
+  `NetworkEngine` (`http_client.rs`) expone `cookie_header_for_js`/
+  `set_cookie_from_js` tomando `page_url: &str` (parsea la `Url`
+  internamente - `engine-js` no depende de el crate `url` en produccion, a
+  proposito, y esto evita añadirlo solo para esto) sobre el MISMO
+  `Mutex<CookieStore>` que ya usan `fetch`/las peticiones de red: una
+  cookie puesta por `document.cookie = ...` viaja despues en el `Cookie:`
+  de un `fetch()` posterior, y una puesta por el servidor aparece en la
+  siguiente lectura de `document.cookie` (salvo que sea `HttpOnly`).
+  El binding nuevo, `engine-js/src/cookie.rs::register_cookie`, sigue el
+  mismo patron que `fetch.rs`/`xhr.rs` (una funcion `register_*` aparte,
+  llamada solo donde hay `NetworkEngine` disponible) en vez de meterse
+  dentro de `DocumentBindings::register`: cuelga el accessor (getter Y
+  setter reales, via `PropertyDescriptor::builder()` + `define_property_or_
+  throw` - el mismo mecanismo que ya usa `xhr.rs` para sus propios
+  accessors, no el `ObjectInitializer` que usa `document.title` porque ese
+  construye un objeto NUEVO y aqui hace falta añadir una propiedad a un
+  `document` que YA EXISTE) sobre el `document` que `bind_dom` ya creo -
+  por eso `core/scripting.rs` lo registra DESPUES de `bind_dom` (implicito,
+  ya habia corrido) y junto a `register_fetch`/`register_xhr`, con el mismo
+  criterio de "solo si hay red" que esos dos. `page_url: None` (sin
+  `NetworkEngine` o sin URL propia) deja `document.cookie` como cadena
+  vacia siempre y el setter como no-op silencioso, mismo criterio que
+  `fetch` sin red.
+  12 tests nuevos repartidos en las tres capas (5 en `cookie.rs` de
+  `engine-net` sobre `CookieStore` directamente, 3 en `http_client.rs`
+  sobre `NetworkEngine::cookie_header_for_js`/`set_cookie_from_js`, 4 en
+  `engine-js/src/cookie.rs` evaluando JS de verdad contra un `JsRuntime`)
+  - incluido el caso que motivo todo esto: una cookie `HttpOnly` puesta por
+  el servidor SI viaja en la siguiente peticion de red pero NUNCA aparece
+  en `document.cookie`, y un script que intente `document.cookie = "a=1;
+  HttpOnly"` para escondersela a si mismo no lo consigue - la cookie queda
+  visible por el mismo `document.cookie` que la creo, exactamente el
+  comportamiento de un navegador real. 610 tests en total tras esta fase
+  (598 + 12).
+  **Simplificaciones que siguen igual, declaradas**: `SameSite` sigue sin
+  aplicarse (exige distinguir peticion de primera parte de tercera parte,
+  que este motor no modela todavia - sin cambios respecto a la Fase 16);
+  sin lista de sufijos publicos (PSL); sin persistencia a disco.
+
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"
 o una cifra de rendimiento), es una mentira que hay que borrar, no una
@@ -2995,7 +3053,7 @@ cambio, cuando llegue, no sea una reescritura del resto del motor.
 ```
 engine/
 ├── crates/
-│   ├── net/         HTTP/HTTPS real (hyper+rustls); CookieStore/WebStorage/CorsPolicy son stubs honestos (mapas en memoria / permite-todo) SIN conectar a `NetworkEngine::fetch` ni a bindings JS todavia - ver doc-comments en cookie.rs/storage.rs/cors.rs
+│   ├── net/         HTTP/HTTPS real (hyper+rustls); `CookieStore` (RFC 6265 real, con `document.cookie` conectado a JS desde la Fase 24 - ver su entrada), `WebStorage` (origen-aislado, conectado a `localStorage`/`sessionStorage` desde la Fase 15) y `CorsPolicy`/`ContentSecurityPolicy` (aplicados de verdad en `NetworkEngine::fetch` desde las Fases 20/21) - ninguno de los tres es ya un stub, ver doc-comments en cookie.rs/storage.rs/cors.rs/csp.rs para las simplificaciones que SI siguen declaradas
 │   ├── dom/         Nodos, arbol, adaptador TreeSink para html5ever (los eventos DOM viven en js/dom_bindings.rs - ver ese crate - no aqui: guardar listeners exige poder guardar un JsObject, y este crate no depende de Boa a proposito)
 │   ├── css/         Parseo real (cssparser), matching de selectores real (selectors: combinadores, compuestos, atributos), resolucion de cascada real (`cascade::resolve_style` - matching+especificidad+atributo style inline; se traslado aqui desde `layout` para que `js` tambien pueda reusarla, ver "Metrica de progreso")
 │   ├── layout/      Cajas con layout de bloque, inline, flex Y tabla real (`BoxType::Block`/`Inline`/`Text`/`Image`; `display: flex` via `taffy` (`flow_flex_children`), `display: table` a mano (`flow_table_children`, Fase 3.4)) + cascada CSS aplicada (via `engine_css::resolve_style`), texto medido con metricas reales de fuente (negrita/cursiva incluidas, via `FontSet`); box model completo desde CSS - `padding`/`border`/`margin` reales (`LayoutBox::box_dimensions`, `Dimensions::padding_box()`/`border_box()`/`margin_box()` en box_model.rs); `position: relative/absolute/fixed` + `z-index` reales (Fase 3.3, `resolve_positioned_boxes`); floats/grid siguen sin existir

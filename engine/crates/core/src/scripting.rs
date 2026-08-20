@@ -111,7 +111,7 @@ pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, externa
 pub struct StorageContext {
     pub storage: engine_js::storage::SharedWebStorage,
     pub origin: String,
-    /// La politica de seguridad de contenido de la pagina (Fase 21) -
+    /// La politica de seguridad de contenido de la pagina (Fase 24) -
     /// decide si sus `<script>` EN LINEA se ejecutan. Los externos ya se
     /// filtraron antes de descargarse (`core::server::filter_by_csp`), asi
     /// que aqui solo queda la mitad inline, que es justo el vector
@@ -153,6 +153,13 @@ pub fn execute_inline_scripts_keeping_runtime(
     if let Some(network) = network {
         if let Err(e) = runtime.register_fetch(network.clone(), page_url.clone()) {
             tracing::warn!("[js] no se pudo registrar fetch: {e}");
+        }
+        // Fase 24: mismo `NetworkEngine`, mismo `CookieStore` de sesion que
+        // `fetch`/`XMLHttpRequest` - ver `engine_js::cookie`. DESPUES de
+        // `bind_dom` (ya corrio arriba) a proposito: el accessor se cuelga
+        // del `document` que `bind_dom` acaba de crear.
+        if let Err(e) = runtime.register_cookie(network.clone(), page_url.clone()) {
+            tracing::warn!("[js] no se pudo registrar document.cookie: {e}");
         }
         // Fase 9: mismo `NetworkEngine`, misma condicion. Un motor con
         // `fetch` pero sin `XMLHttpRequest` deja sin red a toda la parte
@@ -207,7 +214,7 @@ pub fn execute_inline_scripts_keeping_runtime(
     }
 
     // CSP: si la politica no permite `<script>` en linea, no se
-    // ejecutan (Fase 21). Los EXTERNOS ya vienen filtrados desde
+    // ejecutan (Fase 24). Los EXTERNOS ya vienen filtrados desde
     // `core::server`, asi que los que sigan en el mapa estan autorizados.
     let allow_inline = storage_csp.as_ref().is_none_or(|csp| csp.allows_inline("script-src"));
     let script_results = run_scripts(&mut runtime, &scripts, external_scripts, allow_inline);
@@ -220,7 +227,7 @@ pub fn execute_inline_scripts_keeping_runtime(
 /// valor no esta en el mapa se omite con un aviso, en vez de fallar: puede
 /// que la descarga fallara, o que quien llama (los tests de este archivo,
 /// `wpt_runner`) no tenga red en absoluto.
-/// `allow_inline` a `false` (Fase 21) salta los `<script>` SIN `src`:
+/// `allow_inline` a `false` (Fase 24) salta los `<script>` SIN `src`:
 /// la politica de seguridad de la pagina no los permite. Los que tienen
 /// `src` no se comprueban aqui porque ya vienen filtrados de
 /// `core::server::filter_by_csp` - si su contenido esta en el mapa, es que
