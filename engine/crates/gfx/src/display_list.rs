@@ -307,8 +307,9 @@ fn parse_rgb_component(token: &str) -> Option<u8> {
 }
 
 /// Parseo de color CSS: hexadecimal (`#rgb`, `#rrggbb`, `#rrggbbaa`),
-/// nombres (`red`, `white`... ver `NAMED_COLORS`), `rgb()`/`rgba()` y las
-/// palabras clave `transparent`/`currentColor`.
+/// nombres (`red`, `white`... ver `NAMED_COLORS`), `rgb()`/`rgba()`,
+/// `hsl()`/`hsla()` (Fase 28) y las palabras clave `transparent`/
+/// `currentColor`.
 ///
 /// Antes de esta fase SOLO entendia hexadecimal, asi que un
 /// `background: red` - de lo mas comun que hay en CSS real - no pintaba
@@ -316,9 +317,22 @@ fn parse_rgb_component(token: &str) -> Option<u8> {
 /// arreglarlo aqui arregla `color`, `background-color`, `border` y
 /// `box-shadow` a la vez.
 ///
-/// NO implementado: `hsl()`/`hwb()`/`lab()`/`oklch()` y el resto de
-/// espacios de color modernos - devuelven `None` y la caja se queda sin
-/// pintar, en vez de fingir una conversion. Tampoco los ~90 nombres
+/// `hsl()`/`hsla()` (Fase 28) acepta la sintaxis clasica con comas
+/// (`hsl(210, 50%, 40%)`) y la moderna con espacios/`/` para el alfa
+/// (`hsl(210 50% 40% / 0.5)`), igual que ya hacia `rgb()`. El matiz
+/// (`hue`) acepta grados sin unidad (lo mas comun en CSS real) y las
+/// otras tres unidades de angulo del spec (`deg`/`grad`/`rad`/`turn`) -
+/// normalizado a `0..360` con `rem_euclid` antes de convertir, asi que un
+/// matiz negativo o mayor de 360 (legal en el spec) da el mismo color que
+/// su equivalente normalizado. Saturacion y luminosidad EXIGEN `%` (la
+/// sintaxis clasica real, sin la forma moderna sin unidad de CSS Color 4).
+/// La conversion HSL->RGB es la formula estandar del spec (`hsl_to_rgb`,
+/// mas abajo) - sin aproximacion, resultado identico al de un navegador
+/// real para el mismo triplete.
+///
+/// NO implementado: `hwb()`/`lab()`/`lch()`/`oklab()`/`oklch()` y el resto
+/// de espacios de color modernos - devuelven `None` y la caja se queda
+/// sin pintar, en vez de fingir una conversion. Tampoco los ~90 nombres
 /// extendidos que faltan en la tabla.
 fn parse_css_color(value: &str) -> Option<[u8; 4]> {
     let value = value.trim();
@@ -373,7 +387,99 @@ fn parse_css_color(value: &str) -> Option<[u8; 4]> {
         return Some([r, g, b, a]);
     }
 
+    if let Some(rest) = lower.strip_prefix("hsla(").or_else(|| lower.strip_prefix("hsl(")) {
+        let inner = rest.strip_suffix(')')?;
+        let normalised = inner.replace(',', " ").replace('/', " ");
+        let parts: Vec<&str> = normalised.split_whitespace().collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let hue = parse_hue_degrees(parts[0])?;
+        let saturation = parse_percentage_0_1(parts[1])?;
+        let lightness = parse_percentage_0_1(parts[2])?;
+        let (r, g, b) = hsl_to_rgb(hue, saturation, lightness);
+        // Mismo parseo de alfa que `rgb()`/`rgba()` de aqui arriba.
+        let a = match parts.get(3) {
+            Some(token) => {
+                let t = token.trim();
+                let alpha = match t.strip_suffix('%') {
+                    Some(percent) => percent.trim().parse::<f32>().ok()? / 100.0,
+                    None => t.parse::<f32>().ok()?,
+                };
+                (alpha.clamp(0.0, 1.0) * 255.0).round() as u8
+            }
+            None => 255,
+        };
+        return Some([r, g, b, a]);
+    }
+
     NAMED_COLORS.iter().find(|(name, _)| *name == lower).map(|(_, rgba)| *rgba)
+}
+
+/// El matiz (`hue`) de `hsl()` en cualquiera de las cuatro unidades de
+/// angulo del spec, normalizado a grados - `deg` (o sin unidad, la forma
+/// mas comun en CSS real) se toma tal cual, las otras tres se convierten.
+/// El orden de las comprobaciones importa: `strip_suffix("rad")` tambien
+/// coincidiria con un token que termina en `grad` (los ultimos tres
+/// caracteres de "grad" son "rad"), asi que `grad` se comprueba ANTES que
+/// `rad` a proposito.
+fn parse_hue_degrees(token: &str) -> Option<f32> {
+    let token = token.trim();
+    if let Some(v) = token.strip_suffix("deg") {
+        return v.trim().parse::<f32>().ok();
+    }
+    if let Some(v) = token.strip_suffix("grad") {
+        return v.trim().parse::<f32>().ok().map(|g| g * 360.0 / 400.0);
+    }
+    if let Some(v) = token.strip_suffix("turn") {
+        return v.trim().parse::<f32>().ok().map(|t| t * 360.0);
+    }
+    if let Some(v) = token.strip_suffix("rad") {
+        return v.trim().parse::<f32>().ok().map(|r| r.to_degrees());
+    }
+    token.parse::<f32>().ok()
+}
+
+/// Saturacion/luminosidad de `hsl()`: EXIGEN `%` (la sintaxis clasica real
+/// - la forma moderna sin unidad de CSS Color 4 no esta soportada, mismo
+/// criterio de alcance que el resto de este parser). Acotado a `0.0..1.0`,
+/// igual que `parse_rgb_component` acota sus componentes.
+fn parse_percentage_0_1(token: &str) -> Option<f32> {
+    let percent = token.trim().strip_suffix('%')?;
+    Some((percent.trim().parse::<f32>().ok()? / 100.0).clamp(0.0, 1.0))
+}
+
+/// HSL -> RGB, la formula estandar del spec (CSS Color 4 §4.2, identica a
+/// la de HTML/CSS desde HSL original) - no una aproximacion. `hue_deg`
+/// puede venir fuera de `0..360` (el spec lo permite, ver el aviso de
+/// `parse_css_color`) y se normaliza aqui con `rem_euclid` ANTES de
+/// convertir, no despues: un `hue` negativo debe dar el mismo color que su
+/// equivalente positivo, no un canal RGB fuera de rango.
+fn hsl_to_rgb(hue_deg: f32, saturation: f32, lightness: f32) -> (u8, u8, u8) {
+    let h = hue_deg.rem_euclid(360.0);
+    let s = saturation.clamp(0.0, 1.0);
+    let l = lightness.clamp(0.0, 1.0);
+
+    let chroma = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h_prime = h / 60.0;
+    let x = chroma * (1.0 - (h_prime.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = if h_prime < 1.0 {
+        (chroma, x, 0.0)
+    } else if h_prime < 2.0 {
+        (x, chroma, 0.0)
+    } else if h_prime < 3.0 {
+        (0.0, chroma, x)
+    } else if h_prime < 4.0 {
+        (0.0, x, chroma)
+    } else if h_prime < 5.0 {
+        (x, 0.0, chroma)
+    } else {
+        (chroma, 0.0, x)
+    };
+    let m = l - chroma / 2.0;
+
+    let to_channel = |c: f32| ((c + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (to_channel(r1), to_channel(g1), to_channel(b1))
 }
 
 /// Hexadecimal en sus tres longitudes reales: `#rgb`, `#rrggbb` y
@@ -588,10 +694,60 @@ mod tests {
 
     #[test]
     fn unsupported_color_syntaxes_are_none_instead_of_a_made_up_color() {
-        assert_eq!(parse_css_color("hsl(0, 100%, 50%)"), None, "hsl() no esta implementado");
+        assert_eq!(parse_css_color("hwb(0 0% 0%)"), None, "hwb() no esta implementado");
+        assert_eq!(parse_css_color("oklch(0.5 0.2 30)"), None, "oklch() no esta implementado");
         assert_eq!(parse_css_color("currentColor"), None, "currentColor exige el computed_style completo");
         assert_eq!(parse_css_color("basura"), None);
         assert_eq!(parse_css_color(""), None);
+    }
+
+    /// Los tres primarios y los limites de luminosidad (0%/100% siempre dan
+    /// negro/blanco puro, sin importar matiz o saturacion) - los puntos de
+    /// referencia mas faciles de verificar a ojo contra un navegador real.
+    #[test]
+    fn hsl_resolves_the_primaries_and_the_lightness_extremes() {
+        assert_eq!(parse_css_color("hsl(0, 100%, 50%)"), Some([255, 0, 0, 255]), "rojo");
+        assert_eq!(parse_css_color("hsl(120, 100%, 50%)"), Some([0, 255, 0, 255]), "verde");
+        assert_eq!(parse_css_color("hsl(240, 100%, 50%)"), Some([0, 0, 255, 255]), "azul");
+        assert_eq!(parse_css_color("hsl(180, 100%, 50%)"), Some([0, 255, 255, 255]), "cian");
+        assert_eq!(parse_css_color("hsl(0, 100%, 0%)"), Some([0, 0, 0, 255]), "luminosidad 0% siempre es negro");
+        assert_eq!(parse_css_color("hsl(0, 100%, 100%)"), Some([255, 255, 255, 255]), "luminosidad 100% siempre es blanco");
+        assert_eq!(parse_css_color("hsl(0, 0%, 50%)"), Some([128, 128, 128, 255]), "saturacion 0% es gris puro");
+    }
+
+    #[test]
+    fn hsl_accepts_both_comma_and_space_syntax_with_alpha() {
+        assert_eq!(parse_css_color("hsl(0, 100%, 50%)"), parse_css_color("hsl(0 100% 50%)"), "las dos sintaxis deberian dar el mismo color");
+        assert_eq!(parse_css_color("hsla(0, 100%, 50%, 0.5)"), Some([255, 0, 0, 128]), "el alfa va de 0 a 1, no de 0 a 255");
+        assert_eq!(parse_css_color("hsl(0 100% 50% / 50%)"), Some([255, 0, 0, 128]), "alfa en porcentaje tras la barra, sintaxis moderna");
+    }
+
+    /// El matiz es circular (el spec lo permite fuera de `0..360`): -120
+    /// deberia dar el mismo color que su equivalente normalizado 240, y
+    /// 360 el mismo que 0.
+    #[test]
+    fn hsl_hue_wraps_for_negative_and_over_360_values() {
+        assert_eq!(parse_css_color("hsl(-120, 100%, 50%)"), parse_css_color("hsl(240, 100%, 50%)"));
+        assert_eq!(parse_css_color("hsl(360, 100%, 50%)"), parse_css_color("hsl(0, 100%, 50%)"));
+    }
+
+    /// Las cuatro unidades de angulo del spec para el matiz deberian dar
+    /// el mismo color que su equivalente en grados.
+    #[test]
+    fn hsl_hue_accepts_all_four_angle_units() {
+        let referencia = parse_css_color("hsl(180deg, 100%, 50%)");
+        assert_eq!(parse_css_color("hsl(180, 100%, 50%)"), referencia, "sin unidad se asume deg, la forma mas comun en CSS real");
+        assert_eq!(parse_css_color("hsl(200grad, 100%, 50%)"), referencia);
+        assert_eq!(parse_css_color("hsl(0.5turn, 100%, 50%)"), referencia);
+        assert_eq!(parse_css_color("hsl(3.14159265rad, 100%, 50%)"), referencia);
+    }
+
+    /// A diferencia de los componentes de `rgb()`, saturacion y
+    /// luminosidad de `hsl()` EXIGEN `%` en la sintaxis clasica real - un
+    /// numero sin unidad no es valido.
+    #[test]
+    fn hsl_saturation_and_lightness_require_a_percent_sign() {
+        assert_eq!(parse_css_color("hsl(0, 100, 50)"), None, "sin % en saturacion/luminosidad deberia ser invalido");
     }
 
     #[test]

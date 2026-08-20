@@ -3122,6 +3122,44 @@ A fecha de esta limpieza, el motor:
   **Simplificacion que sigue igual, declarada**: sin la clase `Headers`
   real (ni para leer ni para escribir, en ninguna de las dos APIs).
 
+- **`hsl()`/`hsla()` real en `parse_css_color`** (Fase 28): `hsl()` es,
+  junto a `rgb()`, la forma mas comun de declarar color en CSS real
+  moderno (temas/paletas generadas por variables SASS o custom properties
+  casi siempre usan HSL porque separar matiz/saturacion/luminosidad hace
+  mas facil generar variantes claras/oscuras que con RGB) - antes de esta
+  fase, `background: hsl(210, 60%, 50%)` no pintaba absolutamente nada
+  (la propia doc de la funcion ya declaraba el hueco). El shorthand
+  `background: hsl(...)` YA pasaba sin cambios por
+  `background_color_candidate` en `engine-css` (ninguna palabra de
+  `BACKGROUND_NON_COLOR_KEYWORDS` aparece dentro de un `hsl(...)`, asi
+  que cae en la misma rama que ya usaba `rgb()`) - todo el trabajo real
+  fue en `engine-gfx`, el unico crate que sabe pintar.
+  `hsl_to_rgb` es la formula estandar del spec (CSS Color 4 §4.2), sin
+  aproximacion: matiz normalizado con `rem_euclid` ANTES de convertir (un
+  matiz negativo o mayor de 360 - legal en el spec - da el mismo color que
+  su equivalente normalizado, nunca un canal fuera de rango).
+  `parse_hue_degrees` acepta las cuatro unidades de angulo del spec para
+  el matiz (`deg`, sin unidad - la mas comun en CSS real, equivale a
+  `deg` -, `grad`, `rad`, `turn`); saturacion/luminosidad EXIGEN `%` (la
+  sintaxis clasica real, sin la forma moderna sin unidad de CSS Color 4).
+  Acepta la sintaxis clasica con comas y la moderna con espacios/`/` para
+  el alfa, igual que ya hacia `rgb()` - mismo parseo de alfa reusado tal
+  cual.
+  5 tests nuevos (637 en total tras esta fase): los tres primarios mas
+  cian, los limites de luminosidad (0%/100% siempre negro/blanco sin
+  importar matiz), las dos sintaxis con alfa, el matiz circular
+  (`-120` = `240`, `360` = `0`), las cuatro unidades de angulo dando el
+  mismo color que su equivalente en grados, y que saturacion/luminosidad
+  SIN `%` sea invalido (a diferencia de los componentes de `rgb()`, que
+  si aceptan numero puro). Ademas se corrigio un test EXISTENTE
+  (`unsupported_color_syntaxes_...`) que afirmaba "hsl() no esta
+  implementado" - ya no es cierto, sustituido por `hwb()`/`oklch()`, que
+  siguen sin estarlo.
+  **Simplificacion que sigue igual, declarada**: `hwb()`/`lab()`/`lch()`/
+  `oklab()`/`oklch()` y el resto de espacios de color modernos del spec
+  siguen sin implementarse - devuelven `None` y la caja se queda sin
+  pintar, en vez de fingir una conversion.
+
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"
 o una cifra de rendimiento), es una mentira que hay que borrar, no una
