@@ -33,6 +33,14 @@ function App() {
   const [browserUrl, setBrowserUrl] = useState('');
   const [elements, setElements] = useState<InteractiveElement[]>([]);
   const [loading, setLoading] = useState(false);
+  // Historial y pestañas: el motor los soporta desde hace tiempo y los
+  // reporta en cada `state` (`can_go_back`/`can_go_forward`/`tab_id`),
+  // pero la interfaz no los usaba. Se guardan aqui para poder
+  // habilitar/deshabilitar los botones sin llevar una cuenta paralela.
+  const [canGoBack, setCanGoBack] = useState(false);
+  const [canGoForward, setCanGoForward] = useState(false);
+  const [tabs, setTabs] = useState<{ id: number; title: string; url: string }[]>([]);
+  const [activeTabId, setActiveTabId] = useState<number | null>(null);
 
   // Interactividad UI
   const [showOnboarding, setShowOnboarding] = useState(
@@ -58,6 +66,19 @@ function App() {
   // camino...), antes `loading` se quedaba en true para siempre y la app
   // dejaba de reaccionar a NINGÚN clic hasta reiniciarla entera.
   const loadingTimeoutRef = useRef<number | undefined>(undefined);
+
+  // Aplica un mensaje `state` del motor. Antes esto estaba copiado en
+  // tres sitios (IPC inicial, evento IPC, respuesta a comando) y cada uno
+  // leia un subconjunto distinto de campos - de ahi que el historial y las
+  // pestañas se perdieran por el camino.
+  const applyEngineState = (data: any) => {
+    setScreenshot(data.screenshot || '');
+    setBrowserUrl(data.url || '');
+    setElements(data.elements || []);
+    setCanGoBack(Boolean(data.can_go_back));
+    setCanGoForward(Boolean(data.can_go_forward));
+    if (typeof data.tab_id === 'number') setActiveTabId(data.tab_id);
+  };
 
   const showToast = (message: string) => {
     setToast(message);
@@ -144,9 +165,7 @@ function App() {
       
       const unsubscribe = window.electronAPI.onEngineState((data) => {
         if (data.type === 'state') {
-          setScreenshot(data.screenshot || '');
-          setBrowserUrl(data.url || '');
-          setElements(data.elements || []);
+          applyEngineState(data);
           endLoading();
           window.clearTimeout(scrollTimeoutRef.current);
           scrollBusyRef.current = false;
@@ -165,9 +184,8 @@ function App() {
       window.electronAPI.sendEngineRequest({ type: 'resize', width: initialWidth, height: initialHeight })
         .then((res) => {
           if (res?.type === 'state') {
-            setScreenshot(res.screenshot || '');
-            setBrowserUrl(res.url || '');
-            setElements(res.elements || []);
+            applyEngineState(res);
+            refreshTabs();
           }
         })
         .catch((err) => console.log('Inicializando motor vía IPC...', err));
@@ -214,9 +232,7 @@ function App() {
 
         switch (data.type) {
           case 'browser_state':
-            setScreenshot(data.screenshot);
-            setBrowserUrl(data.url);
-            setElements(data.elements || []);
+            applyEngineState(data);
             endLoading();
             window.clearTimeout(scrollTimeoutRef.current);
             scrollBusyRef.current = false;
@@ -261,15 +277,13 @@ function App() {
   }, []);
 
   // Eventos manuales del usuario en el navegador
-  const sendCommand = async (payload: any) => {
+  const sendCommand = async (payload: any): Promise<void> => {
     if (window.electronAPI?.sendEngineRequest) {
       try {
         beginLoading();
         const res = await window.electronAPI.sendEngineRequest(payload);
         if (res?.type === 'state') {
-          setScreenshot(res.screenshot || '');
-          setBrowserUrl(res.url || '');
-          setElements(res.elements || []);
+          applyEngineState(res);
         } else if (res?.type === 'error') {
           showToast(res.message || 'Error en acción del motor');
         }
@@ -284,9 +298,59 @@ function App() {
     }
   };
 
-  const handleManualNavigate = (url: string) => {
+  // `list_tabs` es la unica peticion que NO devuelve un `state`, sino su
+  // propia respuesta con la lista - de ahi que se pida aparte y no salga
+  // de `applyEngineState`. Se refresca tras cualquier accion que pueda
+  // cambiar el conjunto de pestañas (abrir, cerrar, cambiar, y tambien
+  // navegar, porque el titulo de la pestaña activa cambia con la pagina).
+  const refreshTabs = async () => {
+    if (!window.electronAPI?.sendEngineRequest) return;
+    try {
+      const res = await window.electronAPI.sendEngineRequest({ type: 'list_tabs' });
+      if (res?.type === 'tabs') {
+        setTabs(res.tabs || []);
+        if (typeof res.active_tab_id === 'number') setActiveTabId(res.active_tab_id);
+      }
+    } catch {
+      // Sin pestañas que mostrar es un estado valido, no un error que
+      // merezca molestar al usuario con un aviso.
+    }
+  };
+
+  const handleBack = () => {
+    if (loading || !canGoBack) return;
+    sendCommand({ type: 'back' });
+  };
+
+  const handleForward = () => {
+    if (loading || !canGoForward) return;
+    sendCommand({ type: 'forward' });
+  };
+
+  const handleNewTab = async () => {
+    await sendCommand({ type: 'new_tab' });
+    refreshTabs();
+  };
+
+  const handleSwitchTab = async (tabId: number) => {
+    if (tabId === activeTabId) return;
+    await sendCommand({ type: 'switch_tab', tab_id: tabId });
+    refreshTabs();
+  };
+
+  const handleCloseTab = async (tabId: number) => {
+    // El motor rechaza cerrar la ultima pestaña (mantiene la invariante de
+    // que siempre hay al menos una); no se le pide siquiera, para no
+    // mostrar un error por algo que es comportamiento normal.
+    if (tabs.length <= 1) return;
+    await sendCommand({ type: 'close_tab', tab_id: tabId });
+    refreshTabs();
+  };
+
+  const handleManualNavigate = async (url: string) => {
     if (loading) return;
-    sendCommand({ type: 'navigate', url });
+    await sendCommand({ type: 'navigate', url });
+    refreshTabs();
   };
 
   const handleManualClick = (x: number, y: number) => {
@@ -375,6 +439,15 @@ function App() {
           onManualResize={handleManualResize}
           onManualScroll={handleManualScroll}
           loading={loading}
+          canGoBack={canGoBack}
+          canGoForward={canGoForward}
+          onBack={handleBack}
+          onForward={handleForward}
+          tabs={tabs}
+          activeTabId={activeTabId}
+          onNewTab={handleNewTab}
+          onSwitchTab={handleSwitchTab}
+          onCloseTab={handleCloseTab}
         />
       </main>
     </div>
