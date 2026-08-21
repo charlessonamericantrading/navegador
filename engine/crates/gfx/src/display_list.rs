@@ -131,14 +131,6 @@ impl DisplayList {
             return Self::build_clipped_children(layout_box, target, images, z_layers);
         }
         match &layout_box.box_type {
-            // `BoxType::Replaced` (Fase 11: controles de formulario) se
-            // pinta EXACTAMENTE igual que `Block`/`Inline` - fondo/borde/
-            // sombra resueltos de la misma cascada, misma rama. Lo unico
-            // que lo distingue de un `<div>` cualquiera es que
-            // `engine-layout` nunca recursa en sus hijos de verdad (ver
-            // `place_inline_node::BoxType::Replaced`), asi que aqui no hay
-            // ningun contenido de texto/imagen que pintar dentro - solo la
-            // caja del widget en si.
             BoxType::Block | BoxType::Inline => {
                 let radius = parse_css_border_radius(&layout_box.computed_style).unwrap_or(0.0);
                 // `box-shadow` se pinta ANTES que fondo/border (orden real

@@ -3385,6 +3385,61 @@ A fecha de esta limpieza, el motor:
   (`Íntimo`/`España`/`Envío`) - era solo la consola del script de prueba
   mostrando mal el Unicode, no el motor.
 
+- **`value`/`placeholder` de un `BoxType::Replaced` ya se pintan de
+  verdad, y ya no se pintan sus hijos DOM fantasma** (Fase 34): encontrado
+  en vivo contra google.com real - "Google Search"/"I'm Feeling Lucky" se
+  veian como recuadros grises vacios, sin ninguna etiqueta. Causa raiz: un
+  `BoxType::Replaced` (`<input>`/`<select>`/`<textarea>`) solo pintaba
+  fondo/borde/sombra (misma cascada que `Block`/`Inline`), un gap ya
+  declarado desde la Fase 11 pero nunca cerrado. `resolve_replaced_text`
+  (nueva, `engine-layout::tree`) resuelve QUE texto mostrar en
+  `build_node`, donde `attributes`/`dom_node` estan disponibles de forma
+  nativa - el `value` si lo hay; si no, el `placeholder` (marcado con
+  `is_placeholder`, para pintarse en el gris real de un placeholder,
+  `PLACEHOLDER_COLOR` en `engine-gfx`, en vez del `color` de la cascada);
+  `type=submit/button/reset` usa la etiqueta por defecto real del spec
+  ("Submit Query"/"Reset") si no tiene `value` propio, y se centra
+  (`centered`) - asi es el aspecto nativo real de un boton, a diferencia
+  de un campo de texto normal (alineado a la izquierda); `type=password`
+  enmascara cada caracter con un punto, contado por caracter Unicode
+  (`chars().count()`), no por byte, para que un valor con acentos no
+  pinte de mas ni de menos puntos que letras tiene; `<textarea>` lee su
+  CONTENIDO DOM (`Node::text_content`), no un atributo `value` (a
+  diferencia de `input`, asi es el spec real); `checkbox`/`radio`/
+  `hidden`/`file`/`image`/`range`/`color` no llevan texto (su aspecto
+  nativo real no es una cadena dentro de la caja). `<select>` se deja SIN
+  resolver a proposito - que opcion esta seleccionada exige inspeccionar
+  sus `<option>` hijos, fuera del alcance de esta fase, simplificacion
+  declarada.
+  **Segundo hallazgo, mismo hilo**: los hijos DOM reales de un `Replaced`
+  (las `<option>` de un `<select>`, el nodo de texto de un `<textarea>`)
+  se CONSTRUYEN (`build_node` recursa en ellos igual que en cualquier
+  otro elemento) pero nunca se POSICIONAN (`place_inline_node` los deja
+  en `Rect::default()` a proposito - ver su doc-comment) - `engine-gfx::
+  display_list` antes recursaba en ellos de todas formas para pintarlos,
+  asi que terminaban dibujandose en `(0, 0)`, superpuestos con lo que
+  hubiera en la esquina superior izquierda de la pagina ENTERA. Visible
+  en un pantallazo compartido antes de esta fase, contra la pantalla real
+  de consentimiento de google.com: texto ilegible solapado ahi arriba, y
+  el boton "Sign in" con su etiqueta desbordando fuera de la pildora
+  azul. Cerrado sacando `BoxType::Replaced` de la rama que llama a
+  `build_clipped_children` - ya no recursa en sus hijos DOM en absoluto,
+  solo pinta el `replaced_text` ya resuelto.
+  9 tests nuevos (667 en total tras esta fase): 6 en `engine-layout`
+  (value real, placeholder marcado como tal, submit sin value usa la
+  etiqueta por defecto y centrado, submit CON value usa el suyo,
+  password enmascarado por caracter Unicode, checkbox sin texto,
+  textarea desde contenido DOM) y 3 en `engine-gfx` (un `Replaced` con
+  texto resuelto emite `DisplayItem::Text`, un placeholder pinta con
+  `PLACEHOLDER_COLOR` y no con el `color` de la cascada, un hijo DOM sin
+  posicionar nunca se pinta).
+  **Verificado en vivo**: motor recompilado en release y reinstalado
+  sobre la instalacion existente, confirmado contra la MISMA URL real de
+  google.com de las dos fases anteriores - captura PNG con "Google
+  Search"/"I'm Feeling Lucky" ahora legibles y centrados dentro de sus
+  botones, y la pantalla real de consentimiento sin el texto solapado en
+  la esquina superior izquierda que se veia antes.
+
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"
 o una cifra de rendimiento), es una mentira que hay que borrar, no una
