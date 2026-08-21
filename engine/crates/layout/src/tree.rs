@@ -514,9 +514,8 @@ fn resolve_replaced_dimensions(explicit_width: Option<f32>, explicit_height: Opt
 /// `checkbox`/`radio`/`hidden`/`file`/`image`/`range`/`color` no llevan
 /// texto (su aspecto nativo real no es una cadena dentro de la caja) - un
 /// navegador real tampoco pinta el `value` de un checkbox como texto.
-/// `<select>` se deja sin resolver a proposito (que opcion esta
-/// seleccionada requiere inspeccionar sus `<option>` hijos, mas alla del
-/// alcance de esta fase) - simplificacion declarada, no un olvido.
+/// `<select>` (Fase 35) resuelve la opcion seleccionada via
+/// `resolve_select_text`.
 fn resolve_replaced_text(tag_name: &str, attributes: &HashMap<String, String>, dom_node: &Arc<RwLock<Node>>) -> Option<ReplacedText> {
     let input_type = attributes.get("type").map(|v| v.to_lowercase()).unwrap_or_default();
     let has_value = |v: &&String| !v.is_empty();
@@ -574,7 +573,37 @@ fn resolve_replaced_text(tag_name: &str, attributes: &HashMap<String, String>, d
                     .map(|p| ReplacedText { text: p.clone(), is_placeholder: true, centered: false })
             }
         }
+        "select" => resolve_select_text(dom_node),
         _ => None,
+    }
+}
+
+/// Fase 35: la opcion seleccionada de un `<select>` - cerrando la
+/// simplificacion que la Fase 34 dejo declarada a proposito. `<option>` NO
+/// tiene por que ser hijo DIRECTO (puede estar anidado dentro de
+/// `<optgroup>`), asi que `find_all_by_tag` (que ya busca en TODO el
+/// subarbol, no solo hijos directos) es lo correcto aqui, no un simple
+/// `dom_node.children`.
+///
+/// Semantica real del spec: la PRIMERA `<option>` con el atributo booleano
+/// `selected` presente gana (igual criterio de "presencia = true" que
+/// `checked`, ver `ElementAttributes::checked`); si NINGUNA lo declara, el
+/// spec por defecto selecciona la primera opcion de la lista - mismo
+/// comportamiento visible en cualquier navegador real con un `<select>`
+/// sencillo sin `multiple`. Un `<select>` sin ninguna `<option>` no tiene
+/// nada que mostrar (`None`), igual que un campo vacio.
+fn resolve_select_text(dom_node: &Arc<RwLock<Node>>) -> Option<ReplacedText> {
+    let options = Node::find_all_by_tag(dom_node, "option");
+    let is_selected = |opt: &Arc<RwLock<Node>>| -> bool {
+        matches!(&opt.read().unwrap().node_type, NodeType::Element { attributes, .. } if attributes.contains_key("selected"))
+    };
+    let chosen = options.iter().find(|opt| is_selected(opt)).or_else(|| options.first())?;
+    let text = Node::text_content(chosen);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(ReplacedText { text: trimmed.to_string(), is_placeholder: false, centered: false })
     }
 }
 
@@ -2360,6 +2389,68 @@ mod tests {
         let replaced = b.replaced_text.as_ref().expect("deberia resolver texto");
         assert_eq!(replaced.text, "hola desde el contenido");
         assert!(!replaced.is_placeholder);
+    }
+
+    /// Fase 35: el punto real de esta fase - un `<select>` con una
+    /// `<option selected>` explicita (no necesariamente la primera) deberia
+    /// mostrar ESA opcion, no la primera de la lista.
+    #[test]
+    fn a_select_shows_the_explicitly_selected_option_even_if_its_not_the_first() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><select id="s"><option>Uno</option><option selected>Dos</option><option>Tres</option></select></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let node = Node::find_by_id(&dom, "s").expect("deberia existir");
+        let b = find_box_for_dom_node(&root, &node).expect("deberia tener caja");
+        let replaced = b.replaced_text.as_ref().expect("deberia resolver texto");
+        assert_eq!(replaced.text, "Dos");
+    }
+
+    /// Sin ninguna `<option selected>`, el spec real por defecto selecciona
+    /// la PRIMERA opcion - mismo comportamiento que cualquier navegador
+    /// real con un `<select>` sencillo.
+    #[test]
+    fn a_select_without_any_explicit_selected_option_defaults_to_the_first_one() {
+        let dom = HtmlParser::parse(r#"<html><body><select id="s"><option>Uno</option><option>Dos</option></select></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let node = Node::find_by_id(&dom, "s").expect("deberia existir");
+        let b = find_box_for_dom_node(&root, &node).expect("deberia tener caja");
+        let replaced = b.replaced_text.as_ref().expect("deberia resolver texto");
+        assert_eq!(replaced.text, "Uno");
+    }
+
+    /// `<option>` puede estar anidada dentro de `<optgroup>` - la busqueda
+    /// tiene que alcanzar TODO el subarbol, no solo los hijos directos del
+    /// `<select>`.
+    #[test]
+    fn a_select_finds_the_selected_option_nested_inside_an_optgroup() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><select id="s"><optgroup label="Grupo"><option>Uno</option><option selected>Dos</option></optgroup></select></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let node = Node::find_by_id(&dom, "s").expect("deberia existir");
+        let b = find_box_for_dom_node(&root, &node).expect("deberia tener caja");
+        let replaced = b.replaced_text.as_ref().expect("deberia resolver texto");
+        assert_eq!(replaced.text, "Dos");
+    }
+
+    /// Un `<select>` sin ninguna `<option>` no tiene nada que mostrar - no
+    /// deberia entrar en pánico ni inventarse un texto.
+    #[test]
+    fn a_select_with_no_options_at_all_resolves_no_replaced_text() {
+        let dom = HtmlParser::parse(r#"<html><body><select id="s"></select></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let node = Node::find_by_id(&dom, "s").expect("deberia existir");
+        let b = find_box_for_dom_node(&root, &node).expect("deberia tener caja");
+        assert!(b.replaced_text.is_none());
     }
 
     /// `<button>` es el UNICO control que se encoge a su contenido en vez

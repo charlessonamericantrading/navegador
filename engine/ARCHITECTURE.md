@@ -3440,6 +3440,31 @@ A fecha de esta limpieza, el motor:
   botones, y la pantalla real de consentimiento sin el texto solapado en
   la esquina superior izquierda que se veia antes.
 
+- **`<select>` muestra la opcion seleccionada de verdad** (Fase 35):
+  cierra la simplificacion que la propia Fase 34 dejo declarada
+  explicitamente ("`<select>` se deja SIN resolver a proposito"). Ya
+  existia la infraestructura entera (`ReplacedText`, `resolve_replaced_text`)
+  - solo faltaba la rama `"select"`. `resolve_select_text` (nueva,
+  `engine-layout::tree`) usa `Node::find_all_by_tag(dom_node, "option")`
+  (busca en TODO el subarbol, no solo hijos directos - `<option>` puede
+  estar anidada dentro de `<optgroup>`) y aplica la semantica real del
+  spec: la PRIMERA `<option>` con el atributo booleano `selected`
+  presente gana (misma "presencia = true" que `checked`); sin ninguna,
+  la PRIMERA opcion de la lista es la seleccionada por defecto - igual
+  que cualquier navegador real con un `<select>` sencillo sin `multiple`.
+  Un `<select>` sin ninguna `<option>` no resuelve texto (`None`), igual
+  que un campo vacio.
+  4 tests nuevos (671 en total tras esta fase): opcion `selected`
+  explicita que NO es la primera, sin ninguna `selected` (cae a la
+  primera), `<option>` anidada dentro de `<optgroup>`, y un `<select>`
+  vacio sin ninguna `<option>`.
+  **Verificado en vivo**: motor recompilado en release y reinstalado;
+  pagina de prueba local con dos `<select>` (uno con `<option selected>`
+  explicita en la posicion 2, otro sin ninguna `selected`) servida por
+  HTTP real - la captura PNG confirma "Dos" en el primero (la opcion
+  marcada, no la primera) y "Primero" en el segundo (el valor por
+  defecto real sin ninguna marcada).
+
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"
 o una cifra de rendimiento), es una mentira que hay que borrar, no una
