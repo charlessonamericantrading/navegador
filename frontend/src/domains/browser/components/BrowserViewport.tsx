@@ -9,7 +9,7 @@ interface ElementRect {
 
 interface InteractiveElement {
   id: number;
-  tagName: string;
+  tag_name: string;
   text: string;
   rect: ElementRect;
   selector: string;
@@ -17,7 +17,7 @@ interface InteractiveElement {
     id?: string;
     name?: string;
     placeholder?: string;
-    type?: string;
+    element_type?: string;
     role?: string;
     href?: string;
     value?: string;
@@ -187,14 +187,32 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
     }
   }, [inputTextPopup]);
 
+  // La barra de direcciones acepta tanto URLs ("wikipedia.org") como
+  // busquedas en lenguaje natural ("clima en madrid"), igual que un
+  // navegador real: solo lo primero es una direccion navegable, lo
+  // segundo necesita pasar por un motor de busqueda o "navigate" fallaria
+  // literalmente contra "https://clima en madrid".
+  const looksLikeUrl = (input: string) => {
+    if (/\s/.test(input)) return false;
+    if (input.startsWith('http://') || input.startsWith('https://')) return true;
+    if (input === 'localhost' || input.startsWith('localhost:')) return true;
+    // Dominio con al menos un punto (ej. "wikipedia.org", "192.168.1.1") o
+    // puerto explicito (ej. "127.0.0.1:8000").
+    return /^[a-z0-9.-]+\.[a-z]{2,}(:\d+)?(\/.*)?$/i.test(input) || /^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/.test(input);
+  };
+
+  const resolveAddressTarget = (raw: string) => {
+    const input = raw.trim();
+    if (looksLikeUrl(input)) {
+      return input.startsWith('http://') || input.startsWith('https://') ? input : `https://${input}`;
+    }
+    return `https://www.google.com/search?q=${encodeURIComponent(input)}`;
+  };
+
   const handleNavigateSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (addressInput.trim() && !loading) {
-      let target = addressInput.trim();
-      if (!target.startsWith('http://') && !target.startsWith('https://')) {
-        target = 'https://' + target;
-      }
-      onManualNavigate(target);
+      onManualNavigate(resolveAddressTarget(addressInput));
     }
   };
 
@@ -229,7 +247,7 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
         mappedY >= y &&
         mappedY <= y + height
       );
-      return isInside && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA');
+      return isInside && (el.tag_name === 'input' || el.tag_name === 'textarea');
     });
 
     if (clickedInputEl) {

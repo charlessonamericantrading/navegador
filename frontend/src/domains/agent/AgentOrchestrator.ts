@@ -8,7 +8,7 @@ export interface ElementRect {
 
 export interface InteractiveElement {
   id: number;
-  tagName: string;
+  tag_name: string;
   text: string;
   rect: ElementRect;
   selector: string;
@@ -16,7 +16,7 @@ export interface InteractiveElement {
     id?: string;
     name?: string;
     placeholder?: string;
-    type?: string;
+    element_type?: string;
     role?: string;
     href?: string;
     value?: string;
@@ -49,13 +49,13 @@ export interface BrowserInterface {
 export function getSimplifiedDomText(elements: InteractiveElement[]): string {
   const textLines: string[] = [];
   for (const el of elements) {
-    const tag = el.tagName.toLowerCase();
+    const tag = el.tag_name.toLowerCase();
     const desc = el.text || '';
     const attrs = el.attributes || {};
 
     const details: string[] = [];
     if (attrs.placeholder) details.push(`placeholder="${attrs.placeholder}"`);
-    if (attrs.type) details.push(`type="${attrs.type}"`);
+    if (attrs.element_type) details.push(`type="${attrs.element_type}"`);
     if (attrs.href) details.push(`href="${attrs.href}"`);
     if (attrs.name) details.push(`name="${attrs.name}"`);
 
@@ -104,7 +104,7 @@ export class AgentOrchestrator {
         if (el) {
           const cx = Math.round(el.rect.x + el.rect.width / 2);
           const cy = Math.round(el.rect.y + el.rect.height / 2);
-          executionMsg = `Haciendo clic en [${el.id}] ${el.tagName} '${el.text}'`;
+          executionMsg = `Haciendo clic en [${el.id}] ${el.tag_name} '${el.text}'`;
           await this.browser.click(cx, cy);
         } else {
           executionMsg = `Error: Elemento [${stepResult.target_id}] no encontrado`;
@@ -115,7 +115,7 @@ export class AgentOrchestrator {
           const cx = Math.round(el.rect.x + el.rect.width / 2);
           const cy = Math.round(el.rect.y + el.rect.height / 2);
           const text = stepResult.text || '';
-          executionMsg = `Escribiendo '${text}' en [${el.id}] ${el.tagName}`;
+          executionMsg = `Escribiendo '${text}' en [${el.id}] ${el.tag_name}`;
           await this.browser.typeText(cx, cy, text);
         } else {
           executionMsg = `Error: Campo de entrada [${stepResult.target_id}] no encontrado`;
@@ -182,7 +182,7 @@ export class AgentOrchestrator {
 
     if (url.includes('google.com')) {
       const searchInput = elements.find(
-        (e) => e.tagName === 'INPUT' && (e.attributes.name === 'q' || e.text.toLowerCase().includes('search') || e.text.toLowerCase().includes('buscar'))
+        (e) => e.tag_name === 'input' && (e.attributes.name === 'q' || e.text.toLowerCase().includes('search') || e.text.toLowerCase().includes('buscar'))
       );
       if (searchInput) {
         let query = goal;
@@ -197,7 +197,7 @@ export class AgentOrchestrator {
       }
 
       const firstResult = elements.find(
-        (e) => e.tagName === 'A' && e.attributes.href && !e.attributes.href.includes('google.com')
+        (e) => e.tag_name === 'a' && e.attributes.href && !e.attributes.href.includes('google.com')
       );
       if (firstResult) {
         return {
@@ -210,7 +210,7 @@ export class AgentOrchestrator {
 
     if (url.includes('wikipedia.org')) {
       if (url.includes('/wiki/')) {
-        const paragraphs = elements.filter((e) => e.tagName === 'A' && e.text.length > 25);
+        const paragraphs = elements.filter((e) => e.tag_name === 'a' && e.text.length > 25);
         const summary = `He llegado a ${title}. Contenido relevante: '${paragraphs[0]?.text || 'Artículo encontrado'}'.`;
         return {
           thought: `En el artículo de Wikipedia '${title}', extraigo la información solicitada.`,
@@ -228,7 +228,7 @@ export class AgentOrchestrator {
       };
     }
 
-    const firstLink = elements.find((e) => e.tagName === 'A' && e.text.length > 8);
+    const firstLink = elements.find((e) => e.tag_name === 'a' && e.text.length > 8);
     if (firstLink) {
       return {
         thought: `Explorando enlace '${firstLink.text}' (ID ${firstLink.id}).`,

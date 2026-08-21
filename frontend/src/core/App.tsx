@@ -12,7 +12,7 @@ interface ElementRect {
 
 interface InteractiveElement {
   id: number;
-  tagName: string;
+  tag_name: string;
   text: string;
   rect: ElementRect;
   selector: string;
@@ -20,7 +20,7 @@ interface InteractiveElement {
     id?: string;
     name?: string;
     placeholder?: string;
-    type?: string;
+    element_type?: string;
     role?: string;
     href?: string;
     value?: string;
