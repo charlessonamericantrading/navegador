@@ -1,5 +1,5 @@
 use crate::box_model::EdgeSizes;
-use crate::layout_box::{LayoutBox, BoxType, Rect};
+use crate::layout_box::{LayoutBox, BoxType, Rect, ReplacedText};
 use engine_dom::{Node, NodeType};
 use engine_css::StyleSheet;
 use engine_image::DecodedImage;
@@ -506,6 +506,78 @@ fn resolve_replaced_dimensions(explicit_width: Option<f32>, explicit_height: Opt
     )
 }
 
+/// Fase 34: que texto (si alguno) mostrar DENTRO de una caja
+/// `BoxType::Replaced` - ver el doc-comment de `ReplacedText`. Encontrado en
+/// vivo contra google.com real: sin esto, "Google Search"/"I'm Feeling
+/// Lucky" se pintaban como recuadros grises SIN ninguna etiqueta.
+///
+/// `checkbox`/`radio`/`hidden`/`file`/`image`/`range`/`color` no llevan
+/// texto (su aspecto nativo real no es una cadena dentro de la caja) - un
+/// navegador real tampoco pinta el `value` de un checkbox como texto.
+/// `<select>` se deja sin resolver a proposito (que opcion esta
+/// seleccionada requiere inspeccionar sus `<option>` hijos, mas alla del
+/// alcance de esta fase) - simplificacion declarada, no un olvido.
+fn resolve_replaced_text(tag_name: &str, attributes: &HashMap<String, String>, dom_node: &Arc<RwLock<Node>>) -> Option<ReplacedText> {
+    let input_type = attributes.get("type").map(|v| v.to_lowercase()).unwrap_or_default();
+    let has_value = |v: &&String| !v.is_empty();
+
+    match tag_name {
+        "input" => match input_type.as_str() {
+            "checkbox" | "radio" | "hidden" | "file" | "image" | "range" | "color" => None,
+            "submit" | "button" | "reset" => {
+                let default_label = match input_type.as_str() {
+                    "submit" => "Submit Query",
+                    "reset" => "Reset",
+                    _ => "",
+                };
+                let text = attributes.get("value").filter(has_value).cloned().unwrap_or_else(|| default_label.to_string());
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(ReplacedText { text, is_placeholder: false, centered: true })
+                }
+            }
+            _ => {
+                if let Some(value) = attributes.get("value").filter(has_value) {
+                    // `password`: el spec real jamas pinta el valor tal
+                    // cual, sustituye cada caracter por un punto de mascara
+                    // - se cuenta por CARACTERES Unicode (`chars().count()`),
+                    // no bytes, para que un valor con acentos/emoji no
+                    // pinte de mas ni de menos puntos que letras tiene.
+                    let text = if input_type == "password" {
+                        "\u{2022}".repeat(value.chars().count())
+                    } else {
+                        value.clone()
+                    };
+                    Some(ReplacedText { text, is_placeholder: false, centered: false })
+                } else {
+                    attributes
+                        .get("placeholder")
+                        .filter(has_value)
+                        .map(|p| ReplacedText { text: p.clone(), is_placeholder: true, centered: false })
+                }
+            }
+        },
+        "textarea" => {
+            // A diferencia de `input`, el valor inicial de un `<textarea>`
+            // es su CONTENIDO DOM (un nodo de texto hijo), no un atributo -
+            // por eso hace falta `Node::text_content` en vez de
+            // `attributes.get("value")`.
+            let content = Node::text_content(dom_node);
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                Some(ReplacedText { text: trimmed.to_string(), is_placeholder: false, centered: false })
+            } else {
+                attributes
+                    .get("placeholder")
+                    .filter(has_value)
+                    .map(|p| ReplacedText { text: p.clone(), is_placeholder: true, centered: false })
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Traduce las propiedades CSS de un CONTENEDOR flex (`flex-direction`,
 /// `justify-content`, `align-items`) al `taffy::Style` que taffy necesita -
 /// puente honesto: cada valor de la cascada ya resuelto que el motor
@@ -945,6 +1017,9 @@ impl LayoutTreeBuilder {
                 };
                 let mut current_box = LayoutBox::new(box_type);
                 current_box.dom_node = Some(dom_node.clone());
+                if matches!(&current_box.box_type, BoxType::Replaced) {
+                    current_box.replaced_text = resolve_replaced_text(tag_name, attributes, dom_node);
+                }
                 // La resolucion de cascada en si (matching + especificidad +
                 // atributo style inline) vive en `engine_css::resolve_style`
                 // desde hace poco, no aqui - se traslado para que `engine-js`
@@ -2179,6 +2254,112 @@ mod tests {
 
         let hidden_node = Node::find_by_id(&dom, "csrf").expect("deberia existir en el DOM");
         assert!(find_box_for_dom_node(&root, &hidden_node).is_none(), "un input hidden no deberia generar ninguna caja de layout");
+    }
+
+    /// Fase 34: el punto real de esta fase - un `<input>` con `value` deberia
+    /// llevar ese texto listo para pintar, no quedarse en `None` (el gap
+    /// exacto que dejaba "Google Search" como un recuadro gris vacio).
+    #[test]
+    fn an_input_with_a_value_resolves_replaced_text_to_that_value() {
+        let dom = HtmlParser::parse(r#"<html><body><input id="q" value="hola mundo"></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let node = Node::find_by_id(&dom, "q").expect("deberia existir");
+        let b = find_box_for_dom_node(&root, &node).expect("deberia tener caja");
+        let replaced = b.replaced_text.as_ref().expect("deberia resolver texto");
+        assert_eq!(replaced.text, "hola mundo");
+        assert!(!replaced.is_placeholder);
+    }
+
+    /// Sin `value`, el `placeholder` es lo que se ve - pero marcado como tal
+    /// (`is_placeholder`) para que se pinte en gris, no como si fuera texto
+    /// real ya escrito por el usuario.
+    #[test]
+    fn an_input_without_a_value_falls_back_to_its_placeholder_as_dim_text() {
+        let dom = HtmlParser::parse(r#"<html><body><input id="q" placeholder="Buscar..."></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let node = Node::find_by_id(&dom, "q").expect("deberia existir");
+        let b = find_box_for_dom_node(&root, &node).expect("deberia tener caja");
+        let replaced = b.replaced_text.as_ref().expect("deberia resolver texto");
+        assert_eq!(replaced.text, "Buscar...");
+        assert!(replaced.is_placeholder);
+    }
+
+    /// `input[type=submit]` sin `value` propio usa la etiqueta por defecto
+    /// real del spec ("Submit Query"), no se queda vacio - y se centra
+    /// (`centered`), como el aspecto nativo real de un boton.
+    #[test]
+    fn a_submit_input_without_a_value_gets_the_real_default_label_centered() {
+        let dom = HtmlParser::parse(r#"<html><body><input id="btn" type="submit"></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let node = Node::find_by_id(&dom, "btn").expect("deberia existir");
+        let b = find_box_for_dom_node(&root, &node).expect("deberia tener caja");
+        let replaced = b.replaced_text.as_ref().expect("deberia resolver texto");
+        assert_eq!(replaced.text, "Submit Query");
+        assert!(replaced.centered);
+    }
+
+    /// `input[type=submit]` con `value` propio ("Google Search") usa ESE
+    /// texto en vez del por defecto - el caso real que motivo esta fase.
+    #[test]
+    fn a_submit_input_with_its_own_value_uses_that_label_instead_of_the_default() {
+        let dom = HtmlParser::parse(r#"<html><body><input id="btn" type="submit" value="Google Search"></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let node = Node::find_by_id(&dom, "btn").expect("deberia existir");
+        let b = find_box_for_dom_node(&root, &node).expect("deberia tener caja");
+        let replaced = b.replaced_text.as_ref().expect("deberia resolver texto");
+        assert_eq!(replaced.text, "Google Search");
+    }
+
+    /// El spec real jamas pinta un `value` de `type=password` tal cual -
+    /// cada caracter se sustituye por un punto de mascara, contado por
+    /// caracter Unicode, no por byte.
+    #[test]
+    fn a_password_input_masks_its_value_with_dots() {
+        let dom = HtmlParser::parse(r#"<html><body><input id="p" type="password" value="niño"></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let node = Node::find_by_id(&dom, "p").expect("deberia existir");
+        let b = find_box_for_dom_node(&root, &node).expect("deberia tener caja");
+        let replaced = b.replaced_text.as_ref().expect("deberia resolver texto");
+        assert_eq!(replaced.text.chars().count(), 4, "4 caracteres Unicode ('niño'), no 5 bytes (la 'ñ' ocupa 2 bytes en UTF-8)");
+        assert!(replaced.text.chars().all(|c| c == '\u{2022}'));
+    }
+
+    /// Un checkbox/radio/hidden no lleva ningun texto que pintar - su
+    /// aspecto nativo real no es una cadena dentro de la caja.
+    #[test]
+    fn a_checkbox_resolves_no_replaced_text_at_all() {
+        let dom = HtmlParser::parse(r#"<html><body><input id="c" type="checkbox" value="on"></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let node = Node::find_by_id(&dom, "c").expect("deberia existir");
+        let b = find_box_for_dom_node(&root, &node).expect("deberia tener caja");
+        assert!(b.replaced_text.is_none());
+    }
+
+    /// A diferencia de `input`, el valor inicial de un `<textarea>` es su
+    /// CONTENIDO DOM (un nodo de texto hijo), no un atributo `value`.
+    #[test]
+    fn a_textarea_resolves_replaced_text_from_its_dom_text_content() {
+        let dom = HtmlParser::parse(r#"<html><body><textarea id="t">  hola desde el contenido  </textarea></body></html>"#);
+        let stylesheet = CssParser::parse("");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let node = Node::find_by_id(&dom, "t").expect("deberia existir");
+        let b = find_box_for_dom_node(&root, &node).expect("deberia tener caja");
+        let replaced = b.replaced_text.as_ref().expect("deberia resolver texto");
+        assert_eq!(replaced.text, "hola desde el contenido");
+        assert!(!replaced.is_placeholder);
     }
 
     /// `<button>` es el UNICO control que se encoge a su contenido en vez

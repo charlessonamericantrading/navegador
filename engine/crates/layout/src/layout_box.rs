@@ -56,6 +56,30 @@ pub enum BoxType {
     Replaced,
 }
 
+/// Fase 34: texto a pintar DENTRO de una caja `BoxType::Replaced` en vez de
+/// su contenido DOM real, que la propia caja nunca expone como cajas hijas
+/// posicionadas (ver el doc-comment de `BoxType::Replaced` arriba y de
+/// `place_inline_node` en tree.rs - los hijos DOM de un `<select>`/
+/// `<textarea>` se construyen pero se quedan en `Rect::default()`, nunca se
+/// pintan en su sitio). Resuelto en `LayoutTreeBuilder::build_node`, donde
+/// `attributes`/`dom_node` estan disponibles de forma nativa, para que
+/// `engine-gfx` (que no conoce el DOM) solo tenga que pintar una cadena ya
+/// decidida, igual que ya hace con `BoxType::Image(src)` y una imagen ya
+/// resuelta.
+#[derive(Debug, Clone)]
+pub struct ReplacedText {
+    /// El `value` real del control, o su `placeholder` si no hay `value`
+    /// (`is_placeholder` distingue cual de los dos es, para pintarlo con el
+    /// gris tenue real de un placeholder en vez del `color` normal de la
+    /// cascada).
+    pub text: String,
+    pub is_placeholder: bool,
+    /// `<input type="submit/button/reset">` centra su etiqueta (asi es el
+    /// aspecto nativo real de un boton); un campo de texto normal la alinea
+    /// a la izquierda.
+    pub centered: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct LayoutBox {
     pub box_type: BoxType,
@@ -92,6 +116,11 @@ pub struct LayoutBox {
     /// que permite `hit_test` devolver un nodo real en vez de solo unas
     /// coordenadas.
     pub dom_node: Option<Arc<RwLock<Node>>>,
+    /// `None` para todo lo que no sea `BoxType::Replaced`, y tambien para un
+    /// `BoxType::Replaced` sin `value` ni `placeholder` que mostrar
+    /// (checkbox/radio/hidden/`<select>` - ver `resolve_replaced_text` en
+    /// tree.rs).
+    pub replaced_text: Option<ReplacedText>,
 }
 
 impl LayoutBox {
@@ -103,6 +132,7 @@ impl LayoutBox {
             children: Vec::new(),
             computed_style: HashMap::new(),
             dom_node: None,
+            replaced_text: None,
         }
     }
 

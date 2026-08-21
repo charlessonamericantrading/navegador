@@ -9,6 +9,11 @@ use std::sync::Arc;
 /// defecto cuando nada en la cascada los redefine.
 const INITIAL_COLOR: [u8; 4] = [0, 0, 0, 255];
 pub const INITIAL_FONT_SIZE: f32 = 16.0;
+/// Gris real de un `::placeholder` sin estilo de autor (Fase 34) - el mismo
+/// tono que usan Chrome/Firefox por defecto, para que un placeholder se
+/// distinga visualmente de un `value` real sin depender del `color` propio
+/// del control (que un placeholder, a diferencia de un valor, no hereda).
+const PLACEHOLDER_COLOR: [u8; 4] = [117, 117, 117, 255];
 
 #[derive(Debug, Clone)]
 pub enum DisplayItem {
@@ -134,7 +139,7 @@ impl DisplayList {
             // `place_inline_node::BoxType::Replaced`), asi que aqui no hay
             // ningun contenido de texto/imagen que pintar dentro - solo la
             // caja del widget en si.
-            BoxType::Block | BoxType::Inline | BoxType::Replaced => {
+            BoxType::Block | BoxType::Inline => {
                 let radius = parse_css_border_radius(&layout_box.computed_style).unwrap_or(0.0);
                 // `box-shadow` se pinta ANTES que fondo/border (orden real
                 // del spec - ver el doc-comment de `DisplayItem::Shadow`).
@@ -158,6 +163,71 @@ impl DisplayList {
                 if let Some((width, color)) = parse_css_border(&layout_box.computed_style) {
                     target.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color, radius });
                 }
+            }
+            BoxType::Replaced => {
+                let radius = parse_css_border_radius(&layout_box.computed_style).unwrap_or(0.0);
+                if let Some((dx, dy, color)) = parse_css_box_shadow(&layout_box.computed_style) {
+                    let mut rect = layout_box.dimensions.clone();
+                    rect.x += dx;
+                    rect.y += dy;
+                    target.push(DisplayItem::Shadow { rect, color, radius });
+                }
+                if let Some(color) = layout_box.computed_style.get("background-color").and_then(|v| parse_css_color(v)) {
+                    target.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color, radius });
+                }
+                let border_width = if let Some((width, color)) = parse_css_border(&layout_box.computed_style) {
+                    target.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color, radius });
+                    width
+                } else {
+                    0.0
+                };
+
+                // Fase 34: `value`/`placeholder` de un input/textarea, o la
+                // etiqueta de un boton - resuelto en `engine-layout::tree`
+                // (`resolve_replaced_text`), aqui solo se pinta. `inset`
+                // aproxima el `padding` por defecto real de un control
+                // nativo (esta caja nunca tiene `box_dimensions.content`
+                // poblado - se posiciona por el camino de layout EN LINEA,
+                // no por `flow_block_children`, unico sitio que escribe
+                // `box_dimensions` - asi que no hay area de contenido real
+                // de la que partir).
+                if let Some(replaced) = &layout_box.replaced_text {
+                    let font_size = layout_box.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
+                    let inset = border_width + 3.0;
+                    let rect = Rect {
+                        x: layout_box.dimensions.x + inset,
+                        y: layout_box.dimensions.y + ((layout_box.dimensions.height - font_size * 1.2) / 2.0).max(0.0),
+                        width: (layout_box.dimensions.width - inset * 2.0).max(0.0),
+                        height: layout_box.dimensions.height,
+                    };
+                    let color = if replaced.is_placeholder {
+                        PLACEHOLDER_COLOR
+                    } else {
+                        layout_box.computed_style.get("color").and_then(|v| parse_css_color(v)).unwrap_or(INITIAL_COLOR)
+                    };
+                    target.push(DisplayItem::Text {
+                        rect,
+                        text: replaced.text.clone(),
+                        color,
+                        font_size,
+                        bold: false,
+                        italic: false,
+                        underline: false,
+                        text_align: if replaced.centered { TextAlign::Center } else { TextAlign::Left },
+                    });
+                }
+
+                // A diferencia de `Block`/`Inline`, NO se recursa en los
+                // hijos DOM reales: `engine-layout` los construye (un
+                // `<select>` SI tiene una caja por cada `<option>`) pero
+                // nunca los posiciona (`Rect::default()`, ver
+                // `place_inline_node::BoxType::Replaced` en tree.rs) - sin
+                // este corte, `build_clipped_children` los pintaba de
+                // todas formas EN (0,0), superpuestos con lo que hubiera en
+                // la esquina superior izquierda de la pagina. Encontrado en
+                // vivo contra la pantalla de consentimiento real de
+                // google.com (texto ilegible solapado ahi arriba).
+                return;
             }
             BoxType::Text(content) => {
                 let color = layout_box.computed_style.get("color").and_then(|v| parse_css_color(v)).unwrap_or(INITIAL_COLOR);
@@ -833,6 +903,64 @@ mod tests {
         assert_eq!(z_index_for_stacking(&style(Some("relative"), "5")), Some(5));
         assert_eq!(z_index_for_stacking(&style(Some("static"), "5")), None, "z-index sin position real (static) no deberia tener efecto, igual que el spec real");
         assert_eq!(z_index_for_stacking(&style(None, "5")), None, "sin position en absoluto (static por defecto), z-index se ignora igual");
+    }
+
+    /// Fase 34: el punto real de esta fase - un `BoxType::Replaced` con
+    /// `replaced_text` resuelto deberia emitir un `DisplayItem::Text`, no
+    /// quedarse en silencio como antes (el bug real: "Google Search" como
+    /// recuadro gris vacio).
+    #[test]
+    fn a_replaced_box_with_resolved_text_emits_a_text_display_item() {
+        let mut input = LayoutBox::new(BoxType::Replaced);
+        input.dimensions = Rect { x: 10.0, y: 10.0, width: 170.0, height: 21.0 };
+        input.replaced_text = Some(engine_layout::ReplacedText { text: "hola".to_string(), is_placeholder: false, centered: false });
+
+        let list = DisplayList::build(&input, &ImageMap::new());
+
+        assert!(
+            list.items.iter().any(|item| matches!(item, DisplayItem::Text { text, .. } if text == "hola")),
+            "deberia pintar el value resuelto como texto real"
+        );
+    }
+
+    /// Un placeholder se pinta en gris (`PLACEHOLDER_COLOR`), NO con el
+    /// `color` normal de la cascada - para que se distinga de un valor real
+    /// ya escrito, igual que en un navegador real.
+    #[test]
+    fn a_placeholder_paints_in_the_dim_placeholder_color_not_the_cascades_own_color() {
+        let mut input = LayoutBox::new(BoxType::Replaced);
+        input.dimensions = Rect { x: 0.0, y: 0.0, width: 170.0, height: 21.0 };
+        input.computed_style.insert("color".to_string(), "#ff0000".to_string());
+        input.replaced_text = Some(engine_layout::ReplacedText { text: "Buscar...".to_string(), is_placeholder: true, centered: false });
+
+        let list = DisplayList::build(&input, &ImageMap::new());
+
+        let text_item = list.items.iter().find(|item| matches!(item, DisplayItem::Text { .. })).expect("deberia emitir texto");
+        assert!(matches!(text_item, DisplayItem::Text { color, .. } if *color == PLACEHOLDER_COLOR));
+    }
+
+    /// El bug real encontrado en vivo contra la pantalla de consentimiento
+    /// de google.com: los hijos DOM de un `BoxType::Replaced` (las
+    /// `<option>` de un `<select>`, el texto de un `<textarea>`) nunca se
+    /// posicionan (se quedan en `Rect::default()`), asi que si se dejan
+    /// recursar se pintan superpuestos en (0,0) - texto ilegible en la
+    /// esquina superior izquierda de la pagina entera. Un `Replaced` no
+    /// deberia pintar NADA de sus hijos DOM reales.
+    #[test]
+    fn a_replaced_box_never_paints_its_unlaidout_dom_children() {
+        let mut ghost_child = LayoutBox::new(BoxType::Text("opcion fantasma".to_string()));
+        ghost_child.dimensions = Rect::default(); // nunca posicionado, como en la realidad
+
+        let mut select = LayoutBox::new(BoxType::Replaced);
+        select.dimensions = Rect { x: 5.0, y: 5.0, width: 170.0, height: 21.0 };
+        select.children.push(ghost_child);
+
+        let list = DisplayList::build(&select, &ImageMap::new());
+
+        assert!(
+            !list.items.iter().any(|item| matches!(item, DisplayItem::Text { text, .. } if text == "opcion fantasma")),
+            "el hijo DOM sin posicionar nunca deberia pintarse, aunque siga en el arbol"
+        );
     }
 
     /// `visibility: hidden` no debe emitir ningun item de pintado propio
