@@ -3465,6 +3465,60 @@ A fecha de esta limpieza, el motor:
   marcada, no la primera) y "Primero" en el segundo (el valor por
   defecto real sin ninguna marcada).
 
+- **`display: inline-block/inline/block` ya reclasifica Block<->Inline**
+  (Fase 36): investigando el ancho CERO de varios `<div>` reales en la
+  barra superior de google.com (visible desde antes de esta fase, ver
+  captura compartida) se encontro que `box_type` (`build_node`) se
+  decidia SOLO por nombre de etiqueta, sin consultar `display` en
+  absoluto salvo los casos ya especiales de `none`/`flex` - un `<div
+  style="display:inline-block">` (patron real EXTREMADAMENTE comun -
+  barras de navegacion, insignias, grupos de botones, la mayoria de
+  layouts pre-flexbox) se quedaba `BoxType::Block`, excluido de
+  cualquier racha inline (`is_inline_level`), apilandose solo con el
+  ANCHO COMPLETO del contenedor en vez de fluir junto a sus hermanos.
+  `override_box_type_from_display` (nueva, `engine-layout::tree`)
+  reclasifica DESPUES de resolver la cascada (necesita `computed_style`
+  ya resuelto, a diferencia del `box_type` inicial que solo mira
+  `tag_name`): `inline-block`/`inline` fuerzan `Block -> Inline`,
+  `block` fuerza `Inline -> Block`. Acotado a proposito a Block<->Inline
+  - `Image`/`Replaced` quedan siempre forzados por su etiqueta
+  (simplificacion declarada). El cambio no abre ningun camino de codigo
+  NUEVO: `place_inline_node::BoxType::Inline` ya recursaba en hijos
+  `BoxType::Block` sin problema desde antes (necesario para que
+  `<button>`/`<a>` con contenido de bloque dentro no entraran en panico),
+  asi que reclasificar solo dirige tags existentes hacia ramas ya
+  probadas.
+  3 tests nuevos (674 en total tras esta fase): dos `<div
+  style="display:inline-block">` sentandose lado a lado en vez de
+  apilarse, un `<span style="display:block">` llenando el contenedor
+  como cualquier bloque, y una regresion directa confirmando que SIN
+  ningun `display` de autor el comportamiento de siempre (etiqueta ->
+  tipo de caja) no cambia.
+  **Investigado pero NO resuelto, honestamente**: esta fase NO arreglo
+  el ancho-cero real de google.com que la motivo - re-verificado en vivo
+  tras el fix, los mismos `<div>` siguen en 0px. Inspeccionando el HTML/
+  CSS real de google.com se encontro que esos elementos llevan
+  `display:-webkit-box;display:-webkit-flex;display:flex` (el mismo
+  patron de fallback de compatibilidad que esta fase SI arregla para el
+  caso simple), pero ademas hay TRES reglas `.gb_2d{...}` distintas y
+  contradictorias en su hoja de estilos real (`display:none`,
+  `display:flex`, `display:table-cell`) cuya resolucion de cascada/
+  `@media` exacta no se pudo confirmar por inspeccion manual de una hoja
+  minificada de miles de caracteres - podria ser un bug de especificidad/
+  `@media` en `engine-css`, o de medicion de contenido intrinseco dentro
+  de un contenedor flex (`flow_flex_children` ya declara que no mide
+  min-content/max-content real), sin diagnosticar aun cual. Queda como
+  gap abierto, documentado en vez de dado por cerrado.
+  **Verificado en vivo, con comparacion A/B real**: motor recompilado y
+  reinstalado; ademas de la confirmacion negativa de arriba contra
+  google.com, se comparo la MISMA pagina real (es.wikipedia.org/wiki/
+  Python) renderizada con el binario de ANTES de esta fase (via `git
+  stash`) y con el de DESPUES - las dos capturas PNG son identicas byte a
+  byte, confirmando que el solapamiento de texto que Wikipedia ya
+  mostraba (menu de navegacion, selectores CSS complejos aun no
+  soportados - gap ya conocido de antes) es preexistente, no una
+  regresion de esta fase.
+
 Todo esto es exactamente lo que dice el plan de la Fase 1 — ni mas, ni menos.
 Si un archivo de este repo afirma algo distinto (un log que diga "verificado"
 o una cifra de rendimiento), es una mentira que hay que borrar, no una

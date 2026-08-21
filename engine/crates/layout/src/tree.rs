@@ -506,6 +506,40 @@ fn resolve_replaced_dimensions(explicit_width: Option<f32>, explicit_height: Opt
     )
 }
 
+/// Fase 36: `display: inline-block/inline/block` puede RECLASIFICAR una
+/// caja Block<->Inline - encontrado en vivo contra google.com real:
+/// `box_type` (arriba, en `build_node`) se decidia SOLO por nombre de
+/// etiqueta, sin consultar `display` en absoluto salvo los casos ya
+/// especiales de `none`/`flex`. Un `<div style="display:inline-block">`
+/// (patron real EXTREMADAMENTE comun - barras de navegacion, insignias,
+/// grupos de botones, la mayoria de layouts pre-flexbox) se quedaba
+/// `BoxType::Block`: `is_inline_level` lo excluia de cualquier racha
+/// inline (`flow_block_children`), asi que en vez de fluir al lado de sus
+/// hermanos se apilaba solo, con el ANCHO COMPLETO del contenedor - un bug
+/// de layout real, no solo cosmetico (el sintoma exacto que llevo a
+/// investigar esta fase: varios `<div>` con esta declaracion colapsando a
+/// ancho CERO en un caso real, arrastrados por una cascada de contenedores
+/// mal clasificados).
+///
+/// Solo Block<->Inline se reclasifican - `Image`/`Replaced` (`<img>`/
+/// `<input>`/`<select>`/`<textarea>`) quedan SIEMPRE forzados por su
+/// etiqueta: son "elementos reemplazados" cuya naturaleza atomica el spec
+/// real tampoco cambia con `display` (salvo matices de flujo que este
+/// motor no modela) - simplificacion declarada, y mantiene el cambio
+/// acotado a lo que la arquitectura ya soporta de sobra:
+/// `place_inline_node::BoxType::Inline` ya recursa en hijos
+/// `BoxType::Block` sin problema (ver su doc-comment, "un elemento inline
+/// puede contener elementos de bloque"), asi que reclasificar no abre
+/// ningun camino de codigo NUEVO, solo dirige tags existentes hacia ramas
+/// ya probadas por `<button>`/`<a>`/`<span>` de siempre.
+fn override_box_type_from_display(default: &BoxType, display: Option<&str>) -> BoxType {
+    match (display, default) {
+        (Some("inline-block") | Some("inline"), BoxType::Block) => BoxType::Inline,
+        (Some("block"), BoxType::Inline) => BoxType::Block,
+        _ => default.clone(),
+    }
+}
+
 /// Fase 34: que texto (si alguno) mostrar DENTRO de una caja
 /// `BoxType::Replaced` - ver el doc-comment de `ReplacedText`. Encontrado en
 /// vivo contra google.com real: sin esto, "Google Search"/"I'm Feeling
@@ -1069,6 +1103,11 @@ impl LayoutTreeBuilder {
                 if current_box.computed_style.get("display").map(String::as_str) == Some("none") {
                     return;
                 }
+
+                // Fase 36: `display: inline-block/inline/block` puede
+                // RECLASIFICAR Block<->Inline - ver el doc-comment de
+                // `override_box_type_from_display`.
+                current_box.box_type = override_box_type_from_display(&current_box.box_type, current_box.computed_style.get("display").map(String::as_str));
 
                 if tag_name == "img" {
                     apply_image_size_attributes(&mut current_box.computed_style, attributes);
@@ -2467,6 +2506,60 @@ mod tests {
         let btn_box = find_box_for_dom_node(&root, &btn_node).expect("deberia tener caja");
         assert!(btn_box.dimensions.width < 100.0, "un boton con 'Enviar' no deberia acercarse al ancho del contenedor (800px), deberia encogerse a su texto");
         assert!(btn_box.dimensions.width > 0.0, "deberia medir ALGO a partir de su texto, no colapsar a cero");
+    }
+
+    /// Fase 36: el punto real de esta fase - dos `<div>` con
+    /// `display:inline-block` (SIN `display:flex` en el padre, el patron
+    /// pre-flexbox real que motivo esta fase) deberian sentarse UNO AL
+    /// LADO DEL OTRO, no apilados verticalmente como cualquier `<div>`
+    /// normal.
+    #[test]
+    fn two_inline_block_divs_sit_side_by_side_instead_of_stacking() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="a" style="display:inline-block;">a</div><div id="b" style="display:inline-block;">b</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let a_node = Node::find_by_id(&dom, "a").expect("deberia existir");
+        let b_node = Node::find_by_id(&dom, "b").expect("deberia existir");
+        let a_box = find_box_for_dom_node(&root, &a_node).expect("deberia tener caja");
+        let b_box = find_box_for_dom_node(&root, &b_node).expect("deberia tener caja");
+
+        assert_eq!(a_box.dimensions.y, b_box.dimensions.y, "ambos deberian compartir la misma linea (misma y), no apilarse");
+        assert!(a_box.dimensions.width < 100.0, "deberia encogerse a su contenido ('a'), no llenar los 800px del contenedor");
+    }
+
+    /// El reverso: `display:block` sobre una etiqueta naturalmente inline
+    /// (`<span>`) deberia sacarla del flujo inline - ocupando el ANCHO
+    /// COMPLETO del contenedor como cualquier bloque normal, en vez de
+    /// encogerse a su texto.
+    #[test]
+    fn a_span_with_display_block_fills_the_container_like_any_block() {
+        let dom = HtmlParser::parse(r#"<html><body><span id="s" style="display:block;">hola</span></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let node = Node::find_by_id(&dom, "s").expect("deberia existir");
+        let b = find_box_for_dom_node(&root, &node).expect("deberia tener caja");
+        assert_eq!(b.dimensions.width, 800.0, "display:block deberia llenar el contenedor, no encogerse como un span normal");
+    }
+
+    /// Sin ningun `display` de autor, el comportamiento por defecto de
+    /// siempre (etiqueta -> tipo de caja) no deberia cambiar - regresion
+    /// directa contra la reclasificacion nueva de esta fase.
+    #[test]
+    fn without_an_author_display_override_the_tag_based_default_is_unchanged() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="d">bloque</div><span id="s">inline</span></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let div_node = Node::find_by_id(&dom, "d").expect("deberia existir");
+        let span_node = Node::find_by_id(&dom, "s").expect("deberia existir");
+        let div_box = find_box_for_dom_node(&root, &div_node).expect("deberia tener caja");
+        let span_box = find_box_for_dom_node(&root, &span_node).expect("deberia tener caja");
+        assert_eq!(div_box.dimensions.width, 800.0, "un div sin CSS deberia seguir llenando el contenedor, como siempre");
+        assert!(span_box.dimensions.width < 100.0, "un span sin CSS deberia seguir encogiendose a su texto, como siempre");
     }
 
     /// Patron real muy comun: una barra de busqueda `display: flex` con un
