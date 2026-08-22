@@ -1,0 +1,39 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WPT Canvas 2D & Modern Box Model Tests</title>
+</head>
+<body>
+  <div id="box" style="box-sizing: border-box; width: 10rem; padding: 1rem; border: 5px solid black;"></div>
+  <canvas id="cv" width="300" height="150"></canvas>
+
+  <script>
+    test(function() {
+      var canvas = document.getElementById("cv");
+      assert_true(canvas !== null, "el elemento canvas debe existir en el DOM");
+      assert_equals(canvas.tagName, "CANVAS", "el tagName debe ser CANVAS en mayusculas");
+      assert_equals(canvas.width, 300, "el ancho por defecto debe ser 300");
+      assert_equals(canvas.height, 150, "el alto por defecto debe ser 150");
+    }, "canvas properties default to standard dimensions");
+
+    test(function() {
+      var canvas = document.getElementById("cv");
+      var ctx = canvas.getContext("2d");
+      assert_true(ctx !== null, "getContext('2d') debe devolver un contexto valido");
+      assert_equals(ctx.fillStyle, "#000000", "el fillStyle por defecto debe ser negro (#000000)");
+      ctx.fillStyle = "#ff0000";
+      assert_true(typeof ctx.fillRect === "function", "fillRect debe ser una funcion");
+      ctx.fillRect(0, 0, 50, 50);
+      var m = ctx.measureText("Hola Mundo");
+      assert_true(m.width > 0, "measureText debe devolver un ancho numerico positivo");
+    }, "canvas 2d context operations and metrics");
+
+    test(function() {
+      var canvas = document.getElementById("cv");
+      var dataUrl = canvas.toDataURL();
+      assert_true(dataUrl.indexOf("data:image/png;base64,") === 0, "toDataURL debe devolver un URI base64 PNG valido");
+    }, "canvas toDataURL exports base64 png image data");
+  </script>
+</body>
+</html>

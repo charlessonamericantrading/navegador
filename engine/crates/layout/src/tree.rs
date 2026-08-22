@@ -76,27 +76,56 @@ const INITIAL_FONT_SIZE: f32 = 16.0;
 /// que la cascada consigue resolver antes de que nada mas lo lea, asi que
 /// ni esta funcion ni la copia de `engine-gfx` necesitan saber de `em`/`%`.
 fn parse_css_font_size(value: &str) -> Option<f32> {
-    let px = value.trim().strip_suffix("px")?;
-    px.trim().parse::<f32>().ok().filter(|size| *size > 0.0)
+    let trimmed = value.trim();
+    if let Some(px) = trimmed.strip_suffix("px") {
+        px.trim().parse::<f32>().ok().filter(|size| *size > 0.0)
+    } else if let Some(rem) = trimmed.strip_suffix("rem") {
+        rem.trim().parse::<f32>().ok().filter(|n| *n > 0.0).map(|n| n * 16.0)
+    } else {
+        None
+    }
 }
 
-/// Misma simplificacion honesta que `parse_css_font_size`: solo `px`. A
-/// diferencia del tamaño de fuente, aqui SI se acepta `0` (un padding de
-/// cero es perfectamente valido y es ademas el valor inicial real de la
-/// propiedad), pero no un valor negativo (invalido en el spec real).
 fn parse_css_length(value: &str) -> Option<f32> {
-    let px = value.trim().strip_suffix("px")?;
-    px.trim().parse::<f32>().ok().filter(|n| *n >= 0.0)
+    let trimmed = value.trim();
+    if trimmed == "0" {
+        return Some(0.0);
+    }
+    if let Some(px) = trimmed.strip_suffix("px") {
+        px.trim().parse::<f32>().ok().filter(|n| *n >= 0.0)
+    } else if let Some(rem) = trimmed.strip_suffix("rem") {
+        rem.trim().parse::<f32>().ok().filter(|n| *n >= 0.0).map(|n| n * 16.0)
+    } else {
+        None
+    }
 }
 
-/// Igual que `parse_css_length`, pero SI acepta negativos - a diferencia de
-/// padding/border/width (que nunca son negativos en el spec real),
-/// `top`/`right`/`bottom`/`left` (Fase 3.3, `position: relative/absolute/
-/// fixed`) legitimamente pueden serlo (`top: -10px` es una forma comun de
-/// desplazar un elemento hacia arriba de donde caeria en el flujo normal).
 fn parse_css_offset(value: &str) -> Option<f32> {
-    let px = value.trim().strip_suffix("px")?;
-    px.trim().parse::<f32>().ok()
+    let trimmed = value.trim();
+    if trimmed == "0" {
+        return Some(0.0);
+    }
+    if let Some(px) = trimmed.strip_suffix("px") {
+        px.trim().parse::<f32>().ok()
+    } else if let Some(rem) = trimmed.strip_suffix("rem") {
+        rem.trim().parse::<f32>().ok().map(|n| n * 16.0)
+    } else {
+        None
+    }
+}
+
+/// Parsea un offset (`top`, `bottom`, `left`, `right`) soportando tanto
+/// unidades absolutas (`px`, `rem`) como porcentajes (`%`) calculados
+/// contra `reference_size`.
+fn parse_css_offset_relative(value: &str, reference_size: f32) -> Option<f32> {
+    let trimmed = value.trim();
+    if trimmed == "0" {
+        return Some(0.0);
+    }
+    if let Some(pct) = trimmed.strip_suffix('%') {
+        return pct.trim().parse::<f32>().ok().map(|p| p / 100.0 * reference_size);
+    }
+    parse_css_offset(trimmed)
 }
 
 /// `position: absolute`/`fixed` (Fase 3.3) saca al elemento del flujo
@@ -166,17 +195,29 @@ const DEFAULT_FLOAT_WIDTH: f32 = 200.0;
 /// desplazadas, sin necesitar recorrer el subarbol por separado. `left`
 /// gana sobre `right` si ambos estan puestos (`right` se ignora), mismo
 /// criterio para `top`/`bottom` - asi resuelve un navegador real un caso
-/// sobre-especificado. No-op si `position` no es `relative`.
+/// sobre-especificado. No-op si `position` no es `relative` o `sticky`.
 fn apply_relative_offset(node: &mut LayoutBox) {
-    if node.computed_style.get("position").map(String::as_str) != Some("relative") {
+    let pos = node.computed_style.get("position").map(String::as_str);
+    if pos != Some("relative") && pos != Some("sticky") {
         return;
     }
-    let dx = match (node.computed_style.get("left").and_then(|v| parse_css_offset(v)), node.computed_style.get("right").and_then(|v| parse_css_offset(v))) {
+    let dx = match (
+        node.computed_style.get("left").and_then(|v| parse_css_offset_relative(v, node.dimensions.width)),
+        node.computed_style.get("right").and_then(|v| parse_css_offset_relative(v, node.dimensions.width)),
+    ) {
         (Some(l), _) => l,
         (None, Some(r)) => -r,
         (None, None) => 0.0,
     };
-    let dy = match (node.computed_style.get("top").and_then(|v| parse_css_offset(v)), node.computed_style.get("bottom").and_then(|v| parse_css_offset(v))) {
+    let ref_h = node
+        .computed_style
+        .get("height")
+        .and_then(|v| parse_css_length(v))
+        .unwrap_or(node.dimensions.height);
+    let dy = match (
+        node.computed_style.get("top").and_then(|v| parse_css_offset_relative(v, ref_h)),
+        node.computed_style.get("bottom").and_then(|v| parse_css_offset_relative(v, ref_h)),
+    ) {
         (Some(t), _) => t,
         (None, Some(b)) => -b,
         (None, None) => 0.0,
@@ -305,39 +346,40 @@ fn collapse_whitespace(text: &str) -> String {
     result
 }
 
+fn is_border_box(computed_style: &HashMap<String, String>) -> bool {
+    computed_style
+        .get("box-sizing")
+        .map(|v| v.trim().eq_ignore_ascii_case("border-box"))
+        .unwrap_or(false)
+}
+
 /// Resuelve el ancho BORDER-BOX final de una caja de bloque, a partir de
 /// `width`/`max-width`/`min-width` (si estan puestas en la cascada) mas el
 /// ancho que tendria por defecto (`auto_width` - "llenar el espacio
 /// disponible", el unico comportamiento que existia antes de esta tarea).
 ///
-/// `width`/`max-width`/`min-width` son CONTENT-box en el spec real (el
-/// valor inicial de `box-sizing`), asi que se convierten a border-box
-/// sumando el propio padding+border del elemento antes de aplicarlas - sin
-/// esta conversion, un `width: 200px` con padding habria dado un
-/// border-box MAS ESTRECHO que 200px, al reves de lo que hace cualquier
-/// navegador real por defecto. `box-sizing: border-box` (donde `width` ya
-/// seria border-box directamente) no esta soportado.
-///
-/// `max-width` se aplica ANTES que `min-width` - si ambas entran en
-/// conflicto (un `max-width` menor que `min-width`), `min-width` gana,
-/// igual que exige el spec real (`clamp(min, tentative, max)`, no al
-/// reves).
+/// Si `box-sizing: border-box` esta presente, `width`/`max-width`/`min-width`
+/// son directamente el ancho border-box. De lo contrario (el default `content-box`),
+/// se suman padding + border para obtener el border-box.
 fn resolve_block_width(computed_style: &HashMap<String, String>, auto_width: f32) -> f32 {
     let padding = resolve_padding(computed_style);
     let border = resolve_border_width(computed_style);
     let box_model_extra = padding.left + padding.right + border.left + border.right;
+    let border_box = is_border_box(computed_style);
 
     let mut width = computed_style
         .get("width")
         .and_then(|v| parse_css_length(v))
-        .map(|content_width| content_width + box_model_extra)
+        .map(|w| if border_box { w } else { w + box_model_extra })
         .unwrap_or(auto_width);
 
-    if let Some(max_content_width) = computed_style.get("max-width").and_then(|v| parse_css_length(v)) {
-        width = width.min(max_content_width + box_model_extra);
+    if let Some(max_w) = computed_style.get("max-width").and_then(|v| parse_css_length(v)) {
+        let max_limit = if border_box { max_w } else { max_w + box_model_extra };
+        width = width.min(max_limit);
     }
-    if let Some(min_content_width) = computed_style.get("min-width").and_then(|v| parse_css_length(v)) {
-        width = width.max(min_content_width + box_model_extra);
+    if let Some(min_w) = computed_style.get("min-width").and_then(|v| parse_css_length(v)) {
+        let min_limit = if border_box { min_w } else { min_w + box_model_extra };
+        width = width.max(min_limit);
     }
     width.max(0.0)
 }
@@ -768,6 +810,53 @@ fn flex_item_style(computed_style: &HashMap<String, String>) -> taffy::Style {
 /// `resolve_image_dimensions` para `<img>`) en vez de que taffy tenga que
 /// inventar su propio medidor de texto/imagenes - exactamente el patron
 /// que `compute_layout_with_measure` espera.
+/// Mide el ancho intrínseco (min-content / max-content) de un elemento para
+/// que taffy no colapse cajas flex a 0 cuando consulta pasadas especulativas.
+fn measure_intrinsic_width(child: &LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+    let padding = resolve_padding(&child.computed_style);
+    let border = resolve_border_width(&child.computed_style);
+    let extra = padding.left + padding.right + border.left + border.right;
+
+    if let Some(w) = child.computed_style.get("width").and_then(|v| parse_css_length(v)) {
+        let border_box = is_border_box(&child.computed_style);
+        return if border_box { w } else { w + extra };
+    }
+
+    match &child.box_type {
+        BoxType::Image(src) => {
+            let natural_w = images.get(src).map(|img| img.width as f32).unwrap_or(0.0);
+            natural_w + extra
+        }
+        BoxType::Text(text) => {
+            let font_size = child.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
+            let bold = resolve_font_weight_is_bold(&child.computed_style);
+            let italic = resolve_font_style_is_italic(&child.computed_style);
+            let font = font_set.and_then(|s| s.pick(bold, italic));
+            let text_w = font.map(|f| engine_text::measure_text(f, text, font_size).width).unwrap_or(text.len() as f32 * font_size * 0.5);
+            text_w + extra
+        }
+        BoxType::Replaced => 150.0 + extra,
+        _ => {
+            let mut max_w: f32 = 0.0;
+            let mut inline_w: f32 = 0.0;
+            for c in &child.children {
+                let cw = measure_intrinsic_width(c, font_set, images);
+                if c.computed_style.get("display").map(String::as_str) == Some("inline") || matches!(c.box_type, BoxType::Text(_)) {
+                    inline_w += cw;
+                    max_w = max_w.max(inline_w);
+                } else {
+                    inline_w = 0.0;
+                    max_w = max_w.max(cw);
+                }
+            }
+            max_w + extra
+        }
+    }
+}
+
+/// Funcion de medida que `taffy` llama para saber cuanto espacio necesita
+/// UN item flex - taffy puede llamarla varias veces con distintos
+/// `known_dimensions`/`available_space` mientras resuelve el layout final.
 fn measure_flex_item(
     child: &mut LayoutBox,
     known_dimensions: taffy::geometry::Size<Option<f32>>,
@@ -785,11 +874,6 @@ fn measure_flex_item(
             height: known_dimensions.height.unwrap_or(height),
         };
     }
-    // `<input>`/`<select>`/`<textarea>` (Fase 11) dentro de un contenedor
-    // flex - patron real MUY comun (una barra de busqueda es casi siempre
-    // `display: flex` con un input y un boton). Mismo criterio que
-    // `Image` arriba: caja atomica, sin contenido que medir mas alla de
-    // su `width`/`height` de CSS.
     if let BoxType::Replaced = &child.box_type {
         let explicit_width = child.computed_style.get("width").and_then(|v| parse_css_length(v));
         let explicit_height = child.computed_style.get("height").and_then(|v| parse_css_length(v));
@@ -800,14 +884,20 @@ fn measure_flex_item(
         };
     }
 
+    let explicit_w = child.computed_style.get("width").and_then(|v| parse_css_length(v));
     let width = known_dimensions.width.unwrap_or(match available_space.width {
-        taffy::AvailableSpace::Definite(w) => w,
-        // Sin ancho conocido ni disponible definido (min-content/max-content
-        // especulativos): el motor no mide min/max-content real todavia
-        // (ver el doc-comment de `flow_flex_children`) - cero es honesto
-        // (mejor que fingir un ancho arbitrario) y taffy vuelve a preguntar
-        // con un ancho definido antes del layout final de todas formas.
-        _ => 0.0,
+        taffy::AvailableSpace::Definite(w) => {
+            if let Some(ew) = explicit_w {
+                let border_box = is_border_box(&child.computed_style);
+                let extra = child.box_dimensions.padding.left + child.box_dimensions.padding.right + child.box_dimensions.border.left + child.box_dimensions.border.right;
+                if border_box { ew } else { ew + extra }
+            } else {
+                w
+            }
+        }
+        taffy::AvailableSpace::MinContent | taffy::AvailableSpace::MaxContent => {
+            measure_intrinsic_width(child, font_set, images)
+        }
     });
 
     child.dimensions.x = 0.0;
@@ -918,10 +1008,10 @@ impl LayoutTreeBuilder {
         if matches!(position.as_deref(), Some("absolute") | Some("fixed")) {
             let reference = if position.as_deref() == Some("fixed") { viewport } else { containing_block };
 
-            let left = node.computed_style.get("left").and_then(|v| parse_css_offset(v));
-            let right = node.computed_style.get("right").and_then(|v| parse_css_offset(v));
-            let top = node.computed_style.get("top").and_then(|v| parse_css_offset(v));
-            let bottom = node.computed_style.get("bottom").and_then(|v| parse_css_offset(v));
+            let left = node.computed_style.get("left").and_then(|v| parse_css_offset_relative(v, reference.width));
+            let right = node.computed_style.get("right").and_then(|v| parse_css_offset_relative(v, reference.width));
+            let top = node.computed_style.get("top").and_then(|v| parse_css_offset_relative(v, reference.height));
+            let bottom = node.computed_style.get("bottom").and_then(|v| parse_css_offset_relative(v, reference.height));
 
             // Ancho: mismo criterio que el flujo normal (`resolve_block_width`,
             // ya existente) usando el ancho del containing block como "auto" -
@@ -972,7 +1062,7 @@ impl LayoutTreeBuilder {
         // hace falta que tenga `top`/`left` puestos); si no, se propaga el
         // mismo que ya traiamos.
         let next_containing_block =
-            if matches!(position.as_deref(), Some("relative") | Some("absolute") | Some("fixed")) { node.box_dimensions.padding_box() } else { containing_block.clone() };
+            if matches!(position.as_deref(), Some("relative") | Some("sticky") | Some("absolute") | Some("fixed")) { node.box_dimensions.padding_box() } else { containing_block.clone() };
 
         for child in &mut node.children {
             Self::resolve_positioned_boxes(child, &next_containing_block, viewport, font_set, images);
@@ -1401,11 +1491,16 @@ impl LayoutTreeBuilder {
             // `overflow` no esta implementado todavia). Sin
             // `max-height`/`min-height` todavia (fuera del alcance de esta
             // tarea).
-            let explicit_content_height = child.computed_style.get("height").and_then(|v| parse_css_length(v));
-            let resolved_content_height = explicit_content_height.unwrap_or(content_height);
-            child.dimensions.height = match explicit_content_height {
-                Some(h) => h + child_padding.top + child_padding.bottom + child_border.top + child_border.bottom,
-                None => (content_height + child_padding.top + child_padding.bottom + child_border.top + child_border.bottom).max(LINE_HEIGHT_FALLBACK),
+            let vertical_extra = child_padding.top + child_padding.bottom + child_border.top + child_border.bottom;
+            let explicit_height = child.computed_style.get("height").and_then(|v| parse_css_length(v));
+            let border_box = is_border_box(&child.computed_style);
+            let resolved_content_height = match explicit_height {
+                Some(h) => if border_box { (h - vertical_extra).max(0.0) } else { h },
+                None => content_height,
+            };
+            child.dimensions.height = match explicit_height {
+                Some(h) => if border_box { h } else { h + vertical_extra },
+                None => (content_height + vertical_extra).max(LINE_HEIGHT_FALLBACK),
             };
             // El area de contenido real (sin padding NI border, los dos ya
             // sumados arriba) - poblar esto es lo que hace que
@@ -2826,6 +2921,24 @@ mod tests {
         assert_eq!(b_box.dimensions.y, 30.0, "b deberia caer justo donde a habria terminado SIN desplazarse (su alto normal, 30px) - el desplazamiento de a no debe afectarle");
     }
 
+    #[test]
+    fn position_sticky_offsets_visually_like_relative_in_initial_flow() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="sticky" style="position: sticky; top: 15px; left: 25px; height: 40px;">s</div><div id="b" style="height: 10px;">b</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let sticky_node = Node::find_by_id(&dom, "sticky").expect("sticky deberia existir");
+        let b_node = Node::find_by_id(&dom, "b").expect("b deberia existir");
+        let sticky_box = find_box_for_dom_node(&root, &sticky_node).expect("sticky deberia tener caja");
+        let b_box = find_box_for_dom_node(&root, &b_node).expect("b deberia tener caja");
+
+        assert_eq!(sticky_box.dimensions.x, 25.0, "desplazado 25px por left");
+        assert_eq!(sticky_box.dimensions.y, 15.0, "desplazado 15px por top");
+        assert_eq!(b_box.dimensions.y, 40.0, "b ocupa su lugar de flujo normal tras sticky (40px)");
+    }
+
     /// `position: relative` en un descendiente de un elemento relative
     /// desplazado deberia heredar el desplazamiento del padre (su propia
     /// posicion se calcula a partir de `dimensions.x`/`.y` YA desplazados
@@ -3397,10 +3510,10 @@ mod tests {
     #[test]
     fn unsupported_units_and_invalid_font_size_values_fall_back_to_the_inherited_size() {
         let dom = HtmlParser::parse("<html><body><span>hola</span></body></html>");
-        // 'rem' no esta soportado (ver resolve_font_size) y 'not-a-size' no
+        // 'vw' no esta soportado (unidades de viewport) y 'not-a-size' no
         // es un valor valido en ninguna unidad - ninguno de los dos deberia
-        // fingir un numero.
-        let stylesheet = CssParser::parse("body { font-size: 20px; } span { font-size: 3rem; }");
+        // fingir un numero y deben caer al font-size heredado.
+        let stylesheet = CssParser::parse("body { font-size: 20px; } span { font-size: 3vw; }");
 
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let text_box = find_text_box(&root, "hola").expect("deberia existir una caja de texto 'hola'");
@@ -3408,7 +3521,7 @@ mod tests {
         assert_eq!(
             text_box.computed_style.get("font-size").map(String::as_str),
             Some("20px"),
-            "rem no soportado: deberia caer al font-size heredado del padre (20px), no a 0 ni a un valor inventado"
+            "vw no soportado: deberia caer al font-size heredado del padre (20px), no a 0 ni a un valor inventado"
         );
     }
 
@@ -4202,5 +4315,109 @@ mod tests {
         assert_eq!(a_box.dimensions.width, 100.0);
         assert_eq!(b_box.dimensions.x, 120.0, "item B deberia empezar en 100px + 20px de gap");
         assert_eq!(b_box.dimensions.width, 100.0);
+    }
+
+    #[test]
+    fn box_sizing_border_box_keeps_exact_outer_width_and_height() {
+        let dom = HtmlParser::parse(
+            r#"<html><body>
+                <div id="target" style="box-sizing: border-box; width: 200px; height: 100px; padding: 20px; border: 5px solid black;">
+                    Contenido
+                </div>
+            </body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let target_node = Node::find_by_id(&dom, "target").expect("target node");
+        let target_box = find_box_for_dom_node(&root, &target_node).expect("target box");
+
+        assert_eq!(target_box.dimensions.width, 200.0, "con border-box el ancho total debe ser exactamente 200px");
+        assert_eq!(target_box.dimensions.height, 100.0, "con border-box el alto total debe ser exactamente 100px");
+        // El contenido interno debe ser 200 - (20+20) - (5+5) = 150px de ancho y 100 - 50 = 50px de alto
+        assert_eq!(target_box.box_dimensions.content.width, 150.0);
+        assert_eq!(target_box.box_dimensions.content.height, 50.0);
+    }
+
+    #[test]
+    fn rem_units_scale_with_root_font_size_base() {
+        let dom = HtmlParser::parse(
+            r#"<html><body>
+                <div id="rembox" style="width: 10rem; height: 5rem; padding: 1rem;">
+                    Texto
+                </div>
+            </body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let rem_node = Node::find_by_id(&dom, "rembox").expect("rembox node");
+        let rem_box = find_box_for_dom_node(&root, &rem_node).expect("rembox box");
+
+        // 10rem = 160px content-width + 2rem (32px) padding = 192px border-box width
+        assert_eq!(rem_box.dimensions.width, 192.0);
+        // 5rem = 80px content-height + 2rem (32px) padding = 112px border-box height
+        assert_eq!(rem_box.dimensions.height, 112.0);
+    }
+
+    #[test]
+    fn position_absolute_resolves_percentage_offsets_against_containing_block() {
+        let dom = HtmlParser::parse(
+            r#"<html><body>
+                <div style="position: relative; width: 400px; height: 200px;">
+                    <div id="target" style="position: absolute; top: 50%; left: 25%; width: 50px; height: 30px;">Abs</div>
+                </div>
+            </body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let target_node = Node::find_by_id(&dom, "target").expect("target node");
+        let target_box = find_box_for_dom_node(&root, &target_node).expect("target box");
+
+        // left: 25% de 400px = 100px
+        assert_eq!(target_box.dimensions.x, 100.0);
+        // top: 50% de 200px = 100px
+        assert_eq!(target_box.dimensions.y, 100.0);
+    }
+
+    #[test]
+    fn position_sticky_resolves_percentage_offsets() {
+        let dom = HtmlParser::parse(
+            r#"<html><body>
+                <div id="sticky_elem" style="position: sticky; top: 10%; left: 20%; width: 100px; height: 50px;">Sticky</div>
+            </body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let sticky_node = Node::find_by_id(&dom, "sticky_elem").expect("sticky node");
+        let sticky_box = find_box_for_dom_node(&root, &sticky_node).expect("sticky box");
+
+        // left: 20% de 100px = 20px
+        assert_eq!(sticky_box.dimensions.x, 20.0);
+        // top: 10% de 50px = 5px
+        assert_eq!(sticky_box.dimensions.y, 5.0);
+    }
+
+    #[test]
+    fn flex_item_without_explicit_width_measures_intrinsic_content_width() {
+        let dom = HtmlParser::parse(
+            r#"<html><body>
+                <div id="flex" style="display: flex; width: 500px;">
+                    <div id="item" style="padding: 10px;">
+                        <span style="display: inline;">Contenido</span>
+                    </div>
+                </div>
+            </body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let item_node = Node::find_by_id(&dom, "item").expect("item node");
+        let item_box = find_box_for_dom_node(&root, &item_node).expect("item box");
+
+        // El ancho no debe colapsar a 0, sino medir el contenido + padding
+        assert!(item_box.dimensions.width > 20.0, "el ancho del item flex debe medirse intrínsecamente y superar el padding");
     }
 }

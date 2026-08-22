@@ -1,0 +1,14 @@
+﻿[package]
+name = "engine-ai"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+engine-dom = { path = "../dom" }
+engine-css = { path = "../css" }
+engine-layout = { path = "../layout" }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

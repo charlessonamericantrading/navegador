@@ -52,6 +52,9 @@ pub struct MitigationReport {
     pub dynamic_code_blocked: bool,
     pub child_processes_blocked: bool,
     pub extension_points_disabled: bool,
+    pub untrusted_fonts_disabled: bool,
+    pub system32_images_preferred: bool,
+    pub strict_handle_checks_enabled: bool,
     /// Plataforma sin soporte (todo lo de arriba en `false` y esto en
     /// `true`) - se distingue de "se intento y fallo" a proposito.
     pub unsupported_platform: bool,
@@ -68,6 +71,9 @@ impl MitigationReport {
             self.dynamic_code_blocked.then_some("codigo-dinamico"),
             self.child_processes_blocked.then_some("procesos-hijo"),
             self.extension_points_disabled.then_some("puntos-de-extension"),
+            self.untrusted_fonts_disabled.then_some("fuentes-no-confiables"),
+            self.system32_images_preferred.then_some("imagenes-system32"),
+            self.strict_handle_checks_enabled.then_some("comprobacion-handles"),
         ]
         .into_iter()
         .flatten()
@@ -90,12 +96,18 @@ mod imp {
     // estables del SO desde Windows 8.
     const PROCESS_DYNAMIC_CODE_POLICY: i32 = 2;
     const PROCESS_EXTENSION_POINT_DISABLE_POLICY: i32 = 6;
+    const PROCESS_FONT_DISABLE_POLICY: i32 = 9;
+    const PROCESS_IMAGE_LOAD_POLICY: i32 = 10;
+    const PROCESS_STRICT_HANDLE_CHECK_POLICY: i32 = 11;
     const PROCESS_CHILD_PROCESS_POLICY: i32 = 13;
 
     // Cada estructura de politica es, en la practica, un unico DWORD de
     // banderas: se pasa como `u32` en vez de declarar las tres structs.
     const PROHIBIT_DYNAMIC_CODE: u32 = 0x1;
     const DISABLE_EXTENSION_POINTS: u32 = 0x1;
+    const DISABLE_UNTRUSTED_FONTS: u32 = 0x1;
+    const PREFER_SYSTEM32_IMAGES: u32 = 0x1;
+    const RAISE_EXCEPTION_ON_INVALID_HANDLE: u32 = 0x1;
     const NO_CHILD_PROCESS_CREATION: u32 = 0x1;
 
     extern "system" {
@@ -118,6 +130,9 @@ mod imp {
             dynamic_code_blocked: apply(PROCESS_DYNAMIC_CODE_POLICY, PROHIBIT_DYNAMIC_CODE),
             child_processes_blocked: apply(PROCESS_CHILD_PROCESS_POLICY, NO_CHILD_PROCESS_CREATION),
             extension_points_disabled: apply(PROCESS_EXTENSION_POINT_DISABLE_POLICY, DISABLE_EXTENSION_POINTS),
+            untrusted_fonts_disabled: apply(PROCESS_FONT_DISABLE_POLICY, DISABLE_UNTRUSTED_FONTS),
+            system32_images_preferred: apply(PROCESS_IMAGE_LOAD_POLICY, PREFER_SYSTEM32_IMAGES),
+            strict_handle_checks_enabled: apply(PROCESS_STRICT_HANDLE_CHECK_POLICY, RAISE_EXCEPTION_ON_INVALID_HANDLE),
             unsupported_platform: false,
         }
     }
@@ -163,10 +178,13 @@ mod tests {
             dynamic_code_blocked: true,
             child_processes_blocked: true,
             extension_points_disabled: true,
+            untrusted_fonts_disabled: true,
+            system32_images_preferred: true,
+            strict_handle_checks_enabled: true,
             unsupported_platform: false,
         };
         let s = todas.summary();
-        assert!(s.contains("codigo-dinamico") && s.contains("procesos-hijo") && s.contains("puntos-de-extension"));
+        assert!(s.contains("codigo-dinamico") && s.contains("procesos-hijo") && s.contains("puntos-de-extension") && s.contains("fuentes-no-confiables"));
     }
 
     #[test]

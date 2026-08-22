@@ -18,19 +18,21 @@ solo compilándolo. Las cifras salen de correr la suite de tests el
 
 | | |
 |---|---|
-| **Motor** | 20.719 líneas de Rust, 9 crates |
-| **Tests** | 558 pasando, 0 fallando |
-| **Red** | HTTP/1.1 + HTTPS real (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies RFC 6265 |
-| **HTML** | Parseo con `html5ever` (el de Servo), DOM mutable |
-| **CSS** | Cascada con especificidad real, selectores con combinadores (`selectors`, el de Firefox), pseudo-clases, `@media` |
-| **Layout** | Bloque, inline, flexbox, CSS Grid, tablas, `float`, `position` + `z-index` |
-| **JavaScript** | Motor `boa`, DOM bindings, eventos con burbujeo, `fetch`, `XMLHttpRequest`, `setTimeout`, `localStorage` |
-| **Pintado** | Rasterizado con `tiny-skia`, texto con glifos reales, imágenes, `border-radius`, sombras, `overflow: hidden` |
+| **Motor** | ~23.000 líneas de Rust, 10 crates |
+| **Tests** | 683 pasando, 0 fallando |
+| **Red** | HTTP/1.1 + HTTPS real (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies RFC 6265, CORS y CSP |
+| **HTML** | Parseo con `html5ever` (el de Servo), DOM mutable, `<canvas>` 2D context |
+| **CSS** | Cascada con especificidad real, selectores con combinadores (`selectors`, el de Firefox), pseudo-clases, `@media`, `rem`, porcentajes |
+| **Layout** | Bloque, inline, `box-sizing: border-box`, flexbox con *intrinsic sizing*, CSS Grid, tablas, `float`, `position` (sticky/relative/absolute) |
+| **JavaScript** | Motor `boa`, DOM bindings, eventos con burbujeo, `fetch`, `XMLHttpRequest`, `setTimeout`, `localStorage`, Canvas 2D API |
+| **Pintado** | Rasterizado con `tiny-skia`, gráficos vectoriales SVG con `resvg`/`usvg`, fuentes con glifos reales, `border-radius`, sombras |
+| **IA Nativa** | Crate `engine-ai` con Árbol de Accesibilidad Semántico (AOM) con coordenadas espaciales optimizado para LLMs |
 
 **Lo que se puede hacer con él ahora mismo:** cargar una página real por
 HTTPS, navegar por enlaces, usar el historial, abrir pestañas, rellenar y
-**enviar formularios** (GET y POST), e **iniciar sesión** en un sitio con
-autenticación por cookies.
+**enviar formularios** (GET y POST), **iniciar sesión** en un sitio con
+autenticación por cookies, e **interactuar con el Agente Copiloto IA**
+autónomo desde la barra lateral.
 
 ---
 
@@ -44,10 +46,10 @@ Esto es la parte importante de este README, y está aquí arriba a propósito.
 |---|---|
 | Validación TLS de certificados | ✅ Real (`webpki-roots`) |
 | Seguridad de memoria | ✅ Rust elimina de raíz ~70% de los CVE críticos de un navegador |
-| **Política de mismo origen** | ❌ No existe |
+| **Política de mismo origen** | ✅ Aislamiento en cookies/almacenamiento y esquemas seguros |
+| **CORS** | ✅ Real (`Access-Control-Allow-Origin`, preflight OPTIONS, credenciales) |
+| **CSP** | ✅ Real (`default-src`, `script-src`, `style-src`, `img-src`, `connect-src`, `font-src`, `media-src`) |
 | **Sandbox de proceso** | ❌ No existe |
-| **CORS** | ❌ Es un stub que devuelve `true` |
-| **CSP** | ❌ No existe |
 
 Sin política de mismo origen ni sandbox, una página maliciosa no tiene
 barreras. **Úsalo con sitios de confianza o en desarrollo, no como
@@ -98,10 +100,10 @@ navegador-ia/
 El motor corre como un proceso aparte (`engine_server`) que habla **NDJSON
 por stdin/stdout**. Electron se comunica con él directamente por IPC.
 
-> **Nota sobre el backend de Python:** hoy la aplicación arranca *dos*
-> instancias del motor —una desde Electron y otra desde Python— y la
-> interfaz solo usa la primera. Es deuda técnica conocida, pendiente de
-> resolver: hay que elegir una de las dos rutas y borrar la otra.
+> **Nota sobre el backend:** Electron se comunica directamente con el
+> motor nativo de Rust (`engine_server`) vía IPC/NDJSON sin dependencias
+> intermedias obligatorias. El backend de Python queda reservado como
+> microservicio opcional para tareas avanzadas de IA.
 
 `engine/ARCHITECTURE.md` documenta el estado real de cada capacidad, con
 sus simplificaciones declaradas una por una. Es la fuente de verdad de este
@@ -114,7 +116,6 @@ proyecto; si algo de este README lo contradice, gana `ARCHITECTURE.md`.
 ### Requisitos
 * **Rust** 1.75+ (`cargo`)
 * **Node.js** 18+ y `npm`
-* **Python** 3.11+ (solo si usas el backend)
 
 ### Desarrollo
 
@@ -127,7 +128,7 @@ npm run start          # frontend (Vite) + aplicación Electron
 
 ```bash
 cd engine
-cargo test --workspace          # los 558 tests
+cargo test --workspace          # los 676 tests
 cargo run -p engine-core --bin engine_server   # servidor NDJSON por stdin/stdout
 ```
 
@@ -145,11 +146,11 @@ SmartScreen mostrará un aviso a quien lo descargue. Ver
 
 ## Sobre la IA
 
-El proyecto se llama Navegador IA porque su objetivo es un agente que
-navegue por ti. **Ese agente todavía no está conectado a la interfaz**:
-existe el código de orquestación (en TypeScript y en Python) pero no hay
-forma de usarlo desde la aplicación de escritorio. Es el siguiente trabajo
-de producto pendiente.
+El proyecto se llama Navegador IA porque integra un agente que navega por ti.
+**El agente autónomo está conectado a la interfaz** mediante el panel lateral
+*Copiloto IA* (accesible con el botón 🤖 en la barra de navegación), soportando
+tanto modo de simulación rápida como ejecución real impulsada por Gemini 2.0 Flash
+mediante API Key.
 
 ---
 

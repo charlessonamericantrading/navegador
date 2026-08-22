@@ -10,6 +10,7 @@ members = [
     "crates/text",
     "crates/js",
     "crates/core",
+    "crates/ai",
 ]
 
 [workspace.package]

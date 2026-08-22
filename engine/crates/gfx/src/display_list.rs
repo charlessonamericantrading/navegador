@@ -668,8 +668,17 @@ fn resolve_text_align(computed_style: &HashMap<String, String>) -> TextAlign {
 /// `parse_css_font_size` de arriba: dos crates que no deben depender
 /// entre si, y unas pocas lineas no justifican enredar la dependencia.
 fn parse_css_length(value: &str) -> Option<f32> {
-    let px = value.trim().strip_suffix("px")?;
-    px.trim().parse::<f32>().ok().filter(|n| *n >= 0.0)
+    let trimmed = value.trim();
+    if trimmed == "0" {
+        return Some(0.0);
+    }
+    if let Some(px) = trimmed.strip_suffix("px") {
+        px.trim().parse::<f32>().ok().filter(|n| *n >= 0.0)
+    } else if let Some(rem) = trimmed.strip_suffix("rem") {
+        rem.trim().parse::<f32>().ok().filter(|n| *n >= 0.0).map(|n| n * 16.0)
+    } else {
+        None
+    }
 }
 
 /// Ancho+color de `border` (forma abreviada `border: <ancho> <estilo>
@@ -715,7 +724,18 @@ fn parse_css_border(computed_style: &HashMap<String, String>) -> Option<(f32, [u
 /// `padding`/`margin`/`border-width`). `None`/cero/negativo resuelve a
 /// "sin redondeo" (esquinas cuadradas, el valor inicial real).
 fn parse_css_border_radius(computed_style: &HashMap<String, String>) -> Option<f32> {
-    computed_style.get("border-radius").and_then(|v| parse_css_length(v)).filter(|r| *r > 0.0)
+    let raw = computed_style.get("border-radius")?;
+    if let Some(r) = parse_css_length(raw) {
+        return (r > 0.0).then_some(r);
+    }
+    for token in raw.split_whitespace() {
+        if let Some(r) = parse_css_length(token) {
+            if r > 0.0 {
+                return Some(r);
+            }
+        }
+    }
+    None
 }
 
 /// `box-shadow: <offset-x> <offset-y> [<blur-radius>] <color>` (Fase 3.5) -
@@ -1129,6 +1149,7 @@ mod tests {
     #[test]
     fn parse_css_border_radius_reads_a_positive_px_value() {
         assert_eq!(parse_css_border_radius(&style_with("border-radius", "8px")), Some(8.0));
+        assert_eq!(parse_css_border_radius(&style_with("border-radius", "8px 12px")), Some(8.0));
     }
 
     #[test]

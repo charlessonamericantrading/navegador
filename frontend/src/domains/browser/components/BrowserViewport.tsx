@@ -47,6 +47,8 @@ interface BrowserViewportProps {
   onNewTab: () => void;
   onSwitchTab: (tabId: number) => void;
   onCloseTab: (tabId: number) => void;
+  onToggleAgent?: () => void;
+  isAgentOpen?: boolean;
 }
 
 export const BrowserViewport: React.FC<BrowserViewportProps> = ({
@@ -67,7 +69,9 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   activeTabId,
   onNewTab,
   onSwitchTab,
-  onCloseTab
+  onCloseTab,
+  onToggleAgent,
+  isAgentOpen
 }) => {
   const [addressInput, setAddressInput] = useState(url || 'https://www.google.com');
   const [inputTextPopup, setInputTextPopup] = useState<{
@@ -386,6 +390,18 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
             Navegar
           </button>
         </form>
+
+        {onToggleAgent && (
+          <button
+            type="button"
+            onClick={onToggleAgent}
+            className={`agent-toggle-btn ${isAgentOpen ? 'active' : ''}`}
+            title="Abrir Copiloto IA"
+          >
+            <span>🤖</span>
+            <span>Copiloto IA</span>
+          </button>
+        )}
       </div>
 
       {/* Área Principal de Renderizado / Inicio */}

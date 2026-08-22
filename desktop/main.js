@@ -390,11 +390,13 @@ app.whenReady().then(() => {
     return net.fetch('file:///' + formattedPath);
   });
 
-  // Arrancar el motor nativo Rust directamente (prioridad)
+  // Arrancar el motor nativo Rust directamente (controlador prioritario y único)
   startNativeEngine();
 
-  // Arrancar opcionalmente el backend de Python para retrocompatibilidad
-  startPythonBackend();
+  // Arrancar opcionalmente el backend de Python solo si se solicita explícitamente
+  if (process.env.USE_PYTHON_BACKEND === 'true') {
+    startPythonBackend();
+  }
 
   // Crear la ventana principal de la app
   createWindow();

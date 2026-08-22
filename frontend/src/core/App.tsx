@@ -1,6 +1,8 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import BrowserViewport from '../domains/browser/components/BrowserViewport';
 import WelcomeGuide from '../domains/onboarding/components/WelcomeGuide';
+import AgentSidebar from '../domains/agent/components/AgentSidebar';
+import type { BrowserInterface } from '../domains/agent/AgentOrchestrator';
 import './App.css';
 
 interface ElementRect {
@@ -47,6 +49,17 @@ function App() {
     () => localStorage.getItem('onboarding_completed') !== 'true'
   );
   const [toast, setToast] = useState<string | null>(null);
+  const [isAgentOpen, setIsAgentOpen] = useState(false);
+
+  // Referencias en vivo para que el agente siempre lea el estado actualizado
+  const browserUrlRef = useRef(browserUrl);
+  browserUrlRef.current = browserUrl;
+  const elementsRef = useRef(elements);
+  elementsRef.current = elements;
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
+  const activeTabIdRef = useRef(activeTabId);
+  activeTabIdRef.current = activeTabId;
 
   const wsRef = useRef<WebSocket | null>(null);
   const toastTimeoutRef = useRef<number | undefined>(undefined);
@@ -381,6 +394,28 @@ function App() {
     }
   };
 
+  // Interfaz de navegación provista al orquestador del agente IA
+  const browserInterface: BrowserInterface = useMemo(() => ({
+    getUrl: async () => browserUrlRef.current,
+    getTitle: async () => {
+      const currentTab = tabsRef.current.find((t) => t.id === activeTabIdRef.current);
+      return currentTab?.title || currentTab?.url || 'Página Web';
+    },
+    getElements: async () => elementsRef.current,
+    navigate: async (url: string) => {
+      await handleManualNavigate(url);
+    },
+    click: async (x: number, y: number) => {
+      await sendCommand({ type: 'click', x, y });
+    },
+    typeText: async (x: number, y: number, text: string) => {
+      await sendCommand({ type: 'type_text', x, y, text, press_enter: true });
+    },
+    pressKey: async (key: string) => {
+      await sendCommand({ type: 'press_key', key });
+    }
+  }), []);
+
   return (
     <div className="app-container">
       {backendIssue?.status === 'failed' && (
@@ -448,10 +483,19 @@ function App() {
           onNewTab={handleNewTab}
           onSwitchTab={handleSwitchTab}
           onCloseTab={handleCloseTab}
+          onToggleAgent={() => setIsAgentOpen((prev) => !prev)}
+          isAgentOpen={isAgentOpen}
         />
       </main>
+
+      {/* Panel Lateral: Agente Autónomo de IA */}
+      <AgentSidebar
+        isOpen={isAgentOpen}
+        onClose={() => setIsAgentOpen(false)}
+        browserInterface={browserInterface}
+      />
     </div>
   );
-}
+};
 
 export default App;

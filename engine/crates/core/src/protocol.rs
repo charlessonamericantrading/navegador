@@ -83,6 +83,11 @@ pub enum EngineRequest {
     ListTabs {
         id: Option<String>,
     },
+    /// Árbol Semántico Accesible (Fase 5.2): extrae la jerarquía AOM optimizada
+    /// con coordenadas espaciales para modelos de lenguaje (LLMs).
+    GetAccessibilityTree {
+        id: Option<String>,
+    },
     Shutdown {
         id: Option<String>,
     },
@@ -105,6 +110,7 @@ impl EngineRequest {
             | Self::CloseTab { id, .. }
             | Self::SwitchTab { id, .. }
             | Self::ListTabs { id }
+            | Self::GetAccessibilityTree { id }
             | Self::Shutdown { id } => id.as_deref(),
         }
     }
@@ -155,6 +161,15 @@ pub enum EngineResponse {
         id: Option<String>,
         tabs: Vec<TabInfo>,
         active_tab_id: u32,
+    },
+    /// Respuesta a `GetAccessibilityTree` (Fase 5.2).
+    AccessibilityTree {
+        id: Option<String>,
+        tab_id: u32,
+        url: String,
+        title: String,
+        tree: engine_ai::AccessibilityTree,
+        prompt: String,
     },
     Ok {
         id: Option<String>,

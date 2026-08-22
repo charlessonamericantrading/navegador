@@ -346,6 +346,7 @@ impl EngineServer {
             EngineRequest::CloseTab { tab_id, .. } => (self.close_tab(id, tab_id), false),
             EngineRequest::SwitchTab { tab_id, .. } => (self.switch_tab(id, tab_id), false),
             EngineRequest::ListTabs { .. } => (self.list_tabs(id), false),
+            EngineRequest::GetAccessibilityTree { .. } => (self.accessibility_tree_response(id), false),
             EngineRequest::Shutdown { .. } => (
                 EngineResponse::Ok {
                     id,
@@ -388,6 +389,10 @@ impl EngineServer {
     async fn navigate_with_body(&mut self, id: Option<String>, url: String, record_history: bool, body: Option<Vec<u8>>) -> EngineResponse {
         let request = match NetworkRequest::new(&url) {
             Ok(mut request) => {
+                let scheme = request.url.scheme();
+                if scheme != "http" && scheme != "https" {
+                    return Self::error(id, format!("esquema_no_soportado: solo se admiten peticiones http y https (esquema: {scheme})"));
+                }
                 if let Some(body) = body {
                     request.method = engine_net::request::Method::Post;
                     request.headers.insert("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string());
@@ -1362,6 +1367,29 @@ impl EngineServer {
             elements: collect_interactive_elements(&page.page.layout_root),
             can_go_back,
             can_go_forward,
+        }
+    }
+
+    /// Construye y devuelve el árbol semántico accesible (AOM) de la página activa (Fase 5.2).
+    fn accessibility_tree_response(&self, id: Option<String>) -> EngineResponse {
+        let tab = self.active_tab();
+        let Some(page) = &tab.current_page else {
+            return EngineResponse::Error {
+                id,
+                message: "no_page_loaded".to_string(),
+            };
+        };
+
+        let tree = engine_ai::AccessibilityTree::build(&page.page.layout_root);
+        let prompt = tree.to_llm_representation();
+
+        EngineResponse::AccessibilityTree {
+            id,
+            tab_id: tab.id,
+            url: page.url.clone(),
+            title: page.current_title(),
+            tree,
+            prompt,
         }
     }
 
@@ -2774,5 +2802,49 @@ mod tests {
         let json = serde_json::to_string(&response).expect("response should serialize");
         assert!(json.contains("\"type\":\"tabs\""));
         assert!(json.contains(&format!("\"active_tab_id\":{}", server.active_tab().id)));
+    }
+
+    #[tokio::test]
+    async fn get_accessibility_tree_returns_aom_and_compact_prompt() {
+        let mut server = EngineServer::new();
+        // Sin página cargada debe devolver error
+        let resp = server.accessibility_tree_response(Some("a1".to_string()));
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(json.contains("\"type\":\"error\""));
+
+        // Cargar página mock con HTML y elementos interactivos
+        let (page, runtime) = build_page_keeping_runtime(
+            r#"<html><body>
+                <header><h1>Dashboard</h1></header>
+                <main>
+                    <button id="btn_submit">Guardar</button>
+                    <input type="text" placeholder="Tu nombre" />
+                </main>
+            </body></html>"#,
+            "",
+            800.0,
+            600.0,
+            None,
+            &HashMap::new(),
+            &ImageMap::new(),
+            None,
+            None,
+        );
+        let tab = server.active_tab_mut();
+        tab.current_page = Some(LoadedPage {
+            url: "https://example.test/app".to_string(),
+            title: "Dashboard".to_string(),
+            page,
+            runtime,
+            font_set: None,
+            images: ImageMap::new(),
+            focused_node: None,
+        });
+
+        let resp2 = server.accessibility_tree_response(Some("a3".to_string()));
+        let json2 = serde_json::to_string(&resp2).expect("serialize");
+        assert!(json2.contains("\"type\":\"accessibility_tree\""));
+        assert!(json2.contains("(button) \\\"Guardar\\\""));
+        assert!(json2.contains("(input) \\\"Tu nombre\\\""));
     }
 }

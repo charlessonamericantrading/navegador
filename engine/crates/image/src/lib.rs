@@ -14,6 +14,7 @@
 //! externas).
 
 use std::sync::Arc;
+use usvg::{fontdb, Options, PostProcessingSteps, TreeParsing, TreePostProc};
 
 /// Una imagen ya decodificada en memoria: dimensiones reales en pixeles mas
 /// el buffer RGBA8 (straight alpha, no premultiplicado) fila por fila,
@@ -27,28 +28,45 @@ pub struct DecodedImage {
 }
 
 /// Decodifica bytes crudos ya descargados (ver `engine_net::NetworkResponse
-/// ::body`) a una `DecodedImage`. `None` si el formato no esta soportado o
-/// los bytes estan corruptos/incompletos - un fallo real de decodificacion,
-/// no una excusa: se le devuelve a quien llama para que omita la imagen
-/// (mismo criterio que una hoja de estilo o script externo que falla al
-/// descargarse, ver `core/server.rs`), no una imagen inventada de
-/// respaldo. Tambien `None` para una imagen de 0x0 (formalmente decodifica
-/// pero no tiene ningun pixel que pintar).
+/// ::body`) a una `DecodedImage`.
 ///
-/// `Arc` porque el resultado se comparte tal cual entre quien mide el
-/// layout y quien pinta despues (mismo patron que `engine_text::FontSet`
-/// compartida entre medir y pintar) - clonar varios megabytes de RGBA por
-/// cada relayout/repintado seria un desperdicio real, no teorico.
+/// Soporta tanto imágenes de mapa de bits (PNG, JPEG, GIF, BMP, WebP, ICO, TIFF)
+/// como imágenes vectoriales SVG mediante `resvg`.
+///
+/// `None` si el formato no está soportado o los bytes están corruptos/incompletos.
 pub fn decode_image(bytes: &[u8]) -> Option<Arc<DecodedImage>> {
-    let decoded = image::load_from_memory(bytes)
-        .map_err(|error| tracing::warn!("[engine-image] no se pudo decodificar la imagen: {error}"))
-        .ok()?;
-    let rgba = decoded.to_rgba8();
-    let (width, height) = rgba.dimensions();
+    if let Ok(decoded) = image::load_from_memory(bytes) {
+        let rgba = decoded.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        if width > 0 && height > 0 {
+            return Some(Arc::new(DecodedImage { width, height, rgba: rgba.into_raw() }));
+        }
+    }
+    // Si no es un formato de trama estándar, intentar decodificar como SVG vectorial
+    decode_svg(bytes)
+}
+
+/// Decodifica y rasteriza contenido vectorial SVG a RGBA8 en memoria mediante `resvg`.
+pub fn decode_svg(bytes: &[u8]) -> Option<Arc<DecodedImage>> {
+    let opt = Options::default();
+    let mut tree = usvg::Tree::from_data(bytes, &opt).ok()?;
+    let fontdb = fontdb::Database::new();
+    tree.postprocess(PostProcessingSteps::default(), &fontdb);
+
+    let size = tree.size.to_int_size();
+    let width = size.width();
+    let height = size.height();
     if width == 0 || height == 0 {
         return None;
     }
-    Some(Arc::new(DecodedImage { width, height, rgba: rgba.into_raw() }))
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+
+    Some(Arc::new(DecodedImage {
+        width,
+        height,
+        rgba: pixmap.take(),
+    }))
 }
 
 #[cfg(test)]
@@ -87,5 +105,30 @@ mod tests {
     #[test]
     fn decode_image_rejects_empty_input() {
         assert!(decode_image(&[]).is_none());
+    }
+
+    #[test]
+    fn decode_svg_renders_valid_svg_to_rgba_buffer() {
+        let svg_data = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20">
+            <rect width="20" height="20" fill="#00ff00" />
+        </svg>"##;
+
+        let decoded = decode_svg(svg_data).expect("el SVG válido debe decodificar");
+        assert_eq!(decoded.width, 20);
+        assert_eq!(decoded.height, 20);
+        assert_eq!(decoded.rgba.len(), 20 * 20 * 4);
+        assert_eq!(&decoded.rgba[0..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn decode_image_automatically_dispatches_svg() {
+        let svg_data = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+            <rect width="10" height="10" fill="#0000ff" />
+        </svg>"##;
+
+        let decoded = decode_image(svg_data).expect("decode_image debe aceptar e identificar SVG");
+        assert_eq!(decoded.width, 10);
+        assert_eq!(decoded.height, 10);
+        assert_eq!(&decoded.rgba[0..4], &[0, 0, 255, 255]);
     }
 }

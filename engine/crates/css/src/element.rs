@@ -164,10 +164,12 @@ impl Element for ElementRef {
             EnginePseudoClass::Link | EnginePseudoClass::AnyLink => {
                 matches!(tag_name.as_str(), "a" | "area") && attributes.contains_key("href")
             }
+            // `:focus` y `:focus-visible` se resuelven si el control de formulario
+            // tiene foco explícito declarado (`autofocus` o `data-focused`).
+            EnginePseudoClass::Focus | EnginePseudoClass::FocusVisible | EnginePseudoClass::FocusWithin => {
+                is_form_control && (attributes.contains_key("autofocus") || attributes.contains_key("data-focused"))
+            }
             EnginePseudoClass::Hover
-            | EnginePseudoClass::Focus
-            | EnginePseudoClass::FocusVisible
-            | EnginePseudoClass::FocusWithin
             | EnginePseudoClass::Active
             | EnginePseudoClass::Visited => false,
         }

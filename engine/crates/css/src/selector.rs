@@ -522,6 +522,15 @@ mod tests {
     }
 
     #[test]
+    fn focus_pseudo_class_matches_autofocused_form_controls() {
+        let focused_input = element("input", &[("autofocus", "")]);
+        let plain_input = element("input", &[]);
+        assert!(SelectorMatcher::matches("input:focus", &focused_input));
+        assert!(SelectorMatcher::matches("input:focus-visible", &focused_input));
+        assert!(!SelectorMatcher::matches("input:focus", &plain_input));
+    }
+
+    #[test]
     fn link_matches_an_anchor_with_href_but_visited_never_matches() {
         let enlace = element("a", &[("href", "/x")]);
         let ancla_sin_href = element("a", &[]);

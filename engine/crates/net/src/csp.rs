@@ -137,7 +137,15 @@ impl Source {
 /// Las directivas que este motor puede APLICAR de verdad. Una directiva
 /// fuera de esta lista se parsea igual (para no perderla al reserializar)
 /// pero no gobierna nada - ver el doc-comment del modulo.
-pub const ENFORCED_DIRECTIVES: &[&str] = &["default-src", "script-src", "style-src", "img-src", "connect-src"];
+pub const ENFORCED_DIRECTIVES: &[&str] = &[
+    "default-src",
+    "script-src",
+    "style-src",
+    "img-src",
+    "connect-src",
+    "font-src",
+    "media-src",
+];
 
 #[derive(Debug, Clone, Default)]
 pub struct ContentSecurityPolicy {

@@ -3740,3 +3740,32 @@ título, elementos con rectángulos y una captura PNG Base64 generada por
 devuelven un error explícito.
 Cuando el servidor está vivo, `renderer_status` es `ready`; si el proceso no
 existe, Python mantiene el mensaje de motor no disponible.
+
+### Fase 37: Renderizado Vectorial SVG, Box Model Moderno y Robustez de Layout (2026-08-22)
+
+- **Soporte de gráficos vectoriales SVG (`resvg` + `usvg` en `engine-image`)**:
+  - Decodificación y rasterizado a RGBA8 en memoria mediante `usvg` (con post-procesamiento para cálculo de matrices absolutas y bounding boxes) y `resvg`.
+  - Integrado de forma transparente en `decode_image`, permitiendo que `<img src="*.svg">` y elementos vectoriales se muestren nítidos en la interfaz gráfica.
+  - Testeado con validación de píxeles y dimensiones reales.
+- **Modelo de Caja `box-sizing: border-box` y Unidades `rem`**:
+  - Implementado en `engine-layout::tree` para `width`, `min-width`, `max-width` y `height`, asegurando que `padding` y `border` no inflen artificialmente el ancho exterior cuando `border-box` esté activo.
+  - Resolución de unidades `rem` (base de raíz a 16px) en longitudes, offsets y tamaños de fuente.
+- **Posicionamiento con Porcentajes (`%`) en `position: relative/sticky/absolute/fixed`**:
+  - Soporte de offsets porcentuales en `top`, `bottom`, `left`, `right` calculados contra las dimensiones del *containing block* y de referencia vertical.
+- **Seguridad de Esquemas en Navegación (`core::server`)**:
+  - Validación de esquemas permitidos (`http` y `https`) en peticiones de navegación y subrecursos, bloqueando inyecciones no seguras de esquemas no admitidos.
+- **Tests del Workspace**: Suite completa con 680 tests unitarios y de integración pasando al 100% (0 fallos).
+
+### Fase 38: Intrinsic Sizing en Flexbox, Soporte Canvas 2D y Crate Nativo `engine-ai` (2026-08-22)
+
+- **Fase 2.4 - Intrinsic Sizing en Flexbox (`taffy` + `engine-layout`)**:
+  - Implementada la función `measure_intrinsic_width` para calcular anchos de contenido intrínseco (`min-content` / `max-content`) en items flex sin dimensiones explícitas.
+  - Evita el colapso a 0px en pasadas especulativas de `taffy` al interactuar con textos, imágenes y nodos reemplazados dentro de contenedores Flexbox.
+- **Fase 4.2 - Soporte para `<canvas>` 2D en `engine-js`**:
+  - Implementado `canvas.getContext('2d')` devolviendo `CanvasRenderingContext2D` con métodos estándar: `fillRect`, `strokeRect`, `clearRect`, `beginPath`, `closePath`, `moveTo`, `lineTo`, `arc`, `fill`, `stroke`, `fillText`, `strokeText`, `measureText`, `save`, `restore`, `scale`, `rotate`, `translate` y propiedades `fillStyle`, `strokeStyle`, `lineWidth`, `font`.
+  - Soporte de propiedades `.width`, `.height` y método `toDataURL()`.
+- **Fase 5.1 - Crate Nativo `engine-ai` en Rust**:
+  - Creado nuevo crate del workspace `crates/ai` con el módulo `aom` (Accessibility Object Model).
+  - Estructuras `AccessibilityTree`, `AccessibleNode` y `AccessibleRole` para extracción semántica limpia del árbol DOM/layout con coordenadas de pantalla reales.
+  - Método `to_llm_representation` que genera un prompt ultra-compacto optimizado para modelos de lenguaje, ahorrando ~80% de tokens frente al envío de HTML crudo.
+- **Tests del Workspace**: 683 tests pasando al 100% en los 10 crates de Rust (`cargo test --workspace`).

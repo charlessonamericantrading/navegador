@@ -40,6 +40,7 @@ export interface BrowserInterface {
   getUrl: () => Promise<string>;
   getTitle: () => Promise<string>;
   getElements: () => Promise<InteractiveElement[]>;
+  getAccessibilityPrompt?: () => Promise<string>;
   navigate: (url: string) => Promise<void>;
   click: (x: number, y: number) => Promise<void>;
   typeText: (x: number, y: number, text: string) => Promise<void>;
@@ -82,7 +83,17 @@ export class AgentOrchestrator {
     const title = await this.browser.getTitle();
     const elements = await this.browser.getElements();
 
-    const domText = getSimplifiedDomText(elements);
+    let domText = '';
+    if (this.browser.getAccessibilityPrompt) {
+      try {
+        domText = await this.browser.getAccessibilityPrompt();
+      } catch {
+        domText = getSimplifiedDomText(elements);
+      }
+    }
+    if (!domText) {
+      domText = getSimplifiedDomText(elements);
+    }
 
     let stepResult: AgentStepResult;
     if (mode === 'simulation') {
@@ -303,7 +314,8 @@ Decide el siguiente paso y responde en JSON.`;
       }
 
       const data = await response.json();
-      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+      let rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+      rawText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
       return JSON.parse(rawText) as AgentStepResult;
     } catch (err: any) {
       return {

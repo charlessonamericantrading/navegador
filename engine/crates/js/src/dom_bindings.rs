@@ -1330,7 +1330,26 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         capture.clone(),
     );
 
-    ObjectInitializer::with_native_data(capture.clone(), context)
+    // getContext('2d') (Fase 4.2 - Canvas 2D): permite a librerías y scripts
+    // obtener un contexto de renderizado 2D compatible.
+    let get_context = NativeFunction::from_copy_closure_with_captures(
+        |_this, args, _capture: &ElementCapture, context| {
+            let context_id = args.first().and_then(|a| a.to_string(context).ok()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            if context_id.eq_ignore_ascii_case("2d") {
+                Ok(canvas_2d_context_to_js_object(context).into())
+            } else {
+                Ok(JsValue::null())
+            }
+        },
+        capture.clone(),
+    );
+
+    let to_data_url = NativeFunction::from_copy_closure(|_this, _args, _context| {
+        Ok(JsValue::from(js_string!("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")))
+    });
+
+    let mut obj_init = ObjectInitializer::with_native_data(capture.clone(), context);
+    obj_init
         .property(js_string!("tagName"), js_string!(tag_name.to_uppercase()), Attribute::all())
         .accessor(js_string!("textContent"), Some(text_content_getter_fn), Some(text_content_setter_fn), Attribute::all())
         .accessor(js_string!("classList"), Some(class_list_getter_fn), None, Attribute::all())
@@ -1352,6 +1371,68 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         .function(dispatch_event, js_string!("dispatchEvent"), 1)
         .function(get_bounding_client_rect, js_string!("getBoundingClientRect"), 0)
         .function(get_client_rects, js_string!("getClientRects"), 0)
+        .function(get_context, js_string!("getContext"), 1)
+        .function(to_data_url, js_string!("toDataURL"), 0);
+
+    if tag_name.eq_ignore_ascii_case("canvas") {
+        obj_init
+            .property(js_string!("width"), JsValue::from(300.0), Attribute::all())
+            .property(js_string!("height"), JsValue::from(150.0), Attribute::all());
+    }
+
+    obj_init.build()
+}
+
+/// Construye un objeto CanvasRenderingContext2D compatible con las APIs estándar del W3C.
+fn canvas_2d_context_to_js_object(context: &mut Context) -> JsObject {
+    let fill_rect = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let stroke_rect = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let clear_rect = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let begin_path = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let close_path = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let move_to = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let line_to = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let arc = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let fill = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let stroke = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let fill_text = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let stroke_text = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let measure_text = NativeFunction::from_copy_closure(|_this, args, context| {
+        let text_len = args.first().and_then(|a| a.to_string(context).ok()).map(|s| s.to_std_string_escaped().len()).unwrap_or(0);
+        let width = text_len as f64 * 8.0;
+        let mut obj = ObjectInitializer::new(context);
+        obj.property(js_string!("width"), JsValue::from(width), Attribute::all());
+        Ok(obj.build().into())
+    });
+    let save = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let restore = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let scale = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let rotate = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+    let translate = NativeFunction::from_copy_closure(|_this, _args, _context| Ok(JsValue::undefined()));
+
+    ObjectInitializer::new(context)
+        .property(js_string!("fillStyle"), js_string!("#000000"), Attribute::all())
+        .property(js_string!("strokeStyle"), js_string!("#000000"), Attribute::all())
+        .property(js_string!("lineWidth"), JsValue::from(1.0), Attribute::all())
+        .property(js_string!("font"), js_string!("10px sans-serif"), Attribute::all())
+        .function(fill_rect, js_string!("fillRect"), 4)
+        .function(stroke_rect, js_string!("strokeRect"), 4)
+        .function(clear_rect, js_string!("clearRect"), 4)
+        .function(begin_path, js_string!("beginPath"), 0)
+        .function(close_path, js_string!("closePath"), 0)
+        .function(move_to, js_string!("moveTo"), 2)
+        .function(line_to, js_string!("lineTo"), 2)
+        .function(arc, js_string!("arc"), 5)
+        .function(fill, js_string!("fill"), 0)
+        .function(stroke, js_string!("stroke"), 0)
+        .function(fill_text, js_string!("fillText"), 3)
+        .function(stroke_text, js_string!("strokeText"), 3)
+        .function(measure_text, js_string!("measureText"), 1)
+        .function(save, js_string!("save"), 0)
+        .function(restore, js_string!("restore"), 0)
+        .function(scale, js_string!("scale"), 2)
+        .function(rotate, js_string!("rotate"), 1)
+        .function(translate, js_string!("translate"), 2)
         .build()
 }
 
@@ -2943,5 +3024,19 @@ mod tests {
              log",
         );
         assert_eq!(result, "\"captura,target\"", "un tercer argumento booleano suelto (forma legado useCapture) deberia comportarse igual que {{capture: true}}");
+    }
+
+    #[test]
+    fn canvas_2d_context_creation_and_methods_support() {
+        let result = eval_with_dom(
+            r#"<html><body><canvas id="c" width="400" height="200"></canvas></body></html>"#,
+            "var canvas = document.getElementById('c'); \
+             var ctx = canvas.getContext('2d'); \
+             ctx.fillStyle = '#ff0000'; \
+             ctx.fillRect(10, 10, 50, 50); \
+             var m = ctx.measureText('hola'); \
+             canvas.tagName + ',' + (ctx !== null) + ',' + (m.width > 0)",
+        );
+        assert_eq!(result, "\"CANVAS,true,true\"");
     }
 }

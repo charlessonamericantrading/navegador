@@ -13,3 +13,6 @@ tracing.workspace = true
 # fuera a proposito: SVG es vectorial, no un simple decode-a-RGBA como el
 # resto, y la Fase 3.1 solo cubre imagenes de trama (raster).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff"] }
+resvg = "0.38"
+usvg = { version = "0.38", features = ["text"] }
+tiny-skia = "0.11"
