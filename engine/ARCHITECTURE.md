@@ -3769,3 +3769,172 @@ existe, Python mantiene el mensaje de motor no disponible.
   - Estructuras `AccessibilityTree`, `AccessibleNode` y `AccessibleRole` para extracción semántica limpia del árbol DOM/layout con coordenadas de pantalla reales.
   - Método `to_llm_representation` que genera un prompt ultra-compacto optimizado para modelos de lenguaje, ahorrando ~80% de tokens frente al envío de HTML crudo.
 - **Tests del Workspace**: 683 tests pasando al 100% en los 10 crates de Rust (`cargo test --workspace`).
+
+### Fase 39: Aviso de pagina dependiente de JavaScript, rendimiento y shorthands CSS (2026-08-27)
+
+Esta fase no salio de leer el codigo sino de EJECUTAR el navegador contra
+webs reales y mirar las capturas. El sintoma reportado fue "el navegador no
+funciona, ninguna URL carga". El motor cargaba las URLs perfectamente: lo
+que fallaba era todo lo demas.
+
+#### El diagnostico: la pagina en blanco muda
+
+Medido en vivo contra una web real (`ignislove.com`): 14 KB de HTML, 7
+`<script>`, y **cero caracteres de texto visible**. El servidor manda una
+cascara vacia y el contenido lo construye JavaScript en el cliente, que es
+como esta hecha la mayoria de la web moderna (React/Next/Vue/Shopify). El
+motor descargaba esa cascara, no encontraba nada dentro y pintaba blanco.
+
+Lo importante es POR QUE no habia ningun error: no habia fallado nada. La
+descarga fue correcta, el parseo fue correcto, el layout fue correcto. El
+resultado legitimo de todo eso era una pagina vacia. La interfaz mostraba
+avisos de error correctamente (comprobado), pero no habia error que mostrar.
+
+Contraste medido el mismo dia: Google (que si manda su texto en el HTML)
+carga y se ve bien en 457 ms.
+
+- **`requires_javascript` en el protocolo NDJSON** (`core/protocol.rs`,
+  `core/server.rs::page_content_requires_javascript`): se marca cuando el
+  arbol de LAYOUT no tiene practicamente texto visible Y el documento trae
+  `<script>`. Se reusa `collect_visible_text` (que ya filtra `<script>`/
+  `<noscript>`) en vez de mirar el DOM crudo - si no, el codigo fuente de un
+  bundle grande contaria como "contenido" y el aviso no saltaria nunca.
+- Las dos condiciones son necesarias A PROPOSITO: una pagina vacia SIN
+  scripts esta vacia de verdad, y decir "necesita JavaScript" seria mentir.
+  El umbral (40 caracteres) es un juicio, no un valor del spec, y se elige
+  bajo para preferir callar de mas antes que acusar en falso.
+- **Lo que NO afirma**: no dice que la pagina funcionaria con un motor de JS
+  completo, ni distingue "el script no se ejecuto" de "se ejecuto y no pinto
+  nada". Da un falso positivo en una pagina legitimamente casi vacia que
+  ademas lleve un script de analitica - se acepta: el coste es un aviso de
+  mas en una pagina que igualmente se ve vacia.
+
+#### Rendimiento: dos cuellos distintos, aislados con paginas sinteticas
+
+El articulo "Espana" de Wikipedia (1,77 MB) tardaba 150 s. Aislado midiendo
+por separado nodos, reglas y texto:
+
+| Pagina sintetica | Antes |
+|---|---|
+| 13.000 nodos + 5 reglas | 1,8 s |
+| 200 nodos + 2.000 reglas | 0,5 s |
+| 13.000 nodos + 2.000 reglas | **69,7 s** |
+| 13.000 parrafos con texto real | 1,7 s |
+
+Ni los nodos ni las reglas ni el texto por separado: el cuello era el
+PRODUCTO nodos x reglas, la firma de un bucle anidado.
+
+1. **`SelectorMatcher::matches` reparseaba el selector desde la cadena en
+   CADA comparacion** (`css/src/selector.rs`). La cascada compara cada nodo
+   contra cada regla, asi que eran del orden de 26 millones de parseos de un
+   punado de cadenas. Cache `thread_local` de selectores parseados
+   (`with_parsed_selector`), que cachea tambien el FALLO - un selector no
+   soportado se reintentaba igual de veces que uno valido. Es
+   `thread_local` y no un `static` con candado porque los tipos del crate
+   `selectors` no son `Sync`, y ademas evita cualquier bloqueo en el camino
+   mas caliente del motor.
+2. **Prefiltro por selector clave** (`css/src/stylesheet.rs::RuleKey`): cada
+   regla lleva precalculado su simple-selector mas a la derecha (id, clase o
+   tag), y la cascada descarta sin invocar al matcher completo. Es el mismo
+   truco que usan Chromium y Firefox. **Conservador por construccion**: ante
+   cualquier duda (`[`, `(`, comillas, `*`, una rama no descartable de una
+   lista) devuelve `Any`, que significa "pruebala igual" - por eso este
+   atajo no puede perder un estilo, y esa propiedad esta cubierta por tests.
+3. **Los subrecursos se descargaban EN SERIE**
+   (`core/server.rs::fetch_subresources`). Wikipedia trae 161 `<img>` de
+   `upload.wikimedia.org`; a ~200 ms cada una eso solo eran ~38 s. Ahora
+   `futures_util::buffered(6)` - seis es el limite clasico de conexiones por
+   host de un navegador real. Se usa `buffered` y NO `buffer_unordered`
+   porque el orden del documento es obligatorio para las hojas de estilo
+   (donde "la que viene despues gana a igual especificidad"): devolverlas
+   segun quien contestara antes haria que el aspecto de la pagina dependiera
+   de la latencia de la red.
+
+Resultado medido: sintetica 13k x 2k **69,7 s -> 1,8 s**; Wikipedia solo CPU
+**38,9 s -> 4,0 s**; Google 0,46 s -> 0,37 s (sin regresion).
+
+Al medir hay que servir la pagina en LOCAL: la variabilidad de red enmascara
+por completo el efecto (la misma pagina por internet dio 150 s y 215 s en
+dos pasadas del mismo binario).
+
+#### Maquetacion: los shorthands que se ignoraban enteros
+
+Aislado caja a caja con una pagina de prueba y mirando el PNG:
+
+- **`padding`/`margin` de 2, 3 y 4 valores se ignoraban ENTEROS y resolvian
+  a CERO.** Solo funcionaba la forma de un valor. La causa era que
+  `engine-layout` leia la propiedad abreviada como si fuera una longitud
+  suelta, asi que `parse_css_length("20px 60px")` fallaba y devolvia el
+  valor por defecto. No es un caso exotico: es la forma mas comun de
+  escribir padding en CSS real. Ahora se expanden a longhands en el parser
+  (`expand_box_shorthand`, mismo sitio donde ya vivia la expansion de
+  `background`) y `resolve_box_edges` los lee.
+- **`flex: 1` no hacia nada**: el layout solo leia los longhands. Ahora
+  `expand_flex_shorthand` lo expande, con la trampa clasica del spec:
+  `flex: 1` significa `1 1 0`, NO `1 1 auto`.
+- **`gap` se leia solo en `grid_container_style`**, nunca en flex, asi que
+  los items de un contenedor flex salian pegados.
+- **El fondo de `<html>`/`<body>` no se propagaba al lienzo**
+  (`layout::canvas_background`, consumido por `gfx/raster.rs`). Sin esto,
+  cualquier web con tema oscuro se veia como una franja de color del alto
+  del contenido sobre un fondo gris claro - el sintoma clasico de "esto esta
+  roto". NO implementado: que `<body>` deje de pintar su propio fondo cuando
+  se ha propagado (el spec dice que cede el fondo al lienzo); como se pinta
+  el mismo color en ambos sitios el resultado visible es identico, solo se
+  notaria con fondos semitransparentes superpuestos.
+- Valores con `calc()`/`var()` se dejan SIN expandir a proposito: trocearlos
+  por espacios los romperia. Ahi el longhand no se genera y el layout
+  resuelve a cero, igual que antes.
+
+#### APIs de JavaScript: medidas una a una, no supuestas
+
+Se escribio una pagina sonda que prueba 28 APIs y devuelve el resultado por
+`document.title`. El resultado corrige una suposicion equivocada: **el motor
+ya soportaba 22 de 28**. `async`/`await`, clases, arrow functions, template
+literals, destructuring, spread, `Map`/`Set`, `Symbol.iterator`, `Promise`,
+`JSON`, `fetch`, `getComputedStyle`, `addEventListener`, `innerHTML`,
+`querySelector`, `classList` - `boa` cubre la sintaxis moderna entera. No
+faltaba un motor de JavaScript: faltaban funciones sueltas.
+
+El detalle que importa: **la ausencia de UNA sola de ellas lanzaba
+TypeError en la primera linea util del bundle y mataba el script ENTERO**,
+dejando la pagina en blanco. El coste de una API ausente no es proporcional
+a lo usada que sea.
+
+Anadidas (sonda 22/28 -> 26/28):
+- `document.head` - espejo de `document.body`. Casi todo bundle hace
+  `document.head.appendChild(style)` al arrancar para inyectar sus estilos.
+- `document.createTextNode` - el companero de `createElement` que faltaba.
+- `navigator.userAgent`/`language`/`platform`/`onLine`. El User-Agent
+  declara lo que este motor ES; no imita a Chrome a proposito: una pagina
+  que creyera estar hablando con Chrome usaria APIs que aqui no existen y
+  fallaria mas adelante y de forma mas confusa.
+- `requestAnimationFrame`/`cancelAnimationFrame` sobre la MISMA cola que
+  `setTimeout(fn, 0)`. Sin sincronizacion con el refresco de pantalla y sin
+  la marca de tiempo del fotograma - es lo que puede prometer honestamente
+  un motor sin bucle de fotogramas propio. Se registra porque su AUSENCIA
+  era peor que su aproximacion.
+
+**Siguen faltando, y por que no se pusieron:**
+- `location.href` - necesita llevar la URL de la pagina hasta el runtime de
+  JS, lo que cambia la firma de `pipeline::build_page_keeping_runtime` y sus
+  llamadas. Registrarlo DESPUES de construir la pagina no sirve: los scripts
+  inline ya se ejecutaron.
+- `MutationObserver` - no se puso un stub a proposito. Uno que nunca dispara
+  puede ser PEOR que su ausencia: el codigo cree haberse suscrito y espera
+  para siempre, en vez de fallar rapido y visiblemente.
+
+#### Otros
+
+- La captura se declaraba `data:image/jpeg` siendo PNG (`89504e47`
+  comprobado). Chromium lo decodificaba igual por olfateo de contenido - se
+  verifico en un Chrome real antes de descartarlo como causa del problema
+  original - pero declarar mal el tipo es falso y rompe cualquier consumidor
+  mas estricto.
+- `futures-util` pasa a ser dependencia explicita de `engine-core`. Ya venia
+  en el arbol via `hyper`, asi que declararlo no anade codigo al binario;
+  escribir a mano un limitador de concurrencia correcto (orden preservado,
+  cancelacion, backpressure) es justo lo que la doctrina de dependencias de
+  este documento dice que no hay que reimplementar.
+
+**Tests del Workspace**: 703 pasando, 0 fallando, en los 10 crates.
