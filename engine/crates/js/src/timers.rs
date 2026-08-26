@@ -213,7 +213,28 @@ pub fn register_timers(context: &mut Context) -> JsResult<TimerQueue> {
     context.register_global_builtin_callable(js_string!("setTimeout"), 2, set_timeout)?;
     context.register_global_builtin_callable(js_string!("setInterval"), 2, set_interval)?;
     context.register_global_builtin_callable(js_string!("clearTimeout"), 1, clear.clone())?;
-    context.register_global_builtin_callable(js_string!("clearInterval"), 1, clear)?;
+    context.register_global_builtin_callable(js_string!("clearInterval"), 1, clear.clone())?;
+
+    // `requestAnimationFrame` (Fase 39) sobre la MISMA cola que
+    // `setTimeout(fn, 0)`: es lo que de verdad puede prometer un motor que
+    // no tiene un bucle de fotogramas propio (ver el aviso de este modulo
+    // sobre como avanza el tiempo). La diferencia con un navegador real es
+    // que aqui no hay sincronizacion con el refresco de pantalla y la
+    // callback NO recibe la marca de tiempo del fotograma.
+    //
+    // Se registra porque su AUSENCIA era peor que su aproximacion: un
+    // bundle que hace `requestAnimationFrame(render)` sin comprobar antes
+    // que existe moria con un TypeError en la carga, y con el la pagina
+    // entera. Aproximarlo hace que el codigo siga adelante.
+    let request_animation_frame = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], captured, context| {
+            let callback = args.first().cloned().unwrap_or_default();
+            schedule(&[callback], &captured.0, context, false)
+        },
+        TimerCapture(queue.clone()),
+    );
+    context.register_global_builtin_callable(js_string!("requestAnimationFrame"), 1, request_animation_frame)?;
+    context.register_global_builtin_callable(js_string!("cancelAnimationFrame"), 1, clear)?;
 
     // Colgarlos tambien de `window` si ya existe, porque muchisimo codigo
     // real escribe `window.setTimeout(...)` en vez de la forma corta.

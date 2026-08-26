@@ -159,7 +159,13 @@ impl<'i> QualifiedRuleParser<'i> for RuleParser {
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::QualifiedRule, ParseError<'i, Self::Error>> {
         let (declarations, important) = parse_declaration_list(input);
-        Ok(vec![Rule { selector: prelude, declarations, important, media: None }])
+        Ok(vec![Rule {
+            key: crate::stylesheet::RuleKey::from_selector(&prelude),
+            selector: prelude,
+            declarations,
+            important,
+            media: None,
+        }])
     }
 }
 
@@ -268,7 +274,82 @@ fn insert_declaration(declarations: &mut HashMap<String, String>, name: String, 
             declarations.insert("background-color".to_string(), color);
         }
     }
+    if name == "padding" || name == "margin" {
+        expand_box_shorthand(declarations, &name, &value);
+    }
+    if name == "flex" {
+        expand_flex_shorthand(declarations, &value);
+    }
     declarations.insert(name, value);
+}
+
+/// Expande `padding`/`margin` a sus cuatro longhands con las formas de 1, 2,
+/// 3 y 4 valores del spec.
+///
+/// Antes solo existia la forma de UN valor, y no porque estuviera modelada:
+/// `engine-layout` leia la propiedad abreviada como si fuera una longitud
+/// suelta, asi que `padding: 16px 24px` no fallaba con un aviso - parseaba
+/// como invalido y resolvia a CERO en los cuatro lados. Es decir, la forma
+/// mas comun de escribir padding en CSS real se ignoraba en silencio.
+/// Verificado en vivo: `padding: 20px` se veia y `padding: 20px 60px` no.
+///
+/// Un valor con parentesis (`calc(...)`, `var(...)`) se deja pasar sin
+/// expandir: trocearlo por espacios lo romperia. En ese caso el longhand no
+/// se genera y el layout resuelve a cero, igual que antes - no es una
+/// regresion, es el mismo limite de siempre acotado a un caso mucho menor.
+fn expand_box_shorthand(declarations: &mut HashMap<String, String>, name: &str, value: &str) {
+    if value.contains('(') {
+        return;
+    }
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    let (top, right, bottom, left) = match parts.as_slice() {
+        [all] => (*all, *all, *all, *all),
+        [vertical, horizontal] => (*vertical, *horizontal, *vertical, *horizontal),
+        [top, horizontal, bottom] => (*top, *horizontal, *bottom, *horizontal),
+        [top, right, bottom, left] => (*top, *right, *bottom, *left),
+        _ => return,
+    };
+    for (side, side_value) in [("top", top), ("right", right), ("bottom", bottom), ("left", left)] {
+        declarations.insert(format!("{name}-{side}"), side_value.to_string());
+    }
+}
+
+/// Expande el shorthand `flex` a `flex-grow`/`flex-shrink`/`flex-basis`.
+///
+/// `flex: 1` es la forma en que se escribe flexbox en la practica, y no
+/// estaba soportada: `engine-layout` leia unicamente los longhands, asi que
+/// los items no crecian y se quedaban al ancho de su contenido. Verificado
+/// en vivo: `flex-grow: 1; flex-basis: 0` funcionaba y `flex: 1` no.
+///
+/// Los valores iniciales al expandir NO son los mismos que cuando la
+/// propiedad no esta puesta, que es la trampa clasica de este shorthand:
+/// `flex: 1` significa `1 1 0%`, no `1 1 auto`. Se emite `0px` en vez de
+/// `0%` porque es lo que el layout sabe resolver hoy, y para una base de
+/// cero ambos significan lo mismo.
+fn expand_flex_shorthand(declarations: &mut HashMap<String, String>, value: &str) {
+    let trimmed = value.trim();
+    let (grow, shrink, basis) = match trimmed.to_ascii_lowercase().as_str() {
+        "none" => ("0", "0", "auto"),
+        "auto" => ("1", "1", "auto"),
+        "initial" => ("0", "1", "auto"),
+        _ => {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            let is_number = |token: &str| token.parse::<f32>().is_ok();
+            match parts.as_slice() {
+                // `flex: <grow>` -> 1 de shrink y base CERO (no `auto`).
+                [grow] if is_number(grow) => (*grow, "1", "0px"),
+                // `flex: <basis>` (una longitud suelta) -> crece y encoge.
+                [basis] => ("1", "1", *basis),
+                [grow, second] if is_number(grow) && is_number(second) => (*grow, *second, "0px"),
+                [grow, basis] if is_number(grow) => (*grow, "1", *basis),
+                [grow, shrink, basis] if is_number(grow) && is_number(shrink) => (*grow, *shrink, *basis),
+                _ => return,
+            }
+        }
+    };
+    declarations.insert("flex-grow".to_string(), grow.to_string());
+    declarations.insert("flex-shrink".to_string(), shrink.to_string());
+    declarations.insert("flex-basis".to_string(), basis.to_string());
 }
 
 /// Palabras clave del shorthand `background` que NUNCA son un color -
@@ -607,5 +688,76 @@ mod tests {
     #[test]
     fn parse_inline_style_of_an_empty_string_is_empty() {
         assert!(CssParser::parse_inline_style("").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shorthand_expansion_tests {
+    use super::*;
+
+    fn decls(css: &str) -> HashMap<String, String> {
+        CssParser::parse(css).rules[0].declarations.clone()
+    }
+
+    /// El caso medido en vivo: `padding: 20px` se veia y `padding: 20px 60px`
+    /// no, porque el layout leia la abreviada como una longitud suelta y
+    /// "20px 60px" resolvia a CERO en los cuatro lados.
+    #[test]
+    fn the_two_value_padding_form_expands_to_vertical_and_horizontal() {
+        let d = decls("div { padding: 20px 60px; }");
+        assert_eq!(d.get("padding-top").map(String::as_str), Some("20px"));
+        assert_eq!(d.get("padding-bottom").map(String::as_str), Some("20px"));
+        assert_eq!(d.get("padding-left").map(String::as_str), Some("60px"));
+        assert_eq!(d.get("padding-right").map(String::as_str), Some("60px"));
+    }
+
+    #[test]
+    fn the_one_three_and_four_value_forms_follow_the_spec() {
+        let one = decls("div { margin: 5px; }");
+        assert_eq!(one.get("margin-left").map(String::as_str), Some("5px"));
+
+        let three = decls("div { padding: 1px 2px 3px; }");
+        assert_eq!(three.get("padding-top").map(String::as_str), Some("1px"));
+        assert_eq!(three.get("padding-right").map(String::as_str), Some("2px"));
+        assert_eq!(three.get("padding-bottom").map(String::as_str), Some("3px"));
+        assert_eq!(three.get("padding-left").map(String::as_str), Some("2px"), "izquierda copia a derecha en la forma de 3");
+
+        let four = decls("div { padding: 1px 2px 3px 4px; }");
+        assert_eq!(four.get("padding-left").map(String::as_str), Some("4px"));
+    }
+
+    /// `flex: 1` es como se escribe flexbox en la practica y no se soportaba:
+    /// solo se leian los longhands, asi que los items no crecian.
+    #[test]
+    fn flex_one_expands_to_grow_one_shrink_one_and_a_zero_basis() {
+        let d = decls("div { flex: 1; }");
+        assert_eq!(d.get("flex-grow").map(String::as_str), Some("1"));
+        assert_eq!(d.get("flex-shrink").map(String::as_str), Some("1"));
+        assert_eq!(d.get("flex-basis").map(String::as_str), Some("0px"), "la trampa del shorthand: la base es 0, no auto");
+    }
+
+    #[test]
+    fn the_flex_keywords_follow_the_spec() {
+        assert_eq!(decls("div { flex: none; }").get("flex-grow").map(String::as_str), Some("0"));
+        assert_eq!(decls("div { flex: none; }").get("flex-basis").map(String::as_str), Some("auto"));
+        assert_eq!(decls("div { flex: auto; }").get("flex-grow").map(String::as_str), Some("1"));
+        assert_eq!(decls("div { flex: auto; }").get("flex-basis").map(String::as_str), Some("auto"));
+    }
+
+    /// Un longhand explicito declarado DESPUES sigue ganando al shorthand,
+    /// que es lo que la cascada espera - la expansion no puede romper eso.
+    #[test]
+    fn an_explicit_longhand_after_the_shorthand_still_wins() {
+        let d = decls("div { padding: 10px; padding-left: 99px; }");
+        assert_eq!(d.get("padding-left").map(String::as_str), Some("99px"));
+        assert_eq!(d.get("padding-top").map(String::as_str), Some("10px"));
+    }
+
+    /// `calc()`/`var()` no se trocean: se deja sin expandir en vez de
+    /// partirlos por espacios y generar longhands sin sentido.
+    #[test]
+    fn values_with_parentheses_are_left_alone_instead_of_being_split() {
+        let d = decls("div { padding: calc(10px + 2px) 4px; }");
+        assert!(d.get("padding-top").is_none(), "no deberia inventar longhands a partir de un calc()");
     }
 }

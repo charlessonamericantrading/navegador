@@ -875,6 +875,7 @@ dependencies = [
  "engine-layout",
  "engine-net",
  "engine-text",
+ "futures-util",
  "serde",
  "serde_json",
  "tokio",

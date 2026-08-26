@@ -34,6 +34,10 @@ function App() {
   const [screenshot, setScreenshot] = useState('');
   const [browserUrl, setBrowserUrl] = useState('');
   const [elements, setElements] = useState<InteractiveElement[]>([]);
+  // Fase 39: el motor avisa cuando la pagina se descargo bien pero su
+  // contenido lo genera JavaScript que todavia no se ejecuta. Sin esto la
+  // pantalla se quedaba en blanco sin un solo mensaje.
+  const [requiresJavascript, setRequiresJavascript] = useState(false);
   const [loading, setLoading] = useState(false);
   // Historial y pestañas: el motor los soporta desde hace tiempo y los
   // reporta en cada `state` (`can_go_back`/`can_go_forward`/`tab_id`),
@@ -88,6 +92,7 @@ function App() {
     setScreenshot(data.screenshot || '');
     setBrowserUrl(data.url || '');
     setElements(data.elements || []);
+    setRequiresJavascript(Boolean(data.requires_javascript));
     setCanGoBack(Boolean(data.can_go_back));
     setCanGoForward(Boolean(data.can_go_forward));
     if (typeof data.tab_id === 'number') setActiveTabId(data.tab_id);
@@ -468,6 +473,7 @@ function App() {
           screenshot={screenshot}
           url={browserUrl}
           elements={elements}
+          requiresJavascript={requiresJavascript}
           onManualNavigate={handleManualNavigate}
           onManualClick={handleManualClick}
           onManualType={handleManualType}

@@ -516,6 +516,49 @@ impl DomBindings {
             .constructor(false)
             .build();
 
+        // `document.head` (Fase 39) - espejo exacto de `document.body`.
+        // Falta banal en apariencia y muy cara en la practica: casi todo
+        // bundle de framework hace `document.head.appendChild(style)` al
+        // arrancar para inyectar sus estilos, y sin `head` eso lanzaba
+        // TypeError y mataba el script ENTERO en su primera linea util.
+        let head_getter = NativeFunction::from_copy_closure_with_captures(
+            |_this, _args, capture: &DomRootCapture, context| {
+                Ok(match Node::find_all_by_tag(&capture.0, "head").into_iter().next() {
+                    Some(node) => element_to_js_object(&node, &capture.1, context).into(),
+                    None => JsValue::null(),
+                })
+            },
+            capture.clone(),
+        );
+        let head_getter_fn = FunctionObjectBuilder::new(context.realm(), head_getter)
+            .name(js_string!("get head"))
+            .length(0)
+            .constructor(false)
+            .build();
+
+        // `document.createTextNode(texto)` (Fase 39) - el companero de
+        // `createElement` que faltaba. Devuelve un nodo de TEXTO
+        // desconectado, listo para `appendChild`. Se envuelve con el mismo
+        // `element_to_js_object` que un elemento: sus metodos operan sobre
+        // el `Node` real, y para un nodo de texto `tagName` sale vacio -
+        // que es lo honesto, un nodo de texto no tiene etiqueta.
+        let create_text_node = NativeFunction::from_copy_closure_with_captures(
+            |_this, args: &[JsValue], capture: &DomRootCapture, context| {
+                let text = match args.first() {
+                    Some(value) => value.to_string(context)?.to_std_string_escaped(),
+                    None => String::new(),
+                };
+                let node = Node::new(NodeType::Text(text));
+                Ok(element_to_js_object(&node, &capture.1, context).into())
+            },
+            capture.clone(),
+        );
+        let create_text_node_fn = FunctionObjectBuilder::new(context.realm(), create_text_node)
+            .name(js_string!("createTextNode"))
+            .length(1)
+            .constructor(false)
+            .build();
+
         let document = ObjectInitializer::new(context)
             .function(get_element_by_id, js_string!("getElementById"), 1)
             .function(query_selector, js_string!("querySelector"), 1)
@@ -523,6 +566,8 @@ impl DomBindings {
             .function(create_element, js_string!("createElement"), 1)
             .accessor(js_string!("documentElement"), Some(document_element_getter_fn), None, Attribute::all())
             .accessor(js_string!("body"), Some(body_getter_fn), None, Attribute::all())
+            .accessor(js_string!("head"), Some(head_getter_fn), None, Attribute::all())
+            .property(js_string!("createTextNode"), create_text_node_fn, Attribute::all())
             .accessor(js_string!("title"), Some(title_getter_fn), Some(title_setter_fn), Attribute::all())
             .build();
 

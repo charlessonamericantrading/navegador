@@ -271,8 +271,25 @@ fn collect_table_rows(node: &mut LayoutBox) -> Vec<&mut LayoutBox> {
 /// heredable (ni en el spec real ni en `INHERITABLE_PROPERTIES`) - cada
 /// caja resuelve la suya propia desde su propio `computed_style`.
 fn resolve_padding(computed_style: &HashMap<String, String>) -> EdgeSizes {
-    let px = computed_style.get("padding").and_then(|v| parse_css_length(v)).unwrap_or(0.0);
-    EdgeSizes { top: px, right: px, bottom: px, left: px }
+    resolve_box_edges(computed_style, "padding")
+}
+
+/// Lee los cuatro lados de `padding`/`margin` desde sus LONGHANDS
+/// (`padding-top`...), que es donde el parser deja ya expandida cualquier
+/// forma abreviada de 1/2/3/4 valores.
+///
+/// Se sigue mirando la propiedad abreviada como ultimo recurso para el caso
+/// que el parser no expande (valores con `calc()`/`var()`), y porque hay
+/// tests que construyen el `computed_style` a mano con solo la abreviada.
+fn resolve_box_edges(computed_style: &HashMap<String, String>, name: &str) -> EdgeSizes {
+    let fallback = computed_style.get(name).and_then(|v| parse_css_length(v)).unwrap_or(0.0);
+    let side = |suffix: &str| {
+        computed_style
+            .get(&format!("{name}-{suffix}"))
+            .and_then(|v| parse_css_length(v))
+            .unwrap_or(fallback)
+    };
+    EdgeSizes { top: side("top"), right: side("right"), bottom: side("bottom"), left: side("left") }
 }
 
 /// `margin` real, leido de la cascada - sustituye a `BLOCK_GAP`, otra
@@ -285,8 +302,7 @@ fn resolve_padding(computed_style: &HashMap<String, String>) -> EdgeSizes {
 /// sumarlos - eso no esta implementado, `flow_block_children` simplemente
 /// suma ambos) - simplificacion declarada, no un bug escondido.
 fn resolve_margin(computed_style: &HashMap<String, String>) -> EdgeSizes {
-    let px = computed_style.get("margin").and_then(|v| parse_css_length(v)).unwrap_or(0.0);
-    EdgeSizes { top: px, right: px, bottom: px, left: px }
+    resolve_box_edges(computed_style, "margin")
 }
 
 /// SOLO el ancho de `border` (forma abreviada `border: <ancho> <estilo>
@@ -717,11 +733,21 @@ fn flex_container_style(computed_style: &HashMap<String, String>) -> taffy::Styl
         Some("stretch") => Some(taffy::AlignItems::STRETCH),
         _ => None,
     };
+    // `gap` se leia solo en `grid_container_style`, asi que en un contenedor
+    // flex se ignoraba por completo y los items salian pegados. Misma
+    // propiedad, mismo parseo: es la propiedad unificada del spec, no una
+    // exclusiva de grid.
+    let gap_val = computed_style.get("gap").and_then(|v| parse_css_length(v)).unwrap_or(0.0);
+
     taffy::Style {
         display: taffy::Display::Flex,
         flex_direction,
         justify_content,
         align_items,
+        gap: taffy::geometry::Size {
+            width: taffy::style_helpers::length(gap_val),
+            height: taffy::style_helpers::length(gap_val),
+        },
         ..Default::default()
     }
 }

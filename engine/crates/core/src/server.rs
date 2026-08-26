@@ -822,6 +822,85 @@ impl EngineServer {
         EngineResponse::Tabs { id, tabs, active_tab_id }
     }
 
+    /// Cuantos subrecursos (imagenes, hojas, scripts) se descargan A LA VEZ.
+    ///
+    /// Seis es el limite clasico de conexiones por host de un navegador
+    /// real: suficiente para que la latencia deje de dominar, y bajo como
+    /// para no parecer un ataque al servidor ni agotar descriptores.
+    ///
+    /// El numero importa mucho: antes de esto los subrecursos se
+    /// descargaban EN SERIE, asi que el tiempo de carga era la SUMA de
+    /// todas las latencias. Medido en vivo: el articulo "Espana" de
+    /// Wikipedia trae 161 `<img>` de upload.wikimedia.org y tardaba ~38 s
+    /// solo en recorrerlas una a una.
+    const MAX_CONCURRENT_SUBRESOURCES: usize = 6;
+
+    /// Descarga en PARALELO (acotado, ver `MAX_CONCURRENT_SUBRESOURCES`)
+    /// una lista de referencias crudas (`href`/`src` tal como aparecen en
+    /// el HTML), resolviendolas antes contra `page_url` - la URL final tras
+    /// redirecciones, no la pedida originalmente.
+    ///
+    /// Devuelve `(referencia cruda, respuesta)` EN EL ORDEN ORIGINAL del
+    /// documento, no en el de llegada: se usa `buffered` y no
+    /// `buffer_unordered` justo por eso. El orden es indiferente para
+    /// imagenes y scripts (van a un mapa por clave) pero es OBLIGATORIO
+    /// para las hojas de estilo, donde "la que viene despues gana a igual
+    /// especificidad" - devolverlas segun quien contestara antes haria que
+    /// el aspecto de la pagina dependiera de la latencia de la red.
+    ///
+    /// Lo que falla (URL invalida, peticion no construible, 404, red
+    /// caida) se omite con un aviso y NO aborta la pagina, exactamente
+    /// igual que antes y que un navegador real.
+    async fn fetch_subresources(
+        &self,
+        refs: Vec<String>,
+        page_url: &url::Url,
+        kind: &'static str,
+    ) -> Vec<(String, engine_net::NetworkResponse)> {
+        use futures_util::stream::StreamExt;
+
+        let resolved: Vec<(String, url::Url)> = refs
+            .into_iter()
+            .filter_map(|raw| match page_url.join(&raw) {
+                Ok(absolute) => Some((raw, absolute)),
+                Err(_) => {
+                    tracing::warn!("[server] {kind} con URL invalida, se omite: {raw}");
+                    None
+                }
+            })
+            .collect();
+
+        futures_util::stream::iter(resolved)
+            .map(|(raw, absolute)| async move {
+                let request = match NetworkRequest::new(absolute.as_str()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        tracing::warn!("[server] no se pudo construir la peticion para {absolute}: {error}");
+                        return None;
+                    }
+                };
+                match self.network.fetch(&request).await {
+                    Ok(response) if response.is_success() => Some((raw, response)),
+                    Ok(response) => {
+                        tracing::warn!(
+                            "[server] {absolute} respondio {} {}, se omite",
+                            response.status_code,
+                            response.status_text
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!("[server] no se pudo descargar {absolute}: {error}");
+                        None
+                    }
+                }
+            })
+            .buffered(Self::MAX_CONCURRENT_SUBRESOURCES)
+            .filter_map(|result| async move { result })
+            .collect()
+            .await
+    }
+
     /// Descarga cada href de `<link rel="stylesheet">` ya descubierto por
     /// `find_external_stylesheet_hrefs` y concatena su contenido, en orden
     /// de documento - la inmensa mayoria de la web real no lleva su CSS en
@@ -836,31 +915,11 @@ impl EngineServer {
     /// estilos aunque una hoja concreta no cargue.
     async fn fetch_external_stylesheets(&self, hrefs: Vec<String>, page_url: &url::Url) -> String {
         let mut combined = String::new();
-        for href in hrefs {
-            let Ok(sheet_url) = page_url.join(&href) else {
-                tracing::warn!("[server] href de <link rel=stylesheet> invalido, se omite: {href}");
-                continue;
-            };
-            let request = match NetworkRequest::new(sheet_url.as_str()) {
-                Ok(request) => request,
-                Err(error) => {
-                    tracing::warn!("[server] no se pudo construir la peticion para {sheet_url}: {error}");
-                    continue;
-                }
-            };
-            match self.network.fetch(&request).await {
-                Ok(response) if response.is_success() => {
-                    let css = response.text();
-                    combined.push_str(&css);
-                    combined.push('\n');
-                }
-                Ok(response) => tracing::warn!(
-                    "[server] {sheet_url} respondio {} {}, se omite",
-                    response.status_code,
-                    response.status_text
-                ),
-                Err(error) => tracing::warn!("[server] no se pudo descargar {sheet_url}: {error}"),
-            }
+        // El orden que devuelve `fetch_subresources` es el del documento,
+        // no el de llegada - imprescindible aqui (ver su doc-comment).
+        for (_href, response) in self.fetch_subresources(hrefs, page_url, "<link rel=stylesheet>").await {
+            combined.push_str(&response.text());
+            combined.push('\n');
         }
         combined
     }
@@ -879,30 +938,8 @@ impl EngineServer {
     /// descargarse se omite con un aviso, no aborta la pagina entera.
     async fn fetch_external_scripts(&self, srcs: Vec<String>, page_url: &url::Url) -> HashMap<String, String> {
         let mut fetched = HashMap::new();
-        for src in srcs {
-            let Ok(script_url) = page_url.join(&src) else {
-                tracing::warn!("[server] src de <script> invalido, se omite: {src}");
-                continue;
-            };
-            let request = match NetworkRequest::new(script_url.as_str()) {
-                Ok(request) => request,
-                Err(error) => {
-                    tracing::warn!("[server] no se pudo construir la peticion para {script_url}: {error}");
-                    continue;
-                }
-            };
-            match self.network.fetch(&request).await {
-                Ok(response) if response.is_success() => {
-                    let js = response.text();
-                    fetched.insert(src, js);
-                }
-                Ok(response) => tracing::warn!(
-                    "[server] {script_url} respondio {} {}, se omite",
-                    response.status_code,
-                    response.status_text
-                ),
-                Err(error) => tracing::warn!("[server] no se pudo descargar {script_url}: {error}"),
-            }
+        for (src, response) in self.fetch_subresources(srcs, page_url, "<script src>").await {
+            fetched.insert(src, response.text());
         }
         fetched
     }
@@ -918,31 +955,16 @@ impl EngineServer {
     /// `external_scripts`.
     async fn fetch_images(&self, srcs: Vec<String>, page_url: &url::Url) -> ImageMap {
         let mut fetched = ImageMap::new();
-        for src in srcs {
-            let Ok(image_url) = page_url.join(&src) else {
-                tracing::warn!("[server] src de <img> invalido, se omite: {src}");
-                continue;
-            };
-            let request = match NetworkRequest::new(image_url.as_str()) {
-                Ok(request) => request,
-                Err(error) => {
-                    tracing::warn!("[server] no se pudo construir la peticion para {image_url}: {error}");
-                    continue;
+        for (src, response) in self.fetch_subresources(srcs, page_url, "<img src>").await {
+            // La DECODIFICACION sigue siendo secuencial a proposito: es
+            // trabajo de CPU, no de red, y paralelizarla necesitaria sacarla
+            // a un pool aparte. Lo que dominaba el tiempo era la espera de
+            // red, y eso es lo que se acaba de arreglar.
+            match decode_image(&response.body) {
+                Some(image) => {
+                    fetched.insert(src, image);
                 }
-            };
-            match self.network.fetch(&request).await {
-                Ok(response) if response.is_success() => match decode_image(&response.body) {
-                    Some(image) => {
-                        fetched.insert(src, image);
-                    }
-                    None => tracing::warn!("[server] {image_url} no se pudo decodificar como imagen, se omite"),
-                },
-                Ok(response) => tracing::warn!(
-                    "[server] {image_url} respondio {} {}, se omite",
-                    response.status_code,
-                    response.status_text
-                ),
-                Err(error) => tracing::warn!("[server] no se pudo descargar {image_url}: {error}"),
+                None => tracing::warn!("[server] {src} no se pudo decodificar como imagen, se omite"),
             }
         }
         fetched
@@ -1339,6 +1361,9 @@ impl EngineServer {
                 title: String::new(),
                 screenshot: String::new(),
                 elements: Vec::new(),
+                // Sin pagina cargada no hay nada que diagnosticar: el
+                // frontend pinta su pagina de inicio, no un aviso.
+                requires_javascript: false,
                 can_go_back,
                 can_go_forward,
             };
@@ -1365,6 +1390,10 @@ impl EngineServer {
             title: page.current_title(),
             screenshot,
             elements: collect_interactive_elements(&page.page.layout_root),
+            requires_javascript: page_content_requires_javascript(
+                &page.page.dom_root,
+                &page.page.layout_root,
+            ),
             can_go_back,
             can_go_forward,
         }
@@ -1963,6 +1992,46 @@ fn collect_interactive_elements(layout_root: &engine_layout::LayoutBox) -> Vec<I
 /// interaccion) aunque nunca se pintara en pantalla. Reusar el arbol de
 /// layout en vez de duplicar la lista de tags excluidos aqui: una sola
 /// fuente de verdad sobre que cuenta como "visible".
+/// Minimo de texto visible para dar una pagina por "con contenido".
+/// 40 caracteres es aproximadamente una frase corta: por debajo de eso no
+/// hay nada que un humano reconozca como pagina. El numero es un JUICIO,
+/// no un valor del spec - se elige bajo a proposito para no acusar de
+/// "vacia" a una pagina real y escueta (un 404 de texto plano, una landing
+/// de una sola linea): preferimos callar de mas que mentir.
+const MIN_VISIBLE_TEXT_CHARS: usize = 40;
+
+/// Fase 39: ¿esta pagina esta en blanco PORQUE su contenido lo genera
+/// JavaScript que este motor todavia no ejecuta?
+///
+/// Se responde con lo unico que se puede observar sin ejecutar nada:
+/// 1. el arbol de LAYOUT no tiene practicamente texto visible (se reusa
+///    `collect_visible_text`, que ya filtra `<script>`/`<noscript>`, en vez
+///    de mirar el DOM crudo - si no, el propio codigo del script contaria
+///    como "contenido"), y
+/// 2. el documento SI trae `<script>`.
+///
+/// Las dos condiciones juntas describen exactamente la cascara vacia que
+/// sirven React/Next/Vue/Shopify. Verificado en vivo: `ignislove.com`
+/// devuelve 0 caracteres de texto visible con 7 `<script>`; Google y
+/// Wikipedia mandan su texto en el HTML y no se marcan.
+///
+/// Lo que esto NO hace, a proposito: no afirma que la pagina FUNCIONARIA
+/// con un motor de JS completo (puede fallar por otras razones), no
+/// distingue "el script no se ejecuto" de "se ejecuto y no pinto nada", y
+/// da un falso positivo en una pagina legitimamente casi vacia que ademas
+/// lleve un script (analitica, por ejemplo). Ese falso positivo se acepta:
+/// el coste es un aviso de mas en una pagina que igualmente se ve vacia.
+fn page_content_requires_javascript(
+    dom_root: &std::sync::Arc<std::sync::RwLock<Node>>,
+    layout_root: &LayoutBox,
+) -> bool {
+    let visible = collect_visible_text(layout_root);
+    if visible.trim().chars().count() >= MIN_VISIBLE_TEXT_CHARS {
+        return false;
+    }
+    !Node::find_all_by_tag(dom_root, "script").is_empty()
+}
+
 fn collect_visible_text(layout_box: &LayoutBox) -> String {
     let mut text = String::new();
     collect_visible_text_recursive(layout_box, &mut text);
@@ -2048,6 +2117,72 @@ mod tests {
         assert!(!text.contains("iframe"), "el marcado de <noscript> no deberia colarse en el texto visible: {text:?}");
         assert!(!text.contains("var x"), "el codigo fuente de <script> no deberia colarse en el texto visible: {text:?}");
         assert!(text.contains("contenido real"), "el contenido normal de la pagina si deberia aparecer");
+    }
+
+    /// Helper de los tests de Fase 39: parsea HTML y construye su layout,
+    /// que es exactamente el par que recibe `page_content_requires_javascript`.
+    fn dom_and_layout(html: &str) -> (std::sync::Arc<std::sync::RwLock<Node>>, LayoutBox) {
+        let dom = engine_dom::HtmlParser::parse(html);
+        let stylesheet = engine_css::CssParser::parse("");
+        let layout_root = LayoutTreeBuilder::build(&dom, &stylesheet, 1280.0, 720.0, None, &ImageMap::new());
+        (dom, layout_root)
+    }
+
+    /// El caso que motivo la Fase 39, medido en vivo contra una web real
+    /// (`ignislove.com`): el servidor manda una cascara sin una sola letra
+    /// visible y 7 `<script>` que construirian la pagina en el cliente.
+    /// Antes esto se pintaba como un blanco mudo.
+    #[test]
+    fn an_empty_shell_with_scripts_is_reported_as_javascript_dependent() {
+        let (dom, layout) = dom_and_layout(
+            r#"<html><head><title>Tienda</title></head><body><div id="root"></div><script src="/app.js"></script></body></html>"#,
+        );
+        assert!(
+            page_content_requires_javascript(&dom, &layout),
+            "una cascara vacia con <script> deberia marcarse como dependiente de JavaScript"
+        );
+    }
+
+    /// Una pagina que SI trae su texto en el HTML no se marca, aunque lleve
+    /// scripts (analitica, por ejemplo) - que es el caso de Wikipedia y
+    /// Google, ambos comprobados en vivo.
+    #[test]
+    fn a_page_that_ships_its_text_is_not_reported_even_with_scripts() {
+        let (dom, layout) = dom_and_layout(
+            r#"<html><body><h1>Espana</h1><p>Espana es un pais soberano situado en el suroeste de Europa.</p><script src="/analytics.js"></script></body></html>"#,
+        );
+        assert!(
+            !page_content_requires_javascript(&dom, &layout),
+            "una pagina con texto real no deberia marcarse aunque tenga scripts"
+        );
+    }
+
+    /// Sin `<script>` no hay nada que culpar: una pagina vacia y SIN
+    /// scripts esta vacia de verdad, y decir "necesita JavaScript" seria
+    /// mentir. Es la mitad de la heuristica que evita el falso positivo mas
+    /// obvio.
+    #[test]
+    fn an_empty_page_without_scripts_is_not_blamed_on_javascript() {
+        let (dom, layout) = dom_and_layout(r#"<html><body></body></html>"#);
+        assert!(
+            !page_content_requires_javascript(&dom, &layout),
+            "sin scripts, una pagina vacia no deberia atribuirse a JavaScript"
+        );
+    }
+
+    /// El codigo fuente del propio script no cuenta como contenido: si
+    /// contara (mirando el DOM crudo en vez del arbol de layout), un bundle
+    /// grande haria que la cascara pareciera llena y el aviso no saltaria
+    /// nunca. Es la razon exacta de reusar `collect_visible_text`.
+    #[test]
+    fn a_long_inline_script_does_not_count_as_visible_content() {
+        let long_code = "var configuracionMuyLarga = { clave: 'valor', otra: 'cosa', mas: 12345 };";
+        let html = format!(r#"<html><body><div id="app"></div><script>{long_code}</script></body></html>"#);
+        let (dom, layout) = dom_and_layout(&html);
+        assert!(
+            page_content_requires_javascript(&dom, &layout),
+            "el codigo del script no deberia contar como contenido visible y tapar el aviso"
+        );
     }
 
     #[tokio::test]

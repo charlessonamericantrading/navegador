@@ -23,7 +23,14 @@ pub fn render_layout_to_png(
 ) -> Result<Vec<u8>, String> {
     let mut pixmap = Pixmap::new(width, height)
         .ok_or_else(|| format!("no se pudo crear la superficie de rasterizado {width}x{height}"))?;
-    pixmap.fill(Color::from_rgba8(245, 245, 245, 255));
+    // El fondo del elemento raiz se propaga al lienzo ENTERO (ver
+    // `engine_layout::canvas_background`). Sin esto, una pagina con tema
+    // oscuro se veia como una franja de color sobre gris claro.
+    let canvas_color = engine_layout::canvas_background(layout_root)
+        .and_then(|value| crate::display_list::parse_css_color(&value))
+        .map(|[r, g, b, a]| Color::from_rgba8(r, g, b, a))
+        .unwrap_or_else(|| Color::from_rgba8(245, 245, 245, 255));
+    pixmap.fill(canvas_color);
 
     let display_list = DisplayList::build(layout_root, images);
     paint_display_list(&mut pixmap, &display_list.items, font_set, scroll_offset_y);

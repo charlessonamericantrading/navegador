@@ -21,6 +21,13 @@ license = "MIT"
 
 [workspace.dependencies]
 tokio = { version = "1.38", features = ["full"] }
+# Concurrencia acotada para descargar subrecursos en paralelo (Fase 39).
+# Ya venia en el arbol de dependencias a traves de hyper: declararlo
+# explicitamente no anade codigo nuevo al binario, solo lo hace visible.
+# Escribir a mano un limitador de concurrencia correcto (orden preservado,
+# cancelacion, backpressure) es justo lo que la doctrina de dependencias
+# dice que no hay que reimplementar.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rustls = { version = "0.23", features = ["ring"] }
 url = "2.5"
 thiserror = "1.0"

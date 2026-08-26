@@ -88,6 +88,29 @@ pub fn register_window(context: &mut Context) -> JsResult<PendingWindowOpens> {
         .build();
     context.register_global_property(js_string!("window"), window, Attribute::all())?;
 
+    // `navigator` (Fase 39). Una cantidad enorme de codigo real lee
+    // `navigator.userAgent` en su primera linea para decidir rutas de
+    // compatibilidad; sin el objeto, eso era un TypeError que se llevaba
+    // por delante el script entero.
+    //
+    // El User-Agent declara lo que este motor ES, no imita a Chrome. Eso
+    // significa que el sniffing de navegador de algunas paginas no nos
+    // reconocera - preferible a mentir: una pagina que crea estar hablando
+    // con Chrome usaria APIs que aqui no existen y fallaria mas adelante y
+    // de forma mas confusa.
+    let navigator = ObjectInitializer::new(context)
+        .property(
+            js_string!("userAgent"),
+            js_string!("Mozilla/5.0 (Windows NT 10.0; Win64; x64) NavegadorIA/0.1 (motor propio en Rust)"),
+            Attribute::all(),
+        )
+        .property(js_string!("language"), js_string!("es-ES"), Attribute::all())
+        .property(js_string!("platform"), js_string!("Win32"), Attribute::all())
+        // `onLine` en `true`: si el motor esta cargando la pagina, hay red.
+        .property(js_string!("onLine"), JsValue::from(true), Attribute::all())
+        .build();
+    context.register_global_property(js_string!("navigator"), navigator, Attribute::all())?;
+
     // `getComputedStyle` es del spec un metodo de `window`, pero se
     // registra como GLOBAL en `DomBindings::register` (Fase 8), que es
     // donde nace el snapshot de layout que consulta. Aqui se cuelga

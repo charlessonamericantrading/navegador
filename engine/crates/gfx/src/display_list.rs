@@ -409,7 +409,7 @@ fn parse_rgb_component(token: &str) -> Option<u8> {
 /// de espacios de color modernos - devuelven `None` y la caja se queda
 /// sin pintar, en vez de fingir una conversion. Tampoco los ~90 nombres
 /// extendidos que faltan en la tabla.
-fn parse_css_color(value: &str) -> Option<[u8; 4]> {
+pub(crate) fn parse_css_color(value: &str) -> Option<[u8; 4]> {
     let value = value.trim();
 
     if let Some(hex) = value.strip_prefix('#') {
