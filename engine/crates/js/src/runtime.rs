@@ -29,6 +29,8 @@ pub struct JsRuntime {
     /// Igual que `pending_window_opens` pero para `history.pushState`/
     /// `history.replaceState` (Fase 7) - ver `crate::history`.
     pending_history_ops: Option<crate::history::PendingHistoryOps>,
+    pending_navigations: Option<crate::location::PendingNavigations>,
+    mutation_observers: Option<crate::mutation_observer::ObserverRegistry>,
     /// `Some` una vez que `register_timers` haya corrido (Fase 14) - la
     /// cola de `setTimeout`/`setInterval` pendientes. `None` en un runtime
     /// sin temporizadores registrados, donde `setTimeout` ni siquiera
@@ -40,11 +42,17 @@ impl JsRuntime {
     pub fn new() -> Self {
         let mut context = Context::default();
         let _ = AsyncEventLoop::register_microtasks(&mut context);
-        Self { context, document_bindings: None, pending_window_opens: None, pending_history_ops: None, timers: None }
+        Self { context, document_bindings: None, pending_window_opens: None, pending_history_ops: None, pending_navigations: None, mutation_observers: None, timers: None }
     }
 
     pub fn bind_dom(&mut self, dom_root: Arc<RwLock<Node>>) -> Result<(), JsError> {
         let registry = DomBindings::register(&mut self.context, dom_root).map_err(|e| JsError::Execution(e.to_string()))?;
+        // `MutationObserver` necesita el mismo `DocumentBindings` que acaba
+        // de nacer: es ahi donde viven las mutaciones que los elementos
+        // apuntan al cambiar.
+        let observers = crate::mutation_observer::register_mutation_observer(&mut self.context, registry.clone())
+            .map_err(|e| JsError::Execution(e.to_string()))?;
+        self.mutation_observers = Some(observers);
         self.document_bindings = Some(registry);
         Ok(())
     }
@@ -168,6 +176,25 @@ impl JsRuntime {
     /// (Fase 7), y engancha `window.addEventListener` al elemento raiz si
     /// hay `window` y DOM ya registrados - por eso conviene llamarlo
     /// DESPUES de `bind_dom` y `register_window` (ver `crate::history`).
+    /// Registra `location` (y `window.location`) con la URL real de la
+    /// pagina; `None` en un documento sin origen, que reporta
+    /// `about:blank`. DESPUES de `register_window`, para poder colgar
+    /// `window.location` del objeto `window` ya existente.
+    pub fn register_location(&mut self, page_url: Option<String>) -> Result<(), JsError> {
+        let pending = crate::location::register_location(&mut self.context, page_url).map_err(|e| JsError::Execution(e.to_string()))?;
+        self.pending_navigations = Some(pending);
+        Ok(())
+    }
+
+    /// Saca (y VACIA) las navegaciones que un script haya pedido
+    /// (`location.href = ...`, `assign`, `replace`, `reload`) - mismo
+    /// contrato que `take_pending_history_ops`: el runtime solo las apunta,
+    /// quien navega de verdad es `core::server`.
+    pub fn take_pending_navigations(&mut self) -> Vec<crate::location::PendingNavigation> {
+        let Some(pending) = &self.pending_navigations else { return Vec::new() };
+        std::mem::take(&mut *pending.lock().unwrap())
+    }
+
     pub fn register_history(&mut self) -> Result<(), JsError> {
         let pending = crate::history::register_history(&mut self.context).map_err(|e| JsError::Execution(e.to_string()))?;
         self.pending_history_ops = Some(pending);
@@ -252,6 +279,37 @@ impl JsRuntime {
     /// y el `eval` que lo envuelve ya se encarga al terminar.
     fn drain_jobs(&mut self) {
         self.context.run_jobs();
+        self.deliver_mutations();
+    }
+
+    /// Entrega a los `MutationObserver` lo que haya cambiado en el DOM.
+    ///
+    /// Va en `drain_jobs` y no en cada mutacion a proposito: el spec entrega
+    /// al terminar la tarea, con todas las mutaciones AGRUPADAS, que es lo
+    /// que hace que un bucle de cien `appendChild` produzca una sola llamada
+    /// al callback y no cien. `drain_jobs` es justo ese punto: ya se llama
+    /// tras cada evaluacion y tras cada evento despachado.
+    ///
+    /// Se repite mientras haya mutaciones nuevas porque un callback puede
+    /// mutar el DOM a su vez; el tope corta un observador que se realimente
+    /// a si mismo sin fin.
+    fn deliver_mutations(&mut self) {
+        let (Some(observers), Some(bindings)) = (self.mutation_observers.clone(), self.document_bindings.clone()) else {
+            return;
+        };
+        for _ in 0..8 {
+            let entregados = crate::mutation_observer::deliver_mutations(
+                &observers,
+                bindings.mutations(),
+                &bindings,
+                &mut self.context,
+            );
+            if entregados == 0 {
+                return;
+            }
+            self.context.run_jobs();
+        }
+        tracing::warn!("[js] un MutationObserver sigue generando mutaciones tras 8 rondas, se corta");
     }
 
     #[cfg(test)]
@@ -274,7 +332,11 @@ impl JsRuntime {
         // en un navegador real. Se drena tanto si el script tuvo éxito como
         // si no: lo que ya se encolo antes de un error a mitad de script
         // deberia seguir corriendo, igual que el spec.
-        self.context.run_jobs();
+        //
+        // `drain_jobs` y no `run_jobs` a secas: ese es ademas el punto donde
+        // se entregan las mutaciones a los `MutationObserver`, y "termina la
+        // tarea actual" es exactamente cuando el spec dice que se entregan.
+        self.drain_jobs();
         result
     }
 }

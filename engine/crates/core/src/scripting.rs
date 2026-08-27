@@ -188,6 +188,15 @@ pub fn execute_inline_scripts_keeping_runtime(
     if let Err(e) = runtime.register_history() {
         tracing::warn!("[js] no se pudo registrar history: {e}");
     }
+    // `location` - SIEMPRE, por la misma razon que `window` y los
+    // temporizadores: un `location.href` sobre un global inexistente lanza
+    // `ReferenceError` y aborta el script ENTERO, asi que no tenerlo no
+    // costaba solo la navegacion, costaba toda la pagina. Sin URL (documento
+    // sin origen) reporta `about:blank`, que es lo que hace un navegador
+    // real, en vez de no existir.
+    if let Err(e) = runtime.register_location(page_url.clone()) {
+        tracing::warn!("[js] no se pudo registrar location: {e}");
+    }
     // Temporizadores (Fase 14) - se registran SIEMPRE, por la misma razon
     // que `window`: `setTimeout` es de lo que TODA pagina real da por
     // sentado, y dejarlo sin definir rompe la pagina entera con un
@@ -218,6 +227,21 @@ pub fn execute_inline_scripts_keeping_runtime(
     // `core::server`, asi que los que sigan en el mapa estan autorizados.
     let allow_inline = storage_csp.as_ref().is_none_or(|csp| csp.allows_inline("script-src"));
     let script_results = run_scripts(&mut runtime, &scripts, external_scripts, allow_inline);
+
+    // `DOMContentLoaded`: el documento ya esta parseado entero y todos sus
+    // scripts han corrido, que es EXACTAMENTE cuando el spec dice que se
+    // dispara. Va aqui y no en `core::server` para que lo vea tambien
+    // cualquier otro consumidor del pipeline.
+    //
+    // Sin esto, `document.addEventListener('DOMContentLoaded', ...)` - como
+    // arranca casi cualquier pagina real - registraba un listener que no se
+    // invocaba jamas, y toda la inicializacion de la pagina se perdia en
+    // silencio. Un listener registrado que nunca corre es peor que no poder
+    // registrarlo: no hay ningun error que delate el fallo.
+    if let Err(e) = runtime.dispatch_event(dom_root, "DOMContentLoaded") {
+        tracing::warn!("[js] fallo al disparar DOMContentLoaded: {e}");
+    }
+
     (script_results, runtime)
 }
 

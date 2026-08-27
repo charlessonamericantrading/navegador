@@ -207,6 +207,30 @@ pub struct LayoutBox {
     /// las celdas siguientes de esa fila una columna a la izquierda, que es
     /// lo que descuadraba las filas de subtitulo de Hacker News.
     pub(crate) colspan: u32,
+    /// Cuantas FILAS ocupa esta celda (`rowspan`), 1 si no lo declara.
+    /// Mismo motivo que `colspan` para vivir aqui y no en la cascada: es un
+    /// atributo presentacional de HTML, no una propiedad CSS.
+    pub(crate) rowspan: u32,
+    /// Ancho del BLOQUE CONTENEDOR de esta caja, que es la referencia contra
+    /// la que el spec resuelve cualquier porcentaje suyo - tambien el de
+    /// `padding-top`/`margin-bottom`, no solo el de `width`.
+    ///
+    /// Se guarda aqui, y no se pasa como parametro, porque quien lo conoce
+    /// (el padre, al colocar al hijo) y quien lo necesita (el hijo, al
+    /// resolver su propio padding dentro de su propia pasada de flujo) estan
+    /// en llamadas distintas. `0.0` significa "todavia sin colocar", y un
+    /// porcentaje sobre esa referencia resuelve a cero - que es justo lo que
+    /// hace el spec cuando la referencia es indefinida.
+    pub(crate) containing_width: f32,
+    /// Alto del bloque contenedor, o `0.0` si es INDEFINIDO (lo normal: un
+    /// contenedor con `height: auto` crece con su contenido, asi que no hay
+    /// numero contra el que medir todavia).
+    ///
+    /// El spec dice que un `height` en porcentaje sobre una referencia
+    /// indefinida se comporta como `auto`, que es justo lo que produce
+    /// dejarlo en cero: `resolve_explicit_height` no devuelve nada y la caja
+    /// sigue creciendo con su contenido.
+    pub(crate) containing_height: f32,
 }
 
 impl LayoutBox {
@@ -222,6 +246,9 @@ impl LayoutBox {
             measure_cache: Vec::new(),
             static_position: None,
             colspan: 1,
+            rowspan: 1,
+            containing_width: 0.0,
+            containing_height: 0.0,
         }
     }
 

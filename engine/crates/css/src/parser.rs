@@ -46,6 +46,21 @@ impl<'i> AtRuleParser<'i> for RuleParser {
         name: cssparser::CowRcStr<'i>,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::Prelude, ParseError<'i, Self::Error>> {
+        if name.eq_ignore_ascii_case("supports") {
+            // `@supports` se evalua AQUI, en el preludio, y se traduce al
+            // mismo `MediaCondition` que ya gobierna `@media`: si la
+            // condicion no se cumple, sus reglas se conservan pero no se
+            // aplican jamas. Reusar el mismo mecanismo evita un segundo
+            // sistema de compuertas en la cascada.
+            //
+            // Antes se rechazaba aqui y `StyleSheetParser` se saltaba el
+            // bloque ENTERO: todo lo que una pagina pusiera dentro de un
+            // `@supports` no existia para el motor.
+            let start = input.position();
+            while input.next().is_ok() {}
+            let cumple = evaluate_supports(input.slice_from(start));
+            return Ok(MediaCondition { never_matches: !cumple, ..Default::default() });
+        }
         if !name.eq_ignore_ascii_case("media") {
             return Err(input.new_custom_error(()));
         }
@@ -81,6 +96,175 @@ impl<'i> AtRuleParser<'i> for RuleParser {
         }
         Ok(rules)
     }
+}
+
+/// Propiedades CSS que este motor aplica de verdad. Es la lista contra la
+/// que se responde `@supports`.
+///
+/// Se declara explicitamente en vez de responder "si" a todo: una pagina
+/// usa `@supports` justo para dar un camino alternativo al navegador que no
+/// entiende algo, y mentirle le hace tomar el camino equivocado. Lo que no
+/// este aqui se responde honestamente como no soportado.
+const SUPPORTED_PROPERTIES: &[&str] = &[
+    "display",
+    "position",
+    "top",
+    "right",
+    "bottom",
+    "left",
+    "width",
+    "height",
+    "min-width",
+    "max-width",
+    "min-height",
+    "max-height",
+    "margin",
+    "margin-top",
+    "margin-right",
+    "margin-bottom",
+    "margin-left",
+    "padding",
+    "padding-top",
+    "padding-right",
+    "padding-bottom",
+    "padding-left",
+    "color",
+    "background",
+    "background-color",
+    "border",
+    "border-width",
+    "border-color",
+    "border-style",
+    "border-radius",
+    "box-shadow",
+    "box-sizing",
+    "font-size",
+    "font-weight",
+    "font-style",
+    "font-family",
+    "line-height",
+    "text-align",
+    "text-decoration",
+    "letter-spacing",
+    "visibility",
+    "overflow",
+    "overflow-x",
+    "overflow-y",
+    "float",
+    "clear",
+    "z-index",
+    "flex",
+    "flex-grow",
+    "flex-shrink",
+    "flex-basis",
+    "flex-direction",
+    "flex-wrap",
+    "justify-content",
+    "align-items",
+    "gap",
+    "grid-template-columns",
+    "grid-template-rows",
+];
+
+/// Valores concretos que este motor NO sabe producir aunque si entienda la
+/// propiedad. Sin esta lista, `@supports (display: grid)` y
+/// `@supports (color: light-dark(a, b))` responderian lo mismo.
+fn supports_value(property: &str, value: &str) -> bool {
+    let v = value.trim();
+    // Cualquier funcion CSS que no sepamos evaluar invalida la respuesta -
+    // `light-dark()`, `color-mix()`, `oklch()`... Se permiten las que si
+    // resolvemos.
+    if let Some(abre) = v.find('(') {
+        let funcion = v[..abre].trim().rsplit(|c: char| c.is_whitespace() || c == ',').next().unwrap_or("");
+        if !matches!(funcion, "calc" | "var" | "rgb" | "rgba" | "hsl" | "hsla") {
+            return false;
+        }
+    }
+    if property == "display" {
+        return matches!(v, "block" | "inline" | "inline-block" | "flex" | "grid" | "none" | "table" | "table-row" | "table-cell" | "list-item");
+    }
+    if property == "position" {
+        return matches!(v, "static" | "relative" | "absolute" | "fixed" | "sticky");
+    }
+    true
+}
+
+/// Evalua el preludio de un `@supports`. Devuelve `true` si el motor
+/// declara soportar lo que pide.
+///
+/// Entiende `(prop: valor)`, `not (...)`, y las cadenas con `and` / `or`.
+/// Cualquier forma que no sepa leer responde `false`, que es la respuesta
+/// conservadora: la pagina tomara su camino alternativo.
+fn evaluate_supports(prelude: &str) -> bool {
+    let texto = prelude.trim();
+    if let Some(resto) = texto.strip_prefix("not ").or_else(|| texto.strip_prefix("not(")) {
+        let resto = if texto.starts_with("not(") { format!("({resto}") } else { resto.to_string() };
+        return !evaluate_supports(&resto);
+    }
+
+    // Se trocean las condiciones de primer nivel respetando los parentesis.
+    let mut condiciones: Vec<String> = Vec::new();
+    let mut operadores: Vec<String> = Vec::new();
+    let mut actual = String::new();
+    let mut nivel = 0usize;
+    let bytes: Vec<char> = texto.chars().collect();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            '(' => {
+                nivel += 1;
+                actual.push(c);
+            }
+            ')' => {
+                nivel = nivel.saturating_sub(1);
+                actual.push(c);
+            }
+            _ if nivel == 0 => {
+                let resto: String = bytes[i..].iter().collect();
+                let bajo = resto.to_ascii_lowercase();
+                if bajo.starts_with("and ") || bajo.starts_with("or ") {
+                    let op = if bajo.starts_with("and ") { "and" } else { "or" };
+                    condiciones.push(std::mem::take(&mut actual));
+                    operadores.push(op.to_string());
+                    i += op.len();
+                    continue;
+                }
+                actual.push(c);
+            }
+            _ => actual.push(c),
+        }
+        i += 1;
+    }
+    condiciones.push(actual);
+
+    let evaluar_simple = |cond: &str| -> bool {
+        let c = cond.trim();
+        let Some(interior) = c.strip_prefix('(').and_then(|r| r.strip_suffix(')')) else {
+            return false;
+        };
+        let interior = interior.trim();
+        // Anidado: `((a: b) and (c: d))`.
+        if interior.starts_with('(') || interior.to_ascii_lowercase().starts_with("not ") {
+            return evaluate_supports(interior);
+        }
+        let Some((prop, valor)) = interior.split_once(':') else { return false };
+        let prop = prop.trim().to_ascii_lowercase();
+        // Una propiedad personalizada siempre se "soporta": el spec dice que
+        // `@supports (--x: y)` es cierto en cualquier navegador que entienda
+        // propiedades personalizadas, y este ya las entiende.
+        if prop.starts_with("--") {
+            return true;
+        }
+        SUPPORTED_PROPERTIES.contains(&prop.as_str()) && supports_value(&prop, valor)
+    };
+
+    let mut resultado = evaluar_simple(&condiciones[0]);
+    for (indice, op) in operadores.iter().enumerate() {
+        let siguiente = evaluar_simple(&condiciones[indice + 1]);
+        resultado = if op == "and" { resultado && siguiente } else { resultado || siguiente };
+    }
+    resultado
 }
 
 /// Longitud en pixeles de un valor de media query (`769px`, `0`).
@@ -680,6 +864,38 @@ mod tests {
         let h1 = sheet.rules.iter().find(|r| r.selector == "h1").expect("la regla posterior al bloque deberia parsearse intacta");
         assert_eq!(h1.declarations.get("color").map(String::as_str), Some("red"));
         assert!(h1.media.is_none());
+    }
+
+    /// `@supports` se evalua de verdad. Antes se rechazaba el bloque entero,
+    /// asi que TODO lo que una pagina pusiera dentro no existia para el
+    /// motor - incluidos sus caminos alternativos.
+    #[test]
+    fn supports_responde_segun_lo_que_el_motor_soporta_de_verdad() {
+        let cond = |css: &str| CssParser::parse(css).rules[0].media.clone().expect("condicion");
+
+        assert!(!cond("@supports (display: flex) { a { color: red; } }").never_matches, "display:flex si se soporta");
+        assert!(
+            cond("@supports (color: light-dark(red, blue)) { a { color: red; } }").never_matches,
+            "una funcion de color que el motor no evalua no se debe declarar soportada"
+        );
+        assert!(
+            !cond("@supports not (color: light-dark(red, blue)) { a { color: red; } }").never_matches,
+            "y su negacion, por tanto, si se cumple"
+        );
+        assert!(
+            cond("@supports (mask-image: none) { a { color: red; } }").never_matches,
+            "una propiedad que el motor no aplica se responde honestamente como no soportada"
+        );
+    }
+
+    /// `and` y `or` combinan condiciones al nivel de arriba.
+    #[test]
+    fn supports_combina_condiciones_con_and_y_or() {
+        let cond = |css: &str| CssParser::parse(css).rules[0].media.clone().expect("condicion");
+
+        assert!(!cond("@supports (display: flex) and (position: sticky) { a { color: red; } }").never_matches);
+        assert!(cond("@supports (display: flex) and (mask-image: none) { a { color: red; } }").never_matches, "`and` exige las dos");
+        assert!(!cond("@supports (display: flex) or (mask-image: none) { a { color: red; } }").never_matches, "`or` basta con una");
     }
 
     /// La sintaxis de RANGOS de Media Queries nivel 4 (`(width > 769px)`)

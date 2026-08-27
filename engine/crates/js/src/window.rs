@@ -86,6 +86,17 @@ pub fn register_window(context: &mut Context) -> JsResult<PendingWindowOpens> {
     let window = ObjectInitializer::new(context)
         .function(open_fn, js_string!("open"), 1)
         .build();
+
+    // `window.getComputedStyle` es LA MISMA funcion que el global
+    // `getComputedStyle` (ver `dom_bindings`), no una copia: codigo real usa
+    // las dos formas indistintamente, y tener solo una hacia fallar a la
+    // otra con "not a callable function".
+    if let Ok(gcs) = context.global_object().get(js_string!("getComputedStyle"), context) {
+        if !gcs.is_undefined() {
+            window.set(js_string!("getComputedStyle"), gcs, false, context)?;
+        }
+    }
+
     context.register_global_property(js_string!("window"), window, Attribute::all())?;
 
     // `navigator` (Fase 39). Una cantidad enorme de codigo real lee

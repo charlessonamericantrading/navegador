@@ -265,6 +265,24 @@ pub struct DocumentBindings {
     /// documento, compartido por todas las consultas.
     #[unsafe_ignore_trace]
     layout: LayoutSnapshot,
+    /// Mutaciones del DOM ocurridas y todavia sin entregar a los
+    /// `MutationObserver` (ver `crate::mutation_observer`). Vive aqui por lo
+    /// mismo que los listeners: es UNA por documento y ya se propaga sola a
+    /// todos los objetos de elemento, que son quienes mutan.
+    #[unsafe_ignore_trace]
+    mutations: crate::mutation_observer::MutationLog,
+}
+
+impl DocumentBindings {
+    /// El registro de mutaciones de este documento.
+    pub fn mutations(&self) -> &crate::mutation_observer::MutationLog {
+        &self.mutations
+    }
+
+    /// Apunta una mutacion. Se llama desde cada funcion que toca el DOM.
+    fn record_mutation(&self, mutation: crate::mutation_observer::PendingMutation) {
+        self.mutations.lock().unwrap().push(mutation);
+    }
 }
 
 /// Envoltorio para poder capturar `Arc<RwLock<Node>>` en un closure nativo
@@ -348,14 +366,14 @@ impl DomBindings {
 
         context.register_global_builtin_callable(js_string!("printEngineLog"), 1, print_fn)?;
 
-        let bindings = DocumentBindings { listeners: Arc::new(Mutex::new(HashMap::new())), layout: cssom::new_layout_snapshot() };
+        let bindings = DocumentBindings { listeners: Arc::new(Mutex::new(HashMap::new())), layout: cssom::new_layout_snapshot(), mutations: Arc::new(Mutex::new(Vec::new())) };
         // `getComputedStyle` es un GLOBAL (no un metodo de elemento), asi
         // que se registra aqui, donde nace el snapshot que consulta. Se le
         // pasa `node_from_js_value` porque el tipo que lleva los datos
         // nativos del elemento (`ElementCapture`) es privado de este
         // archivo - ver `cssom::register_computed_style`.
         cssom::register_computed_style(context, bindings.layout.clone(), node_from_js_value)?;
-        let capture = DomRootCapture(dom_root, bindings.clone());
+        let capture = DomRootCapture(dom_root.clone(), bindings.clone());
 
         let get_element_by_id = NativeFunction::from_copy_closure_with_captures(
             |_this, args, capture: &DomRootCapture, context| {
@@ -559,7 +577,27 @@ impl DomBindings {
             .constructor(false)
             .build();
 
+        // `document.addEventListener` / `removeEventListener` /
+        // `dispatchEvent`.
+        //
+        // No son una copia de la maquinaria de elementos: son LA MISMA. El
+        // registro de listeners se indexa por puntero de nodo DOM, asi que
+        // basta construir el objeto de elemento del nodo RAIZ y quedarse con
+        // sus tres funciones - `document` pasa a ser un objetivo de eventos
+        // mas, con el mismo registro y el mismo despachador.
+        //
+        // Importa tenerlo: `document.addEventListener('DOMContentLoaded',
+        // ...)` es como arranca casi cualquier pagina real. Sin el, ese
+        // registro no existia y el script de arranque entero se perdia.
+        let document_target = element_to_js_object(&dom_root, &bindings, context);
+        let document_add_listener = document_target.get(js_string!("addEventListener"), context)?;
+        let document_remove_listener = document_target.get(js_string!("removeEventListener"), context)?;
+        let document_dispatch = document_target.get(js_string!("dispatchEvent"), context)?;
+
         let document = ObjectInitializer::new(context)
+            .property(js_string!("addEventListener"), document_add_listener, Attribute::all())
+            .property(js_string!("removeEventListener"), document_remove_listener, Attribute::all())
+            .property(js_string!("dispatchEvent"), document_dispatch, Attribute::all())
             .function(get_element_by_id, js_string!("getElementById"), 1)
             .function(query_selector, js_string!("querySelector"), 1)
             .function(query_selector_all, js_string!("querySelectorAll"), 1)
@@ -879,7 +917,7 @@ fn event_listener_options_capture(arg: Option<&JsValue>, context: &mut Context) 
 /// se pasa explicito en vez de crearse aqui para que `addEventListener`
 /// registrado desde una consulta y `dispatchEvent` desde otra sigan viendo
 /// el mismo registro.
-fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, context: &mut Context) -> JsObject {
+pub(crate) fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, context: &mut Context) -> JsObject {
     let tag_name = {
         let n = node.read().unwrap();
         match &n.node_type {
@@ -918,8 +956,19 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
             };
             let mut n = capture.0.write().unwrap();
             if let NodeType::Element { attributes, .. } = &mut n.node_type {
-                attributes.insert(name, value);
+                attributes.insert(name.clone(), value);
             }
+            // El lock se suelta ANTES de apuntar la mutacion: el registro
+            // tiene su propio candado y anidarlos es la receta de un
+            // interbloqueo.
+            drop(n);
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "attributes",
+                target: capture.0.clone(),
+                attribute_name: Some(name),
+                added: Vec::new(),
+                removed: Vec::new(),
+            });
             Ok(JsValue::undefined())
         },
         capture.clone(),
@@ -948,10 +997,21 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
             // Reemplaza TODOS los hijos por un unico nodo de texto - la
             // semantica real de `textContent`, no un append.
             let mut n = capture.0.write().unwrap();
-            n.children.clear();
+            let quitados: Vec<_> = std::mem::take(&mut n.children);
             let text_node = Node::new(NodeType::Text(value));
             text_node.write().unwrap().parent = Some(Arc::downgrade(&capture.0));
-            n.children.push(text_node);
+            n.children.push(text_node.clone());
+            drop(n);
+            // `textContent` reemplaza TODO el contenido: para un observador
+            // eso es una mutacion de lista de hijos, con lo que entra y lo
+            // que sale.
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "childList",
+                target: capture.0.clone(),
+                attribute_name: None,
+                added: vec![text_node],
+                removed: quitados,
+            });
             Ok(JsValue::undefined())
         },
         capture.clone(),
@@ -980,7 +1040,14 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
 
             detach_from_parent(&child_node);
             child_node.write().unwrap().parent = Some(Arc::downgrade(&capture.0));
-            capture.0.write().unwrap().children.push(child_node);
+            capture.0.write().unwrap().children.push(child_node.clone());
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "childList",
+                target: capture.0.clone(),
+                attribute_name: None,
+                added: vec![child_node],
+                removed: Vec::new(),
+            });
             Ok(child_value.clone())
         },
         capture.clone(),
@@ -1006,6 +1073,13 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
                 return Ok(JsValue::null());
             }
             child_node.write().unwrap().parent = None;
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "childList",
+                target: capture.0.clone(),
+                attribute_name: None,
+                added: Vec::new(),
+                removed: vec![child_node],
+            });
             Ok(child_value.clone())
         },
         capture.clone(),
@@ -1817,6 +1891,74 @@ mod tests {
         let mut runtime = JsRuntime::new();
         runtime.bind_dom(dom).expect("bind_dom no deberia fallar en estos tests");
         runtime.eval(script).expect("el script de test deberia ser JS valido")
+    }
+
+    /// Ejecuta `script` y DESPUES lee `expresion` en una evaluacion aparte.
+    ///
+    /// Hace falta para probar `MutationObserver`: la entrega ocurre al
+    /// terminar la tarea, no dentro de ella, asi que leer el contador en la
+    /// misma evaluacion que provoca las mutaciones lo veria siempre a cero -
+    /// y el test pasaria aunque el observador no funcionara.
+    fn eval_then_read(html: &str, script: &str, expresion: &str) -> String {
+        let dom = HtmlParser::parse(html);
+        let mut runtime = JsRuntime::new();
+        runtime.bind_dom(dom).expect("bind_dom no deberia fallar en estos tests");
+        runtime.eval(script).expect("el script de test deberia ser JS valido");
+        runtime.eval(expresion).expect("la expresion de lectura deberia ser JS valido")
+    }
+
+    /// `MutationObserver` entrega AGRUPADO al final de la tarea, no en cada
+    /// mutacion: tres cambios seguidos son UNA llamada con tres registros.
+    /// Es lo que hace que un bucle que añade cien nodos no dispare cien
+    /// callbacks.
+    #[test]
+    fn mutation_observer_agrupa_las_mutaciones_en_una_sola_entrega() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja"><span id="viejo">v</span></div></body></html>"#,
+            "var llamadas = 0; var tipos = [];              var mo = new MutationObserver(function(registros) {                  llamadas = llamadas + 1;                  for (var i = 0; i < registros.length; i++) { tipos.push(registros[i].type); }              });              var caja = document.getElementById('caja');              mo.observe(caja, { childList: true, attributes: true, subtree: true });              caja.setAttribute('a', '1');              caja.appendChild(document.createElement('p'));              document.getElementById('viejo').setAttribute('b', '2');",
+            "llamadas + ':' + tipos.join(',')",
+        );
+        assert_eq!(
+            result, "\"1:attributes,childList,attributes\"",
+            "las tres mutaciones deberian llegar en UNA sola llamada, y la tercera solo porque se pidio subtree"
+        );
+    }
+
+    /// `disconnect()` deja de observar de verdad. Se comprueba contra un
+    /// observador GEMELO que sigue conectado, para que el test no pueda
+    /// pasar simplemente porque no se entregue nada.
+    #[test]
+    fn mutation_observer_disconnect_deja_de_entregar() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja"></div></body></html>"#,
+            "var desconectado = false; var conectado = false;              var caja = document.getElementById('caja');              var a = new MutationObserver(function() { desconectado = true; });              var b = new MutationObserver(function() { conectado = true; });              a.observe(caja, { attributes: true });              b.observe(caja, { attributes: true });              a.disconnect();              caja.setAttribute('a', '1');",
+            "desconectado + '/' + conectado",
+        );
+        assert_eq!(result, "\"false/true\"", "el desconectado no deberia recibir nada; el que sigue conectado, si");
+    }
+
+    /// Un observador que NO pidio `subtree` no debe ver los cambios de sus
+    /// descendientes - pero SI los suyos propios.
+    #[test]
+    fn mutation_observer_sin_subtree_ignora_a_los_descendientes() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja"><span id="hijo">h</span></div></body></html>"#,
+            "var vistos = [];              var mo = new MutationObserver(function(r) { for (var i = 0; i < r.length; i++) { vistos.push(r[i].attributeName); } });              mo.observe(document.getElementById('caja'), { attributes: true });              document.getElementById('hijo').setAttribute('delHijo', '1');              document.getElementById('caja').setAttribute('propio', '1');",
+            "vistos.join(',')",
+        );
+        assert_eq!(result, "\"propio\"", "sin subtree solo se ve el atributo del propio nodo observado");
+    }
+
+    /// `document` es un objetivo de eventos como cualquier elemento -
+    /// `document.addEventListener('DOMContentLoaded', ...)` es como arranca
+    /// casi toda pagina real, y sin esto ese registro no existia.
+    #[test]
+    fn document_es_un_objetivo_de_eventos() {
+        let result = eval_with_dom(
+            r#"<html><body><p>x</p></body></html>"#,
+            "var visto = '';              document.addEventListener('prueba', function() { visto = 'si'; });              document.dispatchEvent(new Event('prueba'));              visto",
+        );
+        assert_eq!(result, "\"si\"");
     }
 
     /// La prueba real de esta tarea: el `JsRuntime` (y con el, los

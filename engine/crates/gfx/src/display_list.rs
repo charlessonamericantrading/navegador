@@ -267,7 +267,7 @@ impl DisplayList {
     /// visible (un hijo puede reactivar su propio pintado con `visibility:
     /// visible`, ver el doc-comment de esa rama).
     fn build_clipped_children(layout_box: &LayoutBox, target: &mut Vec<DisplayItem>, images: &ImageMap, z_layers: &mut Vec<(i32, Vec<DisplayItem>)>) {
-        let clips = layout_box.computed_style.get("overflow").map(String::as_str) == Some("hidden");
+        let clips = establishes_clip(&layout_box.computed_style);
         if clips {
             target.push(DisplayItem::PushClip { rect: layout_box.dimensions.clone() });
         }
@@ -300,6 +300,32 @@ impl DisplayList {
             target.push(DisplayItem::PopClip);
         }
     }
+}
+
+/// Si esta caja recorta su contenido desbordado.
+///
+/// Antes se comparaba SOLO contra el literal `"hidden"`, asi que
+/// `overflow: auto` (igual de comun), `overflow: scroll`, la forma de dos
+/// valores `overflow: hidden auto` y las variantes por eje `overflow-x`/
+/// `overflow-y` no recortaban nada y su contenido se derramaba por encima
+/// del resto de la pagina.
+///
+/// `auto` y `scroll` recortan igual que `hidden` porque este motor todavia
+/// no puede desplazar el interior de una caja: lo que en un navegador real
+/// quedaria oculto tras una barra de scroll, aqui queda simplemente oculto.
+/// Es una simplificacion declarada, pero mucho mas cercana a la verdad que
+/// dejarlo salir.
+fn establishes_clip(computed_style: &HashMap<String, String>) -> bool {
+    let recorta = |valor: &str| matches!(valor.trim(), "hidden" | "clip" | "scroll" | "auto");
+    for prop in ["overflow", "overflow-x", "overflow-y"] {
+        let Some(valor) = computed_style.get(prop) else { continue };
+        // `overflow: hidden auto` son DOS valores (eje x y eje y): basta con
+        // que uno de los dos recorte.
+        if valor.split_whitespace().any(recorta) {
+            return true;
+        }
+    }
+    false
 }
 
 /// `z-index` SOLO participa en el orden de pintado si el elemento tambien
@@ -1035,6 +1061,27 @@ mod tests {
             !list.items.iter().any(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [255, 0, 0, 255])),
             "el ancestro oculto en si no deberia pintar su propio fondo"
         );
+    }
+
+    /// `overflow` recorta con cualquiera de sus valores de recorte, no solo
+    /// con el literal `hidden`: `auto` y `scroll` son igual de comunes, y la
+    /// forma de dos valores y las variantes por eje tambien. Comparando solo
+    /// contra `"hidden"`, todo eso se derramaba por encima del resto de la
+    /// pagina.
+    #[test]
+    fn overflow_recorta_con_auto_scroll_y_las_formas_por_eje() {
+        let con = |prop: &str, valor: &str| {
+            let mut m = HashMap::new();
+            m.insert(prop.to_string(), valor.to_string());
+            m
+        };
+        assert!(establishes_clip(&con("overflow", "hidden")));
+        assert!(establishes_clip(&con("overflow", "auto")), "`auto` recorta: este motor no puede desplazar el interior de una caja");
+        assert!(establishes_clip(&con("overflow", "scroll")));
+        assert!(establishes_clip(&con("overflow", "hidden auto")), "la forma de dos ejes recorta si cualquiera de los dos lo hace");
+        assert!(establishes_clip(&con("overflow-y", "auto")));
+        assert!(!establishes_clip(&con("overflow", "visible")), "`visible` es el valor inicial: no recorta nada");
+        assert!(!establishes_clip(&HashMap::new()), "sin `overflow` declarado tampoco");
     }
 
     /// El fondo de un ANCESTRO va siempre por debajo del contenido de sus

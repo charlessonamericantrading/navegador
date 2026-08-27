@@ -159,6 +159,233 @@ const INITIAL_FONT_SIZE: f32 = 16.0;
 /// diseño, `resolve_font_size` (mas abajo) ya deja resuelto a `px` todo lo
 /// que la cascada consigue resolver antes de que nada mas lo lea, asi que
 /// ni esta funcion ni la copia de `engine-gfx` necesitan saber de `em`/`%`.
+/// Convierte a pixeles una longitud escrita en cualquier unidad que dependa
+/// SOLO del elemento y del viewport - `em`, `rem`, `vw`, `vh`, `vmin`,
+/// `vmax`, `pt` - y evalua `calc()` cuando todos sus operandos son de ese
+/// tipo. Los PORCENTAJES no: dependen del bloque contenedor, que en este
+/// punto todavia no existe, asi que se dejan intactos para que los resuelva
+/// la maquetacion (ver `resolve_block_width`, `resolve_box_edges`).
+///
+/// `None` si no es una longitud de esta familia (un color, `auto`, un
+/// porcentaje suelto...), en cuyo caso quien llama deja el valor como esta.
+fn absolute_length_to_px(token: &str, font_px: f32, viewport: (f32, f32)) -> Option<f32> {
+    let t = token.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t == "0" {
+        return Some(0.0);
+    }
+    let (vw, vh) = viewport;
+    // El orden importa: `rem` termina en "em", asi que se prueba antes.
+    for (sufijo, escala) in [
+        ("rem", 16.0),
+        ("em", font_px),
+        ("vmin", vw.min(vh) / 100.0),
+        ("vmax", vw.max(vh) / 100.0),
+        ("vw", vw / 100.0),
+        ("vh", vh / 100.0),
+        ("pt", 4.0 / 3.0),
+        ("px", 1.0),
+    ] {
+        if let Some(numero) = t.strip_suffix(sufijo) {
+            return numero.trim().parse::<f32>().ok().map(|n| n * escala);
+        }
+    }
+    None
+}
+
+/// Evalua un `calc()` cuyos operandos sean longitudes absolutas o numeros
+/// puros. Soporta `+ - * /` con la precedencia normal y parentesis
+/// anidados.
+///
+/// `None` si aparece algo que no se puede resolver aqui (un porcentaje, una
+/// `var()` sin sustituir, una funcion desconocida): entonces la declaracion
+/// se deja tal cual, que es mejor que inventarse un numero.
+fn eval_calc(expr: &str, font_px: f32, viewport: (f32, f32)) -> Option<f32> {
+    // Tokenizado: numeros-con-unidad, operadores y parentesis. Un `-` solo
+    // es operador si va rodeado de espacios o sigue a otro operador; en CSS
+    // `10px -5px` son dos valores y `10px-5px` no es valido, asi que exigir
+    // el espacio es lo correcto y ademas evita partir "e-5" de un numero.
+    let mut tokens: Vec<String> = Vec::new();
+    let mut actual = String::new();
+    let mut anterior_es_valor = false;
+    let mut chars = expr.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '(' | ')' => {
+                if !actual.trim().is_empty() {
+                    tokens.push(actual.trim().to_string());
+                }
+                actual.clear();
+                tokens.push(c.to_string());
+                anterior_es_valor = c == ')';
+            }
+            '+' | '*' | '/' => {
+                if !actual.trim().is_empty() {
+                    tokens.push(actual.trim().to_string());
+                }
+                actual.clear();
+                tokens.push(c.to_string());
+                anterior_es_valor = false;
+            }
+            '-' if anterior_es_valor && actual.trim().is_empty() => {
+                tokens.push("-".to_string());
+                anterior_es_valor = false;
+            }
+            c if c.is_whitespace() => {
+                if !actual.trim().is_empty() {
+                    tokens.push(actual.trim().to_string());
+                    anterior_es_valor = true;
+                }
+                actual.clear();
+            }
+            c => actual.push(c),
+        }
+    }
+    if !actual.trim().is_empty() {
+        tokens.push(actual.trim().to_string());
+    }
+
+    let mut pos = 0usize;
+    let valor = eval_suma(&tokens, &mut pos, font_px, viewport)?;
+    if pos != tokens.len() {
+        return None;
+    }
+    Some(valor)
+}
+
+fn eval_suma(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f32, f32)) -> Option<f32> {
+    let mut acc = eval_producto(tokens, pos, font_px, viewport)?;
+    while *pos < tokens.len() && (tokens[*pos] == "+" || tokens[*pos] == "-") {
+        let op = tokens[*pos].clone();
+        *pos += 1;
+        let derecha = eval_producto(tokens, pos, font_px, viewport)?;
+        acc = if op == "+" { acc + derecha } else { acc - derecha };
+    }
+    Some(acc)
+}
+
+fn eval_producto(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f32, f32)) -> Option<f32> {
+    let mut acc = eval_atomo(tokens, pos, font_px, viewport)?;
+    while *pos < tokens.len() && (tokens[*pos] == "*" || tokens[*pos] == "/") {
+        let op = tokens[*pos].clone();
+        *pos += 1;
+        let derecha = eval_atomo(tokens, pos, font_px, viewport)?;
+        if op == "*" {
+            acc *= derecha;
+        } else {
+            if derecha == 0.0 {
+                return None;
+            }
+            acc /= derecha;
+        }
+    }
+    Some(acc)
+}
+
+fn eval_atomo(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f32, f32)) -> Option<f32> {
+    let token = tokens.get(*pos)?.clone();
+    if token == "(" {
+        *pos += 1;
+        let dentro = eval_suma(tokens, pos, font_px, viewport)?;
+        if tokens.get(*pos)? != ")" {
+            return None;
+        }
+        *pos += 1;
+        return Some(dentro);
+    }
+    *pos += 1;
+    if let Some(px) = absolute_length_to_px(&token, font_px, viewport) {
+        return Some(px);
+    }
+    // Un numero puro (el factor de un `* 2`).
+    token.parse::<f32>().ok()
+}
+
+/// Reescribe un valor de propiedad dejando en PIXELES todo lo que se pueda
+/// resolver sin conocer el bloque contenedor. Respeta los valores de varios
+/// tokens (`padding: 1em 2em`) convirtiendo cada uno por separado.
+///
+/// Devuelve `None` si no habia nada que convertir, para no reescribir el
+/// mapa de estilos sin motivo.
+fn resolve_relative_units(value: &str, font_px: f32, viewport: (f32, f32)) -> Option<String> {
+    if !necesita_resolver_unidades(value) {
+        return None;
+    }
+    let mut salida: Vec<String> = Vec::new();
+    let mut cambiado = false;
+    for token in dividir_en_tokens(value) {
+        let bajo = token.to_ascii_lowercase();
+        if let Some(interior) = bajo.strip_prefix("calc(").and_then(|r| r.strip_suffix(')')) {
+            match eval_calc(interior, font_px, viewport) {
+                Some(px) => {
+                    salida.push(format!("{px}px"));
+                    cambiado = true;
+                }
+                None => salida.push(token.to_string()),
+            }
+            continue;
+        }
+        // `px` no se toca: ya esta en la unidad final y reescribirlo solo
+        // introduciria ruido de coma flotante.
+        if bajo.ends_with("px") {
+            salida.push(token.to_string());
+            continue;
+        }
+        match absolute_length_to_px(&bajo, font_px, viewport) {
+            Some(px) => {
+                salida.push(format!("{px}px"));
+                cambiado = true;
+            }
+            None => salida.push(token.to_string()),
+        }
+    }
+    if cambiado {
+        Some(salida.join(" "))
+    } else {
+        None
+    }
+}
+
+/// Filtro barato para no tokenizar cada valor de cada caja: solo los que
+/// pueden contener una unidad relativa o un `calc()`.
+fn necesita_resolver_unidades(value: &str) -> bool {
+    let v = value.as_bytes();
+    // "em" cubre tambien "rem"; "v" cubre vw/vh/vmin/vmax.
+    value.contains("em") || value.contains("calc(") || value.contains("pt") || value.contains("vw") || value.contains("vh") || value.contains("vmin") || value.contains("vmax") || v.is_empty()
+}
+
+/// Parte un valor en tokens separados por espacios, SIN romper el interior
+/// de una funcion (`calc(1em + 2px)` es un solo token pese a sus espacios).
+fn dividir_en_tokens(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut actual = String::new();
+    let mut nivel = 0usize;
+    for c in value.chars() {
+        match c {
+            '(' => {
+                nivel += 1;
+                actual.push(c);
+            }
+            ')' => {
+                nivel = nivel.saturating_sub(1);
+                actual.push(c);
+            }
+            c if c.is_whitespace() && nivel == 0 => {
+                if !actual.is_empty() {
+                    out.push(std::mem::take(&mut actual));
+                }
+            }
+            c => actual.push(c),
+        }
+    }
+    if !actual.is_empty() {
+        out.push(actual);
+    }
+    out
+}
+
 fn parse_css_font_size(value: &str) -> Option<f32> {
     let trimmed = value.trim();
     if let Some(px) = trimmed.strip_suffix("px") {
@@ -424,8 +651,8 @@ fn collect_table_rows(node: &mut LayoutBox) -> Vec<&mut LayoutBox> {
 /// propiedad, no un numero inventado. `padding` no es una propiedad
 /// heredable (ni en el spec real ni en `INHERITABLE_PROPERTIES`) - cada
 /// caja resuelve la suya propia desde su propio `computed_style`.
-fn resolve_padding(computed_style: &HashMap<String, String>) -> EdgeSizes {
-    resolve_box_edges(computed_style, "padding")
+fn resolve_padding(computed_style: &HashMap<String, String>, containing_width: f32) -> EdgeSizes {
+    resolve_box_edges(computed_style, "padding", containing_width)
 }
 
 /// Lee los cuatro lados de `padding`/`margin` desde sus LONGHANDS
@@ -435,12 +662,16 @@ fn resolve_padding(computed_style: &HashMap<String, String>) -> EdgeSizes {
 /// Se sigue mirando la propiedad abreviada como ultimo recurso para el caso
 /// que el parser no expande (valores con `calc()`/`var()`), y porque hay
 /// tests que construyen el `computed_style` a mano con solo la abreviada.
-fn resolve_box_edges(computed_style: &HashMap<String, String>, name: &str) -> EdgeSizes {
-    let fallback = computed_style.get(name).and_then(|v| parse_css_length(v)).unwrap_or(0.0);
+fn resolve_box_edges(computed_style: &HashMap<String, String>, name: &str, containing_width: f32) -> EdgeSizes {
+    // OJO: los cuatro lados resuelven su porcentaje contra el ANCHO del
+    // bloque contenedor, tambien arriba y abajo. No es un descuido: asi lo
+    // define el spec, para que un `padding: 5%` de un lado a otro de una
+    // caja produzca un hueco cuadrado.
+    let fallback = computed_style.get(name).and_then(|v| parse_css_length_relative(v, containing_width)).unwrap_or(0.0);
     let side = |suffix: &str| {
         computed_style
             .get(&format!("{name}-{suffix}"))
-            .and_then(|v| parse_css_length(v))
+            .and_then(|v| parse_css_length_relative(v, containing_width))
             .unwrap_or(fallback)
     };
     EdgeSizes { top: side("top"), right: side("right"), bottom: side("bottom"), left: side("left") }
@@ -455,8 +686,8 @@ fn resolve_box_edges(computed_style: &HashMap<String, String>, name: &str) -> Ed
 /// margin-top del siguiente, quedandose con el mayor de los dos en vez de
 /// sumarlos - eso no esta implementado, `flow_block_children` simplemente
 /// suma ambos) - simplificacion declarada, no un bug escondido.
-fn resolve_margin(computed_style: &HashMap<String, String>) -> EdgeSizes {
-    resolve_box_edges(computed_style, "margin")
+fn resolve_margin(computed_style: &HashMap<String, String>, containing_width: f32) -> EdgeSizes {
+    resolve_box_edges(computed_style, "margin", containing_width)
 }
 
 /// SOLO el ancho de `border` (forma abreviada `border: <ancho> <estilo>
@@ -531,23 +762,91 @@ fn is_border_box(computed_style: &HashMap<String, String>) -> bool {
 /// Si `box-sizing: border-box` esta presente, `width`/`max-width`/`min-width`
 /// son directamente el ancho border-box. De lo contrario (el default `content-box`),
 /// se suman padding + border para obtener el border-box.
+/// Longitud que ademas admite PORCENTAJE, resuelto contra `reference`.
+///
+/// Los porcentajes no se pueden resolver donde se resuelven `em` o `calc()`
+/// (ver `resolve_relative_units`): dependen del bloque contenedor, que solo
+/// existe ya durante la maquetacion. Por eso viven aqui, en las funciones
+/// que SI conocen esa referencia.
+fn parse_css_length_relative(value: &str, reference: f32) -> Option<f32> {
+    let trimmed = value.trim();
+    if let Some(pct) = trimmed.strip_suffix('%') {
+        return pct.trim().parse::<f32>().ok().filter(|n| *n >= 0.0).map(|n| n / 100.0 * reference);
+    }
+    parse_css_length(trimmed)
+}
+
+/// `height` explicito de una caja, ya acotado por `min-height`/`max-height`,
+/// resolviendo los porcentajes contra `containing_height`.
+///
+/// `None` cuando no hay `height` declarada, o cuando la hay en porcentaje
+/// pero el bloque contenedor no tiene un alto definido - en ese caso el
+/// spec dice que se comporta como `auto`, y devolver `None` es exactamente
+/// eso: la caja sigue creciendo con su contenido.
+fn resolve_explicit_height(computed_style: &HashMap<String, String>, containing_height: f32) -> Option<f32> {
+    let porcentaje_resoluble = |v: &String| -> Option<f32> {
+        if v.trim().ends_with('%') && containing_height <= 0.0 {
+            return None;
+        }
+        parse_css_length_relative(v, containing_height)
+    };
+
+    let mut height = computed_style.get("height").and_then(porcentaje_resoluble);
+    // `min`/`max-height` acotan tambien una altura AUTO, no solo una
+    // declarada: un `max-height` sobre contenido que crece es justo su caso
+    // de uso. Por eso se aplican aunque `height` sea `None`... salvo que
+    // entonces no hay nada que acotar todavia y decidirlo aqui seria
+    // adivinar el alto del contenido, asi que solo se acota lo declarado.
+    if let Some(h) = height.as_mut() {
+        if let Some(max_h) = computed_style.get("max-height").and_then(porcentaje_resoluble) {
+            *h = h.min(max_h);
+        }
+        if let Some(min_h) = computed_style.get("min-height").and_then(porcentaje_resoluble) {
+            *h = h.max(min_h);
+        }
+    }
+    height
+}
+
+/// Acota un alto ya calculado (el del contenido) con `min-height`/
+/// `max-height`. Separado de `resolve_explicit_height` porque aqui SI hay un
+/// numero que acotar.
+fn clamp_height(height: f32, computed_style: &HashMap<String, String>, containing_height: f32) -> f32 {
+    let porcentaje_resoluble = |v: &String| -> Option<f32> {
+        if v.trim().ends_with('%') && containing_height <= 0.0 {
+            return None;
+        }
+        parse_css_length_relative(v, containing_height)
+    };
+    let mut h = height;
+    if let Some(max_h) = computed_style.get("max-height").and_then(porcentaje_resoluble) {
+        h = h.min(max_h);
+    }
+    if let Some(min_h) = computed_style.get("min-height").and_then(porcentaje_resoluble) {
+        h = h.max(min_h);
+    }
+    h
+}
+
 fn resolve_block_width(computed_style: &HashMap<String, String>, auto_width: f32) -> f32 {
-    let padding = resolve_padding(computed_style);
+    let padding = resolve_padding(computed_style, auto_width);
     let border = resolve_border_width(computed_style);
     let box_model_extra = padding.left + padding.right + border.left + border.right;
     let border_box = is_border_box(computed_style);
 
+    // `auto_width` es el ancho del bloque contenedor, que es exactamente la
+    // referencia contra la que el spec resuelve un `width` en porcentaje.
     let mut width = computed_style
         .get("width")
-        .and_then(|v| parse_css_length(v))
+        .and_then(|v| parse_css_length_relative(v, auto_width))
         .map(|w| if border_box { w } else { w + box_model_extra })
         .unwrap_or(auto_width);
 
-    if let Some(max_w) = computed_style.get("max-width").and_then(|v| parse_css_length(v)) {
+    if let Some(max_w) = computed_style.get("max-width").and_then(|v| parse_css_length_relative(v, auto_width)) {
         let max_limit = if border_box { max_w } else { max_w + box_model_extra };
         width = width.min(max_limit);
     }
-    if let Some(min_w) = computed_style.get("min-width").and_then(|v| parse_css_length(v)) {
+    if let Some(min_w) = computed_style.get("min-width").and_then(|v| parse_css_length_relative(v, auto_width)) {
         let min_limit = if border_box { min_w } else { min_w + box_model_extra };
         width = width.max(min_limit);
     }
@@ -893,9 +1192,20 @@ fn flex_container_style(computed_style: &HashMap<String, String>) -> taffy::Styl
     // exclusiva de grid.
     let gap_val = computed_style.get("gap").and_then(|v| parse_css_length(v)).unwrap_or(0.0);
 
+    // `flex-wrap`: sin el, un contenedor cuyos items no caben los aplasta a
+    // todos en una sola linea en vez de pasarlos a la siguiente - que es
+    // justo para lo que se declara `wrap`. Lo resuelve taffy, solo hay que
+    // traducirle el valor.
+    let flex_wrap = match computed_style.get("flex-wrap").map(String::as_str) {
+        Some("wrap") => taffy::FlexWrap::Wrap,
+        Some("wrap-reverse") => taffy::FlexWrap::WrapReverse,
+        _ => taffy::FlexWrap::NoWrap,
+    };
+
     taffy::Style {
         display: taffy::Display::Flex,
         flex_direction,
+        flex_wrap,
         justify_content,
         align_items,
         gap: taffy::geometry::Size {
@@ -926,15 +1236,129 @@ fn parse_grid_template_tracks(value: &str) -> Vec<taffy::GridTemplateComponent<S
 
 /// Traduce las propiedades CSS de un contenedor GRID (`grid-template-columns`,
 /// `grid-template-rows`, `gap`/`grid-gap`) a `taffy::Style`.
+/// Rectangulo que ocupa un area con nombre dentro de la rejilla, en LINEAS
+/// de grid (base 1, como el spec).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GridArea {
+    row_start: u16,
+    row_end: u16,
+    column_start: u16,
+    column_end: u16,
+}
+
+/// Interpreta `grid-template-areas` - la rejilla dibujada con nombres, una
+/// cadena por fila:
+///
+/// ```text
+/// grid-template-areas: 'siteNotice siteNotice' 'columnStart pageContent'
+/// ```
+///
+/// Devuelve, para cada nombre, el rectangulo de lineas que ocupa. Es como
+/// se maqueta hoy una pagina de dos columnas: sin esto, los items caen en
+/// posiciones automaticas y el orden visual no tiene nada que ver con el
+/// que pidio el autor - en la Wikipedia real, el indice de contenidos se
+/// colaba ENTERO por delante del articulo.
+fn parse_grid_template_areas(value: &str) -> HashMap<String, GridArea> {
+    let mut filas: Vec<Vec<String>> = Vec::new();
+    let mut actual = String::new();
+    let mut dentro: Option<char> = None;
+    for c in value.chars() {
+        match dentro {
+            Some(comilla) if c == comilla => {
+                filas.push(actual.split_whitespace().map(str::to_string).collect());
+                actual.clear();
+                dentro = None;
+            }
+            Some(_) => actual.push(c),
+            None if c == '\'' || c == '"' => dentro = Some(c),
+            None => {}
+        }
+    }
+
+    let mut areas: HashMap<String, GridArea> = HashMap::new();
+    for (indice_fila, fila) in filas.iter().enumerate() {
+        for (indice_col, nombre) in fila.iter().enumerate() {
+            // `.` es el nombre reservado para "hueco vacio".
+            if nombre == "." {
+                continue;
+            }
+            let r = indice_fila as u16 + 1;
+            let c = indice_col as u16 + 1;
+            areas
+                .entry(nombre.clone())
+                .and_modify(|a| {
+                    // Un mismo nombre repetido en celdas contiguas define un
+                    // area RECTANGULAR que las abarca todas.
+                    a.row_start = a.row_start.min(r);
+                    a.row_end = a.row_end.max(r + 1);
+                    a.column_start = a.column_start.min(c);
+                    a.column_end = a.column_end.max(c + 1);
+                })
+                .or_insert(GridArea { row_start: r, row_end: r + 1, column_start: c, column_end: c + 1 });
+        }
+    }
+    areas
+}
+
+/// Traduce las propiedades de colocacion de UN item de rejilla
+/// (`grid-area`, `grid-column`, `grid-row`) a las lineas que taffy entiende.
+///
+/// `areas` es el mapa de `grid-template-areas` del contenedor: un
+/// `grid-area: pageContent` no significa nada sin el.
+fn grid_item_style(computed_style: &HashMap<String, String>, areas: &HashMap<String, GridArea>) -> taffy::Style {
+    use taffy::style_helpers::line;
+    let mut style = flex_item_style(computed_style);
+
+    if let Some(area) = computed_style.get("grid-area").and_then(|nombre| areas.get(nombre.trim())) {
+        style.grid_row = taffy::geometry::Line { start: line(area.row_start as i16), end: line(area.row_end as i16) };
+        style.grid_column = taffy::geometry::Line { start: line(area.column_start as i16), end: line(area.column_end as i16) };
+        return style;
+    }
+
+    // Formas numericas: `grid-column: 2`, `grid-column: 1 / 3`,
+    // `grid-column: 1 / -1` (hasta el final).
+    let colocar = |valor: &str| -> Option<taffy::geometry::Line<taffy::GridPlacement>> {
+        let (a, b) = match valor.split_once('/') {
+            Some((a, b)) => (a.trim(), Some(b.trim())),
+            None => (valor.trim(), None),
+        };
+        let inicio: i16 = a.parse().ok()?;
+        let fin = match b {
+            Some(b) => b.parse::<i16>().ok()?,
+            None => inicio + 1,
+        };
+        Some(taffy::geometry::Line { start: line(inicio), end: line(fin) })
+    };
+    if let Some(l) = computed_style.get("grid-column").and_then(|v| colocar(v)) {
+        style.grid_column = l;
+    }
+    if let Some(l) = computed_style.get("grid-row").and_then(|v| colocar(v)) {
+        style.grid_row = l;
+    }
+    style
+}
+
 fn grid_container_style(computed_style: &HashMap<String, String>) -> taffy::Style {
+    // `grid-template: <filas> / <columnas>` es la forma abreviada, y es la
+    // que usan las paginas reales (Wikipedia entre ellas). Los longhands
+    // ganan si estan puestos.
+    let (abreviada_filas, abreviada_columnas) = match computed_style.get("grid-template").and_then(|v| v.split_once('/')) {
+        Some((filas, columnas)) => (Some(filas.trim().to_string()), Some(columnas.trim().to_string())),
+        None => (None, None),
+    };
+
     let grid_template_columns = computed_style
         .get("grid-template-columns")
-        .map(|v| parse_grid_template_tracks(v))
+        .cloned()
+        .or(abreviada_columnas)
+        .map(|v| parse_grid_template_tracks(&v))
         .unwrap_or_else(|| vec![taffy::GridTemplateComponent::Single(taffy::style_helpers::fr(1.0))]);
 
     let grid_template_rows = computed_style
         .get("grid-template-rows")
-        .map(|v| parse_grid_template_tracks(v))
+        .cloned()
+        .or(abreviada_filas)
+        .map(|v| parse_grid_template_tracks(&v))
         .unwrap_or_default();
 
     let gap_val = computed_style
@@ -1032,7 +1456,10 @@ fn measure_intrinsic_width(child: &mut LayoutBox, mode: IntrinsicWidth, font_set
 }
 
 fn measure_intrinsic_width_uncached(child: &mut LayoutBox, mode: IntrinsicWidth, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
-    let padding = resolve_padding(&child.computed_style);
+    // Al medir el tamano INTRINSECO no hay bloque contenedor contra el que
+    // resolver un porcentaje (justo se esta calculando cuanto pide la caja),
+    // asi que cuentan como cero - el mismo criterio del spec.
+    let padding = resolve_padding(&child.computed_style, 0.0);
     let border = resolve_border_width(&child.computed_style);
     let extra = padding.left + padding.right + border.left + border.right;
 
@@ -1312,13 +1739,17 @@ impl LayoutTreeBuilder {
             width: viewport_width,
             height: viewport_height,
         };
+        // La caja raiz hace de bloque contenedor inicial: cualquier
+        // porcentaje de primer nivel se mide contra el viewport.
+        root_box.containing_width = viewport_width;
+        root_box.containing_height = viewport_height;
 
         // Cronometro de las tres pasadas (cascada+construccion del arbol,
         // flujo normal, posicionados). Nivel `info`, igual que el resto del
         // pipeline: en uso normal no cuesta nada y con `RUST_LOG=info` dice
         // cual de las tres domina, en vez de dejarlas como un solo numero.
         let t = std::time::Instant::now();
-        Self::build_node(dom_root, &mut root_box, stylesheet, &HashMap::new(), viewport_width);
+        Self::build_node(dom_root, &mut root_box, stylesheet, &HashMap::new(), (viewport_width, viewport_height));
         tracing::info!("[tiempo]     cascada + construccion del arbol {:?}", t.elapsed());
         let t = std::time::Instant::now();
         Self::flow_block_children(&mut root_box, font_set, images);
@@ -1371,6 +1802,7 @@ impl LayoutTreeBuilder {
 
         if matches!(position.as_deref(), Some("absolute") | Some("fixed")) {
             let reference = if position.as_deref() == Some("fixed") { viewport } else { containing_block };
+            node.containing_width = reference.width;
 
             let left = node.computed_style.get("left").and_then(|v| parse_css_offset_relative(v, reference.width));
             let right = node.computed_style.get("right").and_then(|v| parse_css_offset_relative(v, reference.width));
@@ -1470,12 +1902,12 @@ impl LayoutTreeBuilder {
     /// resuelve contra la VENTANA, no contra el contenedor de cada
     /// elemento (eso serian container queries, que son otra cosa y no
     /// estan implementadas).
-    fn build_node(dom_node: &Arc<RwLock<Node>>, parent_layout_box: &mut LayoutBox, stylesheet: &StyleSheet, inherited: &HashMap<String, String>, viewport_width: f32) {
+    fn build_node(dom_node: &Arc<RwLock<Node>>, parent_layout_box: &mut LayoutBox, stylesheet: &StyleSheet, inherited: &HashMap<String, String>, viewport: (f32, f32)) {
         let r = dom_node.read().unwrap();
         match &r.node_type {
             NodeType::Document => {
                 for child in &r.children {
-                    Self::build_node(child, parent_layout_box, stylesheet, inherited, viewport_width);
+                    Self::build_node(child, parent_layout_box, stylesheet, inherited, viewport);
                 }
             }
             NodeType::Element { tag_name, attributes } => {
@@ -1549,6 +1981,7 @@ impl LayoutTreeBuilder {
                 // ilegible cuenta como 1, igual que exige el propio HTML.
                 if matches!(tag_name.as_str(), "td" | "th") {
                     current_box.colspan = attributes.get("colspan").and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(1).max(1);
+                    current_box.rowspan = attributes.get("rowspan").and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(1).max(1);
                 }
                 if matches!(&current_box.box_type, BoxType::Replaced) {
                     current_box.replaced_text = resolve_replaced_text(tag_name, attributes, dom_node);
@@ -1559,7 +1992,7 @@ impl LayoutTreeBuilder {
                 // (`getComputedStyle`, en construccion) tambien pueda
                 // reusarla sin depender de `layout` solo para esto. Misma
                 // logica exacta, cero cambio de comportamiento.
-                current_box.computed_style = engine_css::resolve_style(dom_node, stylesheet, viewport_width);
+                current_box.computed_style = engine_css::resolve_style(dom_node, stylesheet, viewport.0);
 
                 // `display: none` (no confundir con `visibility: hidden`,
                 // que SI genera caja - ver `engine-gfx::display_list`): el
@@ -1661,8 +2094,33 @@ impl LayoutTreeBuilder {
                     child_inherited.insert(prop.to_string(), resolved);
                 }
 
+                // Unidades relativas -> pixeles. Va AQUI, despues del bucle
+                // de herencia, porque `em` se mide contra el `font-size` YA
+                // resuelto de esta caja, y ese bucle es quien lo deja en px.
+                //
+                // Sin esto, `width: 10em` o `calc(100px + 50px)` no parsean
+                // como longitud y la caja cae a "ocupo todo el contenedor":
+                // cualquier diseño de varias columnas se renderiza como una
+                // sola columna a ancho completo.
+                let font_px = current_box
+                    .computed_style
+                    .get("font-size")
+                    .and_then(|v| parse_css_font_size(v))
+                    .unwrap_or(INITIAL_FONT_SIZE);
+                let por_resolver: Vec<(String, String)> = current_box
+                    .computed_style
+                    .iter()
+                    .filter(|(k, v)| !is_custom_property(k) && k.as_str() != "font-size" && necesita_resolver_unidades(v))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for (prop, value) in por_resolver {
+                    if let Some(resuelto) = resolve_relative_units(&value, font_px, viewport) {
+                        current_box.computed_style.insert(prop, resuelto);
+                    }
+                }
+
                 for child in &r.children {
-                    Self::build_node(child, &mut current_box, stylesheet, &child_inherited, viewport_width);
+                    Self::build_node(child, &mut current_box, stylesheet, &child_inherited, viewport);
                 }
                 parent_layout_box.children.push(current_box);
             }
@@ -1751,7 +2209,7 @@ impl LayoutTreeBuilder {
     /// fila (ver alli).
     fn flow_normal_block_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
 
-        let padding = resolve_padding(&container.computed_style);
+        let padding = resolve_padding(&container.computed_style, container.containing_width);
         let border = resolve_border_width(&container.computed_style);
         container.box_dimensions.padding = padding;
         container.box_dimensions.border = border;
@@ -1764,6 +2222,15 @@ impl LayoutTreeBuilder {
         let inner_width = (container.dimensions.width - inset_left - inset_right).max(0.0);
         let content_top = container.dimensions.y + inset_top;
         let mut cursor_y = content_top;
+
+        // Alto de contenido de ESTE contenedor, pero solo si es DEFINIDO -
+        // o sea, si el autor lo declaro. Con `height: auto` (lo normal) no
+        // hay numero: el contenedor crece con su contenido, asi que un
+        // `height: 50%` de un hijo no tiene contra que medirse y el spec lo
+        // trata como `auto`. `0.0` codifica ese "indefinido".
+        let definite_inner_height = resolve_explicit_height(&container.computed_style, container.containing_height)
+            .map(|h| if is_border_box(&container.computed_style) { (h - border.top - border.bottom - padding.top - padding.bottom).max(0.0) } else { h })
+            .unwrap_or(0.0);
 
         // `float: left`/`right` (Fase 12) - a lo sumo UN float activo por
         // lado a la vez (simplificacion declarada, ver el doc-comment de
@@ -1884,7 +2351,9 @@ impl LayoutTreeBuilder {
             // `build_node`) - por construccion, una caja de texto nunca
             // tiene "margin" en su mapa, asi que esto resuelve a cero para
             // texto de forma automatica, sin necesitar un caso aparte.
-            let margin = resolve_margin(&child.computed_style);
+            child.containing_width = eff_inner_width;
+            child.containing_height = definite_inner_height;
+            let margin = resolve_margin(&child.computed_style, eff_inner_width);
             child.box_dimensions.margin = margin;
 
             cursor_y += margin.top;
@@ -1926,15 +2395,15 @@ impl LayoutTreeBuilder {
             // blanco entre la cabecera y el titulo del articulo, y separaba
             // entre si todas las secciones.
             let vertical_extra = child_padding.top + child_padding.bottom + child_border.top + child_border.bottom;
-            let explicit_height = child.computed_style.get("height").and_then(|v| parse_css_length(v));
+            let explicit_height = resolve_explicit_height(&child.computed_style, child.containing_height);
             let border_box = is_border_box(&child.computed_style);
             let resolved_content_height = match explicit_height {
                 Some(h) => if border_box { (h - vertical_extra).max(0.0) } else { h },
-                None => content_height,
+                None => clamp_height(content_height, &child.computed_style, child.containing_height),
             };
             child.dimensions.height = match explicit_height {
                 Some(h) => if border_box { h } else { h + vertical_extra },
-                None => content_height + vertical_extra,
+                None => resolved_content_height + vertical_extra,
             };
             // El area de contenido real (sin padding NI border, los dos ya
             // sumados arriba) - poblar esto es lo que hace que
@@ -2009,7 +2478,8 @@ impl LayoutTreeBuilder {
     ) {
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
-        let margin = resolve_margin(&child.computed_style);
+        child.containing_width = inner_width;
+        let margin = resolve_margin(&child.computed_style, inner_width);
         child.box_dimensions.margin = margin;
 
         let width = resolve_block_width(&child.computed_style, DEFAULT_FLOAT_WIDTH);
@@ -2077,7 +2547,7 @@ impl LayoutTreeBuilder {
     /// paginas reales, exacta cuando el item tiene su propio `width`).
     fn flow_flex_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
         FLEX_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let padding = resolve_padding(&container.computed_style);
+        let padding = resolve_padding(&container.computed_style, container.containing_width);
         let border = resolve_border_width(&container.computed_style);
         container.box_dimensions.padding = padding;
         container.box_dimensions.border = border;
@@ -2168,6 +2638,7 @@ impl LayoutTreeBuilder {
         for (index, node_id) in &child_node_ids {
             let layout = *taffy_tree.layout(*node_id).expect("layout deberia existir tras compute_layout_with_measure");
             let child = &mut container.children[*index];
+            child.containing_width = inner_width;
             child.dimensions.x = origin_x + layout.location.x;
             child.dimensions.y = origin_y + layout.location.y;
             child.dimensions.width = layout.size.width;
@@ -2187,7 +2658,7 @@ impl LayoutTreeBuilder {
     /// Layout real de `display: grid` (Fase 3) - delegado al motor CSS Grid de `taffy`.
     fn flow_grid_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
         GRID_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let padding = resolve_padding(&container.computed_style);
+        let padding = resolve_padding(&container.computed_style, container.containing_width);
         let border = resolve_border_width(&container.computed_style);
         container.box_dimensions.padding = padding;
         container.box_dimensions.border = border;
@@ -2204,13 +2675,22 @@ impl LayoutTreeBuilder {
             return 0.0;
         }
 
+        // Las areas con nombre del contenedor: hacen falta para colocar cada
+        // item (`grid-area: pageContent`), asi que se leen una vez aqui y no
+        // por hijo.
+        let areas = container
+            .computed_style
+            .get("grid-template-areas")
+            .map(|v| parse_grid_template_areas(v))
+            .unwrap_or_default();
+
         let mut taffy_tree: taffy::TaffyTree<usize> = taffy::TaffyTree::new();
         let mut child_node_ids: Vec<(usize, taffy::NodeId)> = Vec::with_capacity(container.children.len());
         for (index, child) in container.children.iter().enumerate() {
             if is_out_of_flow(&child.computed_style) {
                 continue;
             }
-            let style = flex_item_style(&child.computed_style);
+            let style = grid_item_style(&child.computed_style, &areas);
             let node_id = taffy_tree
                 .new_leaf_with_context(style, index)
                 .expect("crear nodo hoja de taffy para grid");
@@ -2249,6 +2729,7 @@ impl LayoutTreeBuilder {
         for (index, node_id) in &child_node_ids {
             let layout = *taffy_tree.layout(*node_id).expect("layout deberia existir tras compute_layout_with_measure");
             let child = &mut container.children[*index];
+            child.containing_width = inner_width;
             child.dimensions.x = origin_x + layout.location.x;
             child.dimensions.y = origin_y + layout.location.y;
             child.dimensions.width = layout.size.width;
@@ -2298,7 +2779,7 @@ impl LayoutTreeBuilder {
     /// `is_out_of_flow` - caso raro en tablas reales).
     fn flow_table_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
         TABLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let padding = resolve_padding(&container.computed_style);
+        let padding = resolve_padding(&container.computed_style, container.containing_width);
         let border = resolve_border_width(&container.computed_style);
         container.box_dimensions.padding = padding;
         container.box_dimensions.border = border;
@@ -2327,6 +2808,7 @@ impl LayoutTreeBuilder {
                 continue;
             }
             let child = &mut container.children[index];
+            child.containing_width = inner_width;
             child.dimensions.x = origin_x;
             child.dimensions.y = content_top + caption_height;
             child.dimensions.width = inner_width;
@@ -2434,8 +2916,22 @@ impl LayoutTreeBuilder {
             accumulated += w;
         }
 
+        // Ocupacion arrastrada por `rowspan`: cuantas filas mas sigue ocupada
+        // cada columna por una celda que empezo mas arriba. Sin esto, las
+        // celdas de las filas siguientes se corren a la izquierda y toda la
+        // tabla queda descuadrada a partir de la primera celda con
+        // `rowspan`.
+        let mut ocupadas: Vec<u32> = vec![0; column_count];
+        // Para la segunda pasada: (fila, indice de celda dentro de la fila,
+        // filas que abarca). El alto real de una celda con `rowspan` no se
+        // sabe hasta haber medido todas las filas que cruza.
+        let mut celdas_que_abarcan: Vec<(usize, usize, u32)> = Vec::new();
+        let mut tops_de_fila: Vec<f32> = Vec::with_capacity(rows.len());
+        let mut altos_de_fila: Vec<f32> = Vec::with_capacity(rows.len());
+
         let mut cursor_y = content_top;
-        for row in rows {
+        for (indice_fila, row) in rows.iter_mut().enumerate() {
+            row.containing_width = inner_width;
             row.dimensions.x = origin_x;
             row.dimensions.y = cursor_y;
             row.dimensions.width = inner_width;
@@ -2447,17 +2943,38 @@ impl LayoutTreeBuilder {
             if !row.children.iter().any(is_table_cell) {
                 let height = Self::flow_normal_block_children(row, font_set, images);
                 row.dimensions.height = height;
+                // Tambien apunta su top/alto: la segunda pasada indexa estos
+                // vectores POR NUMERO DE FILA, y saltarse una los
+                // desalinearia con todas las de despues.
+                tops_de_fila.push(cursor_y);
+                altos_de_fila.push(height);
                 cursor_y += height;
                 continue;
             }
 
             let mut row_height: f32 = 0.0;
             let mut col = 0usize;
-            for cell in row.children.iter_mut().filter(|c| is_table_cell(c)) {
+            for (indice_celda, cell) in row.children.iter_mut().filter(|c| is_table_cell(c)).enumerate() {
+                // Saltar las columnas que sigue ocupando una celda de una
+                // fila anterior.
+                while col < column_count && ocupadas[col] > 0 {
+                    col += 1;
+                }
                 if col >= column_count {
                     break;
                 }
                 let span = (cell.colspan as usize).clamp(1, column_count - col);
+                let filas_abarcadas = cell.rowspan.max(1);
+                if filas_abarcadas > 1 {
+                    for c in col..(col + span).min(column_count) {
+                        // El contador se decrementa al CERRAR cada fila,
+                        // incluida esta, asi que se apunta el numero total de
+                        // filas y no una menos: si no, la ocupacion se agota
+                        // justo antes de la primera fila que deberia saltar.
+                        ocupadas[c] = filas_abarcadas;
+                    }
+                    celdas_que_abarcan.push((indice_fila, indice_celda, filas_abarcadas));
+                }
                 // Una celda con `colspan` ocupa el ancho SUMADO de todas las
                 // columnas que abarca.
                 let column_width: f32 = (col..col + span).map(|i| column_widths.get(i).copied().unwrap_or(0.0)).sum();
@@ -2501,7 +3018,29 @@ impl LayoutTreeBuilder {
             }
 
             row.dimensions.height = row_height;
+            tops_de_fila.push(cursor_y);
+            altos_de_fila.push(row_height);
             cursor_y += row_height;
+
+            // Consumir una fila de ocupacion pendiente.
+            for o in ocupadas.iter_mut() {
+                *o = o.saturating_sub(1);
+            }
+        }
+
+        // Segunda pasada: una celda con `rowspan` llega hasta el borde
+        // inferior de la ultima fila que abarca. Hasta aqui tenia el alto de
+        // su propia fila, porque las siguientes todavia no estaban medidas.
+        for (indice_fila, indice_celda, filas) in celdas_que_abarcan {
+            let ultima = (indice_fila + filas as usize - 1).min(altos_de_fila.len().saturating_sub(1));
+            let fondo = tops_de_fila[ultima] + altos_de_fila[ultima];
+            let alto = (fondo - tops_de_fila[indice_fila]).max(0.0);
+            if let Some(cell) = rows[indice_fila].children.iter_mut().filter(|c| is_table_cell(c)).nth(indice_celda) {
+                cell.dimensions.height = alto;
+                let p = cell.box_dimensions.padding;
+                let b = cell.box_dimensions.border;
+                cell.box_dimensions.content.height = (alto - p.top - p.bottom - b.top - b.bottom).max(0.0);
+            }
         }
 
         // `content_top` ya viene desplazado por el alto de los captions, asi
@@ -2843,8 +3382,9 @@ impl LayoutTreeBuilder {
                 node.dimensions.x = origin_x;
                 node.dimensions.y = *cursor_y;
                 node.dimensions.width = inner_width;
+                node.containing_width = inner_width;
                 let block_height = Self::flow_block_children(node, font_set, images);
-                let padding = resolve_padding(&node.computed_style);
+                let padding = resolve_padding(&node.computed_style, inner_width);
                 let border = resolve_border_width(&node.computed_style);
                 node.box_dimensions.padding = padding;
                 node.box_dimensions.border = border;
@@ -2895,6 +3435,120 @@ mod tests {
             }
         }
         root.children.iter_mut().find_map(|c| find_box_for_dom_node_mut(c, target))
+    }
+
+    /// `em`, `rem`, `vw` y `calc()` tienen que llegar al layout ya en
+    /// pixeles. Cuando no se resolvian, la declaracion no parseaba como
+    /// longitud y la caja caia a "ocupo todo el contenedor": cualquier
+    /// diseño de varias columnas se renderizaba como una sola a ancho
+    /// completo.
+    #[test]
+    fn las_unidades_relativas_y_calc_se_resuelven_a_pixeles() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="em">e</div><div id="vw">v</div><div id="calc">c</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse(
+            "body { margin: 0px; font-size: 20px; } #em { width: 10em; } #vw { width: 25vw; } #calc { width: calc(100px + 50px); }",
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let ancho = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja").dimensions.width;
+
+        assert_eq!(ancho("em"), 200.0, "10em con font-size 20px son 200px");
+        assert_eq!(ancho("vw"), 200.0, "25vw de un viewport de 800px son 200px");
+        assert_eq!(ancho("calc"), 150.0, "calc(100px + 50px) son 150px");
+    }
+
+    /// Los porcentajes se miden contra el BLOQUE CONTENEDOR, tambien
+    /// anidados. No se pueden resolver junto a `em` (ahi todavia no hay
+    /// bloque contenedor), de ahi que vivan en la maquetacion.
+    #[test]
+    fn los_porcentajes_se_miden_contra_el_bloque_contenedor() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="mitad"><div id="cuarto">c</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } #mitad { width: 50%; } #cuarto { width: 50%; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let ancho = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja").dimensions.width;
+
+        assert_eq!(ancho("mitad"), 400.0, "50% de un viewport de 800px");
+        assert_eq!(ancho("cuarto"), 200.0, "50% del PADRE (400px), no del viewport");
+    }
+
+    /// Un `padding` en porcentaje se mide contra el ANCHO del bloque
+    /// contenedor por los cuatro lados, tambien arriba y abajo - asi lo
+    /// define el spec, para que un `padding: 5%` produzca un hueco cuadrado.
+    #[test]
+    fn un_padding_en_porcentaje_se_mide_contra_el_ancho() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="caja">c</div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } #caja { width: 100px; padding: 10%; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "caja").unwrap()).expect("caja");
+
+        // 10% de 800 = 80 por lado; el ancho de borde suma los dos.
+        assert_eq!(caja.dimensions.width, 260.0, "100px de contenido mas 80px de padding a cada lado");
+        assert_eq!(caja.box_dimensions.padding.top, 80.0, "el padding vertical tambien se mide contra el ANCHO");
+    }
+
+    /// `height: 50%` necesita que el contenedor tenga un alto DEFINIDO. Si
+    /// no lo tiene (`height: auto`, lo normal), el spec dice que se comporta
+    /// como `auto` - y devolver eso es mas correcto que inventarse un alto.
+    #[test]
+    fn un_alto_en_porcentaje_solo_aplica_si_el_contenedor_lo_tiene_definido() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="fijo"><div id="dentro">d</div></div><div id="suelto"><div id="huerfano">h</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse(
+            "body { margin: 0px; } div { margin: 0px; } #fijo { height: 400px; } #dentro { height: 50%; } #huerfano { height: 50%; }",
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let alto = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja").dimensions.height;
+
+        assert_eq!(alto("dentro"), 200.0, "50% de un contenedor de 400px");
+        assert!(alto("huerfano") < 100.0, "sin alto definido en el padre, el 50% no aplica y la caja crece con su contenido");
+    }
+
+    /// `min-height`/`max-height` acotan tanto un alto declarado como el que
+    /// sale del contenido.
+    #[test]
+    fn min_height_y_max_height_acotan_el_alto() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="tope">t</div><div id="suelo">s</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse(
+            "body { margin: 0px; } div { margin: 0px; } #tope { height: 900px; max-height: 120px; } #suelo { height: 5px; min-height: 60px; }",
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let alto = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja").dimensions.height;
+
+        assert_eq!(alto("tope"), 120.0, "max-height recorta un height mayor");
+        assert_eq!(alto("suelo"), 60.0, "min-height eleva un height menor");
+    }
+
+    /// Una celda con `rowspan` ocupa su columna tambien en las filas
+    /// siguientes: las celdas de esas filas NO deben correrse a su hueco.
+    /// Ignorarlo descuadra la tabla entera a partir de la primera celda que
+    /// abarque filas.
+    #[test]
+    fn una_celda_con_rowspan_reserva_su_columna_en_las_filas_siguientes() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table>
+               <tr><td id="alta" rowspan="2">alta</td><td id="a1">a1</td></tr>
+               <tr><td id="b1">b1</td></tr>
+               <tr><td id="c1">c1</td><td id="c2">c2</td></tr>
+               </table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
+
+        let a1 = caja("a1").dimensions.x;
+        assert!(a1 > 0.0, "a1 esta en la segunda columna");
+        assert_eq!(caja("b1").dimensions.x, a1, "b1 deberia quedarse en la SEGUNDA columna, no correrse al hueco de la celda alta");
+        assert_eq!(caja("c1").dimensions.x, 0.0, "pasado el rowspan, la fila vuelve a empezar en la primera columna");
+        assert!(
+            caja("alta").dimensions.height > caja("a1").dimensions.height * 1.5,
+            "la celda con rowspan=2 deberia llegar hasta el fondo de la segunda fila"
+        );
     }
 
     /// Las propiedades personalizadas (`--x`) se resuelven donde se USAN,

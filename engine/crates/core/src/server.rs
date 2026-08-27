@@ -366,7 +366,7 @@ impl EngineServer {
     /// autodestruiria el historial "adelante" al que deberia poder volver
     /// despues.
     async fn navigate(&mut self, id: Option<String>, url: String, record_history: bool) -> EngineResponse {
-        self.navigate_with_body(id, url, record_history, None).await
+        self.navigate_with_body(id, url, record_history, None, 0).await
     }
 
     /// Navega enviando un cuerpo `application/x-www-form-urlencoded` por
@@ -378,7 +378,7 @@ impl EngineServer {
     /// navegador de verdad pregunta antes de hacerlo). Aqui `back` la
     /// repetira como GET, que es distinto - declarado en ARCHITECTURE.md.
     async fn navigate_post(&mut self, id: Option<String>, url: String, body: Vec<u8>) -> EngineResponse {
-        self.navigate_with_body(id, url, true, Some(body)).await
+        self.navigate_with_body(id, url, true, Some(body), 0).await
     }
 
     /// El cuerpo comun de las dos: `body` a `None` hace un GET normal,
@@ -386,7 +386,13 @@ impl EngineServer {
     /// duplicar la funcion entera porque TODO lo que viene despues de la
     /// peticion (seguir redirecciones, descubrir sub-recursos, construir
     /// la pagina, historial, temporizadores de carga) es identico.
-    async fn navigate_with_body(&mut self, id: Option<String>, url: String, record_history: bool, body: Option<Vec<u8>>) -> EngineResponse {
+    /// Numero maximo de redirecciones ENCADENADAS que un script puede
+    /// provocar (`location.href = ...` durante la carga). Un navegador real
+    /// tiene un tope equivalente por la misma razon: sin el, una pagina que
+    /// se redirige a si misma cuelga el motor.
+    const MAX_CLIENT_REDIRECTS: u8 = 5;
+
+    async fn navigate_with_body(&mut self, id: Option<String>, url: String, record_history: bool, body: Option<Vec<u8>>, depth: u8) -> EngineResponse {
         // Cronometro por fases. Sin esto la unica cifra observable era el
         // total de la navegacion, que no distingue "la red va lenta" de
         // "el motor tarda en maquetar" - y sin distinguirlo cualquier
@@ -613,6 +619,38 @@ impl EngineServer {
             .map(|page| page.runtime.take_pending_history_ops())
             .unwrap_or_default();
         self.apply_history_ops(load_time_ops);
+
+        // Navegaciones pedidas por un script de CARGA (`location.href =
+        // ...`, tipico de una redireccion en cliente). A diferencia de
+        // `window.open`, esta SI se honra durante la carga: no abre nada
+        // nuevo, sustituye esta misma pagina, que es lo que la pagina esta
+        // pidiendo. El limite de profundidad corta el bucle de una pagina
+        // que se redirija a si misma; sin el, cada carga volveria a pedir
+        // la siguiente sin fin.
+        let navegaciones = self
+            .active_tab_mut()
+            .current_page
+            .as_mut()
+            .map(|page| page.runtime.take_pending_navigations())
+            .unwrap_or_default();
+        if let Some(destino) = navegaciones.into_iter().next() {
+            if depth < Self::MAX_CLIENT_REDIRECTS {
+                if let Some(page) = self.active_tab().current_page.as_ref() {
+                    if let Ok(base) = url::Url::parse(&page.url) {
+                        if let Ok(resuelta) = base.join(&destino.raw_url) {
+                            let resuelta = resuelta.to_string();
+                            if resuelta != page.url {
+                                tracing::info!("[server] redireccion desde JS a {resuelta}");
+                                return Box::pin(self.navigate_with_body(id, resuelta, !destino.replace_current_entry, None, depth + 1)).await;
+                            }
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!("[server] demasiadas redirecciones desde JS seguidas, se corta el bucle");
+            }
+        }
+
         let t = std::time::Instant::now();
         let response = self.state_response(id);
         tracing::info!("[tiempo] captura PNG en {:?}", t.elapsed());
