@@ -97,6 +97,31 @@ pub fn register_window(context: &mut Context) -> JsResult<PendingWindowOpens> {
         }
     }
 
+    // `window.dispatchEvent` como DELEGACION a `document.documentElement`
+    // (Fase 42) - MISMO nodo al que ya delega `window.addEventListener`/
+    // `removeEventListener` (el shim de `register_history`, ver su
+    // aviso): sin esto, un `window.dispatchEvent(new Event('x'))` manual
+    // fallaria con "not a function" aunque `window.addEventListener('x',
+    // ...)` ya funcionara. `addEventListener`/`removeEventListener` NO se
+    // tocan aqui - `register_history` (que corre DESPUES, ver
+    // `core::scripting`) ya los engancha, y hacerlo tambien aqui solo
+    // se pisaria a si mismo. Guardado tras comprobar que `document` y
+    // `documentElement` existen: sin DOM (el arnes de tests, `window` sin
+    // `bind_dom` previo) no hay nada a lo que delegar.
+    if let Ok(document) = context.global_object().get(js_string!("document"), context) {
+        if let Some(document_obj) = document.as_object() {
+            if let Ok(document_element) = document_obj.get(js_string!("documentElement"), context) {
+                if let Some(document_element_obj) = document_element.as_object() {
+                    if let Ok(dispatch) = document_element_obj.get(js_string!("dispatchEvent"), context) {
+                        if !dispatch.is_undefined() {
+                            window.set(js_string!("dispatchEvent"), dispatch, false, context)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     context.register_global_property(js_string!("window"), window, Attribute::all())?;
 
     // `navigator` (Fase 39). Una cantidad enorme de codigo real lee
@@ -204,5 +229,23 @@ mod tests {
             runtime.eval("typeof window").is_ok_and(|t| t == "\"undefined\""),
             "sin registrar, window no deberia existir"
         );
+    }
+
+    /// `window.dispatchEvent` delega en `document.documentElement`, el
+    /// MISMO nodo al que ya delega `window.addEventListener` (el shim de
+    /// `register_history`) - un listener puesto por una via tiene que
+    /// enterarse de un evento disparado por la otra.
+    #[test]
+    fn window_dispatch_event_reaches_a_listener_added_via_window_add_event_listener() {
+        use engine_dom::HtmlParser;
+        let dom = HtmlParser::parse("<html><body></body></html>");
+        let mut runtime = JsRuntime::new();
+        runtime.bind_dom(dom).expect("bind_dom no deberia fallar");
+        runtime.register_window().expect("window deberia registrarse");
+        runtime.register_history().expect("history deberia registrarse (ahi vive el shim)");
+
+        runtime.eval("var visto = false; window.addEventListener('miEvento', function() { visto = true; });").expect("registrar el listener deberia ser JS valido");
+        runtime.eval("window.dispatchEvent(new Event('miEvento'))").expect("dispatchEvent no deberia lanzar");
+        assert_eq!(runtime.eval("visto").unwrap(), "true", "el listener puesto via window.addEventListener deberia dispararse con window.dispatchEvent");
     }
 }

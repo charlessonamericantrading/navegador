@@ -330,6 +330,19 @@ impl EngineServer {
                 let (w, h) = (self.width, self.height);
                 let tab = self.active_tab_mut();
                 if let Some(page) = &mut tab.current_page {
+                    // Evento `resize` real sobre `<html>` (mismo objetivo y
+                    // mismo motivo que el `scroll` de arriba: es donde
+                    // `window.addEventListener('resize', ...)` delega, ver
+                    // el aviso de `EngineRequest::Scroll`) ANTES del
+                    // relayout - un listener real de `resize` a menudo
+                    // muta el DOM (mostrar/ocultar un menu segun el ancho),
+                    // y ese cambio tiene que estar YA en el arbol que
+                    // `page.relayout` va a construir, no en el siguiente.
+                    if let Some(html) = Node::document_element(&page.page.dom_root) {
+                        if let Err(error) = page.runtime.dispatch_event(&html, "resize") {
+                            return (Self::error(id, format!("resize_event_error: {error}")), false);
+                        }
+                    }
                     page.relayout(w as f32, h as f32);
                     let content_extent = page.page.layout_root.content_extent();
                     tab.scroll_offset_y = clamp_scroll_offset(tab.scroll_offset_y, content_extent, h as f32);
@@ -352,16 +365,27 @@ impl EngineServer {
 
                     // Evento `scroll` real: el desplazamiento de arriba YA
                     // era real (`getBoundingClientRect` ya lo reflejaba),
-                    // lo que faltaba era que un listener JS se enterara.
-                    // `document` (`dom_root`) es un EventTarget completo y
-                    // probado - `document.addEventListener('scroll', ...)`
-                    // funciona. `window` TODAVIA no es un EventTarget en
-                    // este motor (ver `engine_js::window`), asi que
-                    // `window.addEventListener('scroll', ...)` sigue sin
-                    // dispararse - hueco declarado, no de esta tarea.
-                    let dom_root = page.page.dom_root.clone();
-                    if let Err(error) = page.runtime.dispatch_event(&dom_root, "scroll") {
-                        return (Self::error(id, format!("scroll_event_error: {error}")), false);
+                    // lo que faltaba era que un listener JS se enterara. Se
+                    // dispara sobre `<html>` (`documentElement`), NO sobre
+                    // `dom_root` directo - mismo objetivo exacto que ya usa
+                    // `fire_popstate`, y no por casualidad: `window.
+                    // addEventListener` (el shim de `register_history`, ver
+                    // su aviso) delega precisamente en `documentElement`,
+                    // asi que dispararlo ahi es lo unico que hace que
+                    // `window.addEventListener('scroll', ...)` tambien se
+                    // entere. `document.addEventListener('scroll', ...)`
+                    // SIGUE funcionando igual: `documentElement.parent` es
+                    // `dom_root`, y la fase de burbuja del dispatch camina
+                    // por los ancestros reales hasta llegar ahi.
+                    // `None` (documento sin ningun elemento raiz - un DOM
+                    // malformado que HTML5 parsing en la practica nunca
+                    // produce) se salta el evento sin tratarlo como error:
+                    // no hay a quien dispararselo, no que la propia
+                    // operacion de scroll haya fallado.
+                    if let Some(html) = Node::document_element(&page.page.dom_root) {
+                        if let Err(error) = page.runtime.dispatch_event(&html, "scroll") {
+                            return (Self::error(id, format!("scroll_event_error: {error}")), false);
+                        }
                     }
                     // Un listener de scroll puede mutar el DOM (el patron
                     // real de "infinite scroll": cargar mas contenido al
@@ -2448,6 +2472,56 @@ mod tests {
         let page = &server.active_tab().current_page.as_ref().expect("deberia haber pagina").page;
         let marcador = Node::find_by_id(&page.dom_root, "marcador").expect("deberia existir el marcador");
         assert_eq!(Node::text_content(&marcador), "despues", "el listener de scroll deberia haber mutado el DOM, y el relayout deberia reflejarlo");
+    }
+
+    /// El punto real de disparar sobre `<html>` en vez de sobre `dom_root`
+    /// directo: `window.addEventListener('scroll', ...)` (el shim de
+    /// `register_history`, que delega en `document.documentElement`)
+    /// tiene que enterarse tambien, no solo `document.addEventListener`.
+    #[tokio::test]
+    async fn scroll_command_also_fires_on_window_addeventlistener() {
+        let mut server = server_with_scrollable_page_and_script(
+            "var vistoEnWindow = false; window.addEventListener('scroll', function() { vistoEnWindow = true; });",
+        );
+        server.handle(EngineRequest::Scroll { id: Some("s1".to_string()), dx: 0, dy: 200 }).await;
+
+        let runtime = &mut server.active_tab_mut().current_page.as_mut().expect("deberia haber pagina").runtime;
+        assert_eq!(runtime.eval("vistoEnWindow").unwrap(), "true", "window.addEventListener('scroll', ...) deberia haberse disparado tambien");
+    }
+
+    /// Misma cobertura que el scroll, para `resize`: un
+    /// `window.addEventListener('resize', ...)` tiene que dispararse
+    /// cuando llega un comando `Resize` real.
+    #[tokio::test]
+    async fn resize_command_fires_a_real_resize_event_on_window() {
+        let html = "<html><body><script>var vistoResize = false; window.addEventListener('resize', function() { vistoResize = true; });</script></body></html>";
+        let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+        let mut server = EngineServer::new();
+        let tab = server.active_tab_mut();
+        tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+
+        server.handle(EngineRequest::Resize { id: Some("r1".to_string()), width: 1000, height: 700 }).await;
+
+        let runtime = &mut server.active_tab_mut().current_page.as_mut().expect("deberia haber pagina").runtime;
+        assert_eq!(runtime.eval("vistoResize").unwrap(), "true", "window.addEventListener('resize', ...) deberia haberse disparado con un comando Resize real");
+    }
+
+    /// Un listener de `resize` puede mutar el DOM (p.ej. mostrar/ocultar
+    /// un menu segun el ancho) - ese cambio tiene que verse reflejado en
+    /// el MISMO relayout que el propio `resize` ya iba a disparar.
+    #[tokio::test]
+    async fn a_resize_listener_that_mutates_the_dom_is_reflected_after_relayout() {
+        let html = "<html><body><p id=\"marcador\">antes</p><script>window.addEventListener('resize', function() { document.getElementById('marcador').textContent = 'despues'; });</script></body></html>";
+        let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+        let mut server = EngineServer::new();
+        let tab = server.active_tab_mut();
+        tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+
+        server.handle(EngineRequest::Resize { id: Some("r1".to_string()), width: 1000, height: 700 }).await;
+
+        let page = &server.active_tab().current_page.as_ref().expect("deberia haber pagina").page;
+        let marcador = Node::find_by_id(&page.dom_root, "marcador").expect("deberia existir el marcador");
+        assert_eq!(Node::text_content(&marcador), "despues", "el listener de resize deberia haber mutado el DOM, y el relayout deberia reflejarlo");
     }
 
     /// El punto real del reloj de fondo: un `setTimeout` vencido (delay 0,
