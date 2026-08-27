@@ -52,3 +52,50 @@ pub fn paint_image(pixmap: &mut Pixmap, rect: &Rect, image: &DecodedImage, scrol
 
     pixmap.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), transform, mask);
 }
+
+/// Tope de mosaicos por llamada (Fase 40) - una imagen de pocos pixeles
+/// sobre una caja grande generaria decenas de miles de `draw_pixmap`. No es
+/// hipotetico: es el propio patron de "textura diminuta que se repite" que
+/// usan sitios reales para fondos baratos. Pasado el tope, se deja de
+/// pintar (el resto de la caja queda sin mosaico) en vez de colgar el
+/// pintado - misma degradacion honesta que el resto de este archivo.
+const MAX_BACKGROUND_TILES: usize = 8192;
+
+/// Pinta `image` en su TAMAÑO NATURAL (sin escalar, a diferencia de
+/// `paint_image`), repetida en mosaico desde la esquina superior-izquierda
+/// de `rect` hasta cubrirlo por completo - `background-repeat: repeat` y
+/// `background-size: auto`, los dos valores iniciales reales del spec.
+/// `mask` recorta el mosaico: quien llama (`paint::paint_display_list`) ya
+/// lo construyo combinando cualquier `overflow: hidden` activo CON el
+/// propio `rect` de esta caja - sin esa segunda parte, un mosaico se
+/// saldria del borde de su propia caja, no solo del de un ancestro
+/// recortado (a diferencia de `fill_rect`/`paint_image`, que nunca pintan
+/// mas alla de su propio `rect` aunque no haya mascara).
+pub fn paint_background_image(pixmap: &mut Pixmap, rect: &Rect, image: &DecodedImage, scroll_offset_y: f32, mask: Option<&Mask>) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let (tile_w, tile_h) = (image.width as f32, image.height as f32);
+    if tile_w <= 0.0 || tile_h <= 0.0 {
+        return;
+    }
+    let Some(source) = to_premultiplied_pixmap(image) else { return };
+
+    let start_x = rect.x;
+    let start_y = rect.y - scroll_offset_y;
+    let cols = (rect.width / tile_w).ceil().max(1.0) as usize;
+    let rows = (rect.height / tile_h).ceil().max(1.0) as usize;
+
+    let mut drawn = 0usize;
+    'rows: for row in 0..rows {
+        for col in 0..cols {
+            if drawn >= MAX_BACKGROUND_TILES {
+                tracing::warn!("[image_paint] mosaico de fondo cortado en {drawn} tiles (limite {MAX_BACKGROUND_TILES})");
+                break 'rows;
+            }
+            let transform = Transform::from_translate(start_x + col as f32 * tile_w, start_y + row as f32 * tile_h);
+            pixmap.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), transform, mask);
+            drawn += 1;
+        }
+    }
+}

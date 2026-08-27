@@ -9,7 +9,7 @@
 //! `overflow: hidden` (Fase 3.5) se añaden aqui, una sola vez.
 
 use crate::display_list::{DisplayItem, TextAlign};
-use crate::image_paint::paint_image;
+use crate::image_paint::{paint_background_image, paint_image};
 use engine_layout::Rect;
 use engine_text::{baseline_offset, measure_text, shape_text, underline_metrics, wrap_text, FontSet, SystemFont};
 use tiny_skia::{FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Rect as SkiaRect, Stroke, Transform};
@@ -86,6 +86,19 @@ pub fn paint_display_list(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: 
             DisplayItem::Image { rect, image } => {
                 paint_image(pixmap, rect, image, scroll_offset_y, current_mask.as_ref());
             }
+            // El mosaico de un `background-image` no debe salirse de SU
+            // PROPIA caja, no solo de la de un `overflow: hidden` ancestro
+            // (a diferencia del resto de items, cuyo propio dibujo nunca
+            // pinta mas alla de `rect` aunque no haya mascara activa - ver
+            // el doc-comment de `paint_background_image`). Por eso aqui se
+            // reconstruye la mascara con `rect` añadido a la pila de
+            // recorte activa, en vez de reusar `current_mask` tal cual.
+            DisplayItem::BackgroundImage { rect, image } => {
+                let mut own_clip = clip_stack.clone();
+                own_clip.push(rect.clone());
+                let mask = build_clip_mask(width, height, &own_clip, scroll_offset_y);
+                paint_background_image(pixmap, rect, image, scroll_offset_y, mask.as_ref());
+            }
         }
     }
 }
@@ -100,7 +113,8 @@ fn item_rect(item: &DisplayItem) -> Option<&Rect> {
         | DisplayItem::SolidRect { rect, .. }
         | DisplayItem::Text { rect, .. }
         | DisplayItem::Border { rect, .. }
-        | DisplayItem::Image { rect, .. } => Some(rect),
+        | DisplayItem::Image { rect, .. }
+        | DisplayItem::BackgroundImage { rect, .. } => Some(rect),
     }
 }
 

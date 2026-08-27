@@ -5,7 +5,7 @@
 //! el layout con tiny-skia y devuelve la captura PNG en Base64. La salida
 //! estándar contiene exclusivamente JSON; los logs van a stderr.
 
-use crate::pipeline::{build_page_keeping_runtime, find_external_script_srcs, find_external_stylesheet_hrefs, find_image_srcs, PageResult};
+use crate::pipeline::{build_page_keeping_runtime, find_background_image_urls, find_external_script_srcs, find_external_stylesheet_hrefs, find_image_srcs, find_inline_style_css, PageResult};
 use crate::protocol::{
     ElementAttributes, ElementRect, EngineRequest, EngineResponse, InteractiveElement, TabInfo,
     PROTOCOL_VERSION,
@@ -540,16 +540,14 @@ impl EngineServer {
 
         let stylesheet_hrefs = find_external_stylesheet_hrefs(&discovery_dom);
         let script_srcs = find_external_script_srcs(&discovery_dom);
-        let image_srcs = find_image_srcs(&discovery_dom);
 
         // CSP se aplica ANTES de descargar, no despues: el objetivo es no
         // pedirle nada a un origen no autorizado, no descartar lo que ya
         // llego (que ya habria filtrado que la pagina visito ese sitio).
         let stylesheet_hrefs = filter_by_csp(stylesheet_hrefs, "style-src", &csp, &page_url, &page_origin);
         let script_srcs = filter_by_csp(script_srcs, "script-src", &csp, &page_url, &page_origin);
-        let image_srcs = filter_by_csp(image_srcs, "img-src", &csp, &page_url, &page_origin);
 
-        let (n_css, n_js, n_img) = (stylesheet_hrefs.len(), script_srcs.len(), image_srcs.len());
+        let (n_css, n_js) = (stylesheet_hrefs.len(), script_srcs.len());
 
         let t = std::time::Instant::now();
         let external_css = self.fetch_external_stylesheets(stylesheet_hrefs, &page_url).await;
@@ -558,6 +556,21 @@ impl EngineServer {
         let t = std::time::Instant::now();
         let external_scripts = self.fetch_external_scripts(script_srcs, &page_url).await;
         tracing::info!("[tiempo] {n_js} script(s) externos en {:?}", t.elapsed());
+
+        // `background-image`/`background: url(...)` (Fase 40) - las URLs se
+        // descubren escaneando el CSS YA ENSAMBLADO (el `<style>` en linea
+        // del documento + las hojas externas que se acaban de descargar
+        // arriba), no desde el DOM como `<img src>` - por eso este
+        // descubrimiento no puede ocurrir antes que `external_css`. Se
+        // añaden a la MISMA lista que `<img src>` para reusar exactamente
+        // el mismo fetch/decode/`ImageMap` - `img-src` de CSP tambien
+        // gobierna una imagen de fondo, no solo `<img>`.
+        let allow_inline_style = csp.allows_inline("style-src");
+        let inline_css = if allow_inline_style { find_inline_style_css(&discovery_dom) } else { String::new() };
+        let mut image_srcs = find_image_srcs(&discovery_dom);
+        image_srcs.extend(find_background_image_urls(&format!("{inline_css}\n{external_css}")));
+        let image_srcs = filter_by_csp(image_srcs, "img-src", &csp, &page_url, &page_origin);
+        let n_img = image_srcs.len();
 
         let t = std::time::Instant::now();
         let images = self.fetch_images(image_srcs, &page_url).await;

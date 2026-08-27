@@ -131,6 +131,7 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "color",
     "background",
     "background-color",
+    "background-image",
     "border",
     "border-width",
     "border-color",
@@ -176,7 +177,7 @@ fn supports_value(property: &str, value: &str) -> bool {
     // resolvemos.
     if let Some(abre) = v.find('(') {
         let funcion = v[..abre].trim().rsplit(|c: char| c.is_whitespace() || c == ',').next().unwrap_or("");
-        if !matches!(funcion, "calc" | "var" | "rgb" | "rgba" | "hsl" | "hsla") {
+        if !matches!(funcion, "calc" | "var" | "rgb" | "rgba" | "hsl" | "hsla" | "url") {
             return false;
         }
     }
@@ -565,11 +566,12 @@ fn split_important(value: &str) -> (String, bool) {
 /// el shorthand lo resetea - tambien el orden natural de insercion, sin
 /// logica aparte.
 ///
-/// Solo `background` esta expandido hoy, y solo se extrae de el un COLOR
-/// (el unico sub-valor que `engine-gfx` pinta - ver
-/// `display_list::build_items`, que solo lee `background-color`, nunca
-/// `background`): posicion/repeticion/imagen del shorthand se ignoran sin
-/// error, igual que cualquier propiedad no soportada.
+/// Solo `background` esta expandido hoy, y solo se extraen de el un COLOR
+/// y una IMAGEN (`url(...)`, Fase 40) - los dos sub-valores que
+/// `engine-gfx` pinta (ver `display_list::build_items`, que lee
+/// `background-color`/`background-image`, nunca `background` en si):
+/// posicion/repeticion/tamaño del shorthand se ignoran sin error, igual
+/// que cualquier propiedad no soportada.
 ///
 /// **Este modulo no sabe que es un color, y a proposito**: la tabla de
 /// nombres y el parseo de `rgb()`/hex viven en `engine-gfx`
@@ -583,6 +585,9 @@ fn insert_declaration(declarations: &mut HashMap<String, String>, name: String, 
     if name == "background" {
         if let Some(color) = background_color_candidate(&value) {
             declarations.insert("background-color".to_string(), color);
+        }
+        if let Some(image) = background_image_candidate(&value) {
+            declarations.insert("background-image".to_string(), image);
         }
     }
     if name == "padding" || name == "margin" {
@@ -710,6 +715,20 @@ fn background_color_candidate(value: &str) -> Option<String> {
     trimmed.split_whitespace().find(|token| token.starts_with('#')).map(str::to_string)
 }
 
+/// Extrae el `url(...)` de un valor `background` (Fase 40) - a diferencia
+/// de `background_color_candidate`, que solo busca un TOKEN completo
+/// (partido por espacios), aqui hace falta el tramo entre `url(` y su `)`
+/// tal cual, porque una URL entre comillas puede contener espacios
+/// (`url("mi imagen.png")`). No distingue `url(...)` de `linear-gradient(...)`
+/// ni otras funciones de imagen - solo `url()` esta soportado, igual que
+/// `background-image` longhand (ver `insert_declaration`).
+fn background_image_candidate(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let start = lower.find("url(")?;
+    let rel_end = value[start..].find(')')?;
+    Some(value[start..start + rel_end + 1].to_string())
+}
+
 pub struct CssParser;
 
 impl CssParser {
@@ -772,11 +791,30 @@ mod tests {
     /// Un valor de `background` sin ningun color hex (posicion/repeticion/
     /// una imagen sin color de respaldo) no deberia inventarse un
     /// `background-color` de la nada - simplemente no hay color que
-    /// extraer, igual que hoy no hay soporte de `background-image`.
+    /// extraer.
     #[test]
     fn background_shorthand_without_a_hex_color_does_not_fabricate_one() {
         let sheet = CssParser::parse("div { background: no-repeat center; }");
         assert_eq!(sheet.rules[0].declarations.get("background-color"), None);
+    }
+
+    /// `background-image` (Fase 40): el shorthand tambien extrae el
+    /// `url(...)`, no solo el color - es lo que permite que `background:
+    /// url(x.png) no-repeat;` (sin ningun color de respaldo) pinte la
+    /// imagen igual que si el autor hubiera escrito el longhand.
+    #[test]
+    fn background_shorthand_extracts_a_url_even_without_any_color() {
+        let sheet = CssParser::parse("div { background: url(x.png) no-repeat; }");
+        assert_eq!(sheet.rules[0].declarations.get("background-image").map(String::as_str), Some("url(x.png)"));
+        assert_eq!(sheet.rules[0].declarations.get("background-color"), None);
+    }
+
+    /// Una URL entre comillas puede llevar espacios dentro - partir por
+    /// espacios (como hace la busqueda de color) la destrozaria.
+    #[test]
+    fn background_shorthand_url_keeps_spaces_inside_quotes_intact() {
+        let sheet = CssParser::parse(r#"div { background: url("mi imagen.png") repeat; }"#);
+        assert_eq!(sheet.rules[0].declarations.get("background-image").map(String::as_str), Some(r#"url("mi imagen.png")"#));
     }
 
     /// Desde que `engine-gfx` entiende nombres de color, el shorthand
@@ -817,6 +855,7 @@ mod tests {
     fn background_shorthand_with_an_image_still_finds_a_hex_color() {
         let sheet = CssParser::parse("div { background: #ff0000 url(x.png) no-repeat; }");
         assert_eq!(sheet.rules[0].declarations.get("background-color").map(String::as_str), Some("#ff0000"));
+        assert_eq!(sheet.rules[0].declarations.get("background-image").map(String::as_str), Some("url(x.png)"), "el color y la imagen se extraen los dos del mismo shorthand, no uno a costa del otro");
     }
 
     /// Dentro de la MISMA regla, la propiedad declarada DESPUES gana -
@@ -916,6 +955,10 @@ mod tests {
         assert!(
             cond("@supports (mask-image: none) { a { color: red; } }").never_matches,
             "una propiedad que el motor no aplica se responde honestamente como no soportada"
+        );
+        assert!(
+            !cond("@supports (background-image: url(x.png)) { a { color: red; } }").never_matches,
+            "background-image con url() (Fase 40) ya se soporta de verdad"
         );
     }
 

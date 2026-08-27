@@ -43,7 +43,9 @@ pub fn render_layout_to_png(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_image::DecodedImage;
     use engine_layout::BoxType;
+    use std::sync::Arc;
 
     /// **La garantia de correccion del descarte por viewport (Fase 5)**:
     /// pintar una pagina larga tiene que dar EXACTAMENTE los mismos
@@ -176,5 +178,59 @@ mod tests {
 
         let png = render_layout_to_png(&root, None, &engine_layout::ImageMap::new(), 200, 150, 0.0).expect("PNG should encode");
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    /// Fase 40, el punto real de `background-image`: el mosaico tiene que
+    /// pintar pixeles DE VERDAD, repetidos - no basta con que no haga
+    /// panic. Un pixel lejos de la esquina superior-izquierda (35,35 en
+    /// una caja de 40x40 con un tile de 2x2) solo puede ser rojo si el
+    /// tile se repitio de verdad hasta llegar ahi.
+    #[test]
+    fn a_background_image_tiles_a_solid_color_across_its_box() {
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.dimensions.width = 40.0;
+        root.dimensions.height = 40.0;
+        root.computed_style.insert("background-image".to_string(), "url(tile.png)".to_string());
+
+        let mut images = engine_layout::ImageMap::new();
+        images.insert("tile.png".to_string(), Arc::new(DecodedImage { width: 2, height: 2, rgba: [255u8, 0, 0, 255].repeat(4) }));
+
+        let png = render_layout_to_png(&root, None, &images, 40, 40, 0.0).expect("PNG should encode");
+        let pixmap = Pixmap::decode_png(&png).expect("deberia decodificar el PNG");
+        let far_pixel = pixmap.pixel(35, 35).expect("pixel dentro del pixmap");
+        assert_eq!((far_pixel.red(), far_pixel.green(), far_pixel.blue()), (255, 0, 0), "el mosaico deberia seguir repitiendose lejos de la esquina superior-izquierda");
+    }
+
+    /// La razon real de reconstruir la mascara con el propio `rect` metido
+    /// (ver el doc-comment de `DisplayItem::BackgroundImage` en
+    /// `paint.rs`): un tile MAS GRANDE que la caja no deberia derramarse
+    /// sobre el resto de la pagina. Sin ese recorte propio, `draw_pixmap`
+    /// pintaria el tile entero sin respetar el borde de una caja mas
+    /// pequeña que el.
+    #[test]
+    fn a_background_image_larger_than_its_box_does_not_bleed_past_its_own_edges() {
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.dimensions.width = 40.0;
+        root.dimensions.height = 40.0;
+
+        let mut small_box = LayoutBox::new(BoxType::Block);
+        small_box.dimensions.x = 5.0;
+        small_box.dimensions.y = 5.0;
+        small_box.dimensions.width = 10.0;
+        small_box.dimensions.height = 10.0;
+        small_box.computed_style.insert("background-image".to_string(), "url(big.png)".to_string());
+        root.children.push(small_box);
+
+        let mut images = engine_layout::ImageMap::new();
+        images.insert("big.png".to_string(), Arc::new(DecodedImage { width: 30, height: 30, rgba: [0u8, 200, 0, 255].repeat(30 * 30) }));
+
+        let png = render_layout_to_png(&root, None, &images, 40, 40, 0.0).expect("PNG should encode");
+        let pixmap = Pixmap::decode_png(&png).expect("deberia decodificar el PNG");
+        let outside = pixmap.pixel(30, 30).expect("pixel dentro del pixmap");
+        assert_ne!(
+            (outside.red(), outside.green(), outside.blue()),
+            (0, 200, 0),
+            "el mosaico no deberia derramarse fuera de su propia caja aunque el tile sea mas grande que ella"
+        );
     }
 }

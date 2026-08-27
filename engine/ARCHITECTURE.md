@@ -3938,3 +3938,74 @@ Anadidas (sonda 22/28 -> 26/28):
   este documento dice que no hay que reimplementar.
 
 **Tests del Workspace**: 703 pasando, 0 fallando, en los 10 crates.
+
+### Fase 40: `background-image` real, y `window` como `EventTarget` completo (2026-08-27)
+
+Cierre de los huecos que quedaron documentados tras la auditoria de 47
+simplificaciones (ver `huecos_sin_resolver.md`): dos hallazgos concretos, no
+una fase de exploracion.
+
+#### `window` no era un `EventTarget` completo
+
+`document.addEventListener('scroll', ...)` ya disparaba de verdad, pero
+`window.addEventListener('scroll'|'resize', ...)` y `window.dispatchEvent`
+no. La causa: `history.rs` (Fase 7) ya reasignaba `window.addEventListener`/
+`removeEventListener` para delegar en `document.documentElement` (lo que
+necesitaba `popstate`), pero `core::server` disparaba los eventos de scroll/
+resize sobre `dom_root`, que nunca hace bubbling hasta `documentElement` (es
+un HIJO suyo, no un ancestro). Arreglado retargeteando el dispatch a
+`documentElement` - el mismo nodo que `fire_popstate` ya usaba - para que la
+burbuja llegue a los dos sitios (`window` y `document`) a la vez.
+
+#### `background-image`: nunca existio, ni el longhand ni el shorthand
+
+Verificado antes de tocar nada: cero referencias a `background-image` en
+`engine-gfx`/`engine-layout` - ni siquiera el longhand se pintaba, aunque el
+parser ya lo guardara como cualquier propiedad no reconocida.
+
+- **`engine-css/parser.rs`**: `insert_declaration` ahora tambien extrae un
+  `url(...)` del shorthand `background` (antes solo extraia color) -
+  `background_image_candidate` busca el tramo entre `url(` y su `)` tal
+  cual, no por token partido por espacios (una URL entre comillas puede
+  llevar espacios dentro). `@supports (background-image: url(...))`
+  actualizado a la vez - antes habria mentido diciendo que no se soportaba.
+- **Descubrimiento y descarga**: mismo patron que `<img src>`
+  (`find_image_srcs`/`fetch_images`), pero las URLs de fondo no estan en el
+  DOM sino en el CSS YA ENSAMBLADO (`<style>` en linea + hojas externas) -
+  por eso `find_background_image_urls`/`find_inline_style_css`
+  (`pipeline.rs`) solo pueden correr DESPUES de que `core::server` descargue
+  las hojas externas, al reves que el resto del descubrimiento (que ocurre
+  todo de golpe antes de descargar nada). Se añaden a la MISMA lista que
+  `<img src>` para reusar el mismo `ImageMap`, el mismo decode y el mismo
+  filtro `img-src` de CSP (una imagen de fondo es tan "imagen" como un
+  `<img>` para el spec).
+- **Pintado** (`DisplayItem::BackgroundImage`, `image_paint::
+  paint_background_image`): tamaño NATURAL en mosaico infinito
+  (`background-repeat: repeat` + `background-size: auto`, los dos valores
+  iniciales reales - no se leen otros valores de ninguna de las dos
+  propiedades). El detalle que no era obvio: un mosaico tiene que recortarse
+  a SU PROPIA caja, no solo a la de un `overflow: hidden` ancestro - a
+  diferencia de `fill_rect`/`paint_image` (que nunca pintan mas alla de su
+  propio `rect` aunque no haya mascara activa), `draw_pixmap` pinta el tile
+  entero sin respetar ningun borde. Se reconstruye la mascara con el propio
+  `rect` metido en la pila de recorte activa antes de pintar. Tope de 8192
+  tiles por caja (no hipotetico: una textura de pocos pixeles repetida sobre
+  una caja grande es un patron real de fondos baratos).
+- **No implementado, a proposito**: `background-position`,
+  `background-size` con valores explicitos, `background-repeat` con
+  variantes (`repeat-x`/`no-repeat`/...), multiples capas de fondo, y
+  funciones de imagen que no sean `url()` (`linear-gradient()`...). El
+  candidato real siguiente es `background-image` sobre `linear-gradient()`
+  o `background-size`/`background-position` explicitos - no `list-style-
+  image` (evaluado y descartado, ver `huecos_sin_resolver.md`: necesitaria
+  esta MISMA infraestructura, que ahora ya existe, pero es un caso mucho mas
+  raro en CSS real).
+
+Verificado en vivo contra `engine_server.exe` (release): shorthand
+`background: <color> url(...) no-repeat` (el color queda tapado por la
+imagen, correcto - la imagen pinta ENCIMA), longhand `background-color` +
+`background-image` por separado, y un mosaico deliberadamente mas grande
+que su caja dentro de un `overflow: hidden` mas pequeño todavia - las tres
+capturas correctas, sin derrame.
+
+**Tests del Workspace**: 805 pasando, 0 fallando, en los 10 crates.

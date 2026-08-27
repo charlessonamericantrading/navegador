@@ -324,9 +324,85 @@ pub fn find_image_srcs(dom_root: &Arc<RwLock<Node>>) -> Vec<String> {
         .collect()
 }
 
+/// Concatena el texto de cada `<style>` del documento, en orden - mismo
+/// bucle exacto que `build_page_keeping_runtime` usa internamente para
+/// construir `combined_css` (Fase 40: se necesita ANTES de esa llamada,
+/// para descubrir `url(...)` de `background-image` que hay que descargar
+/// primero). Quien llama decide si CSP permite `<style>` en linea
+/// (`csp.allows_inline("style-src")`) - esta funcion es pura y no sabe
+/// nada de CSP, igual que `find_image_srcs`.
+pub fn find_inline_style_css(dom_root: &Arc<RwLock<Node>>) -> String {
+    let mut combined = String::new();
+    for style_tag in &Node::find_all_by_tag(dom_root, "style") {
+        combined.push_str(&Node::text_content(style_tag));
+        combined.push('\n');
+    }
+    combined
+}
+
+/// Devuelve cada `url(...)` declarado en `background`/`background-image`
+/// del CSS ya ensamblado (Fase 40) - mismo patron que `find_image_srcs`:
+/// pura, sin red, quien llama (`core::server`) la resuelve/descarga/
+/// decodifica antes de construir el `ImageMap`, reusando exactamente el
+/// mismo mapa y el mismo `img-src` de CSP que ya gobierna `<img src>` (una
+/// imagen de fondo es tan "imagen" como un `<img>` para el spec de CSP).
+/// Solo lee `background-image` - ya viene expandida ahi tanto si el autor
+/// escribio el longhand como el shorthand `background: ... url(...) ...`
+/// (ver `engine_css::parser::insert_declaration`), asi que no hace falta
+/// mirar las dos claves por separado.
+pub fn find_background_image_urls(css: &str) -> Vec<String> {
+    let sheet = CssParser::parse(css);
+    sheet
+        .rules
+        .iter()
+        .filter_map(|rule| rule.declarations.get("background-image"))
+        .filter_map(|value| extract_url(value))
+        .collect()
+}
+
+/// Extrae la URL "desnuda" (sin `url(...)`/comillas) de un valor
+/// `background-image` ya expandido, p.ej. `url("x.png")` -> `x.png`.
+/// Mismo formato sin resolver que `find_image_srcs` usa para `src` de
+/// `<img>` - asi el mismo `ImageMap` (clave = string sin resolver) sirve
+/// para las dos fuentes de imagen sin distinguir de donde vino cada una.
+fn extract_url(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let start = lower.find("url(")?;
+    let after = &value[start + 4..];
+    let end = after.find(')')?;
+    let inner = after[..end].trim();
+    let inner = inner
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(inner);
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_inline_style_css_concatenates_every_style_tag_in_order() {
+        let dom = HtmlParser::parse("<html><head><style>a{}</style></head><body><style>b{}</style></body></html>");
+        let css = find_inline_style_css(&dom);
+        assert_eq!(css, "a{}\nb{}\n");
+    }
+
+    #[test]
+    fn find_background_image_urls_reads_the_longhand_and_the_shorthand() {
+        let urls = find_background_image_urls(
+            "div { background-image: url(a.png); }\np { background: #fff url(\"b.png\") no-repeat; }",
+        );
+        assert_eq!(urls, vec!["a.png".to_string(), "b.png".to_string()]);
+    }
+
+    #[test]
+    fn find_background_image_urls_ignores_rules_without_one() {
+        let urls = find_background_image_urls("div { color: red; background-color: blue; }");
+        assert!(urls.is_empty());
+    }
 
     #[test]
     fn build_page_runs_the_full_pipeline_without_opening_a_window_or_blocking() {

@@ -52,6 +52,22 @@ pub enum DisplayItem {
     /// en `engine-layout::tree` - no necesariamente el tamaño natural de la
     /// imagen).
     Image { rect: Rect, image: Arc<DecodedImage> },
+    /// `background-image`/`background: url(...)` (Fase 40) - a diferencia
+    /// de `Image` (un `<img>`, que ESCALA la imagen al tamaño resuelto por
+    /// el layout, ver su doc-comment), esto pinta la imagen en su TAMAÑO
+    /// NATURAL repetida en mosaico hasta cubrir `rect` entero
+    /// (`background-repeat: repeat` y `background-size: auto`, los dos
+    /// valores iniciales reales del spec - no se leen otros valores de
+    /// ninguna de las dos propiedades todavia). `rect` es el border-box
+    /// completo de la caja (misma superficie que ya pinta
+    /// `background-color`, mismo criterio de `background-clip: border-box`
+    /// por defecto documentado alli), y el mosaico empieza en su esquina
+    /// superior-izquierda (aproxima `background-position: 0% 0%` sobre el
+    /// padding-box, el origen real por defecto - no distingue border-box
+    /// de padding-box). Se pinta DESPUES de `background-color` y ANTES de
+    /// `Border`, igual que el spec real (una imagen de fondo tapa el color
+    /// solido que haya debajo).
+    BackgroundImage { rect: Rect, image: Arc<DecodedImage> },
     /// `box-shadow` (Fase 3.5) - `rect` YA lleva el desplazamiento
     /// (`offset-x`/`offset-y`) aplicado (ver `parse_css_box_shadow`), asi
     /// que quien pinta esto solo rellena `rect` con `color`, ni sabe que
@@ -162,6 +178,9 @@ impl DisplayList {
                 if let Some(color) = layout_box.computed_style.get("background-color").and_then(|v| parse_css_color(v)) {
                     target.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color, radius });
                 }
+                if let Some(image) = parse_css_background_image(&layout_box.computed_style).and_then(|url| images.get(&url)) {
+                    target.push(DisplayItem::BackgroundImage { rect: layout_box.dimensions.clone(), image: image.clone() });
+                }
                 if let Some((width, color)) = parse_css_border(&layout_box.computed_style) {
                     target.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color, radius });
                 }
@@ -176,6 +195,9 @@ impl DisplayList {
                 }
                 if let Some(color) = layout_box.computed_style.get("background-color").and_then(|v| parse_css_color(v)) {
                     target.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color, radius });
+                }
+                if let Some(image) = parse_css_background_image(&layout_box.computed_style).and_then(|url| images.get(&url)) {
+                    target.push(DisplayItem::BackgroundImage { rect: layout_box.dimensions.clone(), image: image.clone() });
                 }
                 let border_width = if let Some((width, color)) = parse_css_border(&layout_box.computed_style) {
                     target.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color, radius });
@@ -924,6 +946,32 @@ fn parse_css_border(computed_style: &HashMap<String, String>) -> Option<(f32, [u
     Some((resolved_width, resolved_color))
 }
 
+/// `background-image` (Fase 40) - extrae la URL "desnuda" (sin
+/// `url(...)`/comillas) de la declaracion ya expandida por la cascada
+/// (`engine_css::parser::insert_declaration` ya deja aqui el `url(...)`
+/// tanto si el autor escribio el longhand como el shorthand `background:
+/// ... url(...) ...`). Mismo formato sin resolver que usa `ImageMap`/
+/// `BoxType::Image` para `<img src>` (ver su doc-comment en
+/// `engine-layout::tree`) - asi `images.get(...)` encuentra la misma
+/// entrada sin importar de cual de las dos fuentes vino. No distingue
+/// `url(...)` de otra funcion de imagen (`linear-gradient(...)`, sin
+/// soportar) - un valor sin `url(` simplemente no encuentra nada, la
+/// misma degradacion honesta de siempre.
+pub(crate) fn parse_css_background_image(computed_style: &HashMap<String, String>) -> Option<String> {
+    let raw = computed_style.get("background-image")?;
+    let lower = raw.to_ascii_lowercase();
+    let start = lower.find("url(")?;
+    let after = &raw[start + 4..];
+    let end = after.find(')')?;
+    let inner = after[..end].trim();
+    let inner = inner
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(inner);
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
 /// `border-radius` (Fase 3.5) - un unico valor en `px`, aplicado a las 4
 /// esquinas por igual (misma simplificacion "un solo numero" que
 /// `padding`/`margin`/`border-width`). `None`/cero/negativo resuelve a
@@ -1187,6 +1235,44 @@ mod tests {
             list.items.iter().any(|item| matches!(item, DisplayItem::Text { text, .. } if text == "hola")),
             "deberia pintar el value resuelto como texto real"
         );
+    }
+
+    /// Fase 40, el punto real de `background-image`: una caja con la
+    /// propiedad declarada Y la imagen ya presente en el `ImageMap` (mismo
+    /// mapa que sirve `<img src>`) deberia emitir `BackgroundImage`, en
+    /// tamaño natural (no escalado como `Image`) y ANTES de `Border` -
+    /// mismo orden real del spec que ya usa `background-color`.
+    #[test]
+    fn a_box_with_a_resolved_background_image_emits_a_background_image_item() {
+        let mut input = LayoutBox::new(BoxType::Block);
+        input.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        input.computed_style.insert("background-image".to_string(), "url(tile.png)".to_string());
+        input.computed_style.insert("border".to_string(), "2px solid black".to_string());
+
+        let mut images = ImageMap::new();
+        images.insert("tile.png".to_string(), Arc::new(DecodedImage { width: 4, height: 4, rgba: vec![255; 4 * 4 * 4] }));
+
+        let list = DisplayList::build(&input, &images);
+
+        let bg_index = list.items.iter().position(|item| matches!(item, DisplayItem::BackgroundImage { rect, .. } if rect.width == 100.0));
+        let border_index = list.items.iter().position(|item| matches!(item, DisplayItem::Border { .. }));
+        assert!(bg_index.is_some(), "deberia emitir BackgroundImage cuando la imagen esta resuelta");
+        assert!(bg_index.unwrap() < border_index.unwrap(), "el fondo se pinta ANTES que el border, igual que background-color");
+    }
+
+    /// Sin la imagen resuelta en el `ImageMap` (fallo de descarga/
+    /// decodificacion, `src` invalido) no deberia inventarse ningun
+    /// rectangulo - mismo criterio que `BoxType::Image` ya aplica para
+    /// `<img>`.
+    #[test]
+    fn a_background_image_url_missing_from_the_map_paints_nothing() {
+        let mut input = LayoutBox::new(BoxType::Block);
+        input.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        input.computed_style.insert("background-image".to_string(), "url(no-existe.png)".to_string());
+
+        let list = DisplayList::build(&input, &ImageMap::new());
+
+        assert!(!list.items.iter().any(|item| matches!(item, DisplayItem::BackgroundImage { .. })));
     }
 
     /// Un placeholder se pinta en gris (`PLACEHOLDER_COLOR`), NO con el
@@ -1511,6 +1597,20 @@ mod tests {
         let mut style = HashMap::new();
         style.insert(key.to_string(), value.to_string());
         style
+    }
+
+    #[test]
+    fn parse_css_background_image_strips_the_url_wrapper_and_quotes() {
+        assert_eq!(parse_css_background_image(&style_with("background-image", "url(x.png)")), Some("x.png".to_string()));
+        assert_eq!(parse_css_background_image(&style_with("background-image", "url(\"x.png\")")), Some("x.png".to_string()));
+        assert_eq!(parse_css_background_image(&style_with("background-image", "url('x.png')")), Some("x.png".to_string()));
+    }
+
+    #[test]
+    fn parse_css_background_image_is_none_without_a_url_function() {
+        assert_eq!(parse_css_background_image(&style_with("background-image", "none")), None);
+        assert_eq!(parse_css_background_image(&style_with("background-image", "linear-gradient(red, blue)")), None, "solo url() esta soportado, no funciones de degradado");
+        assert_eq!(parse_css_background_image(&HashMap::new()), None);
     }
 
     #[test]
