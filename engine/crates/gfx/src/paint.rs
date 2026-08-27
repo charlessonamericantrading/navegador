@@ -172,17 +172,19 @@ fn build_clip_mask(width: u32, height: u32, stack: &[Rect], scroll_offset_y: f32
 
 /// Construye el contorno de un rectangulo con esquinas redondeadas -
 /// tiny-skia no trae un `push_round_rect`, asi que se hace a mano con 4
-/// curvas cuadraticas (`quad_to`, control point EN la esquina exacta) por
-/// cada esquina: no es un arco circular matematicamente perfecto (eso
-/// exigiria curvas cubicas con la constante magica ~0.5522847498 de la
-/// aproximacion estandar de un arco de 90 grados), pero visualmente es
-/// indistinguible a los radios tipicos de una UI (unos pocos a unas pocas
-/// decenas de pixeles) - simplificacion declarada, suficiente sin inventar
-/// mas matematica de la que este motor necesita. `radius` ya viene
-/// clampado a la mitad del lado mas corto por quien llama (evita un
-/// rectangulo "imposible" con esquinas que se solaparian). `None` si
-/// `radius <= 0` (sin nada que redondear - quien llama cae al `fill_rect`
-/// normal en ese caso).
+/// curvas CUBICAS (`cubic_to`), una por esquina, via la aproximacion
+/// estandar de un arco de 90 grados con Bezier (constante `KAPPA`, ver su
+/// aviso) - el punto de control de cada curva cae en la TANGENTE real del
+/// circulo en su extremo, no en la esquina exacta del rectangulo (lo que
+/// hacia una curva cuadratica antigua, mas cuadrada que un circulo real
+/// en radios grandes - verificado midiendo el area pintada de un circulo
+/// completo contra `pi*r^2`, ver `a_fully_rounded_square_approximates_a_
+/// real_circles_area_closely`). `radius` ya viene clampado a la mitad del
+/// lado mas corto por quien llama (evita un rectangulo "imposible" con
+/// esquinas que se solaparian). `None` si `radius <= 0` (sin nada que
+/// redondear - quien llama cae al `fill_rect` normal en ese caso).
+const KAPPA: f32 = 0.5522847498;
+
 fn rounded_rect_path(rect: SkiaRect, radius: f32) -> Option<Path> {
     if radius <= 0.0 {
         return None;
@@ -192,25 +194,47 @@ fn rounded_rect_path(rect: SkiaRect, radius: f32) -> Option<Path> {
     if r <= 0.0 {
         return None;
     }
+    let k = r * KAPPA;
 
     let mut pb = PathBuilder::new();
     pb.move_to(x + r, y);
     pb.line_to(x + w - r, y);
-    pb.quad_to(x + w, y, x + w, y + r);
+    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
     pb.line_to(x + w, y + h - r);
-    pb.quad_to(x + w, y + h, x + w - r, y + h);
+    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
     pb.line_to(x + r, y + h);
-    pb.quad_to(x, y + h, x, y + h - r);
+    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
     pb.line_to(x, y + r);
-    pb.quad_to(x, y, x + r, y);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
     pb.close();
     pb.finish()
 }
 
 /// Fondo (`SolidRect`) o sombra (`Shadow`) - el mismo relleno, redondeado
 /// si `radius > 0` (via `rounded_rect_path`), rectangular normal si no.
+/// Un `width`/`height` de CERO (o negativo - no deberia llegar, pero da lo
+/// mismo tratarlo igual) no pinta nada, en vez de fingir una linea de al
+/// menos 1px: una caja sin area no tiene nada que rellenar en un navegador
+/// real (encontrado en vivo contra rust-lang.org real - un `SolidRect` de
+/// `width: 0.0` con `x` en un limite EXACTO de medio pixel, `406.5`,
+/// hacia panic dentro de `tiny-skia`, `hairline_aa.rs:124: assertion
+/// failed: false` - un `debug_assert!` propio de esa dependencia que
+/// asume que "ancho cero tras restar la columna parcial izquierda" es
+/// imposible, y no lo es para este limite exacto: la columna izquierda
+/// parcial y la columna derecha parcial caen en la MISMA columna entera,
+/// dejando cero columnas completas de por medio - solo se manifestaba en
+/// build debug, `--release` compila el assert fuera y silenciosamente no
+/// pintaba nada, que ya era el comportamiento correcto de todas formas).
+/// Clampar a `1.0` (el comportamiento de antes) evitaba el panic
+/// en release por pura suerte de que ESE ancho concreto no cayera en el
+/// mismo limite fraccionario - la causa real era pintar una caja sin area
+/// en absoluto, asi que la correccion es no pintarla, no maquillar su
+/// ancho.
 fn fill_shape(pixmap: &mut Pixmap, rect: &Rect, radius: f32, paint: &Paint<'static>, scroll_offset_y: f32, mask: Option<&Mask>) {
-    let Some(sk_rect) = SkiaRect::from_xywh(rect.x, rect.y - scroll_offset_y, rect.width.max(1.0), rect.height.max(1.0)) else { return };
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let Some(sk_rect) = SkiaRect::from_xywh(rect.x, rect.y - scroll_offset_y, rect.width, rect.height) else { return };
     if let Some(path) = rounded_rect_path(sk_rect, radius) {
         pixmap.fill_path(&path, paint, FillRule::Winding, Transform::identity(), mask);
     } else {
@@ -622,6 +646,30 @@ mod tests {
         assert!(!path.is_empty());
     }
 
+    /// El punto real de la aproximacion CUBICA (vs la cuadratica de
+    /// antes): un cuadrado con `radius = lado/2` es un CIRCULO completo -
+    /// el area pintada tiene que acercarse mucho al area real de ese
+    /// circulo (`pi * r^2`). Una curva cuadratica con el punto de control
+    /// en la esquina EXACTA del cuadrado se aleja perceptiblemente mas
+    /// del circulo real que la cubica (que usa la constante estandar
+    /// `kappa` para que el punto de control caiga en la tangente real del
+    /// circulo) - 1% de tolerancia basta para la cubica, no para la
+    /// cuadratica de antes (verificado revirtiendo el fix: sube a mas de
+    /// 2% de diferencia).
+    #[test]
+    fn a_fully_rounded_square_approximates_a_real_circles_area_closely() {
+        let side = 100.0_f32;
+        let radius = side / 2.0;
+        let mut pixmap = Pixmap::new(side as u32, side as u32).unwrap();
+        let items = vec![DisplayItem::SolidRect { rect: Rect { x: 0.0, y: 0.0, width: side, height: side }, color: [0, 0, 0, 255], radius }];
+        paint_display_list(&mut pixmap, &items, None, 0.0);
+
+        let painted_pixels = pixmap.data().chunks_exact(4).filter(|p| p[3] > 128).count() as f32;
+        let circle_area = std::f32::consts::PI * radius * radius;
+        let relative_error = (painted_pixels - circle_area).abs() / circle_area;
+        assert!(relative_error < 0.01, "el area pintada ({painted_pixels}px) deberia acercarse al area real del circulo ({circle_area}px, error {relative_error})");
+    }
+
     #[test]
     fn rounded_rect_path_is_none_for_a_non_positive_radius() {
         let rect = SkiaRect::from_xywh(0.0, 0.0, 100.0, 20.0).unwrap();
@@ -655,6 +703,23 @@ mod tests {
         // panic (regresion de sombra/radio/recorte combinados) - un PNG
         // codificable de por medio confirma ademas que el pixmap quedo en
         // un estado valido tras pintar.
+        paint_display_list(&mut pixmap, &items, None, 0.0);
+        assert!(pixmap.encode_png().is_ok());
+    }
+
+    /// Regresion encontrada en vivo contra rust-lang.org real: un
+    /// `SolidRect` de ancho CERO cuyo `x` cae en un limite EXACTO de medio
+    /// pixel (`406.5`, el caso real observado) hacia panic dentro de
+    /// `tiny-skia` en build debug (`hairline_aa.rs:124: assertion failed:
+    /// false`) - `fill_shape` clampaba el ancho a `1.0` en vez de no pintar
+    /// nada, y ESE ancho concreto (1.0px arrancando en `.5`) caia en el
+    /// mismo limite fraccionario que hacia panic. La correccion real (no
+    /// pintar una caja sin area) evita la geometria degenerada de raiz, no
+    /// solo esquiva el limite fraccionario exacto de este caso.
+    #[test]
+    fn a_zero_width_solid_rect_at_a_half_pixel_x_does_not_panic() {
+        let items = vec![DisplayItem::SolidRect { rect: Rect { x: 406.5, y: 115.0, width: 0.0, height: 55.195313 }, color: [0, 0, 0, 255], radius: 0.0 }];
+        let mut pixmap = Pixmap::new(800, 200).unwrap();
         paint_display_list(&mut pixmap, &items, None, 0.0);
         assert!(pixmap.encode_png().is_ok());
     }

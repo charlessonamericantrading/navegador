@@ -8,21 +8,20 @@
 //! el documento termine de cargar. Sin ellos, la mayoria de paginas con JS
 //! se quedaban a medio inicializar sin ningun error visible.
 //!
-//! ## Como avanza el tiempo aqui (la simplificacion que mas importa)
+//! ## Como avanza el tiempo aqui
 //!
-//! Un navegador real tiene un bucle de eventos con un reloj propio: un
-//! temporizador vencido se ejecuta aunque nadie toque nada. **Este motor no
-//! tiene ese reloj**: los temporizadores vencidos corren cuando
-//! `JsRuntime::run_due_timers` se llama, y quien la llama es
-//! `core::server` despues de cada operacion real (cargar una pagina, un
-//! clic, escribir, una tecla).
-//!
-//! Consecuencia honesta: un `setTimeout(fn, 100)` puesto durante la carga
-//! SI se ejecuta (la propia carga lo dispara al terminar, y 100ms ya
-//! pasaron para cuando el usuario interactua), pero un reloj que se
-//! actualice solo cada segundo con la pagina quieta NO avanza hasta que el
-//! usuario haga algo. Cubre el uso dominante real - diferir inicializacion,
-//! reaccionar a una interaccion - no la animacion continua.
+//! `JsRuntime` en si no tiene reloj propio: los temporizadores vencidos
+//! corren cuando `JsRuntime::run_due_timers` se llama, y quien la llama es
+//! `core::server` - tanto tras cada operacion real (cargar una pagina, un
+//! clic, escribir, una tecla) COMO cada 250ms de fondo
+//! (`EngineServer::tick_active_tab_timers`, via `tokio::select!` en
+//! `run_stdio` - no bloquea la lectura de comandos NDJSON mientras
+//! tanto). Con el tick de fondo, un reloj que se actualice cada segundo
+//! con la pagina quieta SI avanza sin que el usuario haga nada - cubre
+//! tambien la animacion/sondeo continuo, no solo diferir inicializacion o
+//! reaccionar a una interaccion. Granularidad de 250ms, no un reloj
+//! continuo: un `setInterval(fn, 16)` (60fps) sigue sin poder dispararse
+//! a su cadencia real.
 //!
 //! ## Orden de ejecucion
 //!

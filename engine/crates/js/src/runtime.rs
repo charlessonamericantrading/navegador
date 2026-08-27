@@ -145,11 +145,14 @@ impl JsRuntime {
     /// se invocaron - cero si no hay ninguno vencido o si
     /// `register_timers` nunca corrio.
     ///
-    /// Este motor no tiene un reloj de fondo propio: es esta llamada la
-    /// que hace avanzar el tiempo de los temporizadores, y quien la hace
-    /// es `core::server` tras cada operacion real (cargar, clic, escribir,
-    /// tecla). Ver el doc-comment de `crate::timers` para la consecuencia
-    /// exacta de esa simplificacion.
+    /// Este `JsRuntime` no tiene un reloj de fondo propio - la fuente de
+    /// tiempo real vive en `core::server`, no aqui: ademas de tras cada
+    /// operacion real (cargar, clic, escribir, tecla), `run_stdio` llama a
+    /// esto cada 250ms via `EngineServer::tick_active_tab_timers`
+    /// (`tokio::select!` contra el temporizador, sin bloquear la lectura
+    /// de comandos NDJSON) - asi que un `setInterval` SI dispara por si
+    /// solo en el producto real, sin depender de que llegue otro comando
+    /// mientras tanto.
     ///
     /// El valor devuelto le sirve a quien llama para saber si merece la
     /// pena rehacer el layout: si no disparo ningun callback, nada pudo
@@ -234,12 +237,23 @@ impl JsRuntime {
     /// listeners reales registrados via `addEventListener` - SIN pasar
     /// por texto JS (`eval`). Pensada para invocarse desde codigo Rust
     /// cuando el motor tiene una fuente de eventos real que traducir a un
-    /// nodo del DOM: el clic del raton ya esta cableado asi de punta a
-    /// punta (`gfx::window` reporta `MouseInput`/`CursorMoved`,
+    /// nodo del DOM. Para el arnes de pruebas standalone (`core::main`,
+    /// NO el camino real del producto): solo el clic esta cableado asi de
+    /// punta a punta (`gfx::window` reporta `MouseInput`/`CursorMoved`,
     /// `core::main` hace hit-test sobre el `LayoutBox` real y llama aqui,
-    /// ver ARCHITECTURE.md "Clic real del SO cableado de punta a punta") -
-    /// scroll/teclado todavia no tienen fuente equivalente. No-op honesto
-    /// (no un panic, `Ok(false)`) si `bind_dom` no se ha llamado todavia.
+    /// ver ARCHITECTURE.md "Clic real del SO cableado de punta a punta").
+    ///
+    /// Para el producto real (`engine_server.exe` via NDJSON,
+    /// `core::server`): clic, teclado (`PressKey` -> `dispatch_keyboard_event`,
+    /// con `.key` real puesto) Y scroll (`Scroll` -> este metodo con
+    /// `event_type: "scroll"` sobre `document`) SI estan cableados de
+    /// punta a punta. Lo que sigue faltando es que `window` sea un
+    /// `EventTarget` completo (`window.addEventListener('scroll'|'resize',
+    /// ...)` no existe todavia, ver `crate::window`) - `document.
+    /// addEventListener(...)` si funciona para esos mismos eventos.
+    ///
+    /// No-op honesto (no un panic, `Ok(false)`) si `bind_dom` no se ha
+    /// llamado todavia.
     ///
     /// Devuelve si algun listener llamo `event.preventDefault()` (Fase
     /// 4.2) - ver el doc-comment de `DomBindings::dispatch_event`.

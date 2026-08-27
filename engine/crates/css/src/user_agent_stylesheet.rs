@@ -19,14 +19,18 @@
 //!   ARCHITECTURE.md; subrayado real desde la Fase 29, ver
 //!   `DisplayItem::Text::underline` en `engine-gfx::display_list`) - el
 //!   subrayado por defecto de `<a>` es el caso que mas se nota.
-//! - `<li>` declara `display: list-item` (Fase 40) - una vineta real
-//!   (`•`, o el numero+punto si su padre es `<ol>`) se antepone a su
-//!   contenido, ver `place_list_marker` en `engine-layout::tree`.
-//!   `margin-left: 24px` le da hueco donde "colgar" (el marcador se pinta
-//!   FUERA de su propia caja de contenido, en ese margen - equivalente
-//!   honesto-minimo de `list-style-position: outside`, el valor inicial
-//!   real). Solo bala/numero simple: sin `list-style-type` propio
-//!   (`square`/`circle`/`lower-roman`...), sin `list-style-image`.
+//! - `<li>` declara `display: list-item` (Fase 40) - una vineta real se
+//!   antepone a su contenido, ver `place_list_marker`/`list_marker_text`
+//!   en `engine-layout::tree`. `list-style-type` (heredable, propio o
+//!   del `<ul>`/`<ol>` ancestro) SI se lee: `disc`/`circle`/`square`
+//!   (balas), `decimal`/`decimal-leading-zero`/`lower-roman`/
+//!   `upper-roman`/`lower-alpha`/`upper-alpha` (numerados, con la formula
+//!   real de sustraccion para romanos y numeracion bijective real para
+//!   alfa - no una tabla de casos sueltos). `margin-left: 24px` le da
+//!   hueco donde "colgar" (el marcador se pinta FUERA de su propia caja
+//!   de contenido, en ese margen - equivalente honesto-minimo de
+//!   `list-style-position: outside`, el valor inicial real). Sin
+//!   `list-style-image`.
 //! - `table`/`tr`/`td`/`th` (Fase 3.4) SI tienen su `display` real
 //!   (`table`/`table-row`/`table-cell` - ver `flow_table_children` en
 //!   `engine-layout::tree`), pero sin `thead`/`tbody`/`tfoot` con rol propio

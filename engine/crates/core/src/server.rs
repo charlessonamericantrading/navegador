@@ -243,7 +243,10 @@ impl EngineServer {
         Self {
             width: 1280,
             height: 720,
-            network: std::sync::Arc::new(NetworkEngine::new()),
+            // Cookies persistentes a disco - mismo criterio que
+            // `WebStorage::load_from_disk` justo abajo: recupera la sesion
+            // de una carga anterior del mismo perfil.
+            network: std::sync::Arc::new(NetworkEngine::with_persistent_cookies()),
             // Fase 25: `load_from_disk`, no `new()` - recupera el `local`
             // de una sesion anterior del mismo perfil. `session` sigue
             // vacio siempre (ver el aviso de `WebStorage::load_from_disk`).
@@ -261,6 +264,35 @@ impl EngineServer {
 
     fn active_tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active_tab]
+    }
+
+    /// El reloj de fondo real (ver el aviso de `run_stdio`) - se llama
+    /// periodicamente desde una tarea de Tokio aparte, no desde ningun
+    /// comando NDJSON. Solo la pestaña ACTIVA (no todas): una pestaña en
+    /// segundo plano no se esta pintando, tiquearla igual seria trabajo
+    /// tirado (mismo criterio que un navegador real, que tambien
+    /// despriorizca temporizadores de pestañas en segundo plano) - si el
+    /// usuario cambia a ella mas tarde, `switch_tab` ya relayoutea esa
+    /// pestaña por su cuenta.
+    ///
+    /// `run_due_timers()` se llama DIRECTO (no via `relayout`, que lo haria
+    /// de nuevo) solo para decidir barato si merece la pena pagar un
+    /// relayout completo - la inmensa mayoria de los pulsos de este reloj
+    /// no tendran ningun temporizador vencido. Que `relayout()` vuelva a
+    /// comprobar temporizadores vencidos justo despues es inofensivo (no
+    /// hay ninguno nuevo que disparar dos veces), no una duplicacion real.
+    fn tick_active_tab_timers(&mut self) {
+        let (w, h) = (self.width, self.height);
+        let tab = self.active_tab_mut();
+        let Some(page) = &mut tab.current_page else { return };
+        if page.runtime.run_due_timers() == 0 {
+            return;
+        }
+        page.relayout(w as f32, h as f32);
+        let content_extent = page.page.layout_root.content_extent();
+        let scrolled = clamp_scroll_offset(tab.scroll_offset_y, content_extent, h as f32);
+        page.publish_scroll_offset(scrolled);
+        tab.scroll_offset_y = scrolled;
     }
 
     fn ready_response(&self, id: Option<String>) -> EngineResponse {
@@ -307,14 +339,39 @@ impl EngineServer {
             EngineRequest::GetState { .. } => (self.state_response(id), false),
             EngineRequest::Click { x, y, .. } => (self.click(id, x, y).await, false),
             EngineRequest::Scroll { dy, .. } => {
-                let h = self.height;
+                let (w, h) = (self.width, self.height);
                 let tab = self.active_tab_mut();
-                if let Some(page) = &tab.current_page {
+                if let Some(page) = &mut tab.current_page {
                     let content_extent = page.page.layout_root.content_extent();
                     let scrolled = clamp_scroll_offset(tab.scroll_offset_y + dy as f32, content_extent, h as f32);
                     // Fase 8: `getBoundingClientRect` devuelve coordenadas
                     // de VIEWPORT, asi que el snapshot necesita saber
                     // cuanto se ha desplazado el documento.
+                    page.publish_scroll_offset(scrolled);
+                    tab.scroll_offset_y = scrolled;
+
+                    // Evento `scroll` real: el desplazamiento de arriba YA
+                    // era real (`getBoundingClientRect` ya lo reflejaba),
+                    // lo que faltaba era que un listener JS se enterara.
+                    // `document` (`dom_root`) es un EventTarget completo y
+                    // probado - `document.addEventListener('scroll', ...)`
+                    // funciona. `window` TODAVIA no es un EventTarget en
+                    // este motor (ver `engine_js::window`), asi que
+                    // `window.addEventListener('scroll', ...)` sigue sin
+                    // dispararse - hueco declarado, no de esta tarea.
+                    let dom_root = page.page.dom_root.clone();
+                    if let Err(error) = page.runtime.dispatch_event(&dom_root, "scroll") {
+                        return (Self::error(id, format!("scroll_event_error: {error}")), false);
+                    }
+                    // Un listener de scroll puede mutar el DOM (el patron
+                    // real de "infinite scroll": cargar mas contenido al
+                    // acercarse al final) - mismo criterio que `click`/
+                    // `press_key`: relayout despues de dispatchear, y
+                    // reajustar/republicar el scroll contra el arbol
+                    // fresco (pudo haber crecido o encogido).
+                    page.relayout(w as f32, h as f32);
+                    let content_extent = page.page.layout_root.content_extent();
+                    let scrolled = clamp_scroll_offset(tab.scroll_offset_y, content_extent, h as f32);
                     page.publish_scroll_offset(scrolled);
                     tab.scroll_offset_y = scrolled;
                 }
@@ -1660,14 +1717,17 @@ fn is_radio(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> bool {
 /// 2. **Un radio desmarca a su grupo**: los demas `input[type=radio]` con
 ///    el MISMO `name` pierden su `checked`.
 ///
-/// El grupo se busca en el documento ENTERO, no dentro del `<form>` que
-/// contenga al radio - simplificacion declarada: el spec real agrupa por
-/// "form owner", asi que dos formularios distintos en la misma pagina que
-/// reutilicen el mismo `name` se pisarian entre si aqui y no deberian.
-/// Poco comun en paginas reales (reutilizar el mismo `name` en dos
-/// formularios de la misma pagina es raro y casi siempre un error), y
-/// arreglarlo exige un concepto de "form owner" que este motor todavia no
-/// tiene.
+/// El grupo se agrupa por "form owner" (§ del spec real): mismo `name` Y
+/// mismo `<form>` ancestro mas cercano (via `find_form_ancestor`) - dos
+/// radios sin NINGUN `<form>` ancestro tambien se agrupan entre si (ambos
+/// tienen "sin dueño" como form owner, que sigue siendo el MISMO valor).
+/// Antes se agrupaba por `name` a secas en el documento ENTERO, asi que
+/// dos formularios distintos que reutilizaran el mismo `name` se pisaban
+/// entre si - poco comun en paginas reales, pero un formulario real no
+/// puede alcanzar ese estado por clics del usuario. Simplificacion que
+/// SIGUE declarada: no resuelve el atributo `form="id-de-otro-form"` (un
+/// radio puede pertenecer a un `<form>` que no sea su ancestro via ese
+/// atributo, caso mas raro todavia) - solo el ancestro mas cercano.
 ///
 /// Un radio SIN `name` (o con el `name` vacio) no forma grupo con nadie:
 /// se marca el solo, sin tocar a ningun otro - igual que el spec real,
@@ -1681,11 +1741,17 @@ fn apply_checkable_click(
         return;
     }
     if let Some(group) = input_name(node) {
+        let form_owner = find_form_ancestor(node);
+        let same_form_owner = |other: &std::sync::Arc<std::sync::RwLock<Node>>| match (&form_owner, find_form_ancestor(other)) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, &b),
+            (None, None) => true,
+            _ => false,
+        };
         for other in Node::find_all_by_tag(dom_root, "input") {
             if std::sync::Arc::ptr_eq(&other, node) {
                 continue;
             }
-            if is_radio(&other) && input_name(&other).as_deref() == Some(group.as_str()) {
+            if is_radio(&other) && input_name(&other).as_deref() == Some(group.as_str()) && same_form_owner(&other) {
                 set_checked(&other, false);
             }
         }
@@ -1998,27 +2064,47 @@ pub async fn run_stdio() -> io::Result<()> {
 
     write_response(&mut stdout, server.ready_response(Some("boot".to_string()))).await?;
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
+    // Reloj de fondo real (ver el aviso de `EngineServer::
+    // tick_active_tab_timers`): antes de esto, un `setTimeout`/
+    // `setInterval` solo avanzaba cuando llegaba un comando NDJSON nuevo
+    // (clic, tecla, navegar, redimensionar...). NO se reparte en una
+    // tarea de Tokio aparte (`tokio::spawn`) - Boa usa `Rc` internamente
+    // (su `Context` no es `Send`), asi que `EngineServer` tampoco lo es y
+    // ninguna tarea separada podria tocarlo. `tokio::select!` dentro de
+    // este MISMO bucle consigue el mismo efecto (reaccionar a "paso el
+    // tiempo" sin bloquear la lectura de la siguiente linea) sin
+    // necesitar compartir nada entre tareas.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
 
-        let response = match serde_json::from_str::<EngineRequest>(&line) {
-            Ok(request) => {
-                let (response, should_shutdown) = server.handle(request).await;
-                write_response(&mut stdout, response).await?;
-                if should_shutdown {
-                    break;
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Some(line) = line? else { break };
+                if line.trim().is_empty() {
+                    continue;
                 }
-                continue;
-            }
-            Err(error) => EngineResponse::Error {
-                id: None,
-                message: format!("invalid_request: {error}"),
-            },
-        };
 
-        write_response(&mut stdout, response).await?;
+                let response = match serde_json::from_str::<EngineRequest>(&line) {
+                    Ok(request) => {
+                        let (response, should_shutdown) = server.handle(request).await;
+                        write_response(&mut stdout, response).await?;
+                        if should_shutdown {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(error) => EngineResponse::Error {
+                        id: None,
+                        message: format!("invalid_request: {error}"),
+                    },
+                };
+
+                write_response(&mut stdout, response).await?;
+            }
+            _ = tick.tick() => {
+                server.tick_active_tab_timers();
+            }
+        }
     }
 
     Ok(())
@@ -2311,6 +2397,83 @@ mod tests {
         assert_eq!(clamp_scroll_offset(-100.0, 2000.0, 720.0), 0.0);
         assert_eq!(clamp_scroll_offset(5000.0, 2000.0, 720.0), 1280.0);
         assert_eq!(clamp_scroll_offset(50.0, 400.0, 720.0), 0.0);
+    }
+
+    fn server_with_scrollable_page_and_script(script: &str) -> EngineServer {
+        let html = format!("<html><body style=\"height:4000px\"><script>{script}</script></body></html>");
+        let (page, runtime) = build_page_keeping_runtime(&html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+        let mut server = EngineServer::new();
+        let tab = server.active_tab_mut();
+        tab.current_page = Some(LoadedPage {
+            url: "http://ejemplo.test/".to_string(),
+            title: String::new(),
+            page,
+            runtime,
+            font_set: None,
+            images: ImageMap::new(),
+            focused_node: None,
+        });
+        server
+    }
+
+    /// El punto real de esta tarea: un `document.addEventListener('scroll',
+    /// ...)` real tiene que dispararse cuando llega un comando `Scroll` -
+    /// antes de esto, el desplazamiento de viewport YA era real
+    /// (`getBoundingClientRect` ya lo reflejaba) pero ningun listener JS se
+    /// enteraba nunca.
+    #[tokio::test]
+    async fn scroll_command_fires_a_real_scroll_event_on_document() {
+        let mut server = server_with_scrollable_page_and_script(
+            "var vistoScroll = false; document.addEventListener('scroll', function() { vistoScroll = true; });",
+        );
+        server.handle(EngineRequest::Scroll { id: Some("s1".to_string()), dx: 0, dy: 200 }).await;
+
+        let runtime = &mut server.active_tab_mut().current_page.as_mut().expect("deberia haber pagina").runtime;
+        assert_eq!(runtime.eval("vistoScroll").unwrap(), "true", "el listener 'scroll' de document deberia haberse disparado");
+    }
+
+    /// Un listener de `scroll` puede mutar el DOM (el patron real de
+    /// "infinite scroll") - ese cambio tiene que verse reflejado, no
+    /// perderse hasta la siguiente interaccion.
+    #[tokio::test]
+    async fn a_scroll_listener_that_mutates_the_dom_is_reflected_after_relayout() {
+        let html = "<html><body style=\"height:4000px\"><p id=\"marcador\">antes</p><script>document.addEventListener('scroll', function() { document.getElementById('marcador').textContent = 'despues'; });</script></body></html>";
+        let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+        let mut server = EngineServer::new();
+        let tab = server.active_tab_mut();
+        tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+
+        server.handle(EngineRequest::Scroll { id: Some("s1".to_string()), dx: 0, dy: 200 }).await;
+
+        let page = &server.active_tab().current_page.as_ref().expect("deberia haber pagina").page;
+        let marcador = Node::find_by_id(&page.dom_root, "marcador").expect("deberia existir el marcador");
+        assert_eq!(Node::text_content(&marcador), "despues", "el listener de scroll deberia haber mutado el DOM, y el relayout deberia reflejarlo");
+    }
+
+    /// El punto real del reloj de fondo: un `setTimeout` vencido (delay 0,
+    /// ya vencido en cuanto se registra) dispara SOLO con el tick, sin
+    /// ningun comando NDJSON de por medio - antes de esta tarea, nada
+    /// llamaba nunca a `run_due_timers` fuera de un comando real.
+    #[test]
+    fn tick_active_tab_timers_fires_a_due_timeout_without_any_command() {
+        let html = "<html><body><script>var disparo = false; setTimeout(function() { disparo = true; }, 0);</script></body></html>";
+        let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+        let mut server = EngineServer::new();
+        let tab = server.active_tab_mut();
+        tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+
+        server.tick_active_tab_timers();
+
+        let runtime = &mut server.active_tab_mut().current_page.as_mut().expect("deberia haber pagina").runtime;
+        assert_eq!(runtime.eval("disparo").unwrap(), "true", "el tick deberia haber disparado el setTimeout ya vencido, sin ningun comando NDJSON");
+    }
+
+    /// Una pestaña SIN pagina cargada (recien abierta) no deberia hacer
+    /// panic al recibir un tick - no-op honesto.
+    #[test]
+    fn tick_active_tab_timers_on_an_empty_tab_is_a_silent_no_op() {
+        let mut server = EngineServer::new();
+        server.tick_active_tab_timers();
     }
 
     /// `std::mem::forget(dom)` es deliberado, no un descuido: `Node::parent`
@@ -2771,6 +2934,44 @@ mod tests {
             is_checked(&Node::find_by_id(&root, "caja").unwrap()),
             "un checkbox que comparte name con el grupo NO es parte del grupo de radios y no deberia desmarcarse"
         );
+    }
+
+    /// El punto real del "form owner": dos `<form>` DISTINTOS que
+    /// reutilicen el mismo `name` NO deberian pisarse entre si - antes se
+    /// agrupaba por `name` en el documento entero, asi que marcar un radio
+    /// del segundo formulario desmarcaba al del primero.
+    #[test]
+    fn radios_with_the_same_name_in_different_forms_do_not_share_a_group() {
+        let dom = r#"<html><body>
+            <form id="f1"><input id="a" type="radio" name="opcion" checked></form>
+            <form id="f2"><input id="b" type="radio" name="opcion"></form>
+        </body></html>"#;
+        let root = root_of(dom);
+        let b = Node::find_by_id(&root, "b").expect("deberia existir");
+        apply_checkable_click(&root, &b);
+
+        assert!(is_checked(&b), "el clicado queda marcado");
+        assert!(
+            is_checked(&Node::find_by_id(&root, "a").unwrap()),
+            "un radio de OTRO <form> con el mismo name NO deberia desmarcarse - son grupos distintos (form owner distinto)"
+        );
+    }
+
+    /// Dos radios SIN ningun `<form>` ancestro (mismo `name`, ninguno
+    /// dentro de un formulario) siguen agrupandose entre si - "sin dueño"
+    /// tambien es un form owner, y es el MISMO para los dos.
+    #[test]
+    fn radios_with_no_form_ancestor_at_all_still_share_a_group() {
+        let dom = r#"<html><body>
+            <input id="a" type="radio" name="opcion" checked>
+            <input id="b" type="radio" name="opcion">
+        </body></html>"#;
+        let root = root_of(dom);
+        let b = Node::find_by_id(&root, "b").expect("deberia existir");
+        apply_checkable_click(&root, &b);
+
+        assert!(is_checked(&b));
+        assert!(!is_checked(&Node::find_by_id(&root, "a").unwrap()), "sin ningun <form>, los dos siguen en el mismo grupo (mismo form owner: ninguno)");
     }
 
     #[test]

@@ -20,11 +20,15 @@ pub type ImageMap = HashMap<String, Arc<DecodedImage>>;
 /// Propiedades que SI se propagan de un elemento a sus descendientes cuando
 /// estos no las redefinen (herencia CSS real). Ampliada en la Fase 2.5 a la
 /// lista real de propiedades heredables del spec que tienen sentido para
-/// este motor hoy - se excluyen a proposito las que son especificas de
-/// tablas (`border-collapse`, `border-spacing`, `caption-side`,
-/// `empty-cells` - el motor no tiene layout de tablas, Fase 3.4 pendiente)
-/// y las de paginacion impresa (`orphans`/`widows` - un renderer de
-/// pantalla sin paginacion no tiene "pagina" que romper).
+/// este motor hoy - se excluyen a proposito las especificas de tablas
+/// (`border-collapse`, `border-spacing`, `caption-side`, `empty-cells` -
+/// el layout de tablas (Fase 3.4, y `border-spacing`/`border-collapse`
+/// despues) las lee directo del `computed_style` de la propia `<table>`,
+/// no via herencia - el caso real casi siempre las declara ahi mismo con
+/// un selector `table { ... }`, no en un ancestro mas arriba, asi que no
+/// hacia falta la lista de herencia para que funcionaran) y las de
+/// paginacion impresa (`orphans`/`widows` - un renderer de pantalla sin
+/// paginacion no tiene "pagina" que romper).
 ///
 /// Igual que ya pasaba con `font-weight`/`font-style` (Fase 2.4) antes de
 /// que `engine-gfx` las pintara: que una propiedad este aqui significa que
@@ -511,14 +515,95 @@ fn tag_name_of(node: &LayoutBox) -> Option<String> {
     }
 }
 
+/// Palabras clave de `list-style-type` que este motor reconoce (para
+/// buscarlas sueltas dentro del shorthand `list-style`, que no se expande
+/// a longhand en ningun sitio - ver el aviso de `user_agent_stylesheet.rs`
+/// y de `list_style_is_none`). `inside`/`outside` (list-style-position) y
+/// una `url(...)` (list-style-image) nunca coinciden con ninguna de
+/// estas, asi que un shorthand combinado (`list-style: square outside`)
+/// encuentra el tipo correcto sin confundirlo con la posicion.
+const LIST_STYLE_TYPE_KEYWORDS: &[&str] = &[
+    "disc", "circle", "square", "decimal", "decimal-leading-zero", "lower-roman", "upper-roman", "lower-alpha", "upper-alpha", "lower-latin", "upper-latin",
+];
+
+/// El valor de `list-style-type`, declarado directo o dentro del
+/// shorthand `list-style` - `None` si no hay ninguno reconocido (quien
+/// llama cae entonces al valor por defecto real segun el tipo de lista).
+fn declared_list_style_type(computed_style: &HashMap<String, String>) -> Option<String> {
+    if let Some(v) = computed_style.get("list-style-type") {
+        let v = v.trim().to_ascii_lowercase();
+        if LIST_STYLE_TYPE_KEYWORDS.contains(&v.as_str()) {
+            return Some(v);
+        }
+    }
+    computed_style
+        .get("list-style")
+        .and_then(|v| v.split_whitespace().map(|t| t.to_ascii_lowercase()).find(|t| LIST_STYLE_TYPE_KEYWORDS.contains(&t.as_str())))
+}
+
+/// `n` (1-based) en numeros romanos, MAYUSCULA - la formula estandar de
+/// sustraccion (`CM`, `CD`... antes que sumar de uno en uno) sobre los 13
+/// simbolos/valores del sistema, sin libreria: es una tabla cerrada de 13
+/// pares, no vale la pena una dependencia para esto.
+fn to_roman_numeral(mut n: u32) -> String {
+    const VALUES: &[(u32, &str)] = &[(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")];
+    let mut result = String::new();
+    for &(value, symbol) in VALUES {
+        while n >= value {
+            result.push_str(symbol);
+            n -= value;
+        }
+    }
+    result
+}
+
+/// `n` (1-based) como letras, MAYUSCULA - numeracion "bijective base-26"
+/// real del spec: `a`..`z` (1-26), despues `aa`..`az`, `ba`... (27+), NO
+/// como contar en base 26 normal (que tendria un digito "cero" que el
+/// alfabeto no tiene - por eso se resta 1 antes de cada modulo, el truco
+/// estandar de la numeracion bijective).
+fn to_alpha_marker(mut n: u32) -> String {
+    let mut letters = Vec::new();
+    while n > 0 {
+        n -= 1;
+        letters.push((b'A' + (n % 26) as u8) as char);
+        n /= 26;
+    }
+    letters.iter().rev().collect()
+}
+
+/// El texto de la vineta segun `list-style-type` (heredable, ver
+/// `INHERITABLE_PROPERTIES` - un `<li>` normalmente lo hereda de su
+/// `<ul>`/`<ol>`, pero tambien puede declararlo el mismo). Sin ninguno
+/// declarado, cae al valor por defecto real del spec segun el tipo de
+/// lista (`decimal` para `<ol>`, `disc` para cualquier otra) - `ordered`
+/// solo importa para ESE fallback, un `list-style-type` explicito manda
+/// siempre, incluso llevando la cuenta contraria a la del propio tag
+/// (`<ul style="list-style-type: decimal">` numera de verdad, igual que
+/// en un navegador real). Cualquier valor no reconocido (o `disc`
+/// explicito) cae a la bala solida - ni inventa un simbolo ni rompe.
+fn list_marker_text(computed_style: &HashMap<String, String>, ordinal: u32, ordered: bool) -> String {
+    let kind = declared_list_style_type(computed_style).unwrap_or_else(|| if ordered { "decimal".to_string() } else { "disc".to_string() });
+    match kind.as_str() {
+        "circle" => "\u{25E6}".to_string(),
+        "square" => "\u{25AA}".to_string(),
+        "decimal" => format!("{ordinal}."),
+        "decimal-leading-zero" => format!("{ordinal:02}."),
+        "lower-roman" => format!("{}.", to_roman_numeral(ordinal).to_ascii_lowercase()),
+        "upper-roman" => format!("{}.", to_roman_numeral(ordinal)),
+        "lower-alpha" | "lower-latin" => format!("{}.", to_alpha_marker(ordinal).to_ascii_lowercase()),
+        "upper-alpha" | "upper-latin" => format!("{}.", to_alpha_marker(ordinal)),
+        _ => "\u{2022}".to_string(),
+    }
+}
+
 /// Antepone una vineta real a `child` (un `<li>`, ya con sus `dimensions`
 /// finales resueltas por el flujo de bloque normal - por eso se llama
 /// DESPUES de `flow_block_children(child, ...)`, no antes: necesita saber
-/// donde empieza `child` de verdad). `•` para cualquier lista salvo
-/// `<ol>` (numerada, `ordinal.` con el mismo criterio 1-based que un
-/// navegador real), via `ordinal` (posicion 1-based entre sus hermanos
-/// `list-item`, llevada por quien llama - `place_list_marker` en si no
-/// sabe nada de hermanos).
+/// donde empieza `child` de verdad). El texto sale de `list_marker_text`
+/// (ver su aviso) segun `list-style-type`, via `ordinal` (posicion
+/// 1-based entre sus hermanos `list-item`, llevada por quien llama -
+/// `place_list_marker` en si no sabe nada de hermanos).
 ///
 /// El marcador se posiciona FUERA de la caja de contenido de `child`, en
 /// el hueco que le da su propio `margin-left` (ver la hoja UA) -
@@ -529,7 +614,7 @@ fn tag_name_of(node: &LayoutBox) -> Option<String> {
 /// `child` (una caja de texto sintetica, sin `dom_node`) para que pinte
 /// por el mismo camino que cualquier otro texto, sin tocar `engine-gfx`.
 fn place_list_marker(child: &mut LayoutBox, ordinal: u32, ordered: bool, font_set: Option<&FontSet>) {
-    let text = if ordered { format!("{ordinal}.") } else { "\u{2022}".to_string() };
+    let text = list_marker_text(&child.computed_style, ordinal, ordered);
     let font_size = child.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
     let natural_width = match font_set.and_then(|set| set.pick(false, false)) {
         Some(f) => engine_text::wrapped_line_width(f, &text, font_size),
@@ -806,6 +891,33 @@ fn resolve_border_width(computed_style: &HashMap<String, String>) -> EdgeSizes {
     }
     let px = width.unwrap_or(0.0);
     EdgeSizes { top: px, right: px, bottom: px, left: px }
+}
+
+/// `border-spacing`/`border-collapse` de una `display: table` - el hueco
+/// (horizontal, vertical) entre celdas adyacentes Y entre las celdas del
+/// borde y el propio borde/padding de la tabla (el spec real trata ese
+/// hueco exterior con la MISMA magnitud que el interior, no la mitad).
+/// `border-collapse: collapse` colapsa el hueco a cero SIEMPRE, sin
+/// importar lo que diga `border-spacing` - simplificacion declarada: el
+/// spec real ADEMAS fusiona los bordes adyacentes en uno solo (resolviendo
+/// que borde "gana" segun estilo/grosor/color, un algoritmo aparte); este
+/// motor solo quita el hueco, cada celda sigue pintando su propio borde
+/// sin fusionar - el efecto visible que mas se nota (la tabla deja de
+/// verse con doble borde entre celdas) sin el algoritmo completo de
+/// resolucion de conflictos.
+///
+/// Sin `border-spacing` declarado el valor inicial real del spec es
+/// `2px` (no cero) - un `<table>` sin CSS de autor SI tiene un hueco
+/// visible entre celdas en un navegador real.
+fn resolve_border_spacing(computed_style: &HashMap<String, String>) -> (f32, f32) {
+    if computed_style.get("border-collapse").map(|v| v.trim()) == Some("collapse") {
+        return (0.0, 0.0);
+    }
+    let Some(raw) = computed_style.get("border-spacing") else { return (2.0, 2.0) };
+    let mut lengths = raw.split_whitespace().filter_map(parse_css_length);
+    let Some(first) = lengths.next() else { return (2.0, 2.0) };
+    let second = lengths.next().unwrap_or(first);
+    (first, second)
 }
 
 /// Colapsa cualquier RACHA de espacios en blanco (incluidos saltos de
@@ -2972,19 +3084,30 @@ impl LayoutTreeBuilder {
     ///    `vertical-align` inicial es `baseline`, pero el efecto visible por
     ///    defecto es que las celdas de una fila comparten alto).
     ///
-    /// Sin `colspan`/`rowspan`, sin `border-collapse`/`border-spacing`
-    /// (cada celda pinta su propio `border` via el box model normal, sin
-    /// fusionar bordes adyacentes), sin celdas fuera de flujo
-    /// (`position: absolute` en una `td` participa en el reparto de
-    /// columnas igual que cualquier otra, en vez de sacarse del algoritmo
-    /// como hace `flow_block_children`/`flow_flex_children` con
-    /// `is_out_of_flow` - caso raro en tablas reales).
+    /// `colspan`/`rowspan` SI se resuelven (una celda con cualquiera de los
+    /// dos ocupa varias columnas/filas de verdad, ver `ocupadas`/
+    /// `celdas_que_abarcan` mas abajo). `border-spacing` SI se respeta
+    /// (`resolve_border_spacing`, con `2px` como valor inicial real del
+    /// spec cuando no esta declarado) y `border-collapse: collapse` SI lo
+    /// colapsa a cero - lo que sigue sin implementarse de esos dos es la
+    /// fusion de bordes adyacentes en uno solo que el spec real hace
+    /// ADEMAS con `collapse` (que borde "gana" segun estilo/grosor/color):
+    /// cada celda sigue pintando su propio `border` por su cuenta, sin
+    /// fusionar. Sin celdas fuera de flujo (`position: absolute` en una
+    /// `td` participa en el reparto de columnas igual que cualquier otra,
+    /// en vez de sacarse del algoritmo como hace `flow_block_children`/
+    /// `flow_flex_children` con `is_out_of_flow` - caso raro en tablas
+    /// reales).
     fn flow_table_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
         TABLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let padding = resolve_padding(&container.computed_style, container.containing_width);
         let border = resolve_border_width(&container.computed_style);
         container.box_dimensions.padding = padding;
         container.box_dimensions.border = border;
+        // Calculado AQUI, antes de `collect_table_rows` (que devuelve
+        // prestamos mutables de los hijos de `container` y por tanto
+        // impide seguir leyendo `container.computed_style` mas abajo).
+        let (h_spacing, v_spacing) = resolve_border_spacing(&container.computed_style);
 
         let inset_left = border.left + padding.left;
         let inset_right = border.right + padding.right;
@@ -3148,13 +3271,21 @@ impl LayoutTreeBuilder {
                 }
             }
         }
-        let column_widths = distribute_table_columns(&min_widths, &max_widths, inner_width);
-        // Desplazamiento horizontal acumulado de cada columna.
+        // El hueco horizontal se resta ANTES de repartir el ancho entre
+        // columnas (hay `column_count + 1` huecos: antes de la primera
+        // columna, entre cada par, y despues de la ultima) - si no,
+        // `distribute_table_columns` repartiria mas ancho del que de verdad
+        // cabe y la ultima columna se saldria de la tabla.
+        let width_for_columns = (inner_width - (column_count as f32 + 1.0) * h_spacing).max(0.0);
+        let column_widths = distribute_table_columns(&min_widths, &max_widths, width_for_columns);
+        // Desplazamiento horizontal acumulado de cada columna - arranca en
+        // `h_spacing` (el hueco antes de la primera) y cada columna deja
+        // otro `h_spacing` detras de si.
         let mut column_offsets = Vec::with_capacity(column_widths.len());
-        let mut accumulated = 0.0_f32;
+        let mut accumulated = h_spacing;
         for w in &column_widths {
             column_offsets.push(accumulated);
-            accumulated += w;
+            accumulated += w + h_spacing;
         }
 
         // Ocupacion arrastrada por `rowspan`: cuantas filas mas sigue ocupada
@@ -3170,7 +3301,9 @@ impl LayoutTreeBuilder {
         let mut tops_de_fila: Vec<f32> = Vec::with_capacity(rows.len());
         let mut altos_de_fila: Vec<f32> = Vec::with_capacity(rows.len());
 
-        let mut cursor_y = content_top;
+        // Hueco vertical antes de la primera fila, mismo criterio que
+        // `column_offsets` arriba con la primera columna.
+        let mut cursor_y = content_top + v_spacing;
         for (indice_fila, row) in rows.iter_mut().enumerate() {
             row.containing_width = inner_width;
             row.dimensions.x = origin_x;
@@ -3189,7 +3322,7 @@ impl LayoutTreeBuilder {
                 // desalinearia con todas las de despues.
                 tops_de_fila.push(cursor_y);
                 altos_de_fila.push(height);
-                cursor_y += height;
+                cursor_y += height + v_spacing;
                 // Esta fila tambien tiene que consumir una fila de
                 // ocupacion pendiente de un `rowspan` anterior - sin esto,
                 // una fila SIN celdas (poco comun pero valida) desalineaba
@@ -3268,7 +3401,7 @@ impl LayoutTreeBuilder {
             row.dimensions.height = row_height;
             tops_de_fila.push(cursor_y);
             altos_de_fila.push(row_height);
-            cursor_y += row_height;
+            cursor_y += row_height + v_spacing;
 
             // Consumir una fila de ocupacion pendiente.
             for o in ocupadas.iter_mut() {
@@ -3797,7 +3930,7 @@ mod tests {
                <tr><td id="c1">c1</td><td id="c2">c2</td></tr>
                </table></body></html>"#,
         );
-        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; }");
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; border-spacing: 0px; }");
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
 
@@ -3916,7 +4049,7 @@ mod tests {
                <tr><td id="c1">c1</td><td id="c2">c2</td></tr>
                </table></body></html>"#,
         );
-        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; }");
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; border-spacing: 0px; }");
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
 
@@ -5230,6 +5363,83 @@ mod tests {
         assert!(!first_child_is_marker, "list-style: none deberia suprimir la vineta, no anteponerla igual que sin la propiedad");
     }
 
+    fn marker_text_of(root: &LayoutBox, dom: &Arc<RwLock<Node>>, id: &str) -> String {
+        let li = find_box_for_dom_node(root, &Node::find_by_id(dom, id).expect(id)).expect("caja del li");
+        match &li.children.first().expect("deberia tener marcador").box_type {
+            BoxType::Text(t) => t.clone(),
+            other => panic!("el primer hijo deberia ser el marcador de texto, salio {other:?}"),
+        }
+    }
+
+    /// Cada valor de `list-style-type` que este motor reconoce, uno por
+    /// uno - `circle`/`square` (balas), `decimal-leading-zero` (cero a la
+    /// izquierda hasta dos digitos), `lower-roman`/`upper-roman`
+    /// (numeros romanos reales, no una tabla de casos sueltos - hasta
+    /// `MCMXCIX` con la formula de sustraccion), `lower-alpha`/
+    /// `upper-alpha` (letras, incluida la vuelta de "z" a "aa" en la
+    /// posicion 27 - numeracion bijective real, no base-26 ingenua).
+    #[test]
+    fn list_style_type_recognizes_every_supported_value() {
+        let dom = HtmlParser::parse(
+            r#"<html><body>
+                <ul style="list-style-type: circle;"><li id="circulo">x</li></ul>
+                <ul style="list-style-type: square;"><li id="cuadrado">x</li></ul>
+                <ol style="list-style-type: decimal-leading-zero;"><li id="cero1">x</li><li id="cero2">x</li></ol>
+                <ol style="list-style-type: lower-roman;"><li id="rom1">x</li><li id="rom4">x</li><li id="rom9">x</li></ol>
+                <ol style="list-style-type: upper-roman;"><li id="ROM1999">x</li></ol>
+                <ol style="list-style-type: lower-alpha;"><li id="alfa1">x</li><li id="alfa27">x</li></ol>
+                <ol style="list-style-type: upper-alpha;"><li id="ALFA1">x</li></ol>
+            </body></html>"#,
+        );
+        // 27 <li> en el mismo <ol> para forzar la vuelta de "z" a "aa".
+        let mut html_extra = String::from("<html><body><ol style=\"list-style-type: lower-alpha;\">");
+        for i in 1..=27 {
+            html_extra.push_str(&format!("<li id=\"a{i}\">x</li>"));
+        }
+        html_extra.push_str("</ol></body></html>");
+
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        assert_eq!(marker_text_of(&root, &dom, "circulo"), "\u{25E6}");
+        assert_eq!(marker_text_of(&root, &dom, "cuadrado"), "\u{25AA}");
+        assert_eq!(marker_text_of(&root, &dom, "cero1"), "01.");
+        assert_eq!(marker_text_of(&root, &dom, "cero2"), "02.");
+        assert_eq!(marker_text_of(&root, &dom, "rom1"), "i.");
+        assert_eq!(marker_text_of(&root, &dom, "rom4"), "ii.", "el 2o <li> deberia ser el ordinal 2, no el numero 4");
+        assert_eq!(marker_text_of(&root, &dom, "rom9"), "iii.");
+        assert_eq!(marker_text_of(&root, &dom, "ROM1999"), "I.");
+        assert_eq!(marker_text_of(&root, &dom, "alfa1"), "a.");
+        assert_eq!(marker_text_of(&root, &dom, "alfa27"), "b.", "el 2o <li> deberia ser el ordinal 2 (b), no el 27");
+        assert_eq!(marker_text_of(&root, &dom, "ALFA1"), "A.");
+
+        let dom_extra = HtmlParser::parse(&html_extra);
+        let root_extra = LayoutTreeBuilder::build(&dom_extra, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        assert_eq!(marker_text_of(&root_extra, &dom_extra, "a26"), "z.");
+        assert_eq!(marker_text_of(&root_extra, &dom_extra, "a27"), "aa.", "tras z (26) sigue aa (27), numeracion bijective real");
+    }
+
+    /// Un valor explicito de `list-style-type` manda incluso llevando la
+    /// cuenta contraria a la del propio tag - `<ul>` numerando de verdad,
+    /// igual que en un navegador real.
+    #[test]
+    fn an_explicit_list_style_type_overrides_the_tags_default_marker() {
+        let dom = HtmlParser::parse(r#"<html><body><ul style="list-style-type: decimal;"><li id="a">x</li></ul></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        assert_eq!(marker_text_of(&root, &dom, "a"), "1.", "un <ul> con list-style-type: decimal deberia numerar, no usar bala");
+    }
+
+    /// Un `list-style-type` no reconocido (o `disc` explicito) cae a la
+    /// bala solida - ni inventa un simbolo ni hace panic.
+    #[test]
+    fn an_unrecognized_list_style_type_falls_back_to_the_solid_bullet() {
+        let dom = HtmlParser::parse(r#"<html><body><ul style="list-style-type: basura-inventada;"><li id="a">x</li></ul></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        assert_eq!(marker_text_of(&root, &dom, "a"), "\u{2022}");
+    }
+
     /// `justify` se PARSEA (no cae al "no reconocido") pero se pinta como
     /// `left` a proposito - ver el aviso de `resolve_text_align`.
     #[test]
@@ -6179,7 +6389,7 @@ mod tests {
     #[test]
     fn table_lays_out_cells_side_by_side_in_equal_columns() {
         let dom = HtmlParser::parse(r#"<html><body><table id="t" style="width: 400px;"><tr><td id="a">a</td><td id="b">b</td></tr></table></body></html>"#);
-        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; }");
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; } table { border-spacing: 0px; }");
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let a_node = Node::find_by_id(&dom, "a").expect("a deberia existir");
@@ -6193,6 +6403,56 @@ mod tests {
         assert_eq!(a_box.dimensions.y, b_box.dimensions.y, "las celdas de la misma fila deberian compartir Y");
     }
 
+    /// `border-spacing` (con un solo valor, horizontal=vertical) deja un
+    /// hueco real ANTES de la primera fila/columna, ENTRE cada par, y
+    /// DESPUES de la ultima - la misma magnitud en las tres posiciones,
+    /// no la mitad en los bordes exteriores.
+    #[test]
+    fn border_spacing_leaves_a_real_gap_around_and_between_cells() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table id="t" style="width: 220px;">
+                <tr><td id="a" style="width:100px;height:30px;">a</td><td id="b" style="width:100px;height:30px;">b</td></tr>
+                <tr><td id="c" style="height:30px;">c</td><td id="d" style="height:30px;">d</td></tr>
+            </table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; } table { border-spacing: 10px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
+
+        assert_eq!(caja("a").dimensions.x, 10.0, "hueco de 10px antes de la primera columna");
+        assert_eq!(caja("b").dimensions.x, 10.0 + 100.0 + 10.0, "hueco de 10px entre columnas");
+        assert_eq!(caja("a").dimensions.y, 10.0, "hueco de 10px antes de la primera fila");
+        assert_eq!(caja("c").dimensions.y, 10.0 + 30.0 + 10.0, "hueco de 10px entre filas");
+    }
+
+    /// Sin `border-spacing` declarado, el valor inicial REAL del spec es
+    /// `2px` (no cero) - un `<table>` sin CSS de autor si tiene un hueco
+    /// visible entre celdas en un navegador real.
+    #[test]
+    fn border_spacing_defaults_to_2px_when_not_declared() {
+        let dom = HtmlParser::parse(r#"<html><body><table id="t"><tr><td id="a" style="width:50px;height:20px;">a</td><td id="b" style="width:50px;height:20px;">b</td></tr></table></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
+
+        assert_eq!(caja("a").dimensions.x, 2.0);
+        assert_eq!(caja("a").dimensions.y, 2.0);
+    }
+
+    /// `border-collapse: collapse` colapsa el hueco a CERO, sin importar lo
+    /// que diga `border-spacing` a la vez - simplificacion declarada (no
+    /// fusiona bordes adyacentes, solo quita el hueco).
+    #[test]
+    fn border_collapse_collapse_overrides_border_spacing_to_zero() {
+        let dom = HtmlParser::parse(r#"<html><body><table id="t" style="width:100px;"><tr><td id="a" style="width:50px;height:20px;">a</td><td id="b" style="width:50px;height:20px;">b</td></tr></table></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; } table { border-spacing: 10px; border-collapse: collapse; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
+
+        assert_eq!(caja("a").dimensions.x, 0.0, "border-collapse:collapse deberia ganar sobre border-spacing:10px");
+        assert_eq!(caja("b").dimensions.x, 50.0, "sin hueco entre columnas");
+    }
+
     /// Dos filas se apilan verticalmente (segunda fila empieza donde termina
     /// la primera), cada una con su propio alto - la parte "de bloque" del
     /// algoritmo de tabla, analoga a `flow_block_children` pero fila a fila.
@@ -6204,7 +6464,7 @@ mod tests {
                 <tr id="row2"><td id="b" style="height: 50px;">b</td></tr>
             </table></body></html>"#,
         );
-        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; }");
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; } table { border-spacing: 0px; }");
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let a_node = Node::find_by_id(&dom, "a").expect("a deberia existir");
@@ -6249,7 +6509,7 @@ mod tests {
                 <tbody><tr><td id="body_cell">b</td></tr></tbody>
             </table></body></html>"#,
         );
-        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; height: 20px; }");
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; height: 20px; } table { border-spacing: 0px; }");
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let header_node = Node::find_by_id(&dom, "header").expect("header deberia existir");
@@ -6272,7 +6532,7 @@ mod tests {
                 <tr><td id="first">b</td><td id="second">c</td><td id="third">d</td></tr>
             </table></body></html>"#,
         );
-        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; }");
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; } table { border-spacing: 0px; }");
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let only_node = Node::find_by_id(&dom, "only").expect("only deberia existir");

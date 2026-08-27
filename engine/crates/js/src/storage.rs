@@ -10,22 +10,39 @@
 //! script no puede pedir el almacenamiento de otro origen aunque lo
 //! intente: no hay ningun parametro con el que hacerlo.
 //!
-//! ## Lo que NO soporta: el acceso por propiedad
+//! ## Acceso por propiedad
 //!
-//! En un navegador real, `localStorage.tema` y `localStorage.getItem
-//! ("tema")` son equivalentes: el objeto `Storage` es "exotico" y atrapa
-//! cualquier acceso a propiedad. Aqui SOLO funcionan los metodos
-//! (`getItem`/`setItem`/`removeItem`/`clear`/`key`) y `length`.
-//! Implementar la forma con punto exigiria un objeto con manejadores
-//! propios de `[[Get]]`/`[[Set]]`/`[[Delete]]`/`[[OwnPropertyKeys]]` en
-//! Boa - trabajo aparte y de bastante mas superficie. La forma con metodos
-//! es ademas la que recomienda MDN y la que usa la mayoria del codigo
-//! real, asi que la perdida es acotada; se declara aqui en vez de fingir
-//! una API completa.
+//! `localStorage.tema` y `localStorage.getItem("tema")` son equivalentes -
+//! el objeto `Storage` es "exotico" (`Proxy` real de Boa, ver
+//! `boa_engine::object::builtins::JsProxy`) y atrapa cualquier acceso a
+//! propiedad que NO sea uno de los metodos/`length` ya definidos en el
+//! objeto base: `get`/`set`/`has`/`deleteProperty` comprueban primero si
+//! el TARGET (el objeto con `getItem`/`setItem`/`removeItem`/`clear`/
+//! `key`/`length`) ya tiene esa propiedad - si la tiene, se comporta
+//! exactamente igual que antes; si no, la trampa trata el nombre de
+//! propiedad como una CLAVE de `WebStorage`. `set` es la excepcion: SIEMPRE
+//! escribe via `setItem`, incluso si el nombre coincide con un metodo
+//! (`localStorage.getItem = 'x'` guarda un dato llamado "getItem", no
+//! sobrescribe el metodo) - es el comportamiento real del spec, y ademas
+//! mas simple de implementar que comprobar la colision primero.
+//!
+//! Las trampas son punteros a funcion SIN estado propio (`NativeFunctionPointer`,
+//! el tipo que exige `JsProxyBuilder` - a diferencia de los metodos de
+//! abajo, no pueden capturar un closure), asi que el `StorageCapture` de
+//! CADA `Storage` (local/session) se cuelga como DATOS NATIVOS del target
+//! (`ObjectInitializer::with_native_data`) y las trampas lo recuperan del
+//! primer argumento que ya les pasa Boa (`target`, ver `capture_from_target`)
+//! - mismo patron que `ElementCapture` en `dom_bindings.rs`.
+//!
+//! Los simbolos (`Symbol.toPrimitive`, `Symbol.iterator`...) nunca son
+//! claves de almacenamiento - las trampas los delegan al comportamiento
+//! normal del target en vez de intentar convertirlos a cadena (que
+//! lanzaria `TypeError`, igual que en JS puro).
 
-use boa_engine::object::ObjectInitializer;
-use boa_engine::property::Attribute;
-use boa_engine::{js_string, Context, JsError, JsNativeError, JsResult, JsValue, NativeFunction};
+use boa_engine::object::builtins::JsProxy;
+use boa_engine::object::{JsData, ObjectInitializer};
+use boa_engine::property::{Attribute, PropertyKey};
+use boa_engine::{js_string, Context, JsError, JsNativeError, JsObject, JsResult, JsValue, NativeFunction};
 use engine_net::storage::{StorageKind, WebStorage};
 use std::sync::{Arc, Mutex};
 
@@ -47,6 +64,134 @@ unsafe impl boa_gc::Trace for StorageCapture {
 }
 
 impl boa_gc::Finalize for StorageCapture {}
+
+/// Cuerpo vacio le basta, igual que `ElementCapture` en `dom_bindings.rs` -
+/// `NativeObject` se consigue gratis via su impl generica.
+impl JsData for StorageCapture {}
+
+/// Recupera el `StorageCapture` que `build_storage_object` colgo del
+/// TARGET (no del Proxy en si) como datos nativos - `None` si `target` no
+/// es un objeto `Storage` de este motor. Los campos se clonan de uno en
+/// uno (no la guarda entera) para no arriesgar clonar el `Ref` en vez del
+/// `StorageCapture` que envuelve.
+fn capture_from_target(target: &JsObject) -> Option<StorageCapture> {
+    let guard = target.downcast_ref::<StorageCapture>()?;
+    Some(StorageCapture { storage: guard.storage.clone(), kind: guard.kind, origin: guard.origin.clone() })
+}
+
+/// El nombre de propiedad de una trampa de Proxy como cadena Rust, o
+/// `None` si es un simbolo (nunca una clave de almacenamiento).
+fn property_as_string(property: &JsValue) -> Option<String> {
+    property.as_string().map(|s| s.to_std_string_escaped())
+}
+
+/// La clave de propiedad de una trampa de Proxy convertida al tipo que
+/// exigen los metodos de `JsObject` (`get`/`set`/`has_own_property`...) -
+/// una cadena o un simbolo, nunca otra cosa (asi construye Boa el
+/// argumento `property` de cualquier trampa real).
+fn property_key(property: &JsValue) -> Option<PropertyKey> {
+    if let Some(s) = property.as_string() {
+        return Some(PropertyKey::from(s.clone()));
+    }
+    property.as_symbol().map(|sym| PropertyKey::from(sym.clone()))
+}
+
+/// Trampa `get` (ver el aviso del modulo): metodos/`length` del target si
+/// ya existen ahi, si no una lectura de `WebStorage` por esa clave -
+/// `null` (nunca `undefined`) para una clave sin dato, igual que
+/// `getItem`.
+fn proxy_get(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let Some(target) = args.first().and_then(JsValue::as_object) else { return Ok(JsValue::undefined()) };
+    let property = args.get(1).cloned().unwrap_or_default();
+
+    let Some(key) = property_as_string(&property) else {
+        let Some(pk) = property_key(&property) else { return Ok(JsValue::undefined()) };
+        return target.get(pk, context);
+    };
+
+    if target.has_own_property(js_string!(key.clone()), context)? {
+        return target.get(js_string!(key), context);
+    }
+
+    // `undefined`, NO `null`: a diferencia de `getItem` (un metodo con
+    // contrato propio de "devuelve null si no hay"), esto es un acceso de
+    // PROPIEDAD normal - una propiedad que no existe en ningun objeto JS
+    // lee como `undefined`, igual que en un navegador real
+    // (`localStorage.getItem('x')` es `null`, pero `localStorage.x` es
+    // `undefined` si `x` no esta guardado).
+    let Some(capture) = capture_from_target(&target) else { return Ok(JsValue::undefined()) };
+    let Ok(store) = capture.storage.lock() else { return Ok(JsValue::undefined()) };
+    Ok(match store.get_item(capture.kind, &capture.origin, &key) {
+        Some(value) => js_string!(value).into(),
+        None => JsValue::undefined(),
+    })
+}
+
+/// Trampa `set` (ver el aviso del modulo): SIEMPRE escribe via `WebStorage::
+/// set_item`, sin comprobar si el nombre coincide con un metodo - es el
+/// comportamiento real del spec (`localStorage.getItem = 'x'` guarda un
+/// dato, no sobrescribe el metodo). `QuotaExceeded` se propaga como
+/// excepcion real, igual que `setItem`.
+fn proxy_set(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let Some(target) = args.first().and_then(JsValue::as_object) else { return Ok(JsValue::from(false)) };
+    let property = args.get(1).cloned().unwrap_or_default();
+    let value = args.get(2).cloned().unwrap_or_default();
+
+    let Some(key) = property_as_string(&property) else {
+        let Some(pk) = property_key(&property) else { return Ok(JsValue::from(false)) };
+        return Ok(JsValue::from(target.set(pk, value, false, context)?));
+    };
+
+    let Some(capture) = capture_from_target(&target) else { return Ok(JsValue::from(false)) };
+    let value_str = to_storage_string(Some(&value), context)?;
+    let Ok(mut store) = capture.storage.lock() else { return Ok(JsValue::from(false)) };
+    match store.set_item(capture.kind, &capture.origin, &key, &value_str) {
+        Ok(()) => Ok(JsValue::from(true)),
+        Err(_) => Err(JsError::from_native(
+            JsNativeError::error().with_message("QuotaExceededError: se supero la cuota de almacenamiento de este origen"),
+        )),
+    }
+}
+
+/// Trampa `has` (`'tema' in localStorage`, y lo que usa `for...in`): SI el
+/// target ya la tiene (metodo/`length`), o si hay un dato guardado con esa
+/// clave.
+fn proxy_has(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let Some(target) = args.first().and_then(JsValue::as_object) else { return Ok(JsValue::from(false)) };
+    let property = args.get(1).cloned().unwrap_or_default();
+
+    let Some(key) = property_as_string(&property) else {
+        let Some(pk) = property_key(&property) else { return Ok(JsValue::from(false)) };
+        return Ok(JsValue::from(target.has_property(pk, context)?));
+    };
+
+    if target.has_own_property(js_string!(key.clone()), context)? {
+        return Ok(JsValue::from(true));
+    }
+    let Some(capture) = capture_from_target(&target) else { return Ok(JsValue::from(false)) };
+    let Ok(store) = capture.storage.lock() else { return Ok(JsValue::from(false)) };
+    Ok(JsValue::from(store.get_item(capture.kind, &capture.origin, &key).is_some()))
+}
+
+/// Trampa `deleteProperty` (`delete localStorage.tema`): borra la clave de
+/// `WebStorage`. Los propios metodos/`length` del target NO se pueden
+/// borrar (se ignora, `false`) - igual que un navegador real, donde son
+/// propiedades no configurables.
+fn proxy_delete_property(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let Some(target) = args.first().and_then(JsValue::as_object) else { return Ok(JsValue::from(true)) };
+    let property = args.get(1).cloned().unwrap_or_default();
+
+    let Some(key) = property_as_string(&property) else { return Ok(JsValue::from(true)) };
+
+    if target.has_own_property(js_string!(key.clone()), context)? {
+        return Ok(JsValue::from(false));
+    }
+    let Some(capture) = capture_from_target(&target) else { return Ok(JsValue::from(true)) };
+    if let Ok(mut store) = capture.storage.lock() {
+        store.remove_item(capture.kind, &capture.origin, &key);
+    }
+    Ok(JsValue::from(true))
+}
 
 /// Convierte un argumento cualquiera a la cadena que el spec guarda:
 /// `setItem('n', 42)` almacena `"42"`, y `getItem(42)` busca la clave
@@ -135,7 +280,7 @@ fn build_storage_object(context: &mut Context, storage: SharedWebStorage, kind: 
             let Ok(store) = cap.storage.lock() else { return Ok(JsValue::from(0)) };
             Ok(JsValue::from(store.length(cap.kind, &cap.origin) as u32))
         },
-        capture,
+        capture.clone(),
     );
     let length_getter_fn = boa_engine::object::FunctionObjectBuilder::new(context.realm(), length_getter)
         .name(js_string!("get length"))
@@ -143,14 +288,30 @@ fn build_storage_object(context: &mut Context, storage: SharedWebStorage, kind: 
         .constructor(false)
         .build();
 
-    Ok(ObjectInitializer::new(context)
+    // `with_native_data` (no `new`): cuelga `capture` del TARGET en si -
+    // las trampas del Proxy de abajo lo recuperan de ahi (ver
+    // `capture_from_target`), porque son punteros a funcion sin closure
+    // propio.
+    let target = ObjectInitializer::with_native_data(capture, context)
         .function(get_item, js_string!("getItem"), 1)
         .function(set_item, js_string!("setItem"), 2)
         .function(remove_item, js_string!("removeItem"), 1)
         .function(clear, js_string!("clear"), 0)
         .function(key_fn, js_string!("key"), 1)
         .accessor(js_string!("length"), Some(length_getter_fn), None, Attribute::all())
-        .build())
+        .build();
+
+    // El Proxy (ver el aviso del modulo) es lo que hace que
+    // `localStorage.tema` funcione ademas de `localStorage.getItem
+    // ('tema')` - sin el, esto seguiria siendo el objeto de metodos de
+    // siempre.
+    Ok(JsProxy::builder(target)
+        .get(proxy_get)
+        .set(proxy_set)
+        .has(proxy_has)
+        .delete_property(proxy_delete_property)
+        .build(context)
+        .into())
 }
 
 /// Registra `localStorage` y `sessionStorage` para el origen dado.
@@ -296,5 +457,81 @@ mod tests {
     fn storage_is_not_defined_at_all_unless_it_was_registered() {
         let mut r = JsRuntime::new();
         assert_eq!(r.eval("typeof localStorage").unwrap(), "\"undefined\"");
+    }
+
+    /// El punto real del Proxy: `localStorage.tema` y `localStorage.getItem
+    /// ('tema')` tienen que ser equivalentes, en las dos direcciones.
+    #[test]
+    fn property_access_is_equivalent_to_get_item_and_set_item() {
+        let mut r = runtime_at("https://a.test");
+        r.eval("localStorage.tema = 'oscuro'").unwrap();
+        assert_eq!(r.eval("localStorage.getItem('tema')").unwrap(), "\"oscuro\"", "escribir por propiedad deberia verse via getItem");
+        assert_eq!(r.eval("localStorage.tema").unwrap(), "\"oscuro\"", "leer por propiedad deberia devolver lo mismo");
+
+        r.eval("localStorage.setItem('otro', 'valor')").unwrap();
+        assert_eq!(r.eval("localStorage.otro").unwrap(), "\"valor\"", "escribir por setItem deberia verse por propiedad");
+    }
+
+    /// Una clave sin dato leida por propiedad es `undefined` (no `null`) -
+    /// asi se distingue de una propiedad de METODO que si existe (`getItem`
+    /// sigue siendo una funcion, no una clave de almacenamiento).
+    #[test]
+    fn a_missing_property_key_is_undefined_and_methods_still_work_as_methods() {
+        let mut r = runtime_at("https://a.test");
+        assert_eq!(r.eval("localStorage.noexiste").unwrap(), "undefined");
+        assert_eq!(r.eval("typeof localStorage.getItem").unwrap(), "\"function\"", "getItem deberia seguir siendo la funcion, no una clave de almacenamiento");
+        assert_eq!(r.eval("localStorage.length").unwrap(), "0", "length deberia seguir siendo la propiedad de siempre");
+    }
+
+    /// Escribir con un nombre que coincide con un metodo NO deberia
+    /// sobrescribirlo - se comporta como cualquier otra clave, que es el
+    /// comportamiento real del spec (`Storage` es un "legacy platform
+    /// object": el setter SIEMPRE llama a `setItem`, incluso si el nombre
+    /// choca con un metodo).
+    #[test]
+    fn setting_a_property_that_shadows_a_method_name_does_not_overwrite_the_method() {
+        let mut r = runtime_at("https://a.test");
+        r.eval("localStorage.getItem = 'no soy una funcion'").unwrap();
+        assert_eq!(r.eval("typeof localStorage.getItem").unwrap(), "\"function\"", "getItem deberia seguir siendo la funcion real");
+    }
+
+    /// `'clave' in localStorage` (el operador `in`, lo que usa `for...in`
+    /// por debajo) tiene que ver tanto los datos guardados como los
+    /// propios metodos.
+    #[test]
+    fn the_in_operator_sees_both_stored_keys_and_the_built_in_methods() {
+        let mut r = runtime_at("https://a.test");
+        r.eval("localStorage.tema = 'oscuro'").unwrap();
+        assert_eq!(r.eval("'tema' in localStorage").unwrap(), "true");
+        assert_eq!(r.eval("'getItem' in localStorage").unwrap(), "true");
+        assert_eq!(r.eval("'noexiste' in localStorage").unwrap(), "false");
+    }
+
+    /// `delete localStorage.clave` tiene que borrar el dato de verdad
+    /// (equivalente a `removeItem`), sin poder borrar los propios metodos.
+    #[test]
+    fn delete_removes_a_stored_key_but_not_the_built_in_methods() {
+        let mut r = runtime_at("https://a.test");
+        r.eval("localStorage.tema = 'oscuro'; delete localStorage.tema;").unwrap();
+        assert_eq!(r.eval("localStorage.tema").unwrap(), "undefined", "delete deberia haber borrado el dato");
+
+        r.eval("delete localStorage.getItem").unwrap();
+        assert_eq!(r.eval("typeof localStorage.getItem").unwrap(), "\"function\"", "delete no deberia poder quitar un metodo real");
+    }
+
+    /// El acceso por propiedad tambien tiene que respetar el aislamiento
+    /// por origen y por area (local vs sesion) - no es un camino nuevo de
+    /// almacenamiento, es el MISMO `WebStorage` de siempre visto por otra
+    /// puerta.
+    #[test]
+    fn property_access_respects_origin_isolation_and_the_local_session_split() {
+        let (mut a, mut b) = two_runtimes_sharing_storage("https://a.test", "https://b.test");
+        a.eval("localStorage.secreto = '1234'").unwrap();
+        assert_eq!(b.eval("localStorage.secreto").unwrap(), "undefined", "otro origen no deberia ver esto ni por propiedad");
+
+        let mut r = runtime_at("https://c.test");
+        r.eval("localStorage.k = 'de-local'; sessionStorage.k = 'de-sesion';").unwrap();
+        assert_eq!(r.eval("localStorage.k").unwrap(), "\"de-local\"");
+        assert_eq!(r.eval("sessionStorage.k").unwrap(), "\"de-sesion\"");
     }
 }
