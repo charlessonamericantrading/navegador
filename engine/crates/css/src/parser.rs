@@ -83,10 +83,99 @@ impl<'i> AtRuleParser<'i> for RuleParser {
     }
 }
 
+/// Longitud en pixeles de un valor de media query (`769px`, `0`).
+/// Deliberadamente solo `px`: `em`/`rem` dependerian del tamano de letra de
+/// la raiz, que en una media query es el del NAVEGADOR y no el de la
+/// pagina, y `calc()` habria que evaluarlo entero.
+fn parse_media_px(value: &str) -> Option<f32> {
+    let v = value.trim();
+    if v == "0" {
+        return Some(0.0);
+    }
+    v.strip_suffix("px")?.trim().parse::<f32>().ok()
+}
+
+/// Interpreta una caracteristica escrita con la SINTAXIS DE RANGOS de Media
+/// Queries nivel 4 - `(width > 769px)`, `(width <= 1044px)`, y tambien las
+/// formas con el valor a la izquierda (`(769px < width)`) y las de doble
+/// extremo (`(400px <= width <= 900px)`).
+///
+/// No es una comodidad moderna prescindible: es como escribe hoy sus puntos
+/// de ruptura una parte grande de la web (MDN, por ejemplo, mete AHI toda
+/// la maquetacion de su cabecera). Sin entenderla, el bloque entero se
+/// marcaba como no evaluable y se descartaba - la pagina se veia con la
+/// disposicion de movil en una ventana de escritorio.
+///
+/// Devuelve `true` si reconocio la caracteristica (y ya escribio los
+/// limites en `condition`), `false` si no es una comparacion de `width`.
+fn parse_media_range(body: &str, condition: &mut MediaCondition) -> bool {
+    if !body.contains('<') && !body.contains('>') {
+        return false;
+    }
+    // Se normaliza a una lista [operando, operador, operando, ...].
+    let mut partes: Vec<String> = Vec::new();
+    let mut actual = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '<' || c == '>' {
+            partes.push(actual.trim().to_string());
+            actual.clear();
+            let mut op = c.to_string();
+            if chars.peek() == Some(&'=') {
+                chars.next();
+                op.push('=');
+            }
+            partes.push(op);
+        } else {
+            actual.push(c);
+        }
+    }
+    partes.push(actual.trim().to_string());
+
+    // `a OP b` o `a OP b OP c`. Cualquier otra forma no se sabe leer.
+    let comparaciones: Vec<(&str, &str, &str)> = match partes.len() {
+        3 => vec![(partes[0].as_str(), partes[1].as_str(), partes[2].as_str())],
+        5 => vec![
+            (partes[0].as_str(), partes[1].as_str(), partes[2].as_str()),
+            (partes[2].as_str(), partes[3].as_str(), partes[4].as_str()),
+        ],
+        _ => return false,
+    };
+
+    for (izq, op, der) in comparaciones {
+        // Se reescribe siempre como `width OP valor`, dando la vuelta al
+        // operador cuando el valor viene primero (`769px < width`).
+        let (op, valor) = if izq == "width" {
+            (op.to_string(), der)
+        } else if der == "width" {
+            let volteado = match op {
+                "<" => ">",
+                "<=" => ">=",
+                ">" => "<",
+                ">=" => "<=",
+                _ => return false,
+            };
+            (volteado.to_string(), izq)
+        } else {
+            return false;
+        };
+        let Some(px) = parse_media_px(valor) else { return false };
+        match op.as_str() {
+            ">" => condition.min_width_exclusive = Some(px),
+            ">=" => condition.min_width = Some(px),
+            "<" => condition.max_width_exclusive = Some(px),
+            "<=" => condition.max_width = Some(px),
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Interpreta el preludio de un `@media` (`screen and (max-width: 600px)`).
 ///
-/// Solo entiende `min-width`/`max-width` en pixeles y el tipo de medio; ver
-/// `MediaCondition` para por que ese subconjunto. Lo que no sepa
+/// Entiende `min-width`/`max-width` en pixeles, la sintaxis de rangos de
+/// nivel 4 (`width > 600px`, ver `parse_media_range`) y el tipo de medio;
+/// ver `MediaCondition` para por que ese subconjunto. Lo que no sepa
 /// interpretar se marca `never_matches`, de modo que sus reglas se
 /// CONSERVAN pero no se aplican - aplicarlas siempre seria peor (meteria
 /// estilos de impresion o de movil en una ventana de escritorio).
@@ -103,6 +192,13 @@ fn parse_media_condition(prelude: &str) -> MediaCondition {
     let mut saw_supported_feature = false;
     for feature in text.split('(').skip(1) {
         let Some(body) = feature.split(')').next() else { continue };
+        // Sintaxis de rangos de nivel 4 antes que nada: `(width > 769px)`
+        // no lleva dos puntos, asi que sin esto caeria en "caracteristica
+        // sin valor" y anularia la consulta entera.
+        if parse_media_range(body, &mut condition) {
+            saw_supported_feature = true;
+            continue;
+        }
         let Some((name, value)) = body.split_once(':') else {
             // Una caracteristica sin valor (`(hover)`, `(color)`) no se
             // sabe evaluar.
@@ -584,6 +680,42 @@ mod tests {
         let h1 = sheet.rules.iter().find(|r| r.selector == "h1").expect("la regla posterior al bloque deberia parsearse intacta");
         assert_eq!(h1.declarations.get("color").map(String::as_str), Some("red"));
         assert!(h1.media.is_none());
+    }
+
+    /// La sintaxis de RANGOS de Media Queries nivel 4 (`(width > 769px)`)
+    /// es como escribe hoy sus puntos de ruptura una parte grande de la web
+    /// - MDN mete ahi toda la maquetacion de su cabecera. Antes no llevaba
+    /// dos puntos, asi que caia en "caracteristica sin valor" y anulaba el
+    /// bloque entero: la pagina se veia con la disposicion de movil en una
+    /// ventana de escritorio.
+    #[test]
+    fn la_sintaxis_de_rangos_de_media_queries_se_entiende() {
+        let sheet = CssParser::parse("@media (width > 769px) { nav { display: flex; } }");
+        let cond = sheet.rules[0].media.as_ref().expect("deberia llevar condicion");
+        assert!(!cond.never_matches, "un rango de anchura SI se sabe evaluar");
+        assert!(cond.matches(1280.0), "1280px es mayor que 769px");
+        assert!(!cond.matches(700.0), "700px no es mayor que 769px");
+        assert!(!cond.matches(769.0), "`>` es ESTRICTO: justo en el punto de ruptura no aplica");
+    }
+
+    /// Las cuatro comparaciones, el valor a la izquierda, y la forma de
+    /// doble extremo.
+    #[test]
+    fn los_rangos_cubren_las_dos_direcciones_y_el_doble_extremo() {
+        let cond = |css: &str| CssParser::parse(css).rules[0].media.clone().expect("condicion");
+
+        let menor_igual = cond("@media (width <= 1044px) { a { color: red; } }");
+        assert!(menor_igual.matches(1044.0), "`<=` es inclusivo en su punto de ruptura");
+        assert!(!menor_igual.matches(1045.0));
+
+        let volteado = cond("@media (769px < width) { a { color: red; } }");
+        assert!(volteado.matches(1280.0), "`769px < width` es lo mismo que `width > 769px`");
+        assert!(!volteado.matches(700.0));
+
+        let intervalo = cond("@media (400px <= width <= 900px) { a { color: red; } }");
+        assert!(intervalo.matches(600.0));
+        assert!(!intervalo.matches(300.0));
+        assert!(!intervalo.matches(1000.0));
     }
 
     /// Antes, TODO bloque `@media` se descartaba entero - las reglas de

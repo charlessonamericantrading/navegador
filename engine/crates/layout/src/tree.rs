@@ -40,6 +40,90 @@ pub type ImageMap = HashMap<String, Arc<DecodedImage>>;
 /// `resolve_font_size` porque algo -el layout- ya consume ese valor
 /// resuelto) - se propagan como el string crudo que declaro el autor, igual
 /// que `color` siempre ha hecho.
+/// Sustituye cada `var(--nombre, respaldo)` de `value` por el valor de esa
+/// propiedad personalizada, o por el respaldo si no esta definida.
+///
+/// Las propiedades personalizadas (`--color-base: #fff`) son la forma en
+/// que se escribe CSS hoy: MDN usa `var()` 547 veces y Wikipedia declara
+/// hasta sus colores de fondo asi. Sin resolverlas, el valor que llega al
+/// layout es la cadena literal "var(--algo)", que no parsea como longitud
+/// ni como color, y la declaracion entera se pierde - la pagina se maqueta
+/// como si su hoja de estilos no existiera.
+///
+/// Se resuelve de dentro hacia fuera y de forma recursiva (una variable
+/// puede valer otra `var()`), con un tope de profundidad que corta las
+/// referencias circulares: `--a: var(--b); --b: var(--a)` es CSS valido de
+/// escribir y no debe colgar el motor.
+fn substitute_css_vars(value: &str, vars: &HashMap<String, String>, depth: u8) -> String {
+    const MAX_DEPTH: u8 = 8;
+    if depth >= MAX_DEPTH || !value.contains("var(") {
+        return value.to_string();
+    }
+
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if !value[i..].starts_with("var(") {
+            let ch_len = value[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+            out.push_str(&value[i..i + ch_len]);
+            i += ch_len;
+            continue;
+        }
+        // Buscar el parentesis que cierra ESTE `var(`, contando los que se
+        // abran por dentro (el respaldo puede llevar otro `var()` o un
+        // `calc()`).
+        let open = i + 3;
+        let mut level = 0usize;
+        let mut close = None;
+        for (offset, ch) in value[open..].char_indices() {
+            match ch {
+                '(' => level += 1,
+                ')' => {
+                    level -= 1;
+                    if level == 0 {
+                        close = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            // `var(` sin cerrar: se copia tal cual y se deja de interpretar.
+            out.push_str(&value[i..]);
+            break;
+        };
+
+        let inner = &value[open + 1..close];
+        let (name, fallback) = match inner.find(',') {
+            Some(comma) => (inner[..comma].trim(), Some(inner[comma + 1..].trim())),
+            None => (inner.trim(), None),
+        };
+
+        let replacement = match vars.get(name) {
+            Some(found) => substitute_css_vars(found, vars, depth + 1),
+            None => match fallback {
+                Some(f) => substitute_css_vars(f, vars, depth + 1),
+                // Sin valor ni respaldo, el spec declara la propiedad
+                // invalida; dejarla vacia es lo mas parecido que puede hacer
+                // este motor sin un concepto de "valor no valido".
+                None => String::new(),
+            },
+        };
+        out.push_str(&replacement);
+        i = close + 1;
+    }
+    out
+}
+
+/// Una propiedad personalizada es cualquiera cuyo nombre empieza por `--`.
+/// Heredan SIEMPRE (por eso no estan ni pueden estar en
+/// `INHERITABLE_PROPERTIES`, que es una lista cerrada).
+fn is_custom_property(name: &str) -> bool {
+    name.starts_with("--")
+}
+
 const INHERITABLE_PROPERTIES: &[&str] = &[
     "color",
     "font-size",
@@ -992,6 +1076,40 @@ fn measure_intrinsic_width_uncached(child: &mut LayoutBox, mode: IntrinsicWidth,
             text_w + extra
         }
         BoxType::Replaced => 150.0 + extra,
+        // Un contenedor flex NO apila a sus hijos verticalmente, asi que su
+        // anchura intrinseca no es la del hijo mas ancho: en una FILA los
+        // items van uno al lado del otro y sus anchuras se SUMAN (mas los
+        // `gap`). Medirlo como si fuera flujo de bloque lo dejaba mucho mas
+        // estrecho de lo que necesita, y entonces sus propios hijos se
+        // salian de el - eso era la cabecera de Wikipedia, con las cajas
+        // desbordando a la derecha y pisandose unas a otras.
+        //
+        // En una COLUMNA el eje principal es el vertical, asi que la anchura
+        // sigue siendo la del hijo mas ancho, igual que en flujo normal.
+        _ if child.computed_style.get("display").map(String::as_str) == Some("flex") => {
+            let column = matches!(
+                child.computed_style.get("flex-direction").map(String::as_str),
+                Some("column") | Some("column-reverse")
+            );
+            let gap = child.computed_style.get("gap").and_then(|v| parse_css_length(v)).unwrap_or(0.0);
+            let mut total: f32 = 0.0;
+            let mut widest: f32 = 0.0;
+            let mut items = 0;
+            for c in &mut child.children {
+                if is_out_of_flow(&c.computed_style) {
+                    continue;
+                }
+                let cw = measure_intrinsic_width(c, mode, font_set, images);
+                total += cw;
+                widest = widest.max(cw);
+                items += 1;
+            }
+            if column {
+                widest + extra
+            } else {
+                total + gap * (items.max(1) - 1) as f32 + extra
+            }
+        }
         _ => {
             let mut max_w: f32 = 0.0;
             let mut inline_w: f32 = 0.0;
@@ -1491,7 +1609,43 @@ impl LayoutTreeBuilder {
                     current_box.computed_style.entry(prop.clone()).or_insert_with(|| value.clone());
                 }
 
+                // Las propiedades personalizadas heredan siempre y se
+                // propagan tal cual (sin sustituir): su valor puede
+                // contener a su vez `var()`, que se resuelve al usarlas,
+                // no al declararlas.
                 let mut child_inherited = inherited.clone();
+                for (prop, value) in current_box.computed_style.iter() {
+                    if is_custom_property(prop) {
+                        child_inherited.insert(prop.clone(), value.clone());
+                    }
+                }
+
+                // Con todas las variables visibles (propias mas heredadas),
+                // se resuelve `var()` en el resto de propiedades. Va ANTES
+                // del bucle de herencia de abajo para que lo que se propague
+                // a los hijos sea ya el valor final, no una referencia.
+                let variables: HashMap<String, String> = child_inherited
+                    .iter()
+                    .filter(|(k, _)| is_custom_property(k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                if !variables.is_empty() {
+                    let pending: Vec<(String, String)> = current_box
+                        .computed_style
+                        .iter()
+                        .filter(|(k, v)| !is_custom_property(k) && v.contains("var("))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (prop, value) in pending {
+                        let resolved = substitute_css_vars(&value, &variables, 0);
+                        if resolved.trim().is_empty() {
+                            current_box.computed_style.remove(&prop);
+                        } else {
+                            current_box.computed_style.insert(prop, resolved);
+                        }
+                    }
+                }
+
                 for prop in INHERITABLE_PROPERTIES {
                     let Some(value) = current_box.computed_style.get(*prop) else { continue };
                     let resolved = if *prop == "font-size" {
@@ -1596,7 +1750,6 @@ impl LayoutTreeBuilder {
     /// `flow_table_children` cuando una `display: table` no tiene ninguna
     /// fila (ver alli).
     fn flow_normal_block_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
-        const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
         let padding = resolve_padding(&container.computed_style);
         let border = resolve_border_width(&container.computed_style);
@@ -1760,15 +1913,18 @@ impl LayoutTreeBuilder {
             let child_border = child.box_dimensions.border;
             // `height` (si esta puesta) sustituye la altura AUTO (la que
             // acaba de devolver la recursion) por el valor explicito del
-            // autor - a diferencia del ancho auto, aqui NO se aplica el
-            // minimo `LINE_HEIGHT_FALLBACK`: ese minimo es un heuristico
-            // propio del motor para no colapsar una caja vacia a cero, no
-            // una regla real del spec, y no deberia pisar un `height` que
-            // el autor puso a proposito (aunque sea mas pequeño que el
-            // contenido - el contenido simplemente desborda, sin recorte:
-            // `overflow` no esta implementado todavia). Sin
-            // `max-height`/`min-height` todavia (fuera del alcance de esta
-            // tarea).
+            // autor. El contenido que no quepa simplemente desborda, sin
+            // recorte: `overflow` no esta implementado todavia. Sin
+            // `max-height`/`min-height` todavia.
+            //
+            // Una caja de bloque con `height: auto` y sin contenido en flujo
+            // mide CERO, que es lo que dice el spec. Antes se le aplicaba un
+            // suelo de `LINE_HEIGHT_FALLBACK` (un heuristico del motor "para
+            // no colapsar una caja vacia") que le daba 22 px fantasma a cada
+            // `<div>` estructural vacio - y una pagina real tiene cientos.
+            // En la Wikipedia real eso metia mas de 100 px de hueco en
+            // blanco entre la cabecera y el titulo del articulo, y separaba
+            // entre si todas las secciones.
             let vertical_extra = child_padding.top + child_padding.bottom + child_border.top + child_border.bottom;
             let explicit_height = child.computed_style.get("height").and_then(|v| parse_css_length(v));
             let border_box = is_border_box(&child.computed_style);
@@ -1778,7 +1934,7 @@ impl LayoutTreeBuilder {
             };
             child.dimensions.height = match explicit_height {
                 Some(h) => if border_box { h } else { h + vertical_extra },
-                None => (content_height + vertical_extra).max(LINE_HEIGHT_FALLBACK),
+                None => content_height + vertical_extra,
             };
             // El area de contenido real (sin padding NI border, los dos ya
             // sumados arriba) - poblar esto es lo que hace que
@@ -2739,6 +2895,75 @@ mod tests {
             }
         }
         root.children.iter_mut().find_map(|c| find_box_for_dom_node_mut(c, target))
+    }
+
+    /// Las propiedades personalizadas (`--x`) se resuelven donde se USAN,
+    /// heredando desde donde se declararon - casi siempre `:root`. Sin
+    /// esto, el valor que llega al layout es la cadena literal
+    /// "var(--algo)", que no parsea como longitud, y la declaracion se
+    /// pierde: la pagina se maqueta como si su hoja de estilos no
+    /// existiera.
+    #[test]
+    fn las_variables_css_se_resuelven_y_heredan_desde_la_raiz() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="a">a</div><div id="b">b</div><div id="c">c</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse(
+            ":root { --ancho: 300px; --alias: var(--ancho); } body { margin: 0px; }              #a { width: var(--ancho); } #b { width: var(--noexiste, 150px); } #c { width: var(--alias); }",
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let ancho = |id: &str| {
+            find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja").dimensions.width
+        };
+
+        assert_eq!(ancho("a"), 300.0, "una var() declarada en :root deberia heredarse y resolverse");
+        assert_eq!(ancho("b"), 150.0, "una var() sin declarar deberia caer a su valor de respaldo");
+        assert_eq!(ancho("c"), 300.0, "una var() cuyo valor es otra var() deberia resolverse en cadena");
+    }
+
+    /// Una caja de bloque vacia mide CERO de alto. Antes se le aplicaba un
+    /// suelo de 22px "para no colapsarla", que en una pagina real - llena de
+    /// `<div>` estructurales sin contenido propio - metia mas de 100px de
+    /// hueco en blanco entre secciones.
+    #[test]
+    fn una_caja_de_bloque_vacia_no_ocupa_alto() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="vacio"></div><div id="siguiente" style="height: 30px;">x</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let vacio = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "vacio").unwrap()).expect("caja");
+        let siguiente = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "siguiente").unwrap()).expect("caja");
+
+        assert_eq!(vacio.dimensions.height, 0.0, "un div sin contenido mide cero de alto");
+        assert_eq!(siguiente.dimensions.y, 0.0, "y por tanto no empuja hacia abajo a lo que viene despues");
+    }
+
+    /// La anchura intrinseca de un contenedor flex en FILA es la SUMA de
+    /// las de sus items (van uno al lado del otro), no la del mas ancho.
+    /// Medirla como flujo de bloque lo dejaba demasiado estrecho y sus
+    /// propios hijos se salian por la derecha.
+    #[test]
+    fn la_anchura_intrinseca_de_una_fila_flex_suma_sus_items() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="fila" style="display: flex;"><div>aaaa</div><div>bbbb</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let mut root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let fila = find_box_for_dom_node_mut(&mut root, &Node::find_by_id(&dom, "fila").unwrap()).expect("caja");
+        let suma_esperada: f32 = fila
+            .children
+            .iter_mut()
+            .map(|c| measure_intrinsic_width(c, IntrinsicWidth::Max, None, &ImageMap::new()))
+            .sum();
+        let medida = measure_intrinsic_width(fila, IntrinsicWidth::Max, None, &ImageMap::new());
+
+        assert!(
+            (medida - suma_esperada).abs() < 0.5,
+            "la fila deberia medir la suma de sus items ({suma_esperada}), no {medida}"
+        );
     }
 
     /// La anchura MINIMA de contenido de un texto es la de su palabra mas

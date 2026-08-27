@@ -17,6 +17,14 @@ use std::collections::HashMap;
 pub struct MediaCondition {
     pub min_width: Option<f32>,
     pub max_width: Option<f32>,
+    /// Limites ESTRICTOS de la sintaxis de rangos de Media Queries nivel 4
+    /// (`@media (width > 769px)`): a diferencia de `min-width`/`max-width`,
+    /// que son inclusivos, `>` y `<` excluyen el propio punto de ruptura.
+    /// La diferencia solo se nota exactamente en ese pixel, pero es
+    /// precisamente donde un `(width > 769px)` y un `(width <= 769px)`
+    /// vecinos tienen que repartirse el mundo sin solaparse ni dejar hueco.
+    pub min_width_exclusive: Option<f32>,
+    pub max_width_exclusive: Option<f32>,
     /// `true` cuando la consulta pide un medio que no somos (`print`,
     /// `speech`) o usa una caracteristica no soportada.
     pub never_matches: bool,
@@ -36,6 +44,12 @@ impl MediaCondition {
             return false;
         }
         if self.max_width.is_some_and(|max| viewport_width > max) {
+            return false;
+        }
+        if self.min_width_exclusive.is_some_and(|min| viewport_width <= min) {
+            return false;
+        }
+        if self.max_width_exclusive.is_some_and(|max| viewport_width >= max) {
             return false;
         }
         true

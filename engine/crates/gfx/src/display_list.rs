@@ -274,9 +274,24 @@ impl DisplayList {
         for child in &layout_box.children {
             match z_index_for_stacking(&child.computed_style) {
                 Some(z) => {
+                    // El sitio de ESTA capa se reserva ANTES de recursar.
+                    //
+                    // Si se empujara al terminar (que es lo que se hacia),
+                    // cualquier capa creada por un DESCENDIENTE durante esa
+                    // recursion quedaria ANTES en la lista, y como el orden
+                    // se decide con una ordenacion estable por z-index, a
+                    // igual z el ancestro acabaria pintandose ENCIMA de su
+                    // propio contenido. El fondo de un padre va siempre por
+                    // debajo de lo que contiene, y este motor lo estaba
+                    // invirtiendo: en la Wikipedia real, `.mw-page-container`
+                    // pintaba un rectangulo blanco de 1280x62707 sobre el
+                    // articulo entero y la pagina se veia en blanco de la
+                    // cabecera para abajo.
+                    let slot = z_layers.len();
+                    z_layers.push((z, Vec::new()));
                     let mut layer_items = Vec::new();
                     Self::build_items(child, &mut layer_items, images, z_layers);
-                    z_layers.push((z, layer_items));
+                    z_layers[slot].1 = layer_items;
                 }
                 None => Self::build_items(child, target, images, z_layers),
             }
@@ -1019,6 +1034,51 @@ mod tests {
         assert!(
             !list.items.iter().any(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [255, 0, 0, 255])),
             "el ancestro oculto en si no deberia pintar su propio fondo"
+        );
+    }
+
+    /// El fondo de un ANCESTRO va siempre por debajo del contenido de sus
+    /// descendientes, aunque los dos creen capa propia con el MISMO
+    /// z-index.
+    ///
+    /// Se aplanan las capas en una sola lista, y el ancestro terminaba de
+    /// recursar DESPUES de sus hijos, asi que acababa el ultimo de la lista
+    /// y se pintaba encima de su propio contenido. En la Wikipedia real eso
+    /// tapaba el articulo entero con un rectangulo blanco de pagina
+    /// completa.
+    #[test]
+    fn el_fondo_de_un_ancestro_se_pinta_antes_que_el_contenido_de_sus_hijos() {
+        let mut hijo = LayoutBox::new(BoxType::Block);
+        hijo.computed_style.insert("position".to_string(), "relative".to_string());
+        hijo.computed_style.insert("z-index".to_string(), "0".to_string());
+        hijo.computed_style.insert("background-color".to_string(), "#00ff00".to_string());
+        hijo.dimensions = Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
+
+        let mut ancestro = LayoutBox::new(BoxType::Block);
+        ancestro.computed_style.insert("position".to_string(), "relative".to_string());
+        ancestro.computed_style.insert("z-index".to_string(), "0".to_string());
+        ancestro.computed_style.insert("background-color".to_string(), "#ffffff".to_string());
+        ancestro.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        ancestro.children.push(hijo);
+
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.children.push(ancestro);
+
+        let list = DisplayList::build(&root, &ImageMap::new());
+        let blanco = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [255, 255, 255, 255]))
+            .expect("deberia existir el fondo blanco del ancestro");
+        let verde = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [0, 255, 0, 255]))
+            .expect("deberia existir el fondo verde del hijo");
+
+        assert!(
+            blanco < verde,
+            "el fondo del ancestro (indice {blanco}) deberia pintarse ANTES que el del hijo (indice {verde}), no taparlo"
         );
     }
 
