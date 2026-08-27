@@ -275,7 +275,19 @@ pub struct DocumentBindings {
     /// objeto JS ya construido para el. Ver su doc-comment para el porque.
     #[unsafe_ignore_trace]
     element_objects: Arc<Mutex<HashMap<usize, JsObject>>>,
+    /// `scrollTop`/`scrollLeft` de cada elemento con `overflow: auto/
+    /// scroll` que los haya recibido - puntero de nodo -> (scrollLeft,
+    /// scrollTop) en pixeles. `core::pipeline` lo lee tras cada layout
+    /// (`engine_layout::apply_scroll_offsets`) para desplazar de verdad el
+    /// contenido del contenedor - ver el doc-comment de esa funcion para
+    /// el porque scroll de verdad no vive aqui, en `engine-js`, sino en el
+    /// arbol de layout.
+    #[unsafe_ignore_trace]
+    scroll_offsets: ScrollOffsets,
 }
+
+/// Ver `DocumentBindings::scroll_offsets`.
+pub type ScrollOffsets = Arc<Mutex<HashMap<usize, (f32, f32)>>>;
 
 impl DocumentBindings {
     /// El registro de mutaciones de este documento.
@@ -286,6 +298,11 @@ impl DocumentBindings {
     /// Apunta una mutacion. Se llama desde cada funcion que toca el DOM.
     fn record_mutation(&self, mutation: crate::mutation_observer::PendingMutation) {
         self.mutations.lock().unwrap().push(mutation);
+    }
+
+    /// El registro de scroll de este documento - ver `scroll_offsets`.
+    pub fn scroll_offsets(&self) -> &ScrollOffsets {
+        &self.scroll_offsets
     }
 }
 
@@ -370,7 +387,7 @@ impl DomBindings {
 
         context.register_global_builtin_callable(js_string!("printEngineLog"), 1, print_fn)?;
 
-        let bindings = DocumentBindings { listeners: Arc::new(Mutex::new(HashMap::new())), layout: cssom::new_layout_snapshot(), mutations: Arc::new(Mutex::new(Vec::new())), element_objects: Arc::new(Mutex::new(HashMap::new())) };
+        let bindings = DocumentBindings { listeners: Arc::new(Mutex::new(HashMap::new())), layout: cssom::new_layout_snapshot(), mutations: Arc::new(Mutex::new(Vec::new())), element_objects: Arc::new(Mutex::new(HashMap::new())), scroll_offsets: Arc::new(Mutex::new(HashMap::new())) };
         // `getComputedStyle` es un GLOBAL (no un metodo de elemento), asi
         // que se registra aqui, donde nace el snapshot que consulta. Se le
         // pasa `node_from_js_value` porque el tipo que lleva los datos
@@ -990,9 +1007,14 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
                 None => "undefined".to_string(),
             };
             let mut n = capture.0.write().unwrap();
-            if let NodeType::Element { attributes, .. } = &mut n.node_type {
-                attributes.insert(name.clone(), value);
-            }
+            let old_value = if let NodeType::Element { attributes, .. } = &mut n.node_type {
+                // Se captura ANTES de sobrescribir - es el valor "viejo"
+                // que un `MutationObserver` con `attributeOldValue: true`
+                // espera ver en su registro.
+                attributes.insert(name.clone(), value)
+            } else {
+                None
+            };
             // El lock se suelta ANTES de apuntar la mutacion: el registro
             // tiene su propio candado y anidarlos es la receta de un
             // interbloqueo.
@@ -1001,6 +1023,7 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
                 kind: "attributes",
                 target: capture.0.clone(),
                 attribute_name: Some(name),
+                old_value,
                 added: Vec::new(),
                 removed: Vec::new(),
             });
@@ -1044,6 +1067,7 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
                 kind: "childList",
                 target: capture.0.clone(),
                 attribute_name: None,
+                old_value: None,
                 added: vec![text_node],
                 removed: quitados,
             });
@@ -1080,6 +1104,7 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
                 kind: "childList",
                 target: capture.0.clone(),
                 attribute_name: None,
+                old_value: None,
                 added: vec![child_node],
                 removed: Vec::new(),
             });
@@ -1112,6 +1137,7 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
                 kind: "childList",
                 target: capture.0.clone(),
                 attribute_name: None,
+                old_value: None,
                 added: Vec::new(),
                 removed: vec![child_node],
             });
@@ -1172,6 +1198,7 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
                 kind: "childList",
                 target: capture.0.clone(),
                 attribute_name: None,
+                old_value: None,
                 added: vec![new_node],
                 removed: Vec::new(),
             });
@@ -1219,6 +1246,7 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
                 kind: "childList",
                 target: capture.0.clone(),
                 attribute_name: None,
+                old_value: None,
                 added: vec![new_node],
                 removed: vec![old_node],
             });
@@ -1398,6 +1426,66 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         .constructor(false)
         .build();
 
+    // `scrollTop`/`scrollLeft`: get/set reales, respaldados por el registro
+    // de `DocumentBindings` (una entrada por nodo, no por consulta - leer
+    // desde una consulta y escribir desde otra ven el mismo valor). Escribir
+    // aqui SOLO apunta el numero; el desplazamiento real del contenido
+    // ocurre despues, en `core::pipeline`, cuando el layout siguiente
+    // consulta este mismo registro (`engine_layout::apply_scroll_offsets`) -
+    // por eso el efecto visible de asignar `scrollTop` no es instantaneo
+    // dentro del MISMO script, sino en el proximo layout.
+    fn scroll_accessor(
+        context: &mut Context,
+        capture: &ElementCapture,
+        eje: usize,
+        nombre: &str,
+    ) -> (boa_engine::object::builtins::JsFunction, boa_engine::object::builtins::JsFunction) {
+        let getter = NativeFunction::from_copy_closure_with_captures(
+            move |_this, _args, capture: &ElementCapture, _context| {
+                let key = Arc::as_ptr(&capture.0) as usize;
+                let valor = capture.1.scroll_offsets().lock().unwrap().get(&key).map(|xy| if eje == 0 { xy.0 } else { xy.1 }).unwrap_or(0.0);
+                Ok(JsValue::from(valor))
+            },
+            capture.clone(),
+        );
+        let getter = FunctionObjectBuilder::new(context.realm(), getter)
+            .name(js_string!(format!("get {nombre}")))
+            .length(0)
+            .constructor(false)
+            .build();
+        let setter = NativeFunction::from_copy_closure_with_captures(
+            move |_this, args, capture: &ElementCapture, context| {
+                let Some(value) = args.first() else { return Ok(JsValue::undefined()) };
+                let numero = value.to_number(context)?;
+                if !numero.is_finite() {
+                    return Ok(JsValue::undefined());
+                }
+                // Negativo no tiene sentido (no hay "scroll hacia atras del
+                // principio") - se recorta a cero, igual que un navegador
+                // real.
+                let numero = (numero as f32).max(0.0);
+                let key = Arc::as_ptr(&capture.0) as usize;
+                let mut registro = capture.1.scroll_offsets().lock().unwrap();
+                let entrada = registro.entry(key).or_insert((0.0, 0.0));
+                if eje == 0 {
+                    entrada.0 = numero;
+                } else {
+                    entrada.1 = numero;
+                }
+                Ok(JsValue::undefined())
+            },
+            capture.clone(),
+        );
+        let setter = FunctionObjectBuilder::new(context.realm(), setter)
+            .name(js_string!(format!("set {nombre}")))
+            .length(1)
+            .constructor(false)
+            .build();
+        (getter, setter)
+    }
+    let (scroll_left_get, scroll_left_set) = scroll_accessor(context, &capture, 0, "scrollLeft");
+    let (scroll_top_get, scroll_top_set) = scroll_accessor(context, &capture, 1, "scrollTop");
+
     // addEventListener(tipo, listener): valida que `listener` sea invocable
     // (`JsValue::as_callable`, mismo mecanismo que ya usa `test_harness.rs`
     // para `test(fn, name)`) - si no, no-op honesto, nada que registrar. Lo
@@ -1533,6 +1621,8 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         .accessor(js_string!("nextElementSibling"), Some(next_element_sibling_getter_fn), None, Attribute::all())
         .accessor(js_string!("previousElementSibling"), Some(previous_element_sibling_getter_fn), None, Attribute::all())
         .accessor(js_string!("style"), Some(style_getter_fn), None, Attribute::all())
+        .accessor(js_string!("scrollLeft"), Some(scroll_left_get), Some(scroll_left_set), Attribute::all())
+        .accessor(js_string!("scrollTop"), Some(scroll_top_get), Some(scroll_top_set), Attribute::all())
         .function(get_attribute, js_string!("getAttribute"), 1)
         .function(set_attribute, js_string!("setAttribute"), 2)
         .function(append_child, js_string!("appendChild"), 1)
@@ -1961,6 +2051,33 @@ mod tests {
         runtime.eval(expresion).expect("la expresion de lectura deberia ser JS valido")
     }
 
+    /// `scrollTop`/`scrollLeft` se leen y escriben de verdad, y el valor es
+    /// del NODO (compartido entre consultas distintas al mismo elemento),
+    /// no de la consulta - mismo criterio que el resto de estado por nodo
+    /// de este archivo (listeners, atributos...).
+    #[test]
+    fn scroll_top_y_scroll_left_se_leen_y_escriben() {
+        let result = eval_with_dom(
+            r#"<html><body><div id="caja"></div></body></html>"#,
+            "var a = document.getElementById('caja');              var inicial = a.scrollTop + ',' + a.scrollLeft;              a.scrollTop = 40;              a.scrollLeft = 15;              var b = document.getElementById('caja');              inicial + '|' + a.scrollTop + ',' + a.scrollLeft + '|' + b.scrollTop + ',' + b.scrollLeft",
+        );
+        assert_eq!(
+            result, "\"0,0|40,15|40,15\"",
+            "sin asignar, deberia empezar en 0,0; tras asignar, una consulta DISTINTA al mismo nodo deberia ver el mismo valor"
+        );
+    }
+
+    /// Un valor negativo no tiene sentido (no hay "scroll antes del
+    /// principio") - se recorta a cero, igual que un navegador real.
+    #[test]
+    fn scroll_top_negativo_se_recorta_a_cero() {
+        let result = eval_with_dom(
+            r#"<html><body><div id="caja"></div></body></html>"#,
+            "var a = document.getElementById('caja'); a.scrollTop = -50; a.scrollTop",
+        );
+        assert_eq!(result, "0");
+    }
+
     /// `MutationObserver` entrega AGRUPADO al final de la tarea, no en cada
     /// mutacion: tres cambios seguidos son UNA llamada con tres registros.
     /// Es lo que hace que un bucle que añade cien nodos no dispare cien
@@ -2013,6 +2130,24 @@ mod tests {
             "var visto = '';              document.addEventListener('prueba', function() { visto = 'si'; });              document.dispatchEvent(new Event('prueba'));              visto",
         );
         assert_eq!(result, "\"si\"");
+    }
+
+    /// `attributeOldValue` expone el valor REAL de antes de la mutacion, y
+    /// SOLO al observador que lo pidio - otro observador sobre el mismo
+    /// nodo, sin esa bandera, ve `oldValue: null` para la misma mutacion.
+    /// `attributeFilter` reduce ademas que atributos le llegan a ESE
+    /// registro en concreto.
+    #[test]
+    fn attribute_old_value_y_attribute_filter_funcionan_por_observador() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja" data-x="original" data-y="tambien"></div></body></html>"#,
+            "var log = [];              var mo1 = new MutationObserver(function (r) { for (var i = 0; i < r.length; i++) { log.push('mo1:' + r[i].attributeName + '=' + r[i].oldValue); } });              var mo2 = new MutationObserver(function (r) { for (var i = 0; i < r.length; i++) { log.push('mo2:' + r[i].attributeName + '=' + r[i].oldValue); } });              var caja = document.getElementById('caja');              mo1.observe(caja, { attributeOldValue: true, attributeFilter: ['data-x'] });              mo2.observe(caja, { attributes: true });              caja.setAttribute('data-x', 'nuevo');              caja.setAttribute('data-y', 'otro');",
+            "log.join('|')",
+        );
+        assert_eq!(
+            result, "\"mo1:data-x=original|mo2:data-x=null|mo2:data-y=null\"",
+            "mo1 (con filtro) solo deberia ver data-x, con su valor viejo real; mo2 (sin attributeOldValue) deberia ver los dos cambios pero con oldValue null"
+        );
     }
 
     /// Dos lecturas del MISMO nodo (por `getElementById`, o `document.body`

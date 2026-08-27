@@ -17,7 +17,7 @@
 
 use engine_css::{CssParser, StyleSheet};
 use engine_dom::{HtmlParser, Node, NodeType};
-use engine_js::{JsRuntime, TestResult};
+use engine_js::{BoxMetrics, JsRuntime, TestResult};
 use engine_layout::{ImageMap, LayoutBox, LayoutTreeBuilder};
 use engine_net::NetworkEngine;
 use engine_text::FontSet;
@@ -157,7 +157,7 @@ pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, vi
 
     let allow_inline_style = storage.as_ref().is_none_or(|ctx| ctx.csp.allows_inline("style-src"));
     let t = std::time::Instant::now();
-    let (script_results, runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network, storage);
+    let (script_results, mut runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network, storage);
     tracing::info!("[tiempo]   JS {:?} ({} script(s))", t.elapsed(), script_results.len());
 
     let mut combined_css = String::new();
@@ -174,10 +174,77 @@ pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, vi
     tracing::info!("[tiempo]   parseo CSS {:?} ({} reglas de {} bytes)", t.elapsed(), stylesheet.rules.len(), combined_css.len());
 
     let t = std::time::Instant::now();
-    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
+    let mut layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
     tracing::info!("[tiempo]   cascada + layout {:?}", t.elapsed());
 
+    // Un script de CARGA puede asignar `scrollTop`/`scrollLeft` antes de
+    // que este primer layout exista siquiera - se aplica aqui, contra el
+    // arbol que se acaba de construir, mismo mecanismo que usa `core::
+    // server::LoadedPage::relayout` para cualquier layout posterior.
+    if let Some(offsets) = runtime.scroll_offsets() {
+        let copia = offsets.lock().unwrap().clone();
+        engine_layout::apply_scroll_offsets(&mut layout_root, &copia);
+    }
+
+    // El snapshot que lee `getComputedStyle`/`getBoundingClientRect` se
+    // publica AQUI, antes de disparar `DOMContentLoaded` - no despues, como
+    // hacia antes (`core::server` lo publicaba ya de vuelta en su propio
+    // flujo, un paso entero mas tarde). El listener mas comun de la web
+    // real es precisamente `DOMContentLoaded` leyendo geometria/estilo
+    // justo al arrancar; con el snapshot todavia vacio en ese momento,
+    // `getComputedStyle` devolvia un objeto sin ninguna propiedad util.
+    if let Some(snapshot) = runtime.layout_snapshot() {
+        if let Ok(mut data) = snapshot.write() {
+            data.boxes.clear();
+            collect_box_metrics(&layout_root, &mut data.boxes);
+        }
+    }
+
+    // `DOMContentLoaded`: el documento ya esta parseado entero, todos sus
+    // scripts han corrido, Y el layout que acaba de calcularse arriba ya es
+    // visible para JS - las tres cosas que el spec exige que sean ciertas
+    // cuando este evento se dispara. Va aqui, despues del layout, y no
+    // justo al terminar los scripts (que era donde vivia antes, en
+    // `scripting::execute_inline_scripts_keeping_runtime`): un listener
+    // registrado en el patron mas comun de arranque de una pagina real -
+    // leer una medida nada mas cargar - necesita el snapshot YA publicado,
+    // no solo el arbol de layout construido en memoria sin que JS pueda
+    // verlo todavia.
+    if let Err(e) = runtime.dispatch_event(&dom_root, "DOMContentLoaded") {
+        tracing::warn!("[js] fallo al disparar DOMContentLoaded: {e}");
+    }
+
     (PageResult { dom_root, stylesheet, layout_root, script_results }, runtime)
+}
+
+/// Aplana el arbol de layout a la lista de `(nodo, metricas)` que espera el
+/// snapshot de `getComputedStyle`/`getBoundingClientRect`. Solo entran las
+/// cajas CON nodo del DOM detras: las de texto y la raiz sintetica no
+/// corresponden a ningun elemento al que JS pueda llegar (misma regla que
+/// `LayoutBox::hit_test`).
+///
+/// Vive en `core` y no en `layout` porque `BoxMetrics` es un tipo de
+/// `engine-js`, y es `core` - que depende de los dos - el unico sitio
+/// donde las dos capas pueden encontrarse sin crear una dependencia nueva
+/// entre ellas. `pub(crate)` porque `core::server` tambien la necesita
+/// (para volver a publicar el snapshot tras un relayout posterior, cuando
+/// ya no hay ningun `DOMContentLoaded` que disparar).
+pub(crate) fn collect_box_metrics(layout: &LayoutBox, out: &mut Vec<(Arc<RwLock<Node>>, BoxMetrics)>) {
+    if let Some(node) = &layout.dom_node {
+        out.push((
+            node.clone(),
+            BoxMetrics {
+                x: layout.dimensions.x,
+                y: layout.dimensions.y,
+                width: layout.dimensions.width,
+                height: layout.dimensions.height,
+                computed_style: layout.computed_style.clone(),
+            },
+        ));
+    }
+    for child in &layout.children {
+        collect_box_metrics(child, out);
+    }
 }
 
 /// Devuelve el valor CRUDO (sin resolver contra ninguna URL base) del
@@ -283,6 +350,41 @@ mod tests {
         let page = build_page("<html><body><script>1 + 2</script></body></html>", "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new());
         assert_eq!(page.script_results.len(), 1);
         assert_eq!(page.script_results[0].as_deref(), Ok("3"));
+    }
+
+    /// El snapshot que lee `getComputedStyle`/`getBoundingClientRect` tiene
+    /// que estar ya publicado CUANDO `DOMContentLoaded` se dispara - el
+    /// patron mas comun de arranque de una pagina real es precisamente un
+    /// listener de `DOMContentLoaded` leyendo una medida nada mas cargar.
+    /// Publicarlo un paso mas tarde (lo que hacia antes: `core::server`
+    /// publicaba de vuelta en su propio flujo, DESPUES de que este
+    /// pipeline ya hubiera disparado el evento) dejaba ese listener viendo
+    /// un `getComputedStyle` vacio.
+    #[test]
+    fn el_snapshot_de_layout_ya_esta_publicado_cuando_dispara_dom_content_loaded() {
+        let (_page, mut runtime) = build_page_keeping_runtime(
+            r#"<html><head><style>#p { color: rgb(1, 2, 3); width: 200px; }</style></head><body><p id="p">x</p>
+            <script>
+                var resultado = 'sin correr';
+                document.addEventListener('DOMContentLoaded', function () {
+                    var cs = getComputedStyle(document.getElementById('p'));
+                    resultado = cs.getPropertyValue('color') + '|' + cs.getPropertyValue('width');
+                });
+            </script></body></html>"#,
+            "",
+            800.0,
+            600.0,
+            None,
+            &HashMap::new(),
+            &ImageMap::new(),
+            None,
+            None,
+        );
+        let resultado = runtime.eval("resultado").expect("leer 'resultado' deberia ser JS valido");
+        assert_eq!(
+            resultado, "\"rgb(1, 2, 3)|200px\"",
+            "el listener de DOMContentLoaded deberia haber leido el color/ancho REALES, no un snapshot vacio"
+        );
     }
 
     /// `dom_root` y `script_results` deben venir del MISMO documento: un

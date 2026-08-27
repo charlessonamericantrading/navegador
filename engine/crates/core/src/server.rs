@@ -14,7 +14,7 @@ use base64::Engine as _;
 use engine_dom::{Node, NodeType};
 use engine_gfx::render_layout_to_png;
 use engine_image::decode_image;
-use engine_js::{BoxMetrics, JsRuntime};
+use engine_js::JsRuntime;
 use engine_layout::{BoxType, ImageMap, LayoutBox, LayoutTreeBuilder};
 use engine_net::{NetworkEngine, NetworkRequest};
 use engine_text::FontSet;
@@ -68,6 +68,18 @@ impl LoadedPage {
             self.font_set.as_ref(),
             &self.images,
         );
+        // `scrollTop`/`scrollLeft` asignados desde JS desde la ultima vez
+        // se aplican AQUI, contra el arbol recien construido - no en el
+        // momento de la asignacion (ver el aviso en `dom_bindings::
+        // scroll_accessor`). `relayout` es el UNICO sitio que reconstruye
+        // el arbol tras la carga inicial (ver el aviso de arriba: clic,
+        // tecla, redimension, todo pasa por aqui), asi que es el sitio
+        // correcto para que el scroll de cualquier contenedor se refleje
+        // de verdad tras la siguiente interaccion.
+        if let Some(offsets) = self.runtime.scroll_offsets() {
+            let copia = offsets.lock().unwrap().clone();
+            engine_layout::apply_scroll_offsets(&mut self.page.layout_root, &copia);
+        }
         self.publish_layout_snapshot();
     }
 
@@ -111,7 +123,7 @@ impl LoadedPage {
         let Some(snapshot) = self.runtime.layout_snapshot() else { return };
         let Ok(mut data) = snapshot.write() else { return };
         data.boxes.clear();
-        collect_box_metrics(&self.page.layout_root, &mut data.boxes);
+        crate::pipeline::collect_box_metrics(&self.page.layout_root, &mut data.boxes);
     }
 
     /// Actualiza SOLO el desplazamiento del snapshot. Separado de
@@ -128,33 +140,9 @@ impl LoadedPage {
     }
 }
 
-/// Aplana el arbol de layout a la lista de `(nodo, metricas)` que espera el
-/// snapshot. Solo entran las cajas CON nodo del DOM detras: las de texto y
-/// la raiz sintetica no corresponden a ningun elemento al que JS pueda
-/// llegar (misma regla que `LayoutBox::hit_test`).
-///
-/// Aqui es donde se paga la copia que `engine_js::cssom` declara: un clon
-/// del `computed_style` por caja. Se hace en `core` y no en `layout` porque
-/// `BoxMetrics` es un tipo de `engine-js`, y es `core` - que depende de los
-/// dos - el unico sitio donde las dos capas pueden encontrarse sin crear
-/// una dependencia nueva entre ellas.
-fn collect_box_metrics(layout: &LayoutBox, out: &mut Vec<(std::sync::Arc<std::sync::RwLock<Node>>, BoxMetrics)>) {
-    if let Some(node) = &layout.dom_node {
-        out.push((
-            node.clone(),
-            BoxMetrics {
-                x: layout.dimensions.x,
-                y: layout.dimensions.y,
-                width: layout.dimensions.width,
-                height: layout.dimensions.height,
-                computed_style: layout.computed_style.clone(),
-            },
-        ));
-    }
-    for child in &layout.children {
-        collect_box_metrics(child, out);
-    }
-}
+// `collect_box_metrics` vive ahora en `pipeline.rs`: `build_page_keeping_
+// runtime` tambien necesita publicar el snapshot, no solo `EngineServer`
+// (ver su doc-comment alli para el porque).
 
 /// Pestaña (Fase 4.5) - agrupa TODO lo que ya era, antes de esta fase,
 /// estado directo de `EngineServer` y que en realidad pertenece a una

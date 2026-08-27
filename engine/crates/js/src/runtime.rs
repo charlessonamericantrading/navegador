@@ -222,6 +222,14 @@ impl JsRuntime {
         self.document_bindings.as_ref().map(DocumentBindings::layout_snapshot)
     }
 
+    /// El registro de `scrollTop`/`scrollLeft` del documento (ver su
+    /// doc-comment en `DocumentBindings`). Lo necesita `core::pipeline`
+    /// tras cada layout, para desplazar de verdad el contenido de cada
+    /// contenedor con scroll.
+    pub fn scroll_offsets(&self) -> Option<crate::dom_bindings::ScrollOffsets> {
+        self.document_bindings.as_ref().map(|b| b.scroll_offsets().clone())
+    }
+
     /// Dispara `event_type` sobre `node` de verdad, invocando los
     /// listeners reales registrados via `addEventListener` - SIN pasar
     /// por texto JS (`eval`). Pensada para invocarse desde codigo Rust

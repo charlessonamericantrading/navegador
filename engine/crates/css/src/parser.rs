@@ -287,6 +287,23 @@ fn parse_media_px(value: &str) -> Option<f32> {
     if v == "0" {
         return Some(0.0);
     }
+    // `em`/`rem` son tan comunes en breakpoints como `px` - de hecho mas
+    // tradicionales (escalan con el zoom/tamaño de letra del usuario, que
+    // es la razon de ser de accesibilidad por la que muchos sitios los
+    // prefieren). Antes solo se entendia `px`: cualquier `@media
+    // (min-width: 30em)` se marcaba como NO evaluable y el bloque entero
+    // se descartaba - en rust-lang.org eso desactivaba el padding mas
+    // ancho de su barra de navegacion (`ph4-ns`, detras de un
+    // `min-width:30em`), dejando sus items demasiado juntos y solapando.
+    //
+    // Una media query no tiene "el font-size de un elemento" contra el que
+    // medir `em` - el spec lo define relativo al valor INICIAL de
+    // font-size, que es la misma base de 16px que ya usa `rem` en el resto
+    // del motor (ver `parse_css_length`), asi que `em`/`rem` valen lo
+    // mismo aqui.
+    if let Some(n) = v.strip_suffix("rem").or_else(|| v.strip_suffix("em")) {
+        return n.trim().parse::<f32>().ok().map(|n| n * 16.0);
+    }
     v.strip_suffix("px")?.trim().parse::<f32>().ok()
 }
 
@@ -400,7 +417,10 @@ fn parse_media_condition(prelude: &str) -> MediaCondition {
             condition.never_matches = true;
             continue;
         };
-        let px = value.trim().strip_suffix("px").and_then(|n| n.trim().parse::<f32>().ok());
+        // Misma conversion de unidades que la sintaxis de rangos
+        // (`parse_media_px`, ver su doc-comment): `em`/`rem` cuentan igual
+        // que `px` aqui, no solo en `(width > 30em)`.
+        let px = parse_media_px(value.trim());
         match (name.trim(), px) {
             ("min-width", Some(v)) => {
                 condition.min_width = Some(v);
@@ -410,8 +430,8 @@ fn parse_media_condition(prelude: &str) -> MediaCondition {
                 condition.max_width = Some(v);
                 saw_supported_feature = true;
             }
-            // `min-width: 40em` o `(orientation: landscape)`: reconocida la
-            // forma pero no el valor/caracteristica - no se puede evaluar.
+            // `(orientation: landscape)` o similar: reconocida la forma
+            // pero no la caracteristica en si - no se puede evaluar.
             _ => condition.never_matches = true,
         }
     }
@@ -925,6 +945,26 @@ mod tests {
             !cond("@supports Not (mask-image: none) { a { color: red; } }").never_matches,
             "tambien en formas mixtas como \"Not\""
         );
+    }
+
+    /// `em`/`rem` en un `@media (min-width: ...)` clasico, no solo en la
+    /// sintaxis de rangos: antes solo se entendia `px`, asi que cualquier
+    /// breakpoint en `em` (tradicional para que escale con el tamaño de
+    /// letra del usuario) se marcaba NO evaluable y el bloque entero se
+    /// descartaba. En rust-lang.org eso desactivaba el padding ancho de su
+    /// nav (`min-width: 30em`), y sus items quedaban demasiado juntos.
+    #[test]
+    fn los_media_queries_clasicos_entienden_em_y_rem() {
+        let cond = |css: &str| CssParser::parse(css).rules[0].media.clone().expect("condicion");
+
+        let en_em = cond("@media (min-width: 30em) { a { color: red; } }");
+        assert!(!en_em.never_matches, "min-width en em deberia poder evaluarse");
+        assert!(en_em.matches(500.0), "500px es mayor que 30em (480px)");
+        assert!(!en_em.matches(400.0), "400px es menor que 30em (480px)");
+
+        let en_rem = cond("@media (max-width: 20rem) { a { color: red; } }");
+        assert!(en_rem.matches(300.0), "300px es menor que 20rem (320px)");
+        assert!(!en_rem.matches(400.0));
     }
 
     /// La sintaxis de RANGOS de Media Queries nivel 4 (`(width > 769px)`)

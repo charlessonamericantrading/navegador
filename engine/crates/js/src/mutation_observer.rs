@@ -34,6 +34,12 @@ pub struct PendingMutation {
     pub kind: &'static str,
     pub target: Arc<RwLock<Node>>,
     pub attribute_name: Option<String>,
+    /// Valor del atributo justo ANTES de esta mutacion, o `None` si el
+    /// atributo no existia. Se captura SIEMPRE que la mutacion sea de tipo
+    /// `"attributes"` (es un clon de `String`, barato) - decidir si se
+    /// EXPONE en el `MutationRecord` es cosa de cada observador
+    /// (`attributeOldValue`), no de si se captura.
+    pub old_value: Option<String>,
     pub added: Vec<Arc<RwLock<Node>>>,
     pub removed: Vec<Arc<RwLock<Node>>>,
 }
@@ -57,6 +63,16 @@ struct ObservedTarget {
     attributes: bool,
     child_list: bool,
     character_data: bool,
+    /// Si este registro quiere `oldValue` en sus `MutationRecord` de
+    /// atributos. Aparte de `attributes` porque cada observador decide por
+    /// su cuenta si le interesa el valor viejo, aunque otro observador
+    /// distinto este mirando el mismo nodo sin pedirlo.
+    attribute_old_value: bool,
+    /// Si esta presente, un `MutationRecord` de atributos solo llega a
+    /// este registro cuando el atributo cambiado esta en la lista - el
+    /// resto de atributos se ignoran para EL, aunque `attributes: true`
+    /// siga observando otros.
+    attribute_filter: Option<Vec<String>>,
 }
 
 pub type ObserverRegistry = Arc<Mutex<Vec<Observer>>>;
@@ -103,6 +119,17 @@ fn observa(target: &ObservedTarget, mutation: &PendingMutation) -> bool {
     if !interesa {
         return false;
     }
+    // `attributeFilter` reduce el interes por atributos a solo los
+    // nombrados - una mutacion de un atributo FUERA de la lista no cuenta
+    // para este registro, aunque `attributes` este activo.
+    if mutation.kind == "attributes" {
+        if let Some(filtro) = &target.attribute_filter {
+            let coincide = mutation.attribute_name.as_deref().is_some_and(|nombre| filtro.iter().any(|f| f == nombre));
+            if !coincide {
+                return false;
+            }
+        }
+    }
     if Arc::ptr_eq(&target.node, &mutation.target) {
         return true;
     }
@@ -140,15 +167,42 @@ pub fn register_mutation_observer(context: &mut Context, bindings: DocumentBindi
                             .unwrap_or(false)
                     };
                     let child_list = bandera("childList", context);
-                    let attributes = bandera("attributes", context);
                     let character_data = bandera("characterData", context);
                     let subtree = bandera("subtree", context);
+                    let attribute_old_value = bandera("attributeOldValue", context);
+                    let attribute_filter: Option<Vec<String>> = opciones
+                        .as_ref()
+                        .and_then(|o| o.get(js_string!("attributeFilter"), context).ok())
+                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|arreglo| {
+                            let longitud = arreglo.get(js_string!("length"), context).ok()?.to_number(context).ok()? as usize;
+                            let mut nombres = Vec::with_capacity(longitud);
+                            for i in 0..longitud {
+                                let valor = arreglo.get(i as u32, context).ok()?;
+                                nombres.push(valor.to_string(context).ok()?.to_std_string_escaped());
+                            }
+                            Some(nombres)
+                        });
+                    // `attributeFilter`/`attributeOldValue` presentes IMPLICAN
+                    // `attributes: true` aunque no se declare explicito - el
+                    // spec lo exige, y es un atajo real que usa mucho codigo:
+                    // `observe(el, {attributeFilter: ['class']})` sin repetir
+                    // `attributes: true`.
+                    let attributes = bandera("attributes", context) || attribute_old_value || attribute_filter.is_some();
                     // Sin ninguna bandera util el spec lanza TypeError; aqui
                     // se ignora en silencio, que es lo mismo que hacer un
                     // observador que nunca dispara pero sin romper la pagina.
                     let mut registro = capture.0.lock().unwrap();
                     if let Some(obs) = registro.iter_mut().find(|o| o.id == capture.1) {
-                        obs.targets.push(ObservedTarget { node, subtree, attributes, child_list, character_data });
+                        obs.targets.push(ObservedTarget {
+                            node,
+                            subtree,
+                            attributes,
+                            child_list,
+                            character_data,
+                            attribute_old_value,
+                            attribute_filter,
+                        });
                     }
                     Ok(JsValue::undefined())
                 },
@@ -250,10 +304,18 @@ fn build_records_array(records: &[PendingMutation], bindings: &DocumentBindings,
             Some(nombre) => JsValue::from(js_string!(nombre.as_str())),
             None => JsValue::null(),
         };
+        // `null` cuando no se pidio `attributeOldValue` (ya filtrado antes
+        // de llegar aqui) o cuando el atributo no existia - las dos cosas
+        // que el spec exige que devuelvan `null`, no una cadena vacia.
+        let old_value = match &record.old_value {
+            Some(valor) => JsValue::from(js_string!(valor.as_str())),
+            None => JsValue::null(),
+        };
         let objeto = ObjectInitializer::new(context)
             .property(js_string!("type"), js_string!(record.kind), Attribute::all())
             .property(js_string!("target"), target, Attribute::all())
             .property(js_string!("attributeName"), attribute_name, Attribute::all())
+            .property(js_string!("oldValue"), old_value, Attribute::all())
             .property(js_string!("addedNodes"), added, Attribute::all())
             .property(js_string!("removedNodes"), removed, Attribute::all())
             .build();
@@ -280,8 +342,26 @@ pub fn deliver_mutations(registry: &ObserverRegistry, log: &MutationLog, binding
     {
         let mut registro = registry.lock().unwrap();
         for obs in registro.iter_mut() {
-            let suyas: Vec<PendingMutation> =
-                mutaciones.iter().filter(|m| obs.targets.iter().any(|t| observa(t, m))).cloned().collect();
+            // Cada mutacion que le interesa a este observador se clona y, si
+            // NINGUNO de los registros de ESTE observador que la observan
+            // pidio `attributeOldValue`, se le quita el valor viejo antes
+            // de exponerla - el spec deja esa decision a cada observador,
+            // no a la mutacion en si (dos observadores distintos sobre el
+            // mismo nodo pueden pedir cosas distintas).
+            let suyas: Vec<PendingMutation> = mutaciones
+                .iter()
+                .filter_map(|m| {
+                    let coincidentes: Vec<&ObservedTarget> = obs.targets.iter().filter(|t| observa(t, m)).collect();
+                    if coincidentes.is_empty() {
+                        return None;
+                    }
+                    let mut copia = m.clone();
+                    if !coincidentes.iter().any(|t| t.attribute_old_value) {
+                        copia.old_value = None;
+                    }
+                    Some(copia)
+                })
+                .collect();
             if suyas.is_empty() {
                 continue;
             }

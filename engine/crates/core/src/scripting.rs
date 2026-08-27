@@ -228,20 +228,14 @@ pub fn execute_inline_scripts_keeping_runtime(
     let allow_inline = storage_csp.as_ref().is_none_or(|csp| csp.allows_inline("script-src"));
     let script_results = run_scripts(&mut runtime, &scripts, external_scripts, allow_inline);
 
-    // `DOMContentLoaded`: el documento ya esta parseado entero y todos sus
-    // scripts han corrido, que es EXACTAMENTE cuando el spec dice que se
-    // dispara. Va aqui y no en `core::server` para que lo vea tambien
-    // cualquier otro consumidor del pipeline.
-    //
-    // Sin esto, `document.addEventListener('DOMContentLoaded', ...)` - como
-    // arranca casi cualquier pagina real - registraba un listener que no se
-    // invocaba jamas, y toda la inicializacion de la pagina se perdia en
-    // silencio. Un listener registrado que nunca corre es peor que no poder
-    // registrarlo: no hay ningun error que delate el fallo.
-    if let Err(e) = runtime.dispatch_event(dom_root, "DOMContentLoaded") {
-        tracing::warn!("[js] fallo al disparar DOMContentLoaded: {e}");
-    }
-
+    // `DOMContentLoaded` NO se dispara aqui - se dispara en
+    // `pipeline::build_page_keeping_runtime`, DESPUES de construir el
+    // arbol de layout y publicar su snapshot para `getComputedStyle`. El
+    // documento ya esta parseado entero y los scripts ya corrieron en este
+    // punto (que es lo que el spec exige), pero dispararlo AQUI - como se
+    // hacia antes - dejaba el listener mas comun de arranque de una pagina
+    // real (leer una medida nada mas cargar) viendo un snapshot vacio,
+    // porque el layout ni siquiera se habia calculado todavia.
     (script_results, runtime)
 }
 

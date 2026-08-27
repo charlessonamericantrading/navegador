@@ -1322,9 +1322,9 @@ fn parse_grid_template_areas(value: &str) -> HashMap<String, GridArea> {
 ///
 /// `areas` es el mapa de `grid-template-areas` del contenedor: un
 /// `grid-area: pageContent` no significa nada sin el.
-fn grid_item_style(computed_style: &HashMap<String, String>, areas: &HashMap<String, GridArea>) -> taffy::Style {
+fn grid_item_style(computed_style: &HashMap<String, String>, areas: &HashMap<String, GridArea>, margin: EdgeSizes) -> taffy::Style {
     use taffy::style_helpers::line;
-    let mut style = flex_item_style(computed_style);
+    let mut style = flex_item_style(computed_style, margin);
 
     if let Some(area) = computed_style.get("grid-area").and_then(|nombre| areas.get(nombre.trim())) {
         style.grid_row = taffy::geometry::Line { start: line(area.row_start as i16), end: line(area.row_end as i16) };
@@ -1401,7 +1401,17 @@ fn grid_container_style(computed_style: &HashMap<String, String>) -> taffy::Styl
 /// del nodo hoja correspondiente. Valores iniciales reales del spec cuando
 /// la propiedad no esta puesta: `flex-grow: 0`, `flex-shrink: 1`,
 /// `flex-basis: auto`.
-fn flex_item_style(computed_style: &HashMap<String, String>) -> taffy::Style {
+/// `margin` va aparte de `computed_style`: ya viene RESUELTO en pixeles (los
+/// porcentajes se miden contra el ancho del contenedor, que esta funcion no
+/// conoce) por quien llama, con `resolve_margin`.
+///
+/// Faltaba antes por completo - `..Default::default()` deja el margen de
+/// taffy en cero, asi que el ALGORITMO DE FLEX (no solo el pintado)
+/// ignoraba cualquier `margin` de un item. Es justo como Wikipedia separa
+/// los items de su barra de usuario (`margin: 0 4px` en cada `<li>`, no
+/// `gap`): sin esto, taffy los coloca pegados, sin ningun hueco entre
+/// "Donaciones" y "Crear una cuenta".
+fn flex_item_style(computed_style: &HashMap<String, String>, margin: EdgeSizes) -> taffy::Style {
     let flex_grow = computed_style.get("flex-grow").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.0);
     let flex_shrink = computed_style.get("flex-shrink").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0);
     let flex_basis: taffy::Dimension = computed_style
@@ -1418,6 +1428,12 @@ fn flex_item_style(computed_style: &HashMap<String, String>) -> taffy::Style {
         flex_shrink,
         flex_basis,
         size: taffy::geometry::Size { width, height },
+        margin: taffy::geometry::Rect {
+            left: taffy::style_helpers::length(margin.left),
+            right: taffy::style_helpers::length(margin.right),
+            top: taffy::style_helpers::length(margin.top),
+            bottom: taffy::style_helpers::length(margin.bottom),
+        },
         ..Default::default()
     }
 }
@@ -1722,6 +1738,51 @@ pub(crate) static FLEX_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub(crate) static TABLE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static GRID_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static INLINE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Aplica el scroll de cada elemento con `overflow: auto/scroll` que lo
+/// tenga registrado (`offsets`: puntero de nodo DOM -> (scrollLeft,
+/// scrollTop), el mismo registro que llenan `scrollTop`/`scrollLeft` desde
+/// JS - ver `engine_js`). Se llama DESPUES de `LayoutTreeBuilder::build`,
+/// no dentro: el arbol de layout no sabe nada de JS ni de registros, solo
+/// de posiciones.
+///
+/// La idea es la misma que ya usa `apply_relative_offset` para `position:
+/// relative`: el CONTENEDOR se queda donde estaba (su `PushClip` en
+/// `engine-gfx` sigue recortando exactamente el mismo rectangulo), pero
+/// TODO su contenido se desplaza en bloque - hacia arriba/izquierda el
+/// numero de pixeles que se ha scrolleado. Reusar el recorte que
+/// `overflow` ya emite es lo que hace que esto sea scroll de verdad
+/// (contenido que se sale por arriba desaparece, contenido nuevo entra por
+/// abajo) sin tocar `engine-gfx` para nada: pintura y hit-testing leen
+/// `dimensions` como siempre, y `dimensions` ya viene desplazada.
+///
+/// Simplificacion declarada: se desplazan TODOS los descendientes por
+/// igual, incluidos los `position: absolute`/`fixed` que en el spec real
+/// escapan al scroll de un ancestro que no sea su containing block. Cubre
+/// el caso comun (contenido en flujo normal dentro de un contenedor con
+/// scroll) sin resolver el caso raro de un absoluto anidado dentro de un
+/// contenedor con scroll.
+pub fn apply_scroll_offsets(root: &mut LayoutBox, offsets: &HashMap<usize, (f32, f32)>) {
+    if offsets.is_empty() {
+        return;
+    }
+    apply_scroll_offsets_rec(root, offsets);
+}
+
+fn apply_scroll_offsets_rec(node: &mut LayoutBox, offsets: &HashMap<usize, (f32, f32)>) {
+    let propio = node.dom_node.as_ref().and_then(|n| offsets.get(&(Arc::as_ptr(n) as usize)).copied());
+    if let Some((scroll_left, scroll_top)) = propio {
+        if scroll_left != 0.0 || scroll_top != 0.0 {
+            for hijo in &mut node.children {
+                LayoutTreeBuilder::shift_subtree_x(hijo, -scroll_left);
+                LayoutTreeBuilder::shift_subtree_y(hijo, -scroll_top);
+            }
+        }
+    }
+    for hijo in &mut node.children {
+        apply_scroll_offsets_rec(hijo, offsets);
+    }
+}
 
 pub struct LayoutTreeBuilder;
 
@@ -2604,7 +2665,8 @@ impl LayoutTreeBuilder {
             // pequeño de mas aunque la segunda pasada corrija el padding
             // pintado despues.
             child.containing_width = inner_width;
-            let style = flex_item_style(&child.computed_style);
+            let margin = resolve_margin(&child.computed_style, inner_width);
+            let style = flex_item_style(&child.computed_style, margin);
             let node_id = taffy_tree
                 .new_leaf_with_context(style, index)
                 .expect("crear un nodo hoja de taffy no deberia fallar (sin limite de nodos alcanzado)");
@@ -2666,6 +2728,10 @@ impl LayoutTreeBuilder {
             let layout = *taffy_tree.layout(*node_id).expect("layout deberia existir tras compute_layout_with_measure");
             let child = &mut container.children[*index];
             child.containing_width = inner_width;
+            // Ver el mismo comentario en `flow_grid_children`: puebla el
+            // margen que taffy ya uso para colocar el item, no solo el
+            // `Style` que se le paso.
+            child.box_dimensions.margin = resolve_margin(&child.computed_style, inner_width);
             child.dimensions.x = origin_x + layout.location.x;
             child.dimensions.y = origin_y + layout.location.y;
             child.dimensions.width = layout.size.width;
@@ -2720,7 +2786,8 @@ impl LayoutTreeBuilder {
             // Mismo motivo que en `flow_flex_children`: hace falta ANTES de
             // que taffy mida, no solo al comprometer la posicion final.
             child.containing_width = inner_width;
-            let style = grid_item_style(&child.computed_style, &areas);
+            let margin = resolve_margin(&child.computed_style, inner_width);
+            let style = grid_item_style(&child.computed_style, &areas, margin);
             let node_id = taffy_tree
                 .new_leaf_with_context(style, index)
                 .expect("crear nodo hoja de taffy para grid");
@@ -2760,6 +2827,12 @@ impl LayoutTreeBuilder {
             let layout = *taffy_tree.layout(*node_id).expect("layout deberia existir tras compute_layout_with_measure");
             let child = &mut container.children[*index];
             child.containing_width = inner_width;
+            // `box_dimensions.margin` tambien se puebla aqui, no solo el
+            // `Style` que taffy ya consumio - es lo que `getBoundingClientRect`/
+            // `margin_box()` leen despues, y sin esto un item flex/grid
+            // reportaba margen cero aunque taffy ya lo hubiera respetado al
+            // colocarlo.
+            child.box_dimensions.margin = resolve_margin(&child.computed_style, inner_width);
             child.dimensions.x = origin_x + layout.location.x;
             child.dimensions.y = origin_y + layout.location.y;
             child.dimensions.width = layout.size.width;
@@ -3783,6 +3856,64 @@ mod tests {
 
         assert_eq!(vacio.dimensions.height, 0.0, "un div sin contenido mide cero de alto");
         assert_eq!(siguiente.dimensions.y, 0.0, "y por tanto no empuja hacia abajo a lo que viene despues");
+    }
+
+    /// `margin` de un item flex/grid tenia que separar a sus hermanos, no
+    /// solo pintarse: `flex_item_style` nunca lo pasaba a taffy, asi que el
+    /// ALGORITMO de flex los colocaba pegados sin importar el margen
+    /// declarado. Es exactamente como Wikipedia separa los items de su
+    /// barra de usuario (`margin: 0 4px`, no `gap`) - sin esto,
+    /// "Donaciones" y "Crear una cuenta" quedaban unidos sin espacio.
+    #[test]
+    fn el_margin_de_un_item_flex_separa_a_sus_hermanos() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="display: flex; width: 300px;"><div id="a" style="margin: 0px 4px;">Uno</div><div id="b" style="margin: 0px 4px;">Dos</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let a = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "a").unwrap()).expect("caja");
+        let b = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "b").unwrap()).expect("caja");
+
+        let hueco = b.dimensions.x - (a.dimensions.x + a.dimensions.width);
+        assert!(
+            (hueco - 8.0).abs() < 0.5,
+            "deberia haber 8px de hueco (4px margin-right de 'a' + 4px margin-left de 'b'), midio {hueco}"
+        );
+    }
+
+    /// `apply_scroll_offsets` desplaza el CONTENIDO de un contenedor con
+    /// scroll (no el contenedor en si), reusando el mismo mecanismo de
+    /// desplazar un subarbol que ya usa `position: relative` - es lo que
+    /// hace que pintura y hit-testing salgan correctos sin tocar
+    /// `engine-gfx` para nada.
+    #[test]
+    fn apply_scroll_offsets_desplaza_el_contenido_no_el_contenedor() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="caja" style="overflow:auto;width:200px;height:100px;"><div id="uno" style="height:100px;">u</div><div id="dos" style="height:100px;">d</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let caja_node = Node::find_by_id(&dom, "caja").expect("caja");
+        let uno_node = Node::find_by_id(&dom, "uno").expect("uno");
+        let dos_node = Node::find_by_id(&dom, "dos").expect("dos");
+        let caja_ptr = std::sync::Arc::as_ptr(&caja_node) as usize;
+
+        let caja_y_antes = find_box_for_dom_node(&root, &caja_node).unwrap().dimensions.y;
+        let uno_y_antes = find_box_for_dom_node(&root, &uno_node).unwrap().dimensions.y;
+
+        let mut root = root;
+        let mut offsets = HashMap::new();
+        offsets.insert(caja_ptr, (0.0_f32, 100.0_f32));
+        apply_scroll_offsets(&mut root, &offsets);
+
+        let caja_y_despues = find_box_for_dom_node(&root, &caja_node).unwrap().dimensions.y;
+        let uno_y_despues = find_box_for_dom_node(&root, &uno_node).unwrap().dimensions.y;
+        let dos_y_despues = find_box_for_dom_node(&root, &dos_node).unwrap().dimensions.y;
+
+        assert_eq!(caja_y_despues, caja_y_antes, "el CONTENEDOR no se mueve, solo su contenido");
+        assert_eq!(uno_y_despues, uno_y_antes - 100.0, "el contenido se desplaza hacia arriba el scroll aplicado");
+        assert_eq!(dos_y_despues, uno_y_despues + 100.0, "los hermanos mantienen su posicion relativa entre si");
     }
 
     /// La anchura intrinseca de un contenedor flex en FILA es la SUMA de
