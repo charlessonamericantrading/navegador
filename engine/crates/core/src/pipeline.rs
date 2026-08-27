@@ -148,9 +148,17 @@ pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewp
 /// (sin `StorageContext`, ver el resto de este archivo) se permite, igual
 /// que "sin politica" en el spec real.
 pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap, network: Option<Arc<NetworkEngine>>, storage: Option<crate::scripting::StorageContext>) -> (PageResult, JsRuntime) {
+    // Mismo cronometro por fases que `server::navigate_with_body`, un nivel
+    // mas abajo: sin el, las cuatro etapas caras del motor (parsear HTML,
+    // ejecutar JS, parsear CSS, maquetar) son un unico numero opaco.
+    let t = std::time::Instant::now();
     let dom_root = HtmlParser::parse(html);
+    tracing::info!("[tiempo]   parseo HTML {:?}", t.elapsed());
+
     let allow_inline_style = storage.as_ref().is_none_or(|ctx| ctx.csp.allows_inline("style-src"));
+    let t = std::time::Instant::now();
     let (script_results, runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network, storage);
+    tracing::info!("[tiempo]   JS {:?} ({} script(s))", t.elapsed(), script_results.len());
 
     let mut combined_css = String::new();
     if allow_inline_style {
@@ -161,8 +169,13 @@ pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, vi
     }
     combined_css.push_str(css);
 
+    let t = std::time::Instant::now();
     let stylesheet = CssParser::parse(&combined_css);
+    tracing::info!("[tiempo]   parseo CSS {:?} ({} reglas de {} bytes)", t.elapsed(), stylesheet.rules.len(), combined_css.len());
+
+    let t = std::time::Instant::now();
     let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
+    tracing::info!("[tiempo]   cascada + layout {:?}", t.elapsed());
 
     (PageResult { dom_root, stylesheet, layout_root, script_results }, runtime)
 }

@@ -83,6 +83,44 @@ pub struct ReplacedText {
     pub centered: bool,
 }
 
+/// Espacio disponible que el algoritmo flex ofrece en un eje al MEDIR un
+/// item, en terminos propios de este crate (no los de `taffy`): mantener
+/// `layout_box.rs` libre de tipos de `taffy` es lo que permite que la
+/// cache de medidas viva en la caja sin arrastrar esa dependencia hasta
+/// aqui. `tree.rs` convierte desde/hacia los tipos de taffy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AvailableAxis {
+    Definite(f32),
+    MinContent,
+    MaxContent,
+}
+
+/// Clave de `LayoutBox::measure_cache`: identifica QUE medida es. Dos
+/// medidas con la misma clave sobre la misma caja tienen por fuerza el
+/// mismo resultado, porque el subarbol no cambia durante una maquetacion.
+///
+/// Es un enum y no una sola estructura de campos porque hay tres medidas
+/// distintas que no deben mezclarse jamas: la que pide el algoritmo flex
+/// (con sus propias entradas) y las dos anchuras intrinsecas, que son
+/// preguntas independientes sobre la misma caja.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MeasureKey {
+    /// Una medida pedida por el algoritmo flex, con las entradas de las que
+    /// depende su resultado.
+    Flex {
+        known_width: Option<f32>,
+        known_height: Option<f32>,
+        available_width: AvailableAxis,
+        available_height: AvailableAxis,
+    },
+    /// Anchura MINIMA a la que la caja puede reducirse sin desbordar su
+    /// contenido: para un texto, el ancho de su palabra mas larga.
+    MinContentWidth,
+    /// Anchura que la caja ocuparia sin ningun corte de linea: para un
+    /// texto, la frase entera en una sola linea.
+    MaxContentWidth,
+}
+
 #[derive(Debug, Clone)]
 pub struct LayoutBox {
     pub box_type: BoxType,
@@ -124,6 +162,51 @@ pub struct LayoutBox {
     /// (checkbox/radio/hidden/`<select>` - ver `resolve_replaced_text` en
     /// tree.rs).
     pub replaced_text: Option<ReplacedText>,
+    /// Medidas ya calculadas para esta caja, por clave de entrada.
+    ///
+    /// Existe por una razon medida, no por prudencia: `taffy` llama a la
+    /// funcion de medida de un item flex varias veces (min-content,
+    /// max-content, tamaño definitivo), y medir un item significa MAQUETAR
+    /// SU SUBARBOL ENTERO. Con contenedores flex anidados - lo normal en
+    /// cualquier web moderna - ese coste se multiplica por nivel de
+    /// anidamiento en vez de sumarse: en la Wikipedia real eran 505.765
+    /// remaquetados para 35.000 nodos, 84 s de reloj. Recordar el
+    /// resultado por clave lo vuelve lineal, que es lo que hace cualquier
+    /// motor real.
+    ///
+    /// Un `Vec` con busqueda lineal, no un `HashMap`: en la practica son
+    /// dos o tres entradas por caja, donde recorrerlas gana a construir un
+    /// hash, y ademas `f32` no implementa `Hash`.
+    ///
+    /// Solo es valida mientras el subarbol no cambie. No hace falta
+    /// invalidarla nunca porque `LayoutTreeBuilder::build` reconstruye el
+    /// arbol entero desde el DOM en cada maquetacion (tambien al
+    /// redimensionar), asi que cada caja nace con su cache vacia.
+    pub(crate) measure_cache: Vec<(MeasureKey, (f32, f32))>,
+    /// Donde habria caido esta caja si NO estuviera fuera de flujo - la
+    /// "posicion estatica" del spec, en coordenadas absolutas.
+    ///
+    /// Solo se rellena para cajas `position: absolute`/`fixed`, y solo
+    /// existe porque el spec la exige: un absoluto con `left`/`top` en
+    /// `auto` NO va a la esquina de su bloque contenedor, va exactamente
+    /// donde el flujo normal lo habria dejado. Mandarlos todos a la esquina
+    /// (lo que hacia este motor) amontona en (0,0) cada menu desplegable y
+    /// cada tooltip de la pagina, unos encima de otros - en la Wikipedia
+    /// real eso era la franja de texto ilegible pegada al borde superior.
+    ///
+    /// `None` para todo lo demas: una caja en flujo ya tiene su posicion en
+    /// `dimensions`, y no hay nada que recordar.
+    pub(crate) static_position: Option<(f32, f32)>,
+    /// Cuantas columnas ocupa esta celda (`colspan` de `<td>`/`<th>`), 1 si
+    /// no lo declara.
+    ///
+    /// Vive aqui y no en `computed_style` porque `colspan` es un atributo
+    /// PRESENTACIONAL de HTML, no una propiedad CSS: no llega por la
+    /// cascada, se lee del DOM al construir la caja (igual que el `src` de
+    /// una imagen). Ignorarlo no solo ensancha mal una celda - corre TODAS
+    /// las celdas siguientes de esa fila una columna a la izquierda, que es
+    /// lo que descuadraba las filas de subtitulo de Hacker News.
+    pub(crate) colspan: u32,
 }
 
 impl LayoutBox {
@@ -136,6 +219,9 @@ impl LayoutBox {
             computed_style: HashMap::new(),
             dom_node: None,
             replaced_text: None,
+            measure_cache: Vec::new(),
+            static_position: None,
+            colspan: 1,
         }
     }
 

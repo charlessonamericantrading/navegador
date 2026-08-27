@@ -84,23 +84,120 @@ pub fn shape_text(font: &SystemFont, text: &str, font_size: f32, origin_x: f32, 
     glyphs
 }
 
+/// Metricas de una cara que NO dependen del texto medido, solo de la
+/// fuente: se leen una vez por fuente y se reutilizan. Antes cada
+/// `measure_text` reconstruia la `rustybuzz::Face` entera (parsear las
+/// tablas OpenType) y ademas shapeaba el texto, incluso cuando quien
+/// llamaba solo queria el alto de linea.
+#[derive(Debug, Clone, Copy)]
+struct FaceMetrics {
+    units_per_em: f32,
+    ascender: f32,
+    descender: f32,
+    line_gap: f32,
+}
+
+thread_local! {
+    /// `id de fuente -> metricas de su cara`. Ver `FaceMetrics`.
+    static FACE_METRICS: std::cell::RefCell<std::collections::HashMap<u64, Option<FaceMetrics>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// `(id de fuente, tamaño, texto) -> ancho ya shapeado`.
+    ///
+    /// Medir texto es la operacion mas repetida de todo el motor: el layout
+    /// mide para decidir donde cortar las lineas y `engine-gfx` vuelve a
+    /// medir para pintarlas, y una pagina real repite las mismas palabras
+    /// miles de veces. Cada medida sin cache cuesta reconstruir la cara mas
+    /// un shaping completo de HarfBuzz.
+    ///
+    /// `thread_local` y no un `static` global con candado porque
+    /// `rustybuzz` no es `Sync` y porque asi no hay contencion; la clave
+    /// lleva el id de fuente (ver `SystemFont::cache_id`) para que dos
+    /// fuentes distintas no compartan entradas jamas.
+    static TEXT_WIDTHS: std::cell::RefCell<std::collections::HashMap<(u64, u32, Box<str>), f32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Techo de entradas de `TEXT_WIDTHS`. Una pagina real usa unas pocas miles
+/// de palabras distintas; el techo solo existe para que navegar mucho rato
+/// no haga crecer la memoria sin limite. Al alcanzarlo se vacia entera (mas
+/// simple que un LRU y suficiente: lo que importa es la localidad DENTRO de
+/// una pagina, y la siguiente la vuelve a llenar enseguida).
+const MAX_TEXT_WIDTH_ENTRIES: usize = 100_000;
+
+fn face_metrics(font: &SystemFont) -> Option<FaceMetrics> {
+    FACE_METRICS.with(|cache| {
+        *cache.borrow_mut().entry(font.cache_id()).or_insert_with(|| {
+            let face = font.rustybuzz_face()?;
+            let units_per_em = face.units_per_em() as f32;
+            if units_per_em <= 0.0 {
+                return None;
+            }
+            Some(FaceMetrics {
+                units_per_em,
+                ascender: face.ascender() as f32,
+                descender: face.descender() as f32,
+                line_gap: face.line_gap() as f32,
+            })
+        })
+    })
+}
+
+/// Alto de linea de `font` a `font_size` px. No shapea nada - antes la
+/// unica forma de obtenerlo era `measure_text(font, "", font_size)
+/// .line_height`, que reconstruia la cara y llamaba a HarfBuzz para medir
+/// una cadena VACIA (el layout lo hacia una vez por cada racha inline de la
+/// pagina).
+pub fn line_height(font: &SystemFont, font_size: f32) -> f32 {
+    match face_metrics(font) {
+        Some(m) => (m.ascender - m.descender + m.line_gap) * (font_size / m.units_per_em),
+        None => font_size,
+    }
+}
+
+/// Ancho de `text` sin pasar por la cache - el calculo de verdad.
+fn shape_width(font: &SystemFont, text: &str, font_size: f32) -> f32 {
+    let Some(face) = font.rustybuzz_face() else {
+        tracing::warn!("[engine-text] No se pudo reconstruir rustybuzz::Face desde los bytes cargados");
+        return 0.0;
+    };
+    let Some(run) = shape_run(face, text, font_size) else { return 0.0 };
+    run.glyph_buffer.glyph_positions().iter().map(|pos| pos.x_advance as f32 * run.scale).sum()
+}
+
+/// Ancho shapeado de `text`, memoizado por (fuente, tamaño, texto).
+pub fn text_width(font: &SystemFont, text: &str, font_size: f32) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let key = (font.cache_id(), font_size.to_bits(), Box::from(text));
+    TEXT_WIDTHS.with(|cache| {
+        if let Some(&w) = cache.borrow().get(&key) {
+            return w;
+        }
+        let width = shape_width(font, text, font_size);
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= MAX_TEXT_WIDTH_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(key, width);
+        width
+    })
+}
+
 /// Ver `TextMetrics`. Si no se puede reconstruir la fuente o son 0 unidades
 /// por em (fuente corrupta/incompleta), devuelve `width: 0.0` y
 /// `line_height: font_size` como aproximacion honesta de respaldo - no
 /// pretende medir un texto que no se pudo shapear.
+///
+/// Quien solo necesite el alto de linea debe llamar a `line_height`
+/// directamente: esta funcion mide TAMBIEN el ancho, y medir el ancho de
+/// una cadena vacia para tirarlo es trabajo puro desperdiciado.
 pub fn measure_text(font: &SystemFont, text: &str, font_size: f32) -> TextMetrics {
-    let fallback = TextMetrics { width: 0.0, line_height: font_size };
-
-    let Some(face) = font.rustybuzz_face() else {
-        tracing::warn!("[engine-text] No se pudo reconstruir rustybuzz::Face desde los bytes cargados");
-        return fallback;
-    };
-    let Some(run) = shape_run(face, text, font_size) else { return fallback };
-
-    let width: f32 = run.glyph_buffer.glyph_positions().iter().map(|pos| pos.x_advance as f32 * run.scale).sum();
-    let line_height = (run.face.ascender() as f32 - run.face.descender() as f32 + run.face.line_gap() as f32) * run.scale;
-
-    TextMetrics { width, line_height }
+    TextMetrics {
+        width: text_width(font, text, font_size),
+        line_height: line_height(font, font_size),
+    }
 }
 
 /// El desplazamiento vertical desde la parte SUPERIOR de una linea (el
@@ -180,6 +277,40 @@ pub fn underline_metrics(font: &SystemFont, font_size: f32) -> Option<(f32, f32)
 /// actuales; el mismo tipo de coste ya aceptado que el re-shaping por frame
 /// (ver ARCHITECTURE.md), a revisar si algun dia se vuelve el cuello de
 /// botella real.
+/// Ancho que `wrap_text` le atribuye a `text` puesto en UNA sola linea -
+/// la suma de sus palabras mas los espacios que las separan, contando
+/// tambien el espacio inicial/final que `wrap_text` conserva.
+///
+/// Existe para que quien mide el texto y quien lo reparte en lineas usen
+/// exactamente la misma aritmetica. `measure_text` shapea la cadena entera
+/// de una vez, lo que da un valor ligeramente MENOR (incluye el kerning a
+/// traves de los espacios); usarlo para decidir el ancho de la caja hacia
+/// que el pintor creyera que el texto no cabe y lo partiera en una linea
+/// mas de las que la caja tenia reservadas - la linea sobrante acababa
+/// pintada sobre el contenido de debajo.
+pub fn wrapped_line_width(font: &SystemFont, text: &str, font_size: f32) -> f32 {
+    let space_width = text_width(font, " ", font_size);
+    let mut width = 0.0;
+    let mut words = 0;
+    for word in text.split_whitespace() {
+        if words > 0 {
+            width += space_width;
+        }
+        width += text_width(font, word, font_size);
+        words += 1;
+    }
+    if words == 0 {
+        return 0.0;
+    }
+    if text.starts_with(char::is_whitespace) {
+        width += space_width;
+    }
+    if text.ends_with(char::is_whitespace) {
+        width += space_width;
+    }
+    width
+}
+
 pub fn wrap_text(font: &SystemFont, text: &str, font_size: f32, max_width: f32) -> Vec<String> {
     if text.trim().is_empty() {
         return Vec::new();
@@ -194,18 +325,41 @@ pub fn wrap_text(font: &SystemFont, text: &str, font_size: f32, max_width: f32) 
     let mut lines = Vec::new();
     let mut current_line = String::new();
 
-    for word in text.split_whitespace() {
-        let candidate = if current_line.is_empty() {
-            word.to_string()
-        } else {
-            format!("{current_line} {word}")
-        };
+    // Se mide PALABRA A PALABRA y se acumula, en vez de volver a medir la
+    // linea entera cada vez que se le añade una palabra. Aquello era
+    // cuadratico en el numero de palabras de cada linea (y cada medida
+    // implicaba un shaping completo de HarfBuzz), lo que convertia un
+    // articulo largo en decenas de segundos de maquetacion.
+    //
+    // La suma de palabras es siempre MAYOR O IGUAL que medir la linea
+    // entera de una vez (le falta cualquier ajuste de kerning a traves de
+    // los espacios), asi que mientras la suma cabe, la linea real cabe
+    // seguro y no hace falta comprobar nada mas. Solo cuando la suma dice
+    // que NO cabe se mide la linea completa para decidir de verdad - una
+    // sola medida exacta por salto de linea, no una por palabra.
+    //
+    // Quien MIDE el texto para reservarle sitio (`engine-layout`) tiene que
+    // usar esta misma cuenta, no una medida de la cadena entera: si las dos
+    // no acuerdan exactamente donde cae cada corte, el pintor saca una
+    // linea que la caja no reservo y se pinta encima del contenido
+    // siguiente. Para eso existe `wrapped_line_width`, justo debajo.
+    let space_width = text_width(font, " ", font_size);
+    let mut current_width = 0.0;
 
-        if current_line.is_empty() || measure_text(font, &candidate, font_size).width <= max_width {
-            current_line = candidate;
+    for word in text.split_whitespace() {
+        let word_width = text_width(font, word, font_size);
+        let candidate_width = if current_line.is_empty() { word_width } else { current_width + space_width + word_width };
+
+        if current_line.is_empty() || candidate_width <= max_width {
+            if !current_line.is_empty() {
+                current_line.push(' ');
+            }
+            current_line.push_str(word);
+            current_width = candidate_width;
         } else {
             lines.push(std::mem::take(&mut current_line));
             current_line = word.to_string();
+            current_width = word_width;
         }
     }
     if !current_line.is_empty() {

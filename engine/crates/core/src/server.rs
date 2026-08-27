@@ -387,6 +387,13 @@ impl EngineServer {
     /// peticion (seguir redirecciones, descubrir sub-recursos, construir
     /// la pagina, historial, temporizadores de carga) es identico.
     async fn navigate_with_body(&mut self, id: Option<String>, url: String, record_history: bool, body: Option<Vec<u8>>) -> EngineResponse {
+        // Cronometro por fases. Sin esto la unica cifra observable era el
+        // total de la navegacion, que no distingue "la red va lenta" de
+        // "el motor tarda en maquetar" - y sin distinguirlo cualquier
+        // intento de optimizar es a ciegas. Se emite a `info`, asi que en
+        // uso normal (nivel `warn`) no cuesta nada; `RUST_LOG=info` lo
+        // enciende. Ver `bin/engine_server.rs`.
+        let nav_start = std::time::Instant::now();
         let request = match NetworkRequest::new(&url) {
             Ok(mut request) => {
                 let scheme = request.url.scheme();
@@ -426,6 +433,11 @@ impl EngineServer {
         let page_url = response.url.clone();
         let final_url = page_url.to_string();
         let html = response.text();
+        tracing::info!(
+            "[tiempo] documento descargado en {:?} ({} bytes)",
+            nav_start.elapsed(),
+            html.len()
+        );
 
         // Se parsea UNA vez aqui solo para descubrir que recursos externos
         // hacen falta (`<link rel=stylesheet>`, `<script src>`) - un DOM de
@@ -462,11 +474,24 @@ impl EngineServer {
         let script_srcs = filter_by_csp(script_srcs, "script-src", &csp, &page_url, &page_origin);
         let image_srcs = filter_by_csp(image_srcs, "img-src", &csp, &page_url, &page_origin);
 
-        let external_css = self.fetch_external_stylesheets(stylesheet_hrefs, &page_url).await;
-        let external_scripts = self.fetch_external_scripts(script_srcs, &page_url).await;
-        let images = self.fetch_images(image_srcs, &page_url).await;
+        let (n_css, n_js, n_img) = (stylesheet_hrefs.len(), script_srcs.len(), image_srcs.len());
 
+        let t = std::time::Instant::now();
+        let external_css = self.fetch_external_stylesheets(stylesheet_hrefs, &page_url).await;
+        tracing::info!("[tiempo] {n_css} hoja(s) de estilo en {:?} ({} bytes de CSS)", t.elapsed(), external_css.len());
+
+        let t = std::time::Instant::now();
+        let external_scripts = self.fetch_external_scripts(script_srcs, &page_url).await;
+        tracing::info!("[tiempo] {n_js} script(s) externos en {:?}", t.elapsed());
+
+        let t = std::time::Instant::now();
+        let images = self.fetch_images(image_srcs, &page_url).await;
+        tracing::info!("[tiempo] {n_img} imagen(es) en {:?} ({} decodificadas)", t.elapsed(), images.len());
+
+        let t = std::time::Instant::now();
         let font_set = FontSet::load_default_sans_serif();
+        tracing::info!("[tiempo] fuentes cargadas en {:?}", t.elapsed());
+        let t = std::time::Instant::now();
         let (page, mut runtime) = build_page_keeping_runtime(
             &html,
             &external_css,
@@ -496,6 +521,7 @@ impl EngineServer {
         // honrarlas ademas abriria la puerta a que una pagina que llama
         // `window.open` al cargar se abriera a si misma en bucle, ya que
         // cada pestaña nueva vuelve a pasar por aqui.
+        tracing::info!("[tiempo] parseo + JS + cascada + layout en {:?}", t.elapsed());
         let discarded = runtime.take_pending_window_opens();
         if !discarded.is_empty() {
             tracing::info!(
@@ -587,7 +613,11 @@ impl EngineServer {
             .map(|page| page.runtime.take_pending_history_ops())
             .unwrap_or_default();
         self.apply_history_ops(load_time_ops);
-        self.state_response(id)
+        let t = std::time::Instant::now();
+        let response = self.state_response(id);
+        tracing::info!("[tiempo] captura PNG en {:?}", t.elapsed());
+        tracing::info!("[tiempo] TOTAL navegacion {:?}", nav_start.elapsed());
+        response
     }
 
     /// Vuelve a la entrada ANTERIOR del historial (Fase 4.4) - vuelve a

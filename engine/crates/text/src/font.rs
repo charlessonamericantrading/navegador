@@ -17,6 +17,21 @@
 pub struct SystemFont {
     bytes: Vec<u8>,
     face_index: u32,
+    /// Identidad estable de esta cara, para poder cachear medidas de texto
+    /// sin volver a mirar los bytes (ver `shape.rs`). No se puede usar la
+    /// direccion de `bytes` como identidad: `Clone` copia los bytes a otra
+    /// direccion, y una direccion liberada puede reaparecer luego apuntando
+    /// a otra fuente distinta - eso daria medidas de la fuente equivocada.
+    /// `Clone` PROPAGA el id a proposito: un clon tiene exactamente los
+    /// mismos bytes, asi que mide exactamente igual y debe compartir cache.
+    id: u64,
+}
+
+/// Contador de identidades de fuente (ver `SystemFont::id`). Empieza en 1
+/// para que 0 nunca sea un id valido.
+fn next_font_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl SystemFont {
@@ -60,7 +75,14 @@ impl SystemFont {
         db.with_face_data(id, |data, face_index| Self {
             bytes: data.to_vec(),
             face_index,
+            id: next_font_id(),
         })
+    }
+
+    /// Ver el campo `id`. Publico dentro del crate para que `shape.rs`
+    /// pueda usarlo como clave de cache.
+    pub(crate) fn cache_id(&self) -> u64 {
+        self.id
     }
 
     pub(crate) fn rustybuzz_face(&self) -> Option<rustybuzz::Face<'_>> {

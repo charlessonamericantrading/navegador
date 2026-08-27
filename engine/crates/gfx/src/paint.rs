@@ -234,7 +234,7 @@ fn paint_text(
             // lineas que se pinta aqui coincide con el que se reservo alli
             // por construccion, no por coincidencia.
             let lines = wrap_text(font, text, font_size, rect.width);
-            let line_height = measure_text(font, "", font_size).line_height;
+            let line_height = engine_text::line_height(font, font_size);
             for (index, line) in lines.iter().enumerate() {
                 let line_y = screen_y + index as f32 * line_height;
                 // `text-align` (Fase 31) DENTRO de una caja que envuelve

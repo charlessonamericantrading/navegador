@@ -1,5 +1,5 @@
 use crate::box_model::EdgeSizes;
-use crate::layout_box::{LayoutBox, BoxType, Rect, ReplacedText};
+use crate::layout_box::{AvailableAxis, BoxType, LayoutBox, MeasureKey, Rect, ReplacedText};
 use engine_dom::{Node, NodeType};
 use engine_css::StyleSheet;
 use engine_image::DecodedImage;
@@ -226,6 +226,56 @@ fn apply_relative_offset(node: &mut LayoutBox) {
     node.dimensions.y += dy;
 }
 
+/// Reparte `available` entre las columnas de una tabla a partir de la
+/// anchura minima y maxima de contenido de cada una - el algoritmo de
+/// "tabla automatica" del spec, simplificado a un solo reparto
+/// proporcional (sin `colspan`, sin `table-layout: fixed`).
+///
+/// Antes cada columna recibia `available / numero_de_columnas`, a partes
+/// iguales. Eso descuadra CUALQUIER pagina maquetada con tablas: en Hacker
+/// News la columna del numero de orden ("1.", "2.") se llevaba un tercio de
+/// la pantalla y empujaba el titular fuera de su sitio.
+fn distribute_table_columns(min_widths: &[f32], max_widths: &[f32], available: f32) -> Vec<f32> {
+    if min_widths.is_empty() {
+        return Vec::new();
+    }
+    let total_max: f32 = max_widths.iter().sum();
+    let total_min: f32 = min_widths.iter().sum();
+
+    // Cabe todo sin cortar nada: cada columna a su anchura maxima, y el
+    // espacio sobrante se reparte EN PROPORCION a esa anchura para que la
+    // tabla siga ocupando el ancho que se le dio (lo que hace una tabla real
+    // al 100%). Proporcional y no a partes iguales, que es lo que dice CSS
+    // 2.1 y ademas lo unico razonable: repartiendo por igual, la columna del
+    // numero de orden de Hacker News ("1.", "2.") se llevaba los mismos ~200
+    // px que la del titular y empujaba todo el contenido a la derecha.
+    if total_max <= available {
+        let extra = available - total_max;
+        if total_max <= 0.0 {
+            let each = available / max_widths.len() as f32;
+            return vec![each; max_widths.len()];
+        }
+        return max_widths.iter().map(|w| w + extra * (w / total_max)).collect();
+    }
+    // Ni con todas las columnas en su minimo cabe: se quedan en el minimo y
+    // la tabla desborda, igual que una tabla real demasiado ancha.
+    if total_min >= available {
+        return min_widths.to_vec();
+    }
+    // Caso normal: cada columna parte de su minimo y el espacio que sobra se
+    // reparte en proporcion a cuanto quiere crecer cada una.
+    let slack = available - total_min;
+    let total_want: f32 = max_widths.iter().zip(min_widths).map(|(mx, mn)| (mx - mn).max(0.0)).sum();
+    if total_want <= 0.0 {
+        return min_widths.to_vec();
+    }
+    min_widths
+        .iter()
+        .zip(max_widths)
+        .map(|(mn, mx)| mn + slack * ((mx - mn).max(0.0) / total_want))
+        .collect()
+}
+
 fn is_table_cell(b: &LayoutBox) -> bool {
     b.computed_style.get("display").map(String::as_str) == Some("table-cell")
 }
@@ -247,6 +297,26 @@ fn is_table_cell(b: &LayoutBox) -> bool {
 /// ella como cualquier otro hijo de bloque normal) - sin este corte, una
 /// tabla dentro de una celda aplanaria sus filas con las de la tabla
 /// exterior.
+/// Si `node` aporta alguna `table-row` a la tabla que lo contiene,
+/// siguiendo exactamente las mismas reglas de travesia que
+/// `collect_table_rows` (los contenedores intermedios son transparentes; la
+/// busqueda se detiene en una celda o en una tabla anidada).
+///
+/// Sirve para distinguir los hijos de una tabla que SI participan en el
+/// algoritmo de filas y columnas de los que no participan en absoluto -
+/// tipicamente un `<caption>` (`display: table-caption`). Los segundos no
+/// los colocaba nadie: se quedaban en `Rect::default()` y se pintaban todos
+/// superpuestos en la esquina (0,0) de la pagina.
+fn contributes_table_rows(node: &LayoutBox) -> bool {
+    node.children.iter().any(|child| {
+        match child.computed_style.get("display").map(String::as_str) {
+            Some("table-row") => true,
+            Some("table") | Some("table-cell") => false,
+            _ => contributes_table_rows(child),
+        }
+    })
+}
+
 fn collect_table_rows(node: &mut LayoutBox) -> Vec<&mut LayoutBox> {
     let mut rows = Vec::new();
     for child in &mut node.children {
@@ -838,7 +908,46 @@ fn flex_item_style(computed_style: &HashMap<String, String>) -> taffy::Style {
 /// que `compute_layout_with_measure` espera.
 /// Mide el ancho intrínseco (min-content / max-content) de un elemento para
 /// que taffy no colapse cajas flex a 0 cuando consulta pasadas especulativas.
-fn measure_intrinsic_width(child: &LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+/// Cual de las dos anchuras intrinsecas del spec se esta preguntando.
+///
+/// La distincion NO es un matiz: el `min-width: auto` que todo item flex
+/// tiene por defecto resuelve precisamente a `MinContent`, y `taffy` (como
+/// cualquier motor real) se niega a encoger un item por debajo de ese
+/// valor. Cuando este motor devolvia la misma anchura para las dos, todo
+/// item flex con texto declaraba un minimo igual a su frase entera en una
+/// sola linea, asi que NADA podia encogerse: los contenedores flex de
+/// cualquier web moderna se desbordaban por la derecha (medido en la
+/// Wikipedia real: cajas de 8.225 px dentro de un viewport de 1.280) y el
+/// texto no llegaba nunca a cortar linea porque su caja era enorme.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum IntrinsicWidth {
+    /// Lo minimo sin desbordar: para un texto, su palabra mas larga.
+    Min,
+    /// Sin ningun corte de linea: para un texto, la frase entera.
+    Max,
+}
+
+impl IntrinsicWidth {
+    fn cache_key(self) -> MeasureKey {
+        match self {
+            Self::Min => MeasureKey::MinContentWidth,
+            Self::Max => MeasureKey::MaxContentWidth,
+        }
+    }
+}
+
+fn measure_intrinsic_width(child: &mut LayoutBox, mode: IntrinsicWidth, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+    let key = mode.cache_key();
+    if let Some(&(_, (w, _))) = child.measure_cache.iter().find(|(k, _)| *k == key) {
+        return w;
+    }
+    INTRINSIC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let width = measure_intrinsic_width_uncached(child, mode, font_set, images);
+    child.measure_cache.push((key, (width, 0.0)));
+    width
+}
+
+fn measure_intrinsic_width_uncached(child: &mut LayoutBox, mode: IntrinsicWidth, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
     let padding = resolve_padding(&child.computed_style);
     let border = resolve_border_width(&child.computed_style);
     let extra = padding.left + padding.right + border.left + border.right;
@@ -858,16 +967,44 @@ fn measure_intrinsic_width(child: &LayoutBox, font_set: Option<&FontSet>, images
             let bold = resolve_font_weight_is_bold(&child.computed_style);
             let italic = resolve_font_style_is_italic(&child.computed_style);
             let font = font_set.and_then(|s| s.pick(bold, italic));
-            let text_w = font.map(|f| engine_text::measure_text(f, text, font_size).width).unwrap_or(text.len() as f32 * font_size * 0.5);
+            let text_w = match font {
+                // `Min`: la caja mas estrecha en la que este texto cabe sin
+                // desbordar es la de su palabra mas larga - por debajo de eso
+                // esa palabra sobresaldria, porque el motor no parte palabras
+                // por la mitad (igual que un navegador real sin
+                // `overflow-wrap: break-word`).
+                Some(f) if mode == IntrinsicWidth::Min => text
+                    .split_whitespace()
+                    .map(|word| engine_text::text_width(f, word, font_size))
+                    .fold(0.0_f32, f32::max),
+                // Mismo motivo que en `place_inline_node`: la anchura
+                // maxima de contenido es la de la linea tal como el pintor
+                // la va a componer.
+                Some(f) => engine_text::wrapped_line_width(f, text, font_size),
+                // Sin fuente de sistema, la misma aproximacion por numero de
+                // caracteres que ya usaba el motor, aplicada a la palabra mas
+                // larga o a la cadena entera segun el modo.
+                None if mode == IntrinsicWidth::Min => {
+                    text.split_whitespace().map(|w| w.chars().count()).max().unwrap_or(0) as f32 * font_size * 0.5
+                }
+                None => text.chars().count() as f32 * font_size * 0.5,
+            };
             text_w + extra
         }
         BoxType::Replaced => 150.0 + extra,
         _ => {
             let mut max_w: f32 = 0.0;
             let mut inline_w: f32 = 0.0;
-            for c in &child.children {
-                let cw = measure_intrinsic_width(c, font_set, images);
-                if c.computed_style.get("display").map(String::as_str) == Some("inline") || matches!(c.box_type, BoxType::Text(_)) {
+            for c in &mut child.children {
+                let cw = measure_intrinsic_width(c, mode, font_set, images);
+                let is_inline = c.computed_style.get("display").map(String::as_str) == Some("inline") || matches!(c.box_type, BoxType::Text(_));
+                // Los hermanos inline SUMAN solo para `Max`: van todos en la
+                // misma linea si no hay que cortar. Para `Min` cada uno puede
+                // caer en su propia linea, asi que el minimo del conjunto es
+                // el MAYOR de sus minimos y no su suma - sumarlos era lo que
+                // inflaba el minimo de un parrafo entero hasta su ancho
+                // completo.
+                if is_inline && mode == IntrinsicWidth::Max {
                     inline_w += cw;
                     max_w = max_w.max(inline_w);
                 } else {
@@ -883,6 +1020,32 @@ fn measure_intrinsic_width(child: &LayoutBox, font_set: Option<&FontSet>, images
 /// Funcion de medida que `taffy` llama para saber cuanto espacio necesita
 /// UN item flex - taffy puede llamarla varias veces con distintos
 /// `known_dimensions`/`available_space` mientras resuelve el layout final.
+/// Traduce el `AvailableSpace` de taffy al tipo neutro que usa la clave de
+/// cache (ver `layout_box::AvailableAxis`).
+fn available_axis(space: taffy::AvailableSpace) -> AvailableAxis {
+    match space {
+        taffy::AvailableSpace::Definite(v) => AvailableAxis::Definite(v),
+        taffy::AvailableSpace::MinContent => AvailableAxis::MinContent,
+        taffy::AvailableSpace::MaxContent => AvailableAxis::MaxContent,
+    }
+}
+
+/// `measure_flex_item` con memoria. Medir un item significa MAQUETAR SU
+/// SUBARBOL ENTERO (ver el cuerpo de `measure_flex_item_uncached`), y taffy
+/// pide la medida del mismo item varias veces mientras resuelve el reparto
+/// de espacio. Sin recordar el resultado, cada nivel de anidamiento flex
+/// multiplica el trabajo del nivel de abajo en vez de sumarlo - medido en
+/// la Wikipedia real: 505.765 remaquetados y 289.419 medidas para 35.000
+/// nodos, 84 s de reloj solo en el flujo normal.
+///
+/// La clave son las entradas de las que el resultado depende de verdad
+/// (`known_dimensions` y `available_space`); el subarbol no cambia durante
+/// una maquetacion, asi que misma clave implica mismo resultado.
+///
+/// Devolver un valor cacheado se salta el efecto secundario de colocar los
+/// descendientes, y eso es CORRECTO aqui: la posicion definitiva de los
+/// nietos no la fija esta medida sino `finalize_flex_item_children`, que
+/// corre despues con las dimensiones que taffy acabo eligiendo.
 fn measure_flex_item(
     child: &mut LayoutBox,
     known_dimensions: taffy::geometry::Size<Option<f32>>,
@@ -890,6 +1053,28 @@ fn measure_flex_item(
     font_set: Option<&FontSet>,
     images: &ImageMap,
 ) -> taffy::geometry::Size<f32> {
+    let key = MeasureKey::Flex {
+        known_width: known_dimensions.width,
+        known_height: known_dimensions.height,
+        available_width: available_axis(available_space.width),
+        available_height: available_axis(available_space.height),
+    };
+    if let Some(&(_, (width, height))) = child.measure_cache.iter().find(|(k, _)| *k == key) {
+        return taffy::geometry::Size { width, height };
+    }
+    let size = measure_flex_item_uncached(child, known_dimensions, available_space, font_set, images);
+    child.measure_cache.push((key, (size.width, size.height)));
+    size
+}
+
+fn measure_flex_item_uncached(
+    child: &mut LayoutBox,
+    known_dimensions: taffy::geometry::Size<Option<f32>>,
+    available_space: taffy::geometry::Size<taffy::AvailableSpace>,
+    font_set: Option<&FontSet>,
+    images: &ImageMap,
+) -> taffy::geometry::Size<f32> {
+    MEASURE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let BoxType::Image(src) = &child.box_type {
         let natural = images.get(src).map(|img| (img.width as f32, img.height as f32));
         let explicit_width = child.computed_style.get("width").and_then(|v| parse_css_length(v));
@@ -921,9 +1106,8 @@ fn measure_flex_item(
                 w
             }
         }
-        taffy::AvailableSpace::MinContent | taffy::AvailableSpace::MaxContent => {
-            measure_intrinsic_width(child, font_set, images)
-        }
+        taffy::AvailableSpace::MinContent => measure_intrinsic_width(child, IntrinsicWidth::Min, font_set, images),
+        taffy::AvailableSpace::MaxContent => measure_intrinsic_width(child, IntrinsicWidth::Max, font_set, images),
     });
 
     child.dimensions.x = 0.0;
@@ -964,6 +1148,19 @@ fn finalize_flex_item_children(child: &mut LayoutBox, font_set: Option<&FontSet>
     };
 }
 
+/// Contadores de diagnostico (solo `RUST_LOG=info`): cuantas veces se
+/// maqueta un subarbol y cuantas se mide un item flex durante UNA carga.
+/// Existen porque el coste del flujo normal resulto no ser proporcional al
+/// numero de nodos sino al numero de REMAQUETADOS, y eso solo se ve
+/// contandolos.
+pub(crate) static FLOW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static MEASURE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static INTRINSIC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static FLEX_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static TABLE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GRID_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static INLINE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct LayoutTreeBuilder;
 
 impl LayoutTreeBuilder {
@@ -998,8 +1195,29 @@ impl LayoutTreeBuilder {
             height: viewport_height,
         };
 
+        // Cronometro de las tres pasadas (cascada+construccion del arbol,
+        // flujo normal, posicionados). Nivel `info`, igual que el resto del
+        // pipeline: en uso normal no cuesta nada y con `RUST_LOG=info` dice
+        // cual de las tres domina, en vez de dejarlas como un solo numero.
+        let t = std::time::Instant::now();
         Self::build_node(dom_root, &mut root_box, stylesheet, &HashMap::new(), viewport_width);
+        tracing::info!("[tiempo]     cascada + construccion del arbol {:?}", t.elapsed());
+        let t = std::time::Instant::now();
         Self::flow_block_children(&mut root_box, font_set, images);
+        tracing::info!(
+            "[tiempo]     flujo normal {:?} ({} remaquetados, {} medidas flex, {} medidas intrinsecas)",
+            t.elapsed(),
+            FLOW_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed),
+            MEASURE_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed),
+            INTRINSIC_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed)
+        );
+        tracing::info!(
+            "[tiempo]     desglose: {} flex, {} tabla, {} grid, {} rachas inline",
+            FLEX_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed),
+            TABLE_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed),
+            GRID_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed),
+            INLINE_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed)
+        );
         // Segunda pasada (Fase 3.3): `flow_block_children`/`flow_inline_run`/
         // `flow_flex_children`, arriba, ya dejaron cada `position: absolute`/
         // `fixed` SIN resolver a proposito (`is_out_of_flow`, ver esas
@@ -1007,7 +1225,9 @@ impl LayoutTreeBuilder {
         // entero ya existe de verdad y hay "containing blocks" reales contra
         // los que resolverlos. Ver el doc-comment de `resolve_positioned_boxes`.
         let viewport = root_box.dimensions.clone();
+        let t = std::time::Instant::now();
         Self::resolve_positioned_boxes(&mut root_box, &viewport, &viewport, font_set, images);
+        tracing::info!("[tiempo]     posicionados {:?}", t.elapsed());
         root_box
     }
 
@@ -1047,10 +1267,18 @@ impl LayoutTreeBuilder {
             // hueco que `measure_flex_item`, ver su doc-comment).
             let width = resolve_block_width(&node.computed_style, reference.width);
             node.dimensions.width = width;
+            // Con `left` y `right` ambos en `auto` manda la posicion
+            // estatica (donde el flujo normal habria dejado la caja), no la
+            // esquina del bloque contenedor - ver `LayoutBox::
+            // static_position`. Sin posicion estatica anotada (una caja
+            // fuera de flujo dentro de un contenedor que no la registro
+            // todavia) se cae al comportamiento anterior, que al menos la
+            // deja dentro del contenedor.
+            let static_position = node.static_position;
             node.dimensions.x = match (left, right) {
                 (Some(l), _) => reference.x + l,
                 (None, Some(r)) => reference.x + reference.width - width - r,
-                (None, None) => reference.x,
+                (None, None) => static_position.map(|(x, _)| x).unwrap_or(reference.x),
             };
             // Y provisional: si `top` esta puesto, ya es el Y final (`bottom`
             // se ignora cuando ambos estan puestos - un caso sobre-
@@ -1060,7 +1288,10 @@ impl LayoutTreeBuilder {
             // (mas abajo) y poder aplicar `bottom` correctamente.
             node.dimensions.y = match top {
                 Some(t) => reference.y + t,
-                None => reference.y,
+                // Igual que en X: sin `top`, la posicion estatica. Sigue
+                // siendo PROVISIONAL cuando hay `bottom`, que se aplica mas
+                // abajo una vez se conoce el alto real del contenido.
+                None => static_position.map(|(_, y)| y).unwrap_or(reference.y),
             };
 
             let content_height = Self::flow_block_children(node, font_set, images);
@@ -1196,6 +1427,11 @@ impl LayoutTreeBuilder {
                 };
                 let mut current_box = LayoutBox::new(box_type);
                 current_box.dom_node = Some(dom_node.clone());
+                // `colspan` solo tiene sentido en una celda; un valor de 0 o
+                // ilegible cuenta como 1, igual que exige el propio HTML.
+                if matches!(tag_name.as_str(), "td" | "th") {
+                    current_box.colspan = attributes.get("colspan").and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(1).max(1);
+                }
                 if matches!(&current_box.box_type, BoxType::Replaced) {
                     current_box.replaced_text = resolve_replaced_text(tag_name, attributes, dom_node);
                 }
@@ -1329,6 +1565,7 @@ impl LayoutTreeBuilder {
     /// el `cursor_y` final ya resuelve eso por construccion, sin necesitar
     /// un caso aparte para "hijos que se solapan".
     fn flow_block_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+        FLOW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // `display: flex` desvia el contenedor entero a `flow_flex_children`
         // (Fase 3.2, via el crate `taffy` - ver ARCHITECTURE.md "Doctrina de
         // dependencias") ANTES de tocar nada del flujo de bloque normal: un
@@ -1349,6 +1586,16 @@ impl LayoutTreeBuilder {
             return Self::flow_table_children(container, font_set, images);
         }
 
+        Self::flow_normal_block_children(container, font_set, images)
+    }
+
+    /// El flujo de bloque propiamente dicho, ya sin el despacho por
+    /// `display` que hace `flow_block_children`. Separado para que un
+    /// contenedor que se desvio a otro algoritmo pueda VOLVER aqui sin
+    /// rebotar en ese despacho para siempre - lo necesita
+    /// `flow_table_children` cuando una `display: table` no tiene ninguna
+    /// fila (ver alli).
+    fn flow_normal_block_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
         let padding = resolve_padding(&container.computed_style);
@@ -1383,6 +1630,11 @@ impl LayoutTreeBuilder {
             // `resolve_positioned_boxes`, despues de que el flujo normal
             // entero ya este resuelto.
             if is_out_of_flow(&container.children[i].computed_style) {
+                // No reserva espacio ni avanza `cursor_y` - pero SI se
+                // anota donde habria caido, que es lo que el spec usa
+                // cuando `left`/`top` son `auto` (ver
+                // `LayoutBox::static_position`).
+                container.children[i].static_position = Some((origin_x, cursor_y));
                 i += 1;
                 continue;
             }
@@ -1668,6 +1920,7 @@ impl LayoutTreeBuilder {
     /// evitaria partir palabras - aproximacion razonable para la mayoria de
     /// paginas reales, exacta cuando el item tiene su propio `width`).
     fn flow_flex_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+        FLEX_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let padding = resolve_padding(&container.computed_style);
         let border = resolve_border_width(&container.computed_style);
         container.box_dimensions.padding = padding;
@@ -1777,6 +2030,7 @@ impl LayoutTreeBuilder {
 
     /// Layout real de `display: grid` (Fase 3) - delegado al motor CSS Grid de `taffy`.
     fn flow_grid_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+        GRID_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let padding = resolve_padding(&container.computed_style);
         let border = resolve_border_width(&container.computed_style);
         container.box_dimensions.padding = padding;
@@ -1887,6 +2141,7 @@ impl LayoutTreeBuilder {
     /// como hace `flow_block_children`/`flow_flex_children` con
     /// `is_out_of_flow` - caso raro en tablas reales).
     fn flow_table_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+        TABLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let padding = resolve_padding(&container.computed_style);
         let border = resolve_border_width(&container.computed_style);
         container.box_dimensions.padding = padding;
@@ -1900,13 +2155,128 @@ impl LayoutTreeBuilder {
         let inner_width = (container.dimensions.width - inset_left - inset_right).max(0.0);
         let content_top = container.dimensions.y + inset_top;
 
+        // Hijos directos que no aportan NINGUNA fila (un `<caption>`, o
+        // contenido suelto dentro de la tabla) se maquetan como bloque
+        // ENCIMA de las filas: es donde un navegador real pinta un caption
+        // por defecto (`caption-side: top` es el valor inicial), y para el
+        // contenido suelto es la aproximacion mas cercana a la celda
+        // anonima que el spec generaria. Antes no se colocaban en ningun
+        // sitio.
+        let mut caption_height = 0.0;
+        for index in 0..container.children.len() {
+            if contributes_table_rows(&container.children[index]) {
+                continue;
+            }
+            if is_table_cell(&container.children[index]) {
+                continue;
+            }
+            let child = &mut container.children[index];
+            child.dimensions.x = origin_x;
+            child.dimensions.y = content_top + caption_height;
+            child.dimensions.width = inner_width;
+            let content_height = Self::flow_normal_block_children(child, font_set, images);
+            let child_padding = child.box_dimensions.padding;
+            let child_border = child.box_dimensions.border;
+            let explicit_height = child.computed_style.get("height").and_then(|v| parse_css_length(v));
+            child.dimensions.height = explicit_height.unwrap_or(content_height)
+                + child_padding.top
+                + child_padding.bottom
+                + child_border.top
+                + child_border.bottom;
+            caption_height += child.dimensions.height;
+        }
+        let content_top = content_top + caption_height;
+
         let rows = collect_table_rows(container);
         if rows.is_empty() {
-            return 0.0;
+            // Una caja `display: table` SIN ninguna `table-row` dentro sigue
+            // teniendo contenido que hay que colocar. Devolver 0 aqui (lo
+            // que se hacia antes) dejaba ese contenido entero sin posicionar
+            // en `Rect::default()`, o sea en la esquina (0,0) del viewport,
+            // donde ademas se PINTA: en la Wikipedia real eso amontonaba
+            // cientos de pies de foto y enlaces unos sobre otros en una
+            // franja ilegible pegada al borde superior de la pagina.
+            //
+            // El caso es de lo mas comun: MediaWiki maqueta cada miniatura
+            // con `figure { display: table }` + `figcaption { display:
+            // table-caption }`, sin ninguna fila de por medio.
+            //
+            // Un navegador real envuelve ese contenido en cajas anonimas de
+            // fila y celda; el equivalente honesto aqui, sin inventarse
+            // cajas nuevas en el arbol, es maquetarlo con el flujo de bloque
+            // normal - una celda anonima que ocupa la tabla entera se
+            // comporta exactamente asi.
+            return Self::flow_normal_block_children(container, font_set, images);
         }
 
-        let column_count = rows.iter().map(|row| row.children.iter().filter(|c| is_table_cell(c)).count()).max().unwrap_or(0).max(1);
-        let column_width = inner_width / column_count as f32;
+        // El numero de columnas es el maximo de columnas OCUPADAS por una
+        // fila, no el de celdas: una celda con `colspan="2"` ocupa dos.
+        let column_count = rows
+            .iter()
+            .map(|row| row.children.iter().filter(|c| is_table_cell(c)).map(|c| c.colspan as usize).sum::<usize>())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+
+        // Anchura minima y maxima de contenido de cada columna: el maximo,
+        // columna a columna, de lo que pide cada celda de esa columna. Las
+        // medidas van a la cache de la propia celda, asi que recorrer las
+        // filas una vez mas aqui no las vuelve a calcular despues.
+        let mut min_widths = vec![0.0_f32; column_count];
+        let mut max_widths = vec![0.0_f32; column_count];
+        let mut rows = rows;
+        // Primera pasada: solo las celdas de UNA columna, que son las unicas
+        // que atribuyen su anchura a una columna concreta sin ambiguedad.
+        // Las que abarcan varias se reparten despues, cuando ya se sabe
+        // cuanto piden las columnas por su cuenta.
+        let mut spanning: Vec<(usize, u32, f32, f32)> = Vec::new();
+        for row in rows.iter_mut() {
+            let mut col = 0usize;
+            for cell in row.children.iter_mut().filter(|c| is_table_cell(c)) {
+                if col >= column_count {
+                    break;
+                }
+                let span = (cell.colspan as usize).min(column_count - col);
+                let min = measure_intrinsic_width(cell, IntrinsicWidth::Min, font_set, images);
+                let max = measure_intrinsic_width(cell, IntrinsicWidth::Max, font_set, images);
+                if span <= 1 {
+                    min_widths[col] = min_widths[col].max(min);
+                    max_widths[col] = max_widths[col].max(max);
+                } else {
+                    spanning.push((col, span as u32, min, max));
+                }
+                col += span.max(1);
+            }
+        }
+        // Segunda pasada: una celda que abarca varias columnas solo obliga a
+        // ensanchar si lo que ya piden esas columnas juntas no le basta, y
+        // entonces el defecto se reparte a partes iguales entre ellas.
+        for (start, span, min, max) in spanning {
+            let span = span as usize;
+            let range = start..(start + span).min(column_count);
+            let current_min: f32 = range.clone().map(|i| min_widths[i]).sum();
+            if min > current_min {
+                let share = (min - current_min) / span as f32;
+                for i in range.clone() {
+                    min_widths[i] += share;
+                }
+            }
+            let current_max: f32 = range.clone().map(|i| max_widths[i]).sum();
+            if max > current_max {
+                let share = (max - current_max) / span as f32;
+                for i in range {
+                    max_widths[i] += share;
+                }
+            }
+        }
+        let column_widths = distribute_table_columns(&min_widths, &max_widths, inner_width);
+        // Desplazamiento horizontal acumulado de cada columna.
+        let mut column_offsets = Vec::with_capacity(column_widths.len());
+        let mut accumulated = 0.0_f32;
+        for w in &column_widths {
+            column_offsets.push(accumulated);
+            accumulated += w;
+        }
 
         let mut cursor_y = content_top;
         for row in rows {
@@ -1914,9 +2284,28 @@ impl LayoutTreeBuilder {
             row.dimensions.y = cursor_y;
             row.dimensions.width = inner_width;
 
+            // Una fila sin ninguna `table-cell` dentro tiene el mismo
+            // problema que una tabla sin filas (ver arriba): su contenido se
+            // quedaria sin posicionar. Se maqueta como bloque, que es lo que
+            // hace la celda anonima que un navegador real generaria.
+            if !row.children.iter().any(is_table_cell) {
+                let height = Self::flow_normal_block_children(row, font_set, images);
+                row.dimensions.height = height;
+                cursor_y += height;
+                continue;
+            }
+
             let mut row_height: f32 = 0.0;
-            for (col, cell) in row.children.iter_mut().filter(|c| is_table_cell(c)).enumerate() {
-                cell.dimensions.x = origin_x + column_width * col as f32;
+            let mut col = 0usize;
+            for cell in row.children.iter_mut().filter(|c| is_table_cell(c)) {
+                if col >= column_count {
+                    break;
+                }
+                let span = (cell.colspan as usize).clamp(1, column_count - col);
+                // Una celda con `colspan` ocupa el ancho SUMADO de todas las
+                // columnas que abarca.
+                let column_width: f32 = (col..col + span).map(|i| column_widths.get(i).copied().unwrap_or(0.0)).sum();
+                cell.dimensions.x = origin_x + column_offsets.get(col).copied().unwrap_or(0.0);
                 cell.dimensions.y = cursor_y;
                 cell.dimensions.width = column_width;
                 apply_relative_offset(cell);
@@ -1941,6 +2330,7 @@ impl LayoutTreeBuilder {
                     height: resolved_content_height,
                 };
                 row_height = row_height.max(cell.dimensions.height);
+                col += span;
             }
 
             // Segunda pasada corta: estira cada celda de la fila al alto
@@ -1958,7 +2348,10 @@ impl LayoutTreeBuilder {
             cursor_y += row_height;
         }
 
-        (cursor_y - content_top).max(0.0)
+        // `content_top` ya viene desplazado por el alto de los captions, asi
+        // que se vuelve a sumar para que el alto devuelto sea el de la
+        // tabla COMPLETA (caption incluido) y no solo el de sus filas.
+        (cursor_y - content_top).max(0.0) + caption_height
     }
 
     fn is_inline_level(b: &LayoutBox) -> bool {
@@ -2000,13 +2393,14 @@ impl LayoutTreeBuilder {
     /// Devuelve el `cursor_y` final (el tope de una linea nueva lista para
     /// lo que venga despues de la racha).
     fn flow_inline_run(nodes: &mut [LayoutBox], origin_x: f32, inner_width: f32, start_y: f32, font_set: Option<&FontSet>, images: &ImageMap, text_align: TextAlign) -> f32 {
+        INLINE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
         let text_line_height = match font_set {
             Some(set) => {
                 let (font_size, bold, italic) = Self::first_leaf_font_info(nodes).unwrap_or((INITIAL_FONT_SIZE, false, false));
                 match set.pick(bold, italic) {
-                    Some(f) => engine_text::measure_text(f, "", font_size).line_height,
+                    Some(f) => engine_text::line_height(f, font_size),
                     None => LINE_HEIGHT_FALLBACK,
                 }
             }
@@ -2157,7 +2551,10 @@ impl LayoutTreeBuilder {
                 let font = font_set.and_then(|set| set.pick(bold, italic));
 
                 let natural_width = match font {
-                    Some(f) => engine_text::measure_text(f, content, font_size).width,
+                    // `wrapped_line_width` y no `measure_text`: tiene que ser
+                    // la misma aritmetica con la que `engine-gfx` repartira
+                    // este texto en lineas (ver su doc-comment).
+                    Some(f) => engine_text::wrapped_line_width(f, content, font_size),
                     // Sin fuente de sistema (ver engine-gfx/window.rs, mismo
                     // caso): misma aproximacion por caracteres que el resto
                     // del motor sin fuente real.
@@ -2330,6 +2727,162 @@ mod tests {
             }
         }
         root.children.iter().find_map(|c| find_box_for_dom_node(c, target))
+    }
+
+    /// Igual que `find_box_for_dom_node` pero prestando la caja de forma
+    /// MUTABLE - lo necesitan los tests que llaman a `measure_intrinsic_
+    /// width`, que escribe en la cache de medidas de la propia caja.
+    fn find_box_for_dom_node_mut<'a>(root: &'a mut LayoutBox, target: &Arc<RwLock<Node>>) -> Option<&'a mut LayoutBox> {
+        if let Some(node) = &root.dom_node {
+            if Arc::ptr_eq(node, target) {
+                return Some(root);
+            }
+        }
+        root.children.iter_mut().find_map(|c| find_box_for_dom_node_mut(c, target))
+    }
+
+    /// La anchura MINIMA de contenido de un texto es la de su palabra mas
+    /// larga, no la de la frase entera: por debajo de esa palabra el texto
+    /// desbordaria, pero por encima siempre puede cortar linea.
+    ///
+    /// Es la distincion que faltaba y que rompia el renderizado entero (ver
+    /// `IntrinsicWidth`): con min == max, ningun item flex podia encogerse.
+    #[test]
+    fn la_anchura_minima_de_un_texto_es_su_palabra_mas_larga() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="t">uno dos tresmuchomaslarga</div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let mut root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let t_node = Node::find_by_id(&dom, "t").expect("t deberia existir");
+        let t_box = find_box_for_dom_node_mut(&mut root, &t_node).expect("t deberia tener caja");
+        let min = measure_intrinsic_width(t_box, IntrinsicWidth::Min, None, &ImageMap::new());
+        let max = measure_intrinsic_width(t_box, IntrinsicWidth::Max, None, &ImageMap::new());
+
+        assert!(min > 0.0, "la anchura minima no puede ser cero: hay una palabra que ocupa sitio");
+        assert!(
+            min < max,
+            "min-content ({min}) deberia ser MENOR que max-content ({max}): la palabra mas larga cabe en mucho menos que la frase entera"
+        );
+    }
+
+    /// Un item flex cuyo texto no cabe tiene que ENCOGERSE hasta su
+    /// contenedor y cortar linea, no desbordarse por la derecha.
+    ///
+    /// Es el sintoma que se veia en cualquier web moderna: en la Wikipedia
+    /// real habia cajas de 8.225 px dentro de un viewport de 1.280.
+    #[test]
+    fn un_item_flex_con_texto_largo_se_encoge_en_vez_de_desbordar() {
+        let texto = "palabra ".repeat(200);
+        let dom = HtmlParser::parse(&format!(
+            r#"<html><body><div id="c" style="display: flex; width: 400px;"><div id="t">{texto}</div></div></body></html>"#
+        ));
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let t_node = Node::find_by_id(&dom, "t").expect("t deberia existir");
+        let t_box = find_box_for_dom_node(&root, &t_node).expect("t deberia tener caja");
+
+        assert!(
+            t_box.dimensions.width <= 400.0,
+            "el item deberia caber en su contenedor de 400px, pero mide {}",
+            t_box.dimensions.width
+        );
+    }
+
+    /// Una caja `display: table` que no contiene ninguna fila sigue
+    /// teniendo contenido que colocar. Antes se devolvia 0 sin tocar nada y
+    /// ese contenido se quedaba en `Rect::default()` - o sea en (0,0), donde
+    /// ademas se PINTA, amontonado sobre todo lo demas.
+    ///
+    /// El caso es de lo mas comun: MediaWiki maqueta cada miniatura con
+    /// `figure { display: table }`, sin filas de por medio.
+    #[test]
+    fn una_tabla_sin_filas_sigue_colocando_su_contenido() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="height: 40px;">antes</div><figure style="display: table;"><div id="pie">pie de foto</div></figure></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div, figure { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let pie_node = Node::find_by_id(&dom, "pie").expect("pie deberia existir");
+        let pie_box = find_box_for_dom_node(&root, &pie_node).expect("pie deberia tener caja");
+
+        assert!(pie_box.dimensions.width > 0.0, "el contenido de la tabla deberia tener anchura real, no quedarse sin colocar");
+        assert!(
+            pie_box.dimensions.y >= 40.0,
+            "el contenido deberia caer debajo del bloque de 40px que lo precede, no en la esquina (0,0); esta en y={}",
+            pie_box.dimensions.y
+        );
+    }
+
+    /// `position: absolute` sin `left` ni `top` se coloca en su POSICION
+    /// ESTATICA - donde el flujo normal lo habria dejado - no en la esquina
+    /// de su bloque contenedor. Mandarlos todos a la esquina amontonaba en
+    /// (0,0) cada menu y cada tooltip de la pagina.
+    #[test]
+    fn un_absoluto_sin_left_ni_top_usa_su_posicion_estatica() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="height: 50px;">a</div><div style="height: 50px;">b</div><div id="abs" style="position: absolute;">c</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let abs_node = Node::find_by_id(&dom, "abs").expect("abs deberia existir");
+        let abs_box = find_box_for_dom_node(&root, &abs_node).expect("abs deberia tener caja");
+
+        assert_eq!(
+            abs_box.dimensions.y, 100.0,
+            "deberia quedarse donde el flujo lo habria puesto (bajo dos bloques de 50px), no en y=0"
+        );
+    }
+
+    /// Las columnas de una tabla se reparten segun lo que PIDE cada una, no
+    /// a partes iguales. Repartiendo por igual, una columna con un simple
+    /// numero de orden se llevaba lo mismo que una con un titular entero.
+    #[test]
+    fn las_columnas_de_una_tabla_se_reparten_segun_su_contenido() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table><tr><td id="corta">1.</td><td id="larga">un titular considerablemente mas largo que el numero de al lado</td></tr></table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let corta = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "corta").unwrap()).expect("corta deberia tener caja");
+        let larga = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "larga").unwrap()).expect("larga deberia tener caja");
+
+        assert!(
+            larga.dimensions.width > corta.dimensions.width * 2.0,
+            "la columna del titular ({}) deberia ser bastante mas ancha que la del numero ({}), no practicamente igual",
+            larga.dimensions.width,
+            corta.dimensions.width
+        );
+        assert!(
+            corta.dimensions.width > 0.0,
+            "la columna estrecha sigue necesitando anchura suficiente para su contenido"
+        );
+    }
+
+    /// `colspan` es un atributo presentacional de HTML, no CSS: si no se
+    /// lee, la celda ocupa una sola columna y CORRE todas las siguientes de
+    /// su fila una columna a la izquierda.
+    #[test]
+    fn una_celda_con_colspan_ocupa_las_columnas_que_declara() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table><tr><td id="a">a</td><td id="b">b</td></tr><tr><td id="ancha" colspan="2">ocupa las dos</td></tr></table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let a = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "a").unwrap()).expect("a deberia tener caja");
+        let b = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "b").unwrap()).expect("b deberia tener caja");
+        let ancha = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "ancha").unwrap()).expect("ancha deberia tener caja");
+
+        let dos_columnas = a.dimensions.width + b.dimensions.width;
+        assert!(
+            (ancha.dimensions.width - dos_columnas).abs() < 0.5,
+            "la celda con colspan=2 deberia medir lo que suman las dos columnas ({dos_columnas}), pero mide {}",
+            ancha.dimensions.width
+        );
     }
 
     /// El punto real de la Fase 3.2: tres items de ancho fijo en un
