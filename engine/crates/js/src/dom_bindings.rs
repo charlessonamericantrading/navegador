@@ -271,6 +271,10 @@ pub struct DocumentBindings {
     /// todos los objetos de elemento, que son quienes mutan.
     #[unsafe_ignore_trace]
     mutations: crate::mutation_observer::MutationLog,
+    /// Cache de identidad de `element_to_js_object`: puntero de nodo ->
+    /// objeto JS ya construido para el. Ver su doc-comment para el porque.
+    #[unsafe_ignore_trace]
+    element_objects: Arc<Mutex<HashMap<usize, JsObject>>>,
 }
 
 impl DocumentBindings {
@@ -366,7 +370,7 @@ impl DomBindings {
 
         context.register_global_builtin_callable(js_string!("printEngineLog"), 1, print_fn)?;
 
-        let bindings = DocumentBindings { listeners: Arc::new(Mutex::new(HashMap::new())), layout: cssom::new_layout_snapshot(), mutations: Arc::new(Mutex::new(Vec::new())) };
+        let bindings = DocumentBindings { listeners: Arc::new(Mutex::new(HashMap::new())), layout: cssom::new_layout_snapshot(), mutations: Arc::new(Mutex::new(Vec::new())), element_objects: Arc::new(Mutex::new(HashMap::new())) };
         // `getComputedStyle` es un GLOBAL (no un metodo de elemento), asi
         // que se registra aqui, donde nace el snapshot que consulta. Se le
         // pasa `node_from_js_value` porque el tipo que lleva los datos
@@ -910,6 +914,37 @@ fn event_listener_options_capture(arg: Option<&JsValue>, context: &mut Context) 
     }
 }
 
+/// Devuelve el objeto JS de `node`, construyendolo la PRIMERA vez y
+/// reutilizando el MISMO objeto en cualquier consulta posterior sobre el
+/// mismo nodo (`registry.element_objects`, indexado por puntero de nodo).
+///
+/// Antes cada llamada fabricaba un `JsObject` nuevo, asi que la igualdad de
+/// Boa (por identidad de puntero, no de contenido) nunca coincidia entre
+/// dos lecturas del mismo elemento: `document.body === document.body` daba
+/// `false`, y `mutation.target === miElemento` (el patron con el que
+/// practicamente todo codigo real correlaciona un `MutationRecord` con un
+/// elemento que ya tenia a mano) daba `false` SIEMPRE, por bien que
+/// funcionara el resto de `MutationObserver`.
+///
+/// El cache mantiene vivo el nodo mientras exista una entrada suya (el
+/// `JsObject` guarda su propio `Arc<RwLock<Node>>` en cada closure) - un
+/// nodo desconectado del DOM pero todavia referenciado desde JS (por
+/// ejemplo, en `removedNodes` de un `MutationRecord`) sigue siendo un
+/// objeto valido y estable, igual que en un navegador real. Nunca se saca
+/// nada del cache: mismo criterio ya declarado para `ListenerMap` (una
+/// entrada por nodo, por la vida del documento) - una pagina real tiene
+/// miles de nodos, no millones, y el cache muere entero con el
+/// `JsRuntime` al navegar.
+pub(crate) fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, context: &mut Context) -> JsObject {
+    let key = Arc::as_ptr(node) as usize;
+    if let Some(existing) = registry.element_objects.lock().unwrap().get(&key) {
+        return existing.clone();
+    }
+    let object = build_element_object(node, registry, context);
+    registry.element_objects.lock().unwrap().insert(key, object.clone());
+    object
+}
+
 /// Construye el objeto JS de un elemento - `tagName` es foto,
 /// `getAttribute`/`setAttribute`/`textContent`/`appendChild` son vivos; ver
 /// el aviso al principio del archivo para la distincion completa. `registry`
@@ -917,7 +952,7 @@ fn event_listener_options_capture(arg: Option<&JsValue>, context: &mut Context) 
 /// se pasa explicito en vez de crearse aqui para que `addEventListener`
 /// registrado desde una consulta y `dispatchEvent` desde otra sigan viendo
 /// el mismo registro.
-pub(crate) fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, context: &mut Context) -> JsObject {
+fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, context: &mut Context) -> JsObject {
     let tag_name = {
         let n = node.read().unwrap();
         match &n.node_type {
@@ -1125,10 +1160,21 @@ pub(crate) fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &Document
 
             let mut parent = capture.0.write().unwrap();
             match insert_at {
-                Some(index) => parent.children.insert(index, new_node),
-                None => parent.children.push(new_node),
+                Some(index) => parent.children.insert(index, new_node.clone()),
+                None => parent.children.push(new_node.clone()),
             }
             drop(parent);
+            // Faltaba: a diferencia de appendChild/removeChild/setAttribute/
+            // textContent, esta funcion mutaba la lista de hijos sin
+            // apuntarlo - un `MutationObserver` con `childList:true` no veia
+            // NUNCA un insertBefore, aunque si un appendChild identico.
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "childList",
+                target: capture.0.clone(),
+                attribute_name: None,
+                added: vec![new_node],
+                removed: Vec::new(),
+            });
             Ok(new_value.clone())
         },
         capture.clone(),
@@ -1164,10 +1210,18 @@ pub(crate) fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &Document
                 drop(parent);
                 return Ok(JsValue::null());
             };
-            parent.children[index] = new_node;
+            parent.children[index] = new_node.clone();
             drop(parent);
 
             old_node.write().unwrap().parent = None;
+            // Mismo motivo que en insertBefore: faltaba apuntar la mutacion.
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "childList",
+                target: capture.0.clone(),
+                attribute_name: None,
+                added: vec![new_node],
+                removed: vec![old_node],
+            });
             Ok(old_value.clone())
         },
         capture.clone(),
@@ -1959,6 +2013,61 @@ mod tests {
             "var visto = '';              document.addEventListener('prueba', function() { visto = 'si'; });              document.dispatchEvent(new Event('prueba'));              visto",
         );
         assert_eq!(result, "\"si\"");
+    }
+
+    /// Dos lecturas del MISMO nodo (por `getElementById`, o `document.body`
+    /// dos veces) tienen que devolver el mismo objeto JS, no dos envoltorios
+    /// distintos - Boa compara objetos por identidad de puntero, no por
+    /// contenido. Sin cache, `document.body === document.body` daba
+    /// `false`, y peor: `mutation.target === miElementoConocido` (la forma
+    /// mas comun de correlacionar un MutationRecord con un elemento que ya
+    /// se tenia a mano) daba `false` SIEMPRE.
+    #[test]
+    fn dos_lecturas_del_mismo_nodo_devuelven_el_mismo_objeto() {
+        let result = eval_with_dom(
+            r#"<html><body><div id="caja"></div></body></html>"#,
+            "(document.getElementById('caja') === document.getElementById('caja')) + ':' + (document.body === document.body)",
+        );
+        assert_eq!(result, "\"true:true\"");
+    }
+
+    /// La identidad estable tiene que verse tambien en `MutationRecord`: el
+    /// `target` que llega al callback debe ser el MISMO objeto que ya se
+    /// tenia por otra via, no un envoltorio nuevo que nunca compara igual.
+    #[test]
+    fn el_target_de_una_mutacion_es_identico_al_elemento_ya_conocido() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja"></div></body></html>"#,
+            "var caja = document.getElementById('caja'); var coincide = false;              var mo = new MutationObserver(function(r) { coincide = (r[0].target === caja); });              mo.observe(caja, { attributes: true });              caja.setAttribute('a', '1');",
+            "coincide",
+        );
+        assert_eq!(result, "true");
+    }
+
+    /// `insertBefore` mutaba la lista de hijos sin apuntarlo - a diferencia
+    /// de appendChild/removeChild/setAttribute/textContent, que si lo
+    /// hacen. Un observador con `childList:true` no veia NUNCA un
+    /// insertBefore.
+    #[test]
+    fn insert_before_dispara_mutation_observer() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja"><span id="ref"></span></div></body></html>"#,
+            "var disparo = false;              var mo = new MutationObserver(function() { disparo = true; });              mo.observe(document.getElementById('caja'), { childList: true });              var nuevo = document.createElement('p');              document.getElementById('caja').insertBefore(nuevo, document.getElementById('ref'));",
+            "disparo",
+        );
+        assert_eq!(result, "true");
+    }
+
+    /// Mismo motivo que `insertBefore`: `replaceChild` tampoco apuntaba su
+    /// mutacion.
+    #[test]
+    fn replace_child_dispara_mutation_observer() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja"><span id="viejo"></span></div></body></html>"#,
+            "var disparo = false;              var mo = new MutationObserver(function() { disparo = true; });              mo.observe(document.getElementById('caja'), { childList: true });              document.getElementById('caja').replaceChild(document.createElement('p'), document.getElementById('viejo'));",
+            "disparo",
+        );
+        assert_eq!(result, "true");
     }
 
     /// La prueba real de esta tarea: el `JsRuntime` (y con el, los

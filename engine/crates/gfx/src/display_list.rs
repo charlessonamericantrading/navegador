@@ -104,7 +104,7 @@ impl DisplayList {
     pub fn build(layout_root: &LayoutBox, images: &ImageMap) -> Self {
         let mut list = Self::default();
         let mut z_layers: Vec<(i32, Vec<DisplayItem>)> = Vec::new();
-        Self::build_items(layout_root, &mut list.items, images, &mut z_layers);
+        Self::build_items(layout_root, &mut list.items, images, &mut z_layers, &Vec::new());
         z_layers.sort_by_key(|(z, _)| *z);
         for (_, items) in z_layers {
             list.items.extend(items);
@@ -112,7 +112,13 @@ impl DisplayList {
         list
     }
 
-    fn build_items(layout_box: &LayoutBox, target: &mut Vec<DisplayItem>, images: &ImageMap, z_layers: &mut Vec<(i32, Vec<DisplayItem>)>) {
+    fn build_items(
+        layout_box: &LayoutBox,
+        target: &mut Vec<DisplayItem>,
+        images: &ImageMap,
+        z_layers: &mut Vec<(i32, Vec<DisplayItem>)>,
+        active_clips: &[Rect],
+    ) {
         // `visibility: hidden` (a diferencia de `display: none`, ver
         // `engine-layout::tree::build_node`) SI genera caja - sigue
         // ocupando su espacio en el layout, solo no se pinta. Es heredable
@@ -128,7 +134,7 @@ impl DisplayList {
         // propio pintado con su propio `computed_style`.
         let hidden = layout_box.computed_style.get("visibility").map(String::as_str) == Some("hidden");
         if hidden {
-            return Self::build_clipped_children(layout_box, target, images, z_layers);
+            return Self::build_clipped_children(layout_box, target, images, z_layers, active_clips);
         }
         match &layout_box.box_type {
             BoxType::Block | BoxType::Inline => {
@@ -249,7 +255,7 @@ impl DisplayList {
             }
         }
 
-        Self::build_clipped_children(layout_box, target, images, z_layers);
+        Self::build_clipped_children(layout_box, target, images, z_layers, active_clips);
     }
 
     /// `overflow: hidden` (Fase 3.5) envuelve TODO el subarbol de hijos
@@ -266,11 +272,29 @@ impl DisplayList {
     /// sigue recortando y recursando en sus hijos igual que si fuera
     /// visible (un hijo puede reactivar su propio pintado con `visibility:
     /// visible`, ver el doc-comment de esa rama).
-    fn build_clipped_children(layout_box: &LayoutBox, target: &mut Vec<DisplayItem>, images: &ImageMap, z_layers: &mut Vec<(i32, Vec<DisplayItem>)>) {
+    fn build_clipped_children(
+        layout_box: &LayoutBox,
+        target: &mut Vec<DisplayItem>,
+        images: &ImageMap,
+        z_layers: &mut Vec<(i32, Vec<DisplayItem>)>,
+        active_clips: &[Rect],
+    ) {
         let clips = establishes_clip(&layout_box.computed_style);
         if clips {
             target.push(DisplayItem::PushClip { rect: layout_box.dimensions.clone() });
         }
+        // Recorte(s) activos que un descendiente diverted a `z_layers`
+        // deberia seguir respetando - ver mas abajo. Solo se clona cuando
+        // hace falta (esta caja SI recorta): en el caso comun, sin ningun
+        // `overflow` recortando por el camino, es un slice vacio prestado
+        // sin ninguna asignacion.
+        let clips_para_hijos: Vec<Rect>;
+        let clips_para_hijos: &[Rect] = if clips {
+            clips_para_hijos = active_clips.iter().cloned().chain(std::iter::once(layout_box.dimensions.clone())).collect();
+            &clips_para_hijos
+        } else {
+            active_clips
+        };
         for child in &layout_box.children {
             match z_index_for_stacking(&child.computed_style) {
                 Some(z) => {
@@ -287,13 +311,30 @@ impl DisplayList {
                     // pintaba un rectangulo blanco de 1280x62707 sobre el
                     // articulo entero y la pagina se veia en blanco de la
                     // cabecera para abajo.
+                    //
+                    // Una capa z-index se pinta AL FINAL de la lista entera
+                    // (ver `build`), fuera de cualquier `PushClip`/`PopClip`
+                    // que un ANCESTRO haya emitido en el camino normal - asi
+                    // que aqui se envuelve ella misma con los recortes que
+                    // heredaria si no se hubiera desviado. Sin esto, un
+                    // `overflow: hidden/auto/scroll` con un descendiente
+                    // posicionado y con z-index se derramaba sin recortar -
+                    // hueco que se hizo mucho mas frecuente al ampliar
+                    // `establishes_clip` a `auto`/`scroll` (antes solo
+                    // `overflow: hidden` exacto lo disparaba).
                     let slot = z_layers.len();
                     z_layers.push((z, Vec::new()));
                     let mut layer_items = Vec::new();
-                    Self::build_items(child, &mut layer_items, images, z_layers);
+                    for rect in clips_para_hijos {
+                        layer_items.push(DisplayItem::PushClip { rect: rect.clone() });
+                    }
+                    Self::build_items(child, &mut layer_items, images, z_layers, clips_para_hijos);
+                    for _ in clips_para_hijos {
+                        layer_items.push(DisplayItem::PopClip);
+                    }
                     z_layers[slot].1 = layer_items;
                 }
-                None => Self::build_items(child, target, images, z_layers),
+                None => Self::build_items(child, target, images, z_layers, clips_para_hijos),
             }
         }
         if clips {
@@ -1126,6 +1167,53 @@ mod tests {
         assert!(
             blanco < verde,
             "el fondo del ancestro (indice {blanco}) deberia pintarse ANTES que el del hijo (indice {verde}), no taparlo"
+        );
+    }
+
+    /// Un descendiente `position: relative` con `z-index` numerico se pinta
+    /// en una capa aparte, spliceada al FINAL de la lista entera - fuera de
+    /// cualquier `PushClip`/`PopClip` que un ANCESTRO con `overflow`
+    /// hubiera emitido en el camino normal. Sin envolver esa capa con los
+    /// mismos recortes que heredaria de no haberse desviado, un
+    /// `overflow: hidden` con un hijo asi por dentro no lo recorta.
+    #[test]
+    fn una_capa_z_index_hereda_el_recorte_de_su_ancestro_con_overflow() {
+        let mut hijo_posicionado = LayoutBox::new(BoxType::Block);
+        hijo_posicionado.computed_style.insert("position".to_string(), "relative".to_string());
+        hijo_posicionado.computed_style.insert("z-index".to_string(), "1".to_string());
+        hijo_posicionado.computed_style.insert("background-color".to_string(), "#ff0000".to_string());
+        // Deliberadamente mas grande que el contenedor, para que un recorte
+        // ausente sea observable con solo mirar el rectangulo de PushClip.
+        hijo_posicionado.dimensions = Rect { x: 0.0, y: 0.0, width: 500.0, height: 500.0 };
+
+        let mut contenedor = LayoutBox::new(BoxType::Block);
+        contenedor.computed_style.insert("overflow".to_string(), "hidden".to_string());
+        contenedor.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        contenedor.children.push(hijo_posicionado);
+
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.children.push(contenedor);
+
+        let list = DisplayList::build(&root, &ImageMap::new());
+        let rojo = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [255, 0, 0, 255]))
+            .expect("deberia existir el fondo rojo del hijo posicionado");
+
+        let recorte_antes = list.items[..rojo].iter().rev().find_map(|item| match item {
+            DisplayItem::PushClip { rect } => Some(rect.clone()),
+            _ => None,
+        });
+        let recorte = recorte_antes.expect("deberia haber un PushClip inmediatamente antes del contenido de la capa z-index");
+        assert_eq!(
+            (recorte.width, recorte.height),
+            (100.0, 100.0),
+            "el recorte deberia ser el rectangulo del contenedor con overflow:hidden (100x100), no quedarse sin recortar"
+        );
+        assert!(
+            list.items[rojo..].iter().any(|item| matches!(item, DisplayItem::PopClip)),
+            "el PushClip de la capa deberia cerrarse con su PopClip"
         );
     }
 

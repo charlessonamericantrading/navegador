@@ -633,16 +633,23 @@ impl EngineServer {
             .as_mut()
             .map(|page| page.runtime.take_pending_navigations())
             .unwrap_or_default();
-        if let Some(destino) = navegaciones.into_iter().next() {
+        // `.last()`, no `.first()`: varias asignaciones sincronas seguidas
+        // (`location.pathname = 'a'; location.hash = 'b';`) son la ULTIMA
+        // ganando, igual que en un navegador real - la primera se estaba
+        // honrando y la ultima se descartaba en silencio.
+        if let Some(destino) = navegaciones.into_iter().last() {
             if depth < Self::MAX_CLIENT_REDIRECTS {
                 if let Some(page) = self.active_tab().current_page.as_ref() {
-                    if let Ok(base) = url::Url::parse(&page.url) {
-                        if let Ok(resuelta) = base.join(&destino.raw_url) {
+                    match url::Url::parse(&page.url).and_then(|base| base.join(&destino.raw_url)) {
+                        Ok(resuelta) => {
                             let resuelta = resuelta.to_string();
                             if resuelta != page.url {
                                 tracing::info!("[server] redireccion desde JS a {resuelta}");
                                 return Box::pin(self.navigate_with_body(id, resuelta, !destino.replace_current_entry, None, depth + 1)).await;
                             }
+                        }
+                        Err(error) => {
+                            tracing::warn!("[server] URL de location.href invalida, se ignora la redireccion: {} ({error})", destino.raw_url);
                         }
                     }
                 }

@@ -619,13 +619,22 @@ fn is_table_cell(b: &LayoutBox) -> bool {
 /// los colocaba nadie: se quedaban en `Rect::default()` y se pintaban todos
 /// superpuestos en la esquina (0,0) de la pagina.
 fn contributes_table_rows(node: &LayoutBox) -> bool {
-    node.children.iter().any(|child| {
-        match child.computed_style.get("display").map(String::as_str) {
-            Some("table-row") => true,
-            Some("table") | Some("table-cell") => false,
-            _ => contributes_table_rows(child),
-        }
-    })
+    // Comprueba PRIMERO el propio `node`, no solo sus hijos: un `display:
+    // table-row` colocado como hijo DIRECTO de la tabla (sin envoltorio -
+    // valido en CSS puro con divs, aunque un `<table>` HTML real siempre
+    // interpone un `<tbody>` implicito) se perdia, porque la version
+    // anterior solo miraba los HIJOS de `node`, nunca `node` mismo. Se
+    // enmascaraba en cualquier tabla HTML real (el `<tbody>` de por medio
+    // hacia que se llamara sobre el, cuyo hijo SI es el `<tr>`), pero no en
+    // una tabla montada con `display: table`/`table-row` sin ese
+    // envoltorio - encontrado al escribir un test que evitaba a proposito
+    // el "foster parenting" del parser HTML usando divs en vez de
+    // `<table>` real.
+    match node.computed_style.get("display").map(String::as_str) {
+        Some("table-row") => true,
+        Some("table") | Some("table-cell") => false,
+        _ => node.children.iter().any(contributes_table_rows),
+    }
 }
 
 fn collect_table_rows(node: &mut LayoutBox) -> Vec<&mut LayoutBox> {
@@ -811,19 +820,27 @@ fn resolve_explicit_height(computed_style: &HashMap<String, String>, containing_
 /// Acota un alto ya calculado (el del contenido) con `min-height`/
 /// `max-height`. Separado de `resolve_explicit_height` porque aqui SI hay un
 /// numero que acotar.
-fn clamp_height(height: f32, computed_style: &HashMap<String, String>, containing_height: f32) -> f32 {
+///
+/// `border_box`/`box_model_extra`: `max-height`/`min-height` declaran un
+/// valor de BORDER-BOX cuando `box-sizing: border-box` esta activo (igual
+/// que `height`), pero `height` aqui es CONTENIDO puro. Sin convertir el
+/// limite, `max-height: 120px` con `box-sizing: border-box` y 40px de
+/// padding+border acotaba el CONTENIDO a 120px y el `dimensions.height`
+/// final salia en 160px en vez de los 120px que el autor pidio.
+fn clamp_height(height: f32, computed_style: &HashMap<String, String>, containing_height: f32, border_box: bool, box_model_extra: f32) -> f32 {
     let porcentaje_resoluble = |v: &String| -> Option<f32> {
         if v.trim().ends_with('%') && containing_height <= 0.0 {
             return None;
         }
         parse_css_length_relative(v, containing_height)
     };
+    let a_contenido = |limite: f32| if border_box { (limite - box_model_extra).max(0.0) } else { limite };
     let mut h = height;
     if let Some(max_h) = computed_style.get("max-height").and_then(porcentaje_resoluble) {
-        h = h.min(max_h);
+        h = h.min(a_contenido(max_h));
     }
     if let Some(min_h) = computed_style.get("min-height").and_then(porcentaje_resoluble) {
-        h = h.max(min_h);
+        h = h.max(a_contenido(min_h));
     }
     h
 }
@@ -2399,7 +2416,7 @@ impl LayoutTreeBuilder {
             let border_box = is_border_box(&child.computed_style);
             let resolved_content_height = match explicit_height {
                 Some(h) => if border_box { (h - vertical_extra).max(0.0) } else { h },
-                None => clamp_height(content_height, &child.computed_style, child.containing_height),
+                None => clamp_height(content_height, &child.computed_style, child.containing_height, border_box, vertical_extra),
             };
             child.dimensions.height = match explicit_height {
                 Some(h) => if border_box { h } else { h + vertical_extra },
@@ -2573,10 +2590,20 @@ impl LayoutTreeBuilder {
         // con `container.children` - de ahi la tupla en vez de un `Vec`
         // simple.
         let mut child_node_ids: Vec<(usize, taffy::NodeId)> = Vec::with_capacity(container.children.len());
-        for (index, child) in container.children.iter().enumerate() {
+        for (index, child) in container.children.iter_mut().enumerate() {
             if is_out_of_flow(&child.computed_style) {
                 continue;
             }
+            // Se fija ANTES de medir, no solo al comprometer la posicion
+            // final (mas abajo): `measure_flex_item` recursa en
+            // `flow_block_children`, que resuelve el PROPIO padding/height
+            // en porcentaje del item contra `containing_width` - con el
+            // valor por defecto (0.0) de una caja recien creada, un item con
+            // `padding: 5%` mediria con padding cero durante la pasada de
+            // medida de taffy, y el tamaño que taffy comete quedaria
+            // pequeño de mas aunque la segunda pasada corrija el padding
+            // pintado despues.
+            child.containing_width = inner_width;
             let style = flex_item_style(&child.computed_style);
             let node_id = taffy_tree
                 .new_leaf_with_context(style, index)
@@ -2686,10 +2713,13 @@ impl LayoutTreeBuilder {
 
         let mut taffy_tree: taffy::TaffyTree<usize> = taffy::TaffyTree::new();
         let mut child_node_ids: Vec<(usize, taffy::NodeId)> = Vec::with_capacity(container.children.len());
-        for (index, child) in container.children.iter().enumerate() {
+        for (index, child) in container.children.iter_mut().enumerate() {
             if is_out_of_flow(&child.computed_style) {
                 continue;
             }
+            // Mismo motivo que en `flow_flex_children`: hace falta ANTES de
+            // que taffy mida, no solo al comprometer la posicion final.
+            child.containing_width = inner_width;
             let style = grid_item_style(&child.computed_style, &areas);
             let node_id = taffy_tree
                 .new_leaf_with_context(style, index)
@@ -2807,6 +2837,25 @@ impl LayoutTreeBuilder {
             if is_table_cell(&container.children[index]) {
                 continue;
             }
+            // Un `position: absolute`/`fixed` NO ocupa espacio de flujo -
+            // `resolve_positioned_boxes` lo coloca aparte, DESPUES, igual
+            // que hace `flow_normal_block_children`/`flow_flex_children`
+            // con cualquier otro hijo fuera de flujo. Sin este corte, su
+            // alto se sumaba a `caption_height` y empujaba hacia abajo TODA
+            // fila real de la tabla - aunque esa posicion se sobreescribiera
+            // despues, el desplazamiento que ya habia provocado en el resto
+            // del contenido no se deshacia.
+            if is_out_of_flow(&container.children[index].computed_style) {
+                // Misma posicion estatica que anota `flow_normal_block_
+                // children` para cualquier otro hijo fuera de flujo -
+                // `resolve_positioned_boxes` la usa cuando `left`/`top`
+                // estan en `auto`. Sin apuntarla, un absoluto sin
+                // `left`/`top` dentro de una tabla caia a la esquina del
+                // bloque contenedor en vez de a donde el flujo lo habria
+                // dejado.
+                container.children[index].static_position = Some((origin_x, content_top + caption_height));
+                continue;
+            }
             let child = &mut container.children[index];
             child.containing_width = inner_width;
             child.dimensions.x = origin_x;
@@ -2868,9 +2917,20 @@ impl LayoutTreeBuilder {
         // Las que abarcan varias se reparten despues, cuando ya se sabe
         // cuanto piden las columnas por su cuenta.
         let mut spanning: Vec<(usize, u32, f32, f32)> = Vec::new();
+        // Misma ocupacion por `rowspan` que la pasada de POSICIONAMIENTO de
+        // mas abajo (ver `ocupadas` alli) - hace falta TAMBIEN aqui: sin
+        // ella, esta pasada de medida no sabe que una celda con rowspan
+        // sigue bloqueando su columna en las filas siguientes, y le
+        // atribuye el ancho de la primera celda de esas filas a la columna
+        // EQUIVOCADA (la que sigue ocupada, no la que esa celda ocupara de
+        // verdad una vez colocada).
+        let mut ocupadas_medida: Vec<u32> = vec![0; column_count];
         for row in rows.iter_mut() {
             let mut col = 0usize;
             for cell in row.children.iter_mut().filter(|c| is_table_cell(c)) {
+                while col < column_count && ocupadas_medida[col] > 0 {
+                    col += 1;
+                }
                 if col >= column_count {
                     break;
                 }
@@ -2883,7 +2943,16 @@ impl LayoutTreeBuilder {
                 } else {
                     spanning.push((col, span as u32, min, max));
                 }
+                let filas_abarcadas = cell.rowspan.max(1);
+                if filas_abarcadas > 1 {
+                    for c in col..(col + span).min(column_count) {
+                        ocupadas_medida[c] = filas_abarcadas;
+                    }
+                }
                 col += span.max(1);
+            }
+            for o in ocupadas_medida.iter_mut() {
+                *o = o.saturating_sub(1);
             }
         }
         // Segunda pasada: una celda que abarca varias columnas solo obliga a
@@ -2949,6 +3018,13 @@ impl LayoutTreeBuilder {
                 tops_de_fila.push(cursor_y);
                 altos_de_fila.push(height);
                 cursor_y += height;
+                // Esta fila tambien tiene que consumir una fila de
+                // ocupacion pendiente de un `rowspan` anterior - sin esto,
+                // una fila SIN celdas (poco comun pero valida) desalineaba
+                // la cuenta en una fila para todas las de despues.
+                for o in ocupadas.iter_mut() {
+                    *o = o.saturating_sub(1);
+                }
                 continue;
             }
 
@@ -3551,6 +3627,121 @@ mod tests {
         );
     }
 
+    /// `max-height`/`min-height` declaran un valor de BORDER-BOX cuando
+    /// `box-sizing: border-box` esta activo, igual que `height` - pero el
+    /// alto que se acota en la rama `height: auto` es CONTENIDO puro. Sin
+    /// convertir el limite, un `max-height` con padding se quedaba corto:
+    /// el `dimensions.height` final superaba el `max-height` declarado en
+    /// el padding+border que nadie habia restado.
+    #[test]
+    fn max_height_border_box_incluye_el_padding_en_el_limite() {
+        // Tres bloques de 60px (180px de contenido en total, sin depender
+        // de wrap de texto ni de tener una fuente real) desbordan con
+        // creces cualquier limite razonable.
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="caja"><div style="height: 60px;"></div><div style="height: 60px;"></div><div style="height: 60px;"></div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse(
+            "body { margin: 0px; } div { margin: 0px; } #caja { box-sizing: border-box; max-height: 120px; padding: 20px 0px; }",
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "caja").unwrap()).expect("caja");
+
+        assert_eq!(
+            caja.dimensions.height, 120.0,
+            "border-box: 120px de max-height es el alto TOTAL (contenido + 40px de padding), no 120px de contenido mas el padding encima"
+        );
+    }
+
+    /// El bucle que coloca el contenido "suelto" de una tabla (lo que no es
+    /// ni fila ni celda - un `<caption>`, por ejemplo) tenia que saltarse
+    /// los hijos FUERA DE FLUJO igual que hace `flow_normal_block_children`
+    /// con cualquier otro contenido: un `position: absolute` no ocupa
+    /// espacio de flujo, y sumar su alto a `caption_height` empujaba TODA
+    /// fila real hacia abajo aunque `resolve_positioned_boxes` fuera a
+    /// reposicionarlo despues - el desplazamiento que ya habia provocado en
+    /// el resto del contenido no se deshacia.
+    ///
+    /// Se usa `display: table` sobre `<div>`s normales (no `<table>` real):
+    /// el parser HTML reubica ("foster parenting") cualquier `<div>` que no
+    /// sea celda/fila puesto directamente dentro de un `<table>` de
+    /// verdad, lo que taparia el propio escenario que este test quiere
+    /// comprobar.
+    #[test]
+    fn el_contenido_fuera_de_flujo_de_una_tabla_no_empuja_las_filas() {
+        // Sin ningun espacio en blanco entre etiquetas a proposito: un hueco
+        // se parsearia como un nodo de TEXTO (whitespace) hijo directo del
+        // contenedor, que caeria en el mismo bucle de "contenido suelto"
+        // que esta prueba quiere aislar y confundiria el resultado.
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="display: table; width: 200px;"><div style="position: absolute;"><div style="height: 500px;"></div></div><div style="display: table-row;"><div id="celda" style="display: table-cell;">x</div></div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let celda = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "celda").unwrap()).expect("caja");
+
+        assert!(
+            celda.dimensions.y < 10.0,
+            "la celda deberia empezar cerca de y=0 - el hermano fuera de flujo (500px de alto) no deberia empujarla hacia abajo; midio y={}",
+            celda.dimensions.y
+        );
+    }
+
+    /// La pasada que MIDE min/max-content de cada columna tiene que
+    /// respetar la misma ocupacion por `rowspan` que la pasada que las
+    /// COLOCA - si no, atribuye el contenido de una celda a la columna
+    /// equivocada (la que sigue ocupada, no la que esa celda ocupara de
+    /// verdad una vez colocada).
+    #[test]
+    fn la_medida_de_columnas_respeta_la_ocupacion_por_rowspan() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table>
+               <tr><td id="a" rowspan="2">a</td><td id="b0">b0</td></tr>
+               <tr><td id="d">contenidoMuyLargoQueDeberiaEstarEnLaColumnaUno</td></tr>
+               <tr><td id="e">e0</td><td id="f">f1</td></tr>
+               </table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
+
+        // `e` ocupa en solitario la columna 0 en la fila 3, ya fuera del
+        // rowspan de `a` - su ancho ES el ancho real que la tabla decidio
+        // para esa columna. `d` deberia caer en la columna 1 (la 0 sigue
+        // ocupada por `a`); si la medida no lo sabe, le atribuye a la
+        // columna 0 su contenido largo, y esa columna sale mucho mas ancha
+        // de lo que "a"/"e0" (ambos cortos) piden.
+        assert!(
+            caja("e").dimensions.width < caja("f").dimensions.width,
+            "columna 0 (a/e0, cortos: {}) deberia ser mas ESTRECHA que columna 1 (b0 y el contenido largo de d: {})",
+            caja("e").dimensions.width,
+            caja("f").dimensions.width
+        );
+    }
+
+    /// Una fila sin ninguna celda (poco comun, pero valida en HTML) tiene
+    /// que consumir su turno de ocupacion pendiente de un `rowspan`
+    /// anterior igual que cualquier otra fila - saltarselo desalineaba la
+    /// cuenta una fila para todo lo que viniera despues.
+    #[test]
+    fn una_fila_sin_celdas_no_desalinea_el_rowspan_de_las_siguientes() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table>
+               <tr><td id="alta" rowspan="2">alta</td><td id="a1">a1</td></tr>
+               <tr></tr>
+               <tr><td id="c1">c1</td><td id="c2">c2</td></tr>
+               </table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
+
+        assert_eq!(
+            caja("c1").dimensions.x, 0.0,
+            "pasado el rowspan (y la fila vacia intermedia), la fila deberia volver a empezar en la primera columna"
+        );
+    }
+
     /// Las propiedades personalizadas (`--x`) se resuelven donde se USAN,
     /// heredando desde donde se declararon - casi siempre `:root`. Sin
     /// esto, el valor que llega al layout es la cadena literal
@@ -3761,6 +3952,33 @@ mod tests {
             (ancha.dimensions.width - dos_columnas).abs() < 0.5,
             "la celda con colspan=2 deberia medir lo que suman las dos columnas ({dos_columnas}), pero mide {}",
             ancha.dimensions.width
+        );
+    }
+
+    /// `containing_width` de un item flex tiene que estar puesto ANTES de
+    /// que taffy lo MIDA, no solo al comprometer su posicion final: el item
+    /// mide su propio `padding` en porcentaje contra esa referencia, y con
+    /// el valor por defecto (0.0) de una caja recien creada, `padding: 10%`
+    /// se resolvia a CERO durante la medida - taffy comprometia un item mas
+    /// bajo de lo que deberia, y la correccion posterior de
+    /// `finalize_flex_item_children` llega demasiado tarde para el alto ya
+    /// fijado.
+    #[test]
+    fn el_padding_en_porcentaje_de_un_item_flex_se_mide_con_la_referencia_correcta() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="display: flex; width: 400px;"><div id="item"><div style="height: 50px;"></div></div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; } #item { padding: 10%; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let item = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "item").unwrap()).expect("caja");
+
+        // 50px de contenido + 2 x 40px de padding (10% de los 400px del
+        // contenedor) = 130px. Sin la referencia correcta durante la
+        // medida, el padding se cuenta como cero y el alto se queda en 50.
+        assert!(
+            item.dimensions.height > 100.0,
+            "el item deberia medir ~130px (contenido + padding en porcentaje), no quedarse en ~50 con el padding a cero: midio {}",
+            item.dimensions.height
         );
     }
 

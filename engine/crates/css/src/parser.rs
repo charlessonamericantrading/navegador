@@ -197,8 +197,19 @@ fn supports_value(property: &str, value: &str) -> bool {
 /// conservadora: la pagina tomara su camino alternativo.
 fn evaluate_supports(prelude: &str) -> bool {
     let texto = prelude.trim();
-    if let Some(resto) = texto.strip_prefix("not ").or_else(|| texto.strip_prefix("not(")) {
-        let resto = if texto.starts_with("not(") { format!("({resto}") } else { resto.to_string() };
+    // Las palabras clave de CSS (`not`/`and`/`or`) distinguen mayusculas
+    // tan poco como `@media` - `@supports NOT (...)` es tan valido como en
+    // minusculas. Comparar `texto` (sin normalizar) contra el literal
+    // "not " en minusculas dejaba pasar sin negar cualquier `NOT`/`Not`,
+    // justo lo contrario de lo que la pagina pedia.
+    let en_minusculas = texto.to_ascii_lowercase();
+    if let Some(resto) = en_minusculas.strip_prefix("not ").or_else(|| en_minusculas.strip_prefix("not(")) {
+        // El resto se toma del texto ORIGINAL (misma longitud, se preservan
+        // mayusculas/valores) recortando el mismo numero de bytes que
+        // `strip_prefix` quito de la version en minusculas.
+        let recortados = texto.len() - resto.len();
+        let resto_original = &texto[recortados..];
+        let resto = if en_minusculas.starts_with("not(") { format!("({resto_original}") } else { resto_original.to_string() };
         return !evaluate_supports(&resto);
     }
 
@@ -896,6 +907,24 @@ mod tests {
         assert!(!cond("@supports (display: flex) and (position: sticky) { a { color: red; } }").never_matches);
         assert!(cond("@supports (display: flex) and (mask-image: none) { a { color: red; } }").never_matches, "`and` exige las dos");
         assert!(!cond("@supports (display: flex) or (mask-image: none) { a { color: red; } }").never_matches, "`or` basta con una");
+    }
+
+    /// Las palabras clave de CSS distinguen mayusculas tan poco como
+    /// `@media`: `@supports NOT (...)` es tan valido como en minusculas.
+    /// Comparar el prefijo sin normalizar dejaba pasar sin negar cualquier
+    /// `NOT`/`Not`, justo lo contrario de lo que la condicion pedia.
+    #[test]
+    fn supports_not_no_distingue_mayusculas() {
+        let cond = |css: &str| CssParser::parse(css).rules[0].media.clone().expect("condicion");
+
+        assert!(
+            !cond("@supports NOT (mask-image: none) { a { color: red; } }").never_matches,
+            "NOT en mayusculas deberia negar igual que \"not\" en minusculas"
+        );
+        assert!(
+            !cond("@supports Not (mask-image: none) { a { color: red; } }").never_matches,
+            "tambien en formas mixtas como \"Not\""
+        );
     }
 
     /// La sintaxis de RANGOS de Media Queries nivel 4 (`(width > 769px)`)
