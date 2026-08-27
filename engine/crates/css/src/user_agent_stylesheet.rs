@@ -13,23 +13,27 @@
 //!   horizontal en cero; aqui el mismo valor tambien empuja los lados. Se
 //!   declara asi a proposito en vez de fingir una precision que el motor
 //!   de layout no tiene todavia.
-//! - `font-weight`/`font-style` SI quedan en el `computed_style` resultante
-//!   Y SI se pintan de verdad (negrita/cursiva reales via `FontSet`, ver
-//!   `engine-text::font` y la Fase 2.4 en ARCHITECTURE.md). `text-decoration`
-//!   tambien queda en la cascada pero `engine-gfx` todavia no lo LEE al
-//!   pintar (subrayado de `<a>` - pendiente) - esta aqui porque es cascada
-//!   real, no porque ya se vea en pantalla.
-//! - Sin `list-style` (viñetas), sin sangria de listas, sin `display`
-//!   propio por tag (`<li>` no es mas que otro bloque generico todavia,
-//!   ver "layout inline" pendiente).
+//! - `font-weight`/`font-style`/`text-decoration` SI quedan en el
+//!   `computed_style` resultante Y SI se pintan de verdad (negrita/cursiva
+//!   reales via `FontSet`, ver `engine-text::font` y la Fase 2.4 en
+//!   ARCHITECTURE.md; subrayado real desde la Fase 29, ver
+//!   `DisplayItem::Text::underline` en `engine-gfx::display_list`) - el
+//!   subrayado por defecto de `<a>` es el caso que mas se nota.
+//! - `<li>` declara `display: list-item` (Fase 40) - una vineta real
+//!   (`•`, o el numero+punto si su padre es `<ol>`) se antepone a su
+//!   contenido, ver `place_list_marker` en `engine-layout::tree`.
+//!   `margin-left: 24px` le da hueco donde "colgar" (el marcador se pinta
+//!   FUERA de su propia caja de contenido, en ese margen - equivalente
+//!   honesto-minimo de `list-style-position: outside`, el valor inicial
+//!   real). Solo bala/numero simple: sin `list-style-type` propio
+//!   (`square`/`circle`/`lower-roman`...), sin `list-style-image`.
 //! - `table`/`tr`/`td`/`th` (Fase 3.4) SI tienen su `display` real
 //!   (`table`/`table-row`/`table-cell` - ver `flow_table_children` en
 //!   `engine-layout::tree`), pero sin `thead`/`tbody`/`tfoot` con rol propio
 //!   (son transparentes para el layout de tabla, ver
-//!   `collect_table_rows`), sin `border-collapse`/`border-spacing`, y `th`
-//!   solo declara `font-weight: bold` (que si se pinta, igual que `b`/
-//!   `strong`), sin el `text-align: center` que un navegador real tambien
-//!   le da (esa propiedad todavia no se PINTA - ver `INHERITABLE_PROPERTIES`).
+//!   `collect_table_rows`), sin `border-collapse`/`border-spacing`. `th`
+//!   declara `font-weight: bold` y `text-align: center` (ambos se pintan,
+//!   igual que `b`/`strong`), como un navegador real.
 //! - `input`/`select`/`textarea` (Fase 11: controles de formulario, ver
 //!   `BoxType::Replaced` en `engine-layout`) reciben aqui un TAMAÑO FIJO,
 //!   no shrink-to-fit real (este motor no mide min/max-content en ningun
@@ -45,13 +49,12 @@
 //! - `button` (y solo `button` - `input[type=submit/button/...]` sigue
 //!   siendo `BoxType::Replaced`, con tamaño fijo, NO `Inline`) se trata
 //!   como `span`/`a`/etc: se encoge a su contenido real en vez de un
-//!   tamaño fijo, PERO `padding`/`border` de elementos inline no se
-//!   resuelven todavia en el layout (limitacion ya declarada en
-//!   `place_inline_node`, "caso raro para span/a/b/i" - deja de serlo
-//!   para `button`, pero sigue sin resolverse) - el fondo/borde de abajo
-//!   SI se pinta (misma cascada, ver `engine-gfx::display_list`), solo
-//!   queda pegado al texto sin aire alrededor, no con el respiro que
-//!   `padding` le daria en un navegador real.
+//!   tamaño fijo, Y `padding`/`border` de elementos inline SI se
+//!   resuelven en el layout (ver `place_inline_node`, caso
+//!   `BoxType::Inline`) - un boton con `padding` se ve relleno de
+//!   verdad, no con el texto pegado al borde. `margin` de un inline
+//!   sigue sin resolverse (horizontal-only en el spec real, caso raro
+//!   fuera de `button`).
 
 use crate::parser::CssParser;
 use crate::stylesheet::StyleSheet;
@@ -68,6 +71,7 @@ h6 { font-size: 11px; margin: 25px; }
 p { margin: 16px; }
 ul { margin: 16px; }
 ol { margin: 16px; }
+li { display: list-item; margin-left: 24px; }
 a { color: #0000ee; text-decoration: underline; }
 b { font-weight: bold; }
 strong { font-weight: bold; }
@@ -76,7 +80,7 @@ em { font-style: italic; }
 table { display: table; }
 tr { display: table-row; }
 td { display: table-cell; padding: 1px; }
-th { display: table-cell; padding: 1px; font-weight: bold; }
+th { display: table-cell; padding: 1px; font-weight: bold; text-align: center; }
 input { width: 170px; height: 21px; border: 1px solid #767676; background-color: #ffffff; }
 input[type="checkbox"], input[type="radio"] { width: 13px; height: 13px; border: 1px solid #767676; background-color: #ffffff; }
 input[type="radio"] { border-radius: 7px; }
@@ -84,7 +88,7 @@ input[type="submit"], input[type="button"], input[type="reset"], input[type="ima
 input[type="hidden"] { display: none; }
 select { width: 170px; height: 21px; border: 1px solid #767676; background-color: #ffffff; }
 textarea { width: 200px; height: 60px; border: 1px solid #767676; background-color: #ffffff; }
-button { border: 1px solid #767676; background-color: #efefef; }
+button { border: 1px solid #767676; background-color: #efefef; padding: 1px 6px; }
 "#;
 
 /// Devuelve la hoja de agente de usuario, parseada UNA sola vez con el

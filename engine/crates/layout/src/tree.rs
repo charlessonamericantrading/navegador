@@ -141,6 +141,7 @@ const INHERITABLE_PROPERTIES: &[&str] = &[
     "visibility",
     "cursor",
     "direction",
+    "list-style",
     "list-style-type",
     "list-style-position",
     "list-style-image",
@@ -467,6 +468,83 @@ fn float_side(computed_style: &HashMap<String, String>) -> Option<FloatSide> {
         Some("right") => Some(FloatSide::Right),
         _ => None,
     }
+}
+
+/// `display: list-item` (Fase 40, hoja UA: `li { display: list-item; }`) -
+/// el `<li>` sigue siendo `BoxType::Block` de siempre
+/// (`override_box_type_from_display` no reconoce este valor, cae al
+/// `default.clone()` tag-based), esto solo decide si `flow_normal_block_children`
+/// le antepone una vineta.
+fn is_list_item(computed_style: &HashMap<String, String>) -> bool {
+    computed_style.get("display").map(String::as_str) == Some("list-item")
+}
+
+/// `list-style-type: none` o el shorthand `list-style: none` (ambos ya
+/// heredables, ver `INHERITABLE_PROPERTIES`) - la forma real, MUY comun,
+/// con la que una pagina real quita las vinetas por defecto de una lista
+/// entera desde el `<ul>`/`<ol>` (encontrado en vivo contra la Wikipedia
+/// real: su tabla de contenidos es un `<ul>` con `list-style: none` que
+/// pinta su propia numeracion via `<span>`, no la del navegador - sin este
+/// chequeo, `place_list_marker` le anteponia una vineta encima de la suya
+/// propia). El shorthand no se expande a longhand en ningun sitio de este
+/// motor (ver el aviso de `user_agent_stylesheet.rs`), asi que se busca
+/// "none" como TOKEN suelto del valor crudo, no con una comparacion
+/// exacta (cubre `list-style: none outside` igual que el `list-style:
+/// none` simple).
+fn list_style_is_none(computed_style: &HashMap<String, String>) -> bool {
+    if computed_style.get("list-style-type").is_some_and(|v| v.trim().eq_ignore_ascii_case("none")) {
+        return true;
+    }
+    computed_style.get("list-style").is_some_and(|v| v.split_whitespace().any(|token| token.eq_ignore_ascii_case("none")))
+}
+
+/// Etiqueta HTML del elemento que produjo esta caja, o `None` para una
+/// caja de texto/sintetica sin `dom_node` (ver su doc-comment en
+/// `layout_box.rs`) - lo unico que necesita `place_list_marker` para
+/// distinguir `<ol>` (numerado) de cualquier otro contenedor de lista
+/// (con vineta).
+fn tag_name_of(node: &LayoutBox) -> Option<String> {
+    let dom_node = node.dom_node.as_ref()?;
+    match &dom_node.read().unwrap().node_type {
+        NodeType::Element { tag_name, .. } => Some(tag_name.clone()),
+        _ => None,
+    }
+}
+
+/// Antepone una vineta real a `child` (un `<li>`, ya con sus `dimensions`
+/// finales resueltas por el flujo de bloque normal - por eso se llama
+/// DESPUES de `flow_block_children(child, ...)`, no antes: necesita saber
+/// donde empieza `child` de verdad). `•` para cualquier lista salvo
+/// `<ol>` (numerada, `ordinal.` con el mismo criterio 1-based que un
+/// navegador real), via `ordinal` (posicion 1-based entre sus hermanos
+/// `list-item`, llevada por quien llama - `place_list_marker` en si no
+/// sabe nada de hermanos).
+///
+/// El marcador se posiciona FUERA de la caja de contenido de `child`, en
+/// el hueco que le da su propio `margin-left` (ver la hoja UA) -
+/// equivalente honesto-minimo de `list-style-position: outside`, el valor
+/// inicial real de la propiedad: no reserva su propio ancho en el flujo
+/// (no lo necesita, vive en un margen que ya nadie mas ocupa) y no cambia
+/// nada de la posicion/ancho de `child`. Se inserta como el PRIMER hijo de
+/// `child` (una caja de texto sintetica, sin `dom_node`) para que pinte
+/// por el mismo camino que cualquier otro texto, sin tocar `engine-gfx`.
+fn place_list_marker(child: &mut LayoutBox, ordinal: u32, ordered: bool, font_set: Option<&FontSet>) {
+    let text = if ordered { format!("{ordinal}.") } else { "\u{2022}".to_string() };
+    let font_size = child.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
+    let natural_width = match font_set.and_then(|set| set.pick(false, false)) {
+        Some(f) => engine_text::wrapped_line_width(f, &text, font_size),
+        None => text.chars().count() as f32 * 8.0,
+    };
+    const GAP_BEFORE_CONTENT: f32 = 6.0;
+    let mut marker = LayoutBox::new(BoxType::Text(text));
+    marker.computed_style = child.computed_style.clone();
+    marker.dimensions = Rect {
+        x: child.dimensions.x - natural_width - GAP_BEFORE_CONTENT,
+        y: child.dimensions.y,
+        width: natural_width,
+        height: font_size * 1.2,
+    };
+    child.children.insert(0, marker);
 }
 
 /// Un float TODAVIA activo en la posicion vertical actual del flujo
@@ -1789,13 +1867,12 @@ pub struct LayoutTreeBuilder;
 impl LayoutTreeBuilder {
     /// Construye el arbol de layout, resuelve el estilo CSS de cada caja
     /// (ver `resolve_style`) y le asigna posiciones/tamanos reales mediante
-    /// un flujo de bloque top-to-bottom muy simplificado: cada caja ocupa el
-    /// ancho completo del contenedor y se apilan verticalmente. `padding`,
+    /// un flujo de bloque top-to-bottom para el caso general, mas flex/grid
+    /// reales via `taffy`, floats (`float_left`/`float_right`, ver
+    /// `place_float_child`) e inline real (`place_inline_node`). `padding`,
     /// `border` y `margin` reales ya se resuelven desde la cascada (ver
     /// `resolve_padding`/`resolve_border_width`/`resolve_margin`,
-    /// `box_dimensions` en cada `LayoutBox`, sin colapso de margenes);
-    /// floats e inline real todavia no — eso sigue siendo Fase 2, ver
-    /// ARCHITECTURE.md. Esto es honesto-minimo, no el layout final.
+    /// `box_dimensions` en cada `LayoutBox`, sin colapso de margenes).
     /// `font_set`: las 4 variantes de peso/estilo de la MISMA fuente de
     /// sistema que usara `engine-gfx` para pintar (cargadas una sola vez
     /// por quien orquesta el pipeline, ver `core/main.rs`), para que el
@@ -2320,6 +2397,14 @@ impl LayoutTreeBuilder {
         let mut float_left: Option<ActiveFloat> = None;
         let mut float_right: Option<ActiveFloat> = None;
 
+        // `display: list-item` (Fase 40) - se leen UNA sola vez antes del
+        // bucle: `ordered` es una propiedad del CONTENEDOR (`<ol>` vs
+        // cualquier otra lista), no de cada hijo, y el ordinal 1-based
+        // cuenta solo entre hermanos `list-item` (un nodo de texto suelto
+        // entre `<li>` por espacio en blanco del propio HTML no cuenta).
+        let ordered_list = tag_name_of(container).as_deref() == Some("ol");
+        let mut list_item_ordinal: u32 = 0;
+
         let mut i = 0;
         while i < container.children.len() {
             // `position: absolute`/`fixed` (Fase 3.3) se saca del flujo por
@@ -2460,9 +2545,13 @@ impl LayoutTreeBuilder {
             let child_border = child.box_dimensions.border;
             // `height` (si esta puesta) sustituye la altura AUTO (la que
             // acaba de devolver la recursion) por el valor explicito del
-            // autor. El contenido que no quepa simplemente desborda, sin
-            // recorte: `overflow` no esta implementado todavia. Sin
-            // `max-height`/`min-height` todavia.
+            // autor; `max-height`/`min-height` se aplican despues via
+            // `clamp_height`. El layout en si no reduce el contenido para
+            // que quepa (igual que un navegador real: `overflow` no cambia
+            // el tamano de las cajas) - lo que SI ocurre es el recorte
+            // visual en pintura cuando `overflow` lo pide (`hidden`/
+            // `auto`/`scroll`), ver `establishes_clip` en
+            // `engine-gfx::display_list`.
             //
             // Una caja de bloque con `height: auto` y sin contenido en flujo
             // mide CERO, que es lo que dice el spec. Antes se le aplicaba un
@@ -2495,6 +2584,16 @@ impl LayoutTreeBuilder {
                 width: child_width - child_border.left - child_border.right - child_padding.left - child_padding.right,
                 height: resolved_content_height,
             };
+
+            // `display: list-item` (Fase 40) - `child.dimensions` ya es
+            // FINAL en este punto, que es justo lo que `place_list_marker`
+            // necesita para saber donde colgar la vineta a su izquierda.
+            if is_list_item(&child.computed_style) {
+                list_item_ordinal += 1;
+                if !list_style_is_none(&child.computed_style) {
+                    place_list_marker(child, list_item_ordinal, ordered_list, font_set);
+                }
+            }
 
             cursor_y += child.dimensions.height + margin.bottom;
             i += 1;
@@ -3440,16 +3539,28 @@ impl LayoutTreeBuilder {
                 }
             }
             BoxType::Inline => {
-                // `margin`/`padding`/`border` de elementos inline no se
-                // resuelven todavia (fuera de alcance de esta tarea) - el
-                // spec real solo les aplica margen/padding HORIZONTAL de
-                // todas formas (el vertical no afecta el alto de linea), y
-                // es un caso raro en paginas reales para span/a/b/i.
+                // `padding`/`border` de elementos inline (span/a/b/button...)
+                // SI se resuelven: el spec real solo les da efecto HORIZONTAL
+                // sobre el flujo (empujan donde arrancan/terminan los hijos
+                // en la linea; el vertical no reserva mas alto de linea ni
+                // desplaza a los hermanos), pero SI se pintan verticalmente
+                // (el fondo/borde crece simetrico arriba/abajo desde el
+                // texto) - es como un boton real con `padding` se ve
+                // "relleno" sin que la linea entera se separe de la
+                // siguiente. `margin` de un inline sigue sin resolverse
+                // (mismo criterio: horizontal-only en el spec real, caso
+                // raro fuera de `button`).
+                let padding = resolve_padding(&node.computed_style, inner_width);
+                let border = resolve_border_width(&node.computed_style);
                 let start_x = *cursor_x;
                 let start_y = *cursor_y;
+                *cursor_x += padding.left + border.left;
                 for child in &mut node.children {
                     Self::place_inline_node(child, origin_x, inner_width, text_line_height, line_extent, cursor_x, cursor_y, font_set, images);
                 }
+                *cursor_x += padding.right + border.right;
+                node.box_dimensions.padding = padding;
+                node.box_dimensions.border = border;
                 // Rectangulo delimitador de todo lo que contuvo - honesto
                 // solo para el caso comun (contenido que cabe en una sola
                 // linea); si sus hijos terminaron repartidos en mas de una
@@ -3460,9 +3571,9 @@ impl LayoutTreeBuilder {
                 // comun.
                 node.dimensions = Rect {
                     x: start_x,
-                    y: start_y,
+                    y: start_y - padding.top - border.top,
                     width: (*cursor_x - start_x).max(0.0),
-                    height: (*cursor_y - start_y) + *line_extent,
+                    height: (*cursor_y - start_y) + *line_extent + padding.top + padding.bottom + border.top + border.bottom,
                 };
             }
             BoxType::Image(src) => {
@@ -5019,6 +5130,104 @@ mod tests {
         let dom_unset = HtmlParser::parse("<html><body><div>hi</div></body></html>");
         let root_unset = LayoutTreeBuilder::build(&dom_unset, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
         assert_eq!(find_text_box(&root_unset, "hi").unwrap().dimensions.x, 0.0, "el valor inicial real de text-align es left");
+    }
+
+    /// `th` centra su contenido por defecto (hoja de agente de usuario,
+    /// `user_agent_stylesheet.rs`), igual que un navegador real - `td` no.
+    /// `text-align` ya era heredable e implementado end-to-end antes de
+    /// esta prueba; lo que faltaba era la declaracion en la hoja UA.
+    #[test]
+    fn th_centers_its_text_by_default_but_td_does_not() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table style="width:400px"><tr><th id="th" style="width:200px">hi</th><td id="td" style="width:200px">yo</td></tr></table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { border-spacing: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let th_cell = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "th").expect("th")).expect("caja del th");
+        let td_cell = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "td").expect("td")).expect("caja del td");
+        let th_text = find_text_box(&root, "hi").expect("deberia existir la caja de texto 'hi' del th");
+        let td_text = find_text_box(&root, "yo").expect("deberia existir la caja de texto 'yo' del td");
+        let th_offset = th_text.dimensions.x - th_cell.dimensions.x;
+        let td_offset = td_text.dimensions.x - td_cell.dimensions.x;
+        assert!(th_offset > td_offset + 10.0, "el texto del th deberia estar mucho mas desplazado dentro de su celda que el del td (centrado vs pegado a la izquierda): th_offset={th_offset}, td_offset={td_offset}");
+    }
+
+    /// `padding`/`border` de un elemento `BoxType::Inline` (span/a/b/button)
+    /// SI se resuelven ahora: el texto arranca desplazado por
+    /// `padding.left + border.left`, y la caja del propio contenedor crece
+    /// simetrica arriba/abajo (no solo a la derecha) para que un boton se
+    /// vea relleno de verdad.
+    #[test]
+    fn padding_and_border_of_an_inline_box_shift_its_text_and_grow_its_own_rect() {
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+
+        let dom = HtmlParser::parse(
+            r#"<html><body><button id="btn" style="padding: 10px; border: 2px solid black;">hi</button></body></html>"#,
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let btn_box = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "btn").expect("btn")).expect("caja del button");
+        let text_box = find_text_box(&root, "hi").expect("deberia existir la caja de texto 'hi'");
+        assert_eq!(text_box.dimensions.x - btn_box.dimensions.x, 12.0, "10px de padding + 2px de border deberian desplazar el texto 12px del borde izquierdo del boton");
+        assert_eq!(btn_box.box_dimensions.padding.top, 10.0);
+        assert_eq!(btn_box.box_dimensions.border.top, 2.0);
+
+        let dom_sin_relleno = HtmlParser::parse(r#"<html><body><button id="btn" style="padding: 0px; border: none;">hi</button></body></html>"#);
+        let root_sin_relleno = LayoutTreeBuilder::build(&dom_sin_relleno, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let btn_sin_relleno = find_box_for_dom_node(&root_sin_relleno, &Node::find_by_id(&dom_sin_relleno, "btn").expect("btn")).expect("caja del button");
+        assert_eq!(btn_box.dimensions.height - btn_sin_relleno.dimensions.height, 24.0, "10+10px de padding vertical + 2+2px de border deberian crecer la caja del boton 24px por encima de la misma sin relleno");
+    }
+
+    /// `<ul>` antepone una vineta (`•`) a cada `<li>`, colocada a la
+    /// IZQUIERDA de su contenido (en el hueco de su propio `margin-left`,
+    /// ver la hoja UA) - nunca dentro, que empujaria el texto real.
+    #[test]
+    fn ul_prepends_a_bullet_marker_positioned_to_the_left_of_each_li() {
+        let dom = HtmlParser::parse(r#"<html><body><ul><li id="a">uno</li><li id="b">dos</li></ul></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let li_a = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "a").expect("a")).expect("caja del li a");
+        let li_b = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "b").expect("b")).expect("caja del li b");
+
+        let marker_a = li_a.children.first().expect("el li deberia tener un marcador como primer hijo");
+        assert!(matches!(&marker_a.box_type, BoxType::Text(t) if t == "\u{2022}"), "una lista sin ordenar deberia usar una vineta, no un numero");
+        assert!(marker_a.dimensions.x < li_a.dimensions.x, "el marcador deberia pintarse a la izquierda del contenido del li, no dentro de el");
+
+        let marker_b = li_b.children.first().expect("el segundo li tambien deberia tener su propio marcador");
+        assert!(matches!(&marker_b.box_type, BoxType::Text(t) if t == "\u{2022}"));
+    }
+
+    /// `<ol>` numera sus marcadores 1-based y en orden de documento -
+    /// solo entre hermanos `list-item` (no cuenta nada mas).
+    #[test]
+    fn ol_numbers_its_markers_sequentially_starting_at_one() {
+        let dom = HtmlParser::parse(r#"<html><body><ol><li id="a">uno</li><li id="b">dos</li><li id="c">tres</li></ol></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let marker_text = |id: &str| {
+            let li = find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect(id)).expect("caja del li");
+            match &li.children.first().expect("deberia tener marcador").box_type {
+                BoxType::Text(t) => t.clone(),
+                other => panic!("el primer hijo deberia ser el marcador de texto, salio {other:?}"),
+            }
+        };
+        assert_eq!(marker_text("a"), "1.");
+        assert_eq!(marker_text("b"), "2.");
+        assert_eq!(marker_text("c"), "3.");
+    }
+
+    /// `list-style: none` (el shorthand, la forma MUY comun con la que una
+    /// pagina real quita las vinetas de una lista entera desde el `<ul>` -
+    /// encontrado en vivo contra la Wikipedia real, su tabla de
+    /// contenidos) suprime la vineta - heredado desde el `<ul>`, no
+    /// declarado en cada `<li>`.
+    #[test]
+    fn list_style_none_on_the_ul_suppresses_the_marker_of_every_li() {
+        let dom = HtmlParser::parse(r#"<html><body><ul style="list-style: none;"><li id="a">uno</li></ul></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let li_a = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "a").expect("a")).expect("caja del li");
+        let first_child_is_marker = li_a.children.first().is_some_and(|c| matches!(&c.box_type, BoxType::Text(t) if t == "\u{2022}"));
+        assert!(!first_child_is_marker, "list-style: none deberia suprimir la vineta, no anteponerla igual que sin la propiedad");
     }
 
     /// `justify` se PARSEA (no cae al "no reconocido") pero se pinta como

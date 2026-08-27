@@ -57,11 +57,15 @@ pub enum DisplayItem {
     /// que quien pinta esto solo rellena `rect` con `color`, ni sabe que
     /// existio un desplazamiento por separado. Se pinta ANTES que
     /// `SolidRect`/`Border` de la misma caja (orden real del spec: la
-    /// sombra queda DETRAS del fondo/border). Simplificacion declarada:
-    /// sombra "dura" sin difuminado - el tercer valor de `box-shadow`
-    /// (blur radius) se PARSEA (para no romper el resto de tokens) pero se
-    /// descarta, un blur gaussiano real no esta implementado.
-    Shadow { rect: Rect, color: [u8; 4], radius: f32 },
+    /// sombra queda DETRAS del fondo/border). `blur` (el tercer valor de
+    /// `box-shadow`, en px) SI se difumina de verdad (ver `paint_blurred_shadow`
+    /// en `engine-gfx::paint`: se rellena en un lienzo aparte y se le
+    /// aplican 3 pasadas de blur de caja horizontal+vertical, la misma
+    /// tecnica de "cajas repetidas" que aproxima un gaussiano real en la
+    /// mayoria de motores de render) - `0.0` (sin blur declarado) pinta la
+    /// sombra "dura" de siempre, sin lienzo aparte. El spread-radius (4o
+    /// valor) sigue sin soportarse.
+    Shadow { rect: Rect, color: [u8; 4], radius: f32, blur: f32 },
     /// `overflow: hidden` (Fase 3.5) - todo lo que se pinte entre un
     /// `PushClip` y su `PopClip` correspondiente (mismo anidamiento que el
     /// arbol de cajas: `build_items` los emite envolviendo la recursion en
@@ -141,11 +145,11 @@ impl DisplayList {
                 let radius = parse_css_border_radius(&layout_box.computed_style).unwrap_or(0.0);
                 // `box-shadow` se pinta ANTES que fondo/border (orden real
                 // del spec - ver el doc-comment de `DisplayItem::Shadow`).
-                if let Some((dx, dy, color)) = parse_css_box_shadow(&layout_box.computed_style) {
+                if let Some((dx, dy, color, blur)) = parse_css_box_shadow(&layout_box.computed_style) {
                     let mut rect = layout_box.dimensions.clone();
                     rect.x += dx;
                     rect.y += dy;
-                    target.push(DisplayItem::Shadow { rect, color, radius });
+                    target.push(DisplayItem::Shadow { rect, color, radius, blur });
                 }
                 // Sin background-color explicito en la cascada, las cajas de
                 // bloque no pintan fondo propio (transparente = se ve el
@@ -164,11 +168,11 @@ impl DisplayList {
             }
             BoxType::Replaced => {
                 let radius = parse_css_border_radius(&layout_box.computed_style).unwrap_or(0.0);
-                if let Some((dx, dy, color)) = parse_css_box_shadow(&layout_box.computed_style) {
+                if let Some((dx, dy, color, blur)) = parse_css_box_shadow(&layout_box.computed_style) {
                     let mut rect = layout_box.dimensions.clone();
                     rect.x += dx;
                     rect.y += dy;
-                    target.push(DisplayItem::Shadow { rect, color, radius });
+                    target.push(DisplayItem::Shadow { rect, color, radius, blur });
                 }
                 if let Some(color) = layout_box.computed_style.get("background-color").and_then(|v| parse_css_color(v)) {
                     target.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color, radius });
@@ -487,10 +491,15 @@ fn parse_rgb_component(token: &str) -> Option<u8> {
 /// mas abajo) - sin aproximacion, resultado identico al de un navegador
 /// real para el mismo triplete.
 ///
-/// NO implementado: `hwb()`/`lab()`/`lch()`/`oklab()`/`oklch()` y el resto
-/// de espacios de color modernos - devuelven `None` y la caja se queda
-/// sin pintar, en vez de fingir una conversion. Tampoco los ~90 nombres
-/// extendidos que faltan en la tabla.
+/// `hwb()` (blancura/negrura, misma familia que HSL - `hwb_to_rgb` mas
+/// abajo) y `oklch()` (el espacio de color perceptualmente uniforme de CSS
+/// Color 4 - `oklch_to_rgb` mas abajo, la formula de referencia de Björn
+/// Ottosson, sin aproximacion) tambien se parsean de verdad.
+///
+/// NO implementado: `lab()`/`lch()`/`oklab()` y el resto de espacios de
+/// color modernos - devuelven `None` y la caja se queda sin pintar, en vez
+/// de fingir una conversion. Tampoco los ~90 nombres extendidos que faltan
+/// en la tabla.
 pub(crate) fn parse_css_color(value: &str) -> Option<[u8; 4]> {
     let value = value.trim();
 
@@ -570,7 +579,121 @@ pub(crate) fn parse_css_color(value: &str) -> Option<[u8; 4]> {
         return Some([r, g, b, a]);
     }
 
+    if let Some(rest) = lower.strip_prefix("hwb(") {
+        let inner = rest.strip_suffix(')')?;
+        let normalised = inner.replace(',', " ").replace('/', " ");
+        let parts: Vec<&str> = normalised.split_whitespace().collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let hue = parse_hue_degrees(parts[0])?;
+        let whiteness = parse_percentage_0_1(parts[1])?;
+        let blackness = parse_percentage_0_1(parts[2])?;
+        let (r, g, b) = hwb_to_rgb(hue, whiteness, blackness);
+        let a = match parts.get(3) {
+            Some(token) => parse_alpha_0_1_or_percent(token)?,
+            None => 255,
+        };
+        return Some([r, g, b, a]);
+    }
+
+    if let Some(rest) = lower.strip_prefix("oklch(") {
+        let inner = rest.strip_suffix(')')?;
+        let normalised = inner.replace('/', " ");
+        let parts: Vec<&str> = normalised.split_whitespace().collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let lightness = parse_oklch_lightness(parts[0])?;
+        let chroma = parts[1].trim().parse::<f32>().ok()?.max(0.0);
+        let hue = parse_hue_degrees(parts[2])?;
+        let (r, g, b) = oklch_to_rgb(lightness, chroma, hue);
+        let a = match parts.get(3) {
+            Some(token) => parse_alpha_0_1_or_percent(token)?,
+            None => 255,
+        };
+        return Some([r, g, b, a]);
+    }
+
     NAMED_COLORS.iter().find(|(name, _)| *name == lower).map(|(_, rgba)| *rgba)
+}
+
+/// Componente de alfa de `hwb()`/`oklch()` - mismo parseo (numero 0.0-1.0 o
+/// porcentaje) que ya usan `rgb()`/`hsl()` mas arriba, extraido aqui porque
+/// dos consumidores mas lo necesitan tal cual.
+fn parse_alpha_0_1_or_percent(token: &str) -> Option<u8> {
+    let t = token.trim();
+    let alpha = match t.strip_suffix('%') {
+        Some(percent) => percent.trim().parse::<f32>().ok()? / 100.0,
+        None => t.parse::<f32>().ok()?,
+    };
+    Some((alpha.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// `hwb(hue whiteness blackness)` -> RGB, la formula estandar de CSS Color
+/// 4 §7.1: si blancura+negrura cubren el 100% o mas, el resultado es un
+/// gris puro (proporcional a cuanta blancura hay respecto al total);
+/// si no, se parte del color puro de ese matiz (`hsl_to_rgb` con
+/// saturacion 100%/luminosidad 50%, el mismo helper que ya usa `hsl()`) y
+/// se mezcla hacia blanco/negro segun las dos proporciones.
+fn hwb_to_rgb(hue_deg: f32, whiteness: f32, blackness: f32) -> (u8, u8, u8) {
+    let w = whiteness.clamp(0.0, 1.0);
+    let b = blackness.clamp(0.0, 1.0);
+    if w + b >= 1.0 {
+        let gray = (w / (w + b) * 255.0).round() as u8;
+        return (gray, gray, gray);
+    }
+    let (r, g, bl) = hsl_to_rgb(hue_deg, 1.0, 0.5);
+    let mix = |c: u8| -> u8 {
+        let c = c as f32 / 255.0;
+        ((c * (1.0 - w - b) + w) * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    (mix(r), mix(g), mix(bl))
+}
+
+/// Luminosidad (`L`) de `oklch()`: `0.0..1.0` de verdad (mas comun como
+/// porcentaje, `70%`) o el numero directo que tambien acepta CSS Color 4 -
+/// acotado igual que el resto del parseador.
+fn parse_oklch_lightness(token: &str) -> Option<f32> {
+    let token = token.trim();
+    if let Some(percent) = token.strip_suffix('%') {
+        return Some((percent.trim().parse::<f32>().ok()? / 100.0).clamp(0.0, 1.0));
+    }
+    token.parse::<f32>().ok().map(|v| v.clamp(0.0, 1.0))
+}
+
+/// `oklch(L C H)` -> RGB: la formula de referencia de Björn Ottosson
+/// (creador de OKLab) sin aproximacion - LCH cilindrico a OKLab
+/// rectangular (`a = C*cos(H)`, `b = C*sin(H)`), OKLab a sRGB LINEAL via
+/// las matrices estandar del espacio, y de ahi a sRGB con la curva gamma
+/// real del spec (tramo lineal bajo `0.0031308`, potencia `1/2.4` el
+/// resto). Un `L`/`C`/`H` fuera de gama (el color pedido no cabe en sRGB)
+/// se ACOTA al canal 0..1 mas cercano tras la curva gamma en vez de
+/// devolver `None` o un color inventado - un navegador real hace lo mismo
+/// (gamut mapping por recorte).
+fn oklch_to_rgb(lightness: f32, chroma: f32, hue_deg: f32) -> (u8, u8, u8) {
+    let hue = hue_deg.to_radians();
+    let a = chroma * hue.cos();
+    let b = chroma * hue.sin();
+
+    let l_ = lightness + 0.3963377774 * a + 0.2158037573 * b;
+    let m_ = lightness - 0.1055613458 * a - 0.0638541728 * b;
+    let s_ = lightness - 0.0894841775 * a - 1.2914855480 * b;
+
+    let l3 = l_ * l_ * l_;
+    let m3 = m_ * m_ * m_;
+    let s3 = s_ * s_ * s_;
+
+    let r_lin = 4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3;
+    let g_lin = -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3;
+    let b_lin = -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3;
+
+    let gamma_encode = |c: f32| -> u8 {
+        let c = c.clamp(0.0, 1.0);
+        let encoded = if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+        (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    (gamma_encode(r_lin), gamma_encode(g_lin), gamma_encode(b_lin))
 }
 
 /// El matiz (`hue`) de `hsl()` en cualquiera de las cuatro unidades de
@@ -820,18 +943,19 @@ fn parse_css_border_radius(computed_style: &HashMap<String, String>) -> Option<f
     None
 }
 
-/// `box-shadow: <offset-x> <offset-y> [<blur-radius>] <color>` (Fase 3.5) -
-/// el `blur-radius` opcional SI se parsea (para no romper el resto de
-/// tokens, p.ej. tomar el color por el blur) pero se DESCARTA - ver el
-/// doc-comment de `DisplayItem::Shadow` para el porque (sombra "dura", sin
-/// difuminado real). `offset-x`/`offset-y` aceptan negativos (a diferencia
-/// de `parse_css_length`, que rechaza negativos porque un padding/border
-/// negativo no tiene sentido - un offset de sombra si) via `parse_css_offset`
-/// local, deliberadamente NO compartida con la copia de `engine-layout::tree`
-/// (misma razon de siempre: crates que no deben depender entre si). `None`
-/// si faltan offset-x/offset-y o el color, o si la propiedad no esta
-/// puesta - sin sombra por defecto, el valor inicial real de la propiedad.
-fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32, f32, [u8; 4])> {
+/// `box-shadow: <offset-x> <offset-y> [<blur-radius>] <color>` (Fase 3.5,
+/// blur real desde entonces) - `offset-x`/`offset-y` aceptan negativos (a
+/// diferencia de `parse_css_length`, que rechaza negativos porque un
+/// padding/border negativo no tiene sentido - un offset de sombra si) via
+/// `parse_css_offset` local, deliberadamente NO compartida con la copia de
+/// `engine-layout::tree` (misma razon de siempre: crates que no deben
+/// depender entre si). El 3er numero (si esta) es el blur-radius, acotado a
+/// no-negativo igual que el resto del motor acota en vez de rechazar - un
+/// 4o numero (spread-radius) sigue sin soportarse (se ignora, no rompe el
+/// resto del parseo). `None` si faltan offset-x/offset-y o el color, o si la
+/// propiedad no esta puesta - sin sombra por defecto, el valor inicial real
+/// de la propiedad.
+fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32, f32, [u8; 4], f32)> {
     fn parse_offset(value: &str) -> Option<f32> {
         let px = value.trim().strip_suffix("px")?;
         px.trim().parse::<f32>().ok()
@@ -847,12 +971,12 @@ fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32
         } else if let Some(n) = parse_offset(token) {
             offsets.push(n);
         }
-        // Un tercer numero (blur-radius) cae aqui y se ignora a proposito.
     }
 
     let dx = *offsets.first()?;
     let dy = *offsets.get(1)?;
-    Some((dx, dy, color.unwrap_or(INITIAL_COLOR)))
+    let blur = offsets.get(2).copied().unwrap_or(0.0).max(0.0);
+    Some((dx, dy, color.unwrap_or(INITIAL_COLOR), blur))
 }
 
 #[cfg(test)]
@@ -912,11 +1036,59 @@ mod tests {
 
     #[test]
     fn unsupported_color_syntaxes_are_none_instead_of_a_made_up_color() {
-        assert_eq!(parse_css_color("hwb(0 0% 0%)"), None, "hwb() no esta implementado");
-        assert_eq!(parse_css_color("oklch(0.5 0.2 30)"), None, "oklch() no esta implementado");
+        assert_eq!(parse_css_color("lab(50% 40 60)"), None, "lab() no esta implementado");
+        assert_eq!(parse_css_color("oklab(0.5 0.1 0.1)"), None, "oklab() no esta implementado");
         assert_eq!(parse_css_color("currentColor"), None, "currentColor exige el computed_style completo");
         assert_eq!(parse_css_color("basura"), None);
         assert_eq!(parse_css_color(""), None);
+    }
+
+    /// `hwb(0 0% 0%)` es rojo puro (matiz 0, sin blancura ni negrura que lo
+    /// desature) - mismo punto de referencia facil de verificar que ya usan
+    /// las pruebas de `hsl()`.
+    #[test]
+    fn hwb_with_no_whiteness_or_blackness_is_the_pure_hue() {
+        assert_eq!(parse_css_color("hwb(0 0% 0%)"), Some([255, 0, 0, 255]));
+    }
+
+    /// Blancura+negrura sumando 100% o mas colapsa a un gris puro
+    /// (proporcional a cuanta blancura hay) - el matiz deja de importar.
+    #[test]
+    fn hwb_with_whiteness_plus_blackness_over_100_percent_is_a_pure_gray() {
+        assert_eq!(parse_css_color("hwb(210 60% 60%)"), Some([128, 128, 128, 255]));
+    }
+
+    #[test]
+    fn hwb_reads_the_optional_alpha_after_a_slash() {
+        assert_eq!(parse_css_color("hwb(0 0% 0% / 0.5)"), Some([255, 0, 0, 128]));
+    }
+
+    /// `oklch(1 0 0)` es blanco puro (luminosidad maxima, sin croma) y
+    /// `oklch(0 0 0)` es negro puro (luminosidad minima) - los dos puntos
+    /// de referencia que cualquier implementacion de OKLCH tiene que dar
+    /// exactos, sin importar la formula interna.
+    #[test]
+    fn oklch_at_the_lightness_extremes_is_pure_white_or_black() {
+        assert_eq!(parse_css_color("oklch(1 0 0)"), Some([255, 255, 255, 255]));
+        assert_eq!(parse_css_color("oklch(0 0 0)"), Some([0, 0, 0, 255]));
+    }
+
+    /// `oklch(0.63 0.26 29)` es el rojo de referencia de CSS Color 4
+    /// (equivale casi exacto a `red`/`#ff0000`) - el punto de referencia
+    /// que documenta el propio spec para verificar una implementacion de
+    /// OKLCH contra un color RGB conocido.
+    #[test]
+    fn oklch_of_a_known_red_matches_srgb_red_closely() {
+        let Some([r, g, b, a]) = parse_css_color("oklch(0.627955 0.257683 29.2339)") else { panic!("deberia parsear") };
+        assert_eq!(a, 255);
+        assert!(r >= 250, "canal rojo deberia estar cerca de 255, salio {r}");
+        assert!(g <= 20, "canal verde deberia estar cerca de 0, salio {g}");
+        assert!(b <= 20, "canal azul deberia estar cerca de 0, salio {b}");
+    }
+
+    #[test]
+    fn oklch_lightness_accepts_a_percentage_or_a_bare_number() {
+        assert_eq!(parse_css_color("oklch(100% 0 0)"), parse_css_color("oklch(1 0 0)"));
     }
 
     /// Los tres primarios y los limites de luminosidad (0%/100% siempre dan
@@ -1356,26 +1528,23 @@ mod tests {
 
     #[test]
     fn parse_css_box_shadow_reads_offsets_and_color_in_any_order() {
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255])));
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "#ff0000 4px 6px")), Some((4.0, 6.0, [255, 0, 0, 255])), "el orden deberia ser libre, igual que border");
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255], 0.0)));
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "#ff0000 4px 6px")), Some((4.0, 6.0, [255, 0, 0, 255], 0.0)), "el orden deberia ser libre, igual que border");
     }
 
     #[test]
-    fn parse_css_box_shadow_ignores_the_optional_blur_radius_token() {
-        // El tercer numero (blur-radius) se parsea para no romper el color
-        // que viene despues, pero se descarta - offsets siguen siendo los
-        // dos primeros numeros encontrados.
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px 10px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255])));
+    fn parse_css_box_shadow_reads_the_optional_blur_radius_token() {
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px 10px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255], 10.0)));
     }
 
     #[test]
     fn parse_css_box_shadow_accepts_negative_offsets() {
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "-4px -6px #000000")), Some((-4.0, -6.0, [0, 0, 0, 255])));
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "-4px -6px #000000")), Some((-4.0, -6.0, [0, 0, 0, 255], 0.0)));
     }
 
     #[test]
     fn parse_css_box_shadow_defaults_color_to_black_when_missing() {
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px")), Some((4.0, 6.0, [0, 0, 0, 255])));
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px")), Some((4.0, 6.0, [0, 0, 0, 255], 0.0)));
     }
 
     #[test]

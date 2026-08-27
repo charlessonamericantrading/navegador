@@ -24,15 +24,19 @@
 //!
 //! # Consecuencias honestas de que sea un snapshot y no un reflow
 //!
-//! - **Durante la carga de la pagina el snapshot esta VACIO**: todavia no
-//!   ha corrido ningun layout. Un `<script>` que llame a
-//!   `getBoundingClientRect()` en ese momento recibe un rect de ceros, y
-//!   `getComputedStyle(el)` un objeto sin ninguna propiedad. No es un
-//!   invento: es exactamente lo que devuelve un navegador real para un
-//!   elemento que no esta en el arbol de render (`display: none`, o
-//!   desconectado del documento). Donde estas APIs se usan de verdad -
-//!   dentro de un listener de `click`/`input`/`popstate` - el snapshot ya
-//!   esta publicado y los valores son reales.
+//! - **Antes del PRIMER layout el snapshot esta VACIO**: un `<script>`
+//!   sincrono que llame a `getBoundingClientRect()` mientras el HTML
+//!   todavia se esta parseando (antes de que exista ningun arbol de
+//!   layout) recibe un rect de ceros, y `getComputedStyle(el)` un objeto
+//!   sin ninguna propiedad. No es un invento: es exactamente lo que
+//!   devuelve un navegador real para un elemento que no esta en el arbol
+//!   de render (`display: none`, o desconectado del documento). Donde
+//!   estas APIs se usan de verdad - dentro de un listener de
+//!   `click`/`input`/`popstate`, o de `DOMContentLoaded` (el listener de
+//!   arranque mas comun de una pagina real) - el snapshot ya esta
+//!   publicado y los valores son reales: `build_page_keeping_runtime`
+//!   construye el layout y publica el snapshot ANTES de disparar
+//!   `DOMContentLoaded`, no despues.
 //! - **Mutar el DOM no actualiza el snapshot al instante.** Si un listener
 //!   cambia `el.style.width` y acto seguido lee `getBoundingClientRect()`,
 //!   ve la geometria de ANTES del cambio; el navegador real veria la de
