@@ -42,7 +42,12 @@ use serde_json::json;
 /// |            |           | sonda daba `innerHTML` por presente sin     |
 /// |            |           | estarlo, porque asignar una propiedad       |
 /// |            |           | cualquiera a un objeto JS siempre funciona  |
-const MINIMO: usize = 73;
+/// | 2026-09-09 | 85/114    | `CustomEvent`, `KeyboardEvent`,             |
+/// |            |           | `MouseEvent`, `InputEvent`, entorno de      |
+/// |            |           | `window` (`innerWidth`, `matchMedia`...) y  |
+/// |            |           | `document.readyState`, `activeElement`,     |
+/// |            |           | `getElementsByClassName` (tareas C4, C6, C7)|
+const MINIMO: usize = 85;
 
 /// El total de comprobaciones de la sonda. Se vigila aparte del minimo para
 /// cazar un caso concreto: que alguien "suba" el porcentaje borrando

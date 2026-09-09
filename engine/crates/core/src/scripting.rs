@@ -54,7 +54,7 @@ pub fn execute_inline_scripts(dom_root: &Arc<RwLock<Node>>, external_scripts: &H
 /// real de WPT que manipula el DOM. Ninguna pagina real usa esto - solo el
 /// runner de tests (`bin/wpt_runner.rs`) - por eso es una funcion aparte y
 /// no un flag en `execute_inline_scripts`.
-pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, external_scripts: &HashMap<String, String>) -> (Vec<Result<String, String>>, Vec<TestResult>) {
+pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, external_scripts: &HashMap<String, String>, viewport: (f32, f32)) -> (Vec<Result<String, String>>, Vec<TestResult>) {
     let scripts = Node::find_all_by_tag(dom_root, "script");
     if scripts.is_empty() {
         return (Vec::new(), Vec::new());
@@ -63,6 +63,29 @@ pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, externa
     let mut runtime = JsRuntime::new();
     if let Err(e) = runtime.bind_dom(dom_root.clone()) {
         tracing::warn!("[js] no se pudo enlazar el DOM al runtime: {e}");
+    }
+
+    // El arnes registra el MISMO entorno que una pagina real: `window`, las
+    // utilidades de plataforma y el entorno de viewport (Fase 45). Antes no lo
+    // hacia, y eso convertia los tests estilo-WPT en pruebas de un motor
+    // distinto del que corre de verdad - un test que use `window.matchMedia`
+    // fallaba con `ReferenceError` aunque la pagina real lo tuviera. Lo que
+    // NO se registra aqui es la red (`fetch`/`XHR`): el arnes no debe salir a
+    // internet, y su ausencia es una decision, no un olvido.
+    if let Err(e) = runtime.register_window() {
+        tracing::warn!("[js] no se pudo registrar window en el arnes: {e}");
+    }
+    if let Err(e) = runtime.register_platform() {
+        tracing::warn!("[js] no se pudieron registrar las utilidades en el arnes: {e}");
+    }
+    if let Err(e) = runtime.register_window_environment() {
+        tracing::warn!("[js] no se pudo registrar el entorno en el arnes: {e}");
+    }
+    if let Some(snapshot) = runtime.layout_snapshot() {
+        if let Ok(mut data) = snapshot.write() {
+            data.viewport_width = viewport.0;
+            data.viewport_height = viewport.1;
+        }
     }
     let test_results = match TestHarness::register(&mut runtime.context) {
         Ok(results) => results,
@@ -135,6 +158,7 @@ pub fn execute_inline_scripts_keeping_runtime(
     external_scripts: &HashMap<String, String>,
     network: Option<Arc<NetworkEngine>>,
     storage: Option<StorageContext>,
+    viewport: (f32, f32),
 ) -> (Vec<Result<String, String>>, JsRuntime) {
     let scripts = Node::find_all_by_tag(dom_root, "script");
 
@@ -215,6 +239,24 @@ pub fn execute_inline_scripts_keeping_runtime(
     // y hay codigo real que usa las dos formas.
     if let Err(e) = runtime.register_platform() {
         tracing::warn!("[js] no se pudieron registrar las utilidades de plataforma: {e}");
+    }
+    // DESPUES de `register_window` y `bind_dom` (Fase 45): estas propiedades
+    // leen el buzon de layout, que nace en `bind_dom`, y se cuelgan del
+    // objeto `window`, que crea `register_window`.
+    if let Err(e) = runtime.register_window_environment() {
+        tracing::warn!("[js] no se pudo registrar el entorno de window: {e}");
+    }
+    // El viewport se publica ANTES de correr ningun script (Fase 45). No
+    // depende del layout - es un dato de entrada, no un resultado - y
+    // publicarlo con el resto de la geometria (que es lo que hacia el pipeline
+    // por comodidad) dejaba `window.innerWidth` en cero durante TODA la
+    // ejecucion de los scripts, que es justo cuando una pagina lo consulta
+    // para repartir espacio.
+    if let Some(snapshot) = runtime.layout_snapshot() {
+        if let Ok(mut data) = snapshot.write() {
+            data.viewport_width = viewport.0;
+            data.viewport_height = viewport.1;
+        }
     }
     // DESPUES de `bind_dom` y `register_window` a proposito (Fase 7):
     // `register_history` engancha ademas `window.addEventListener`
@@ -508,7 +550,7 @@ mod tests {
     #[test]
     fn execute_inline_scripts_with_harness_records_a_passing_test() {
         let dom = HtmlParser::parse("<html><body><script>test(function() { assert_equals(1 + 1, 2); }, 'suma');</script></body></html>");
-        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new());
+        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new(), (800.0, 600.0));
         assert_eq!(test_results.len(), 1);
         assert!(test_results[0].passed);
         assert_eq!(test_results[0].name, "suma");
@@ -519,7 +561,7 @@ mod tests {
     #[test]
     fn execute_inline_scripts_with_harness_reports_a_failing_test_instead_of_silencing_it() {
         let dom = HtmlParser::parse("<html><body><script>test(function() { assert_equals(1, 2, 'no deberian ser iguales'); }, 'resta rota');</script></body></html>");
-        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new());
+        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new(), (800.0, 600.0));
         assert_eq!(test_results.len(), 1);
         assert!(!test_results[0].passed);
         let message = test_results[0].failure_message.as_ref().expect("deberia haber mensaje de fallo");
@@ -538,7 +580,7 @@ mod tests {
                 }, 'dom real dentro de un test');
             </script></body></html>"#,
         );
-        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new());
+        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new(), (800.0, 600.0));
         assert_eq!(test_results.len(), 1);
         assert!(test_results[0].passed, "el test deberia poder leer el DOM real: {:?}", test_results[0].failure_message);
     }
@@ -557,7 +599,7 @@ mod tests {
                 });
             </script></body></html>"#,
         );
-        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None, None);
+        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None, None, (800.0, 600.0));
         assert_eq!(script_results.len(), 1, "el <script> que registra el listener deberia haberse ejecutado");
 
         let target = Node::find_by_id(&dom, "target").expect("target deberia existir");
@@ -570,7 +612,7 @@ mod tests {
     #[test]
     fn execute_inline_scripts_keeping_runtime_returns_a_bound_runtime_even_with_no_scripts() {
         let dom = HtmlParser::parse("<html><body><p>sin scripts</p></body></html>");
-        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None, None);
+        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None, None, (800.0, 600.0));
         assert!(script_results.is_empty());
         // Sin scripts no hay forma de que se haya registrado ningun
         // listener, pero el runtime en si deberia seguir siendo usable

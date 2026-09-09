@@ -22,7 +22,7 @@
 //! pestañas de verdad. Ver `PendingWindowOpens`.
 
 use boa_engine::{js_string, Context, JsResult, JsValue, NativeFunction};
-use boa_engine::object::ObjectInitializer;
+use boa_engine::object::{FunctionObjectBuilder, ObjectInitializer};
 use boa_engine::property::Attribute;
 use std::sync::{Arc, Mutex};
 
@@ -248,4 +248,168 @@ mod tests {
         runtime.eval("window.dispatchEvent(new Event('miEvento'))").expect("dispatchEvent no deberia lanzar");
         assert_eq!(runtime.eval("visto").unwrap(), "true", "el listener puesto via window.addEventListener deberia dispararse con window.dispatchEvent");
     }
+}
+
+// ---------------------------------------------------------------------------
+// El entorno de `window` (Fase 45, tarea C7 del plan)
+// ---------------------------------------------------------------------------
+
+/// Envoltorio para capturar el buzon de layout dentro de un `NativeFunction`
+/// de Boa. Mismo patron y mismo motivo que `PendingCapture`.
+#[derive(Clone)]
+struct EntornoCapture(crate::cssom::LayoutSnapshot);
+impl boa_gc::Finalize for EntornoCapture {}
+unsafe impl boa_gc::Trace for EntornoCapture {
+    boa_gc::empty_trace!();
+}
+
+/// Registra las propiedades de `window` que describen el ENTORNO:
+/// `innerWidth`/`innerHeight`, `devicePixelRatio`, `scrollX`/`scrollY`,
+/// `scrollTo`/`scrollBy` y `matchMedia`.
+///
+/// Por que van aparte de `register_window` y despues: necesitan el buzon de
+/// layout, que solo existe una vez que `bind_dom` ha corrido. Registrar aqui un
+/// `innerWidth` sin buzon devolveria siempre cero, que es peor que no tenerlo:
+/// una pagina que reparte espacio con `innerWidth` produciria un diseño de
+/// ancho cero en vez de fallar de forma visible.
+///
+/// Todas son ACCESSORS y no propiedades fijas: el viewport cambia con cada
+/// `resize` y el scroll con cada rueda del raton. Una foto tomada al cargar
+/// daria respuestas obsoletas en cuanto el usuario tocara la ventana.
+pub fn register_window_environment(
+    context: &mut Context,
+    snapshot: crate::cssom::LayoutSnapshot,
+) -> JsResult<()> {
+    let captura = EntornoCapture(snapshot);
+
+    let inner_width = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], c: &EntornoCapture, _context| {
+            let ancho = c.0.read().map(|d| d.viewport_width).unwrap_or(0.0);
+            Ok(JsValue::from(ancho as f64))
+        },
+        captura.clone(),
+    );
+    let inner_height = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], c: &EntornoCapture, _context| {
+            let alto = c.0.read().map(|d| d.viewport_height).unwrap_or(0.0);
+            Ok(JsValue::from(alto as f64))
+        },
+        captura.clone(),
+    );
+    let scroll_y = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], c: &EntornoCapture, _context| {
+            let y = c.0.read().map(|d| d.scroll_offset_y).unwrap_or(0.0);
+            Ok(JsValue::from(y as f64))
+        },
+        captura.clone(),
+    );
+
+    // `matchMedia` evalua la MISMA condicion que `@media`, con el mismo parser
+    // (`engine_css::parse_media_condition`). Tener dos evaluadores seria
+    // garantizar que un dia respondan distinto sobre la misma consulta, y ese
+    // es justo el fallo que nadie diagnostica.
+    let match_media = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], c: &EntornoCapture, context| {
+            let consulta = match args.first() {
+                Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                None => String::new(),
+            };
+            let ancho = c.0.read().map(|d| d.viewport_width).unwrap_or(0.0);
+            let condicion = engine_css::parse_media_condition(&consulta);
+            let coincide = condicion.matches(ancho);
+
+            // `addEventListener`/`addListener` existen y NO hacen nada, y eso
+            // es deliberado: un `MediaQueryList` no dispara aqui porque el
+            // motor no reevalua consultas al redimensionar. Registrar el
+            // metodo evita el `TypeError` que mataria el script; no
+            // registrarlo lo mataria. Que ademas no dispare esta declarado en
+            // `huecos_sin_resolver.md` - a diferencia de un observador, un
+            // listener de media query que no dispara deja a la pagina en su
+            // estado inicial, que es un estado valido, no colgada.
+            let sin_efecto =
+                NativeFunction::from_fn_ptr(|_this, _args, _context| Ok(JsValue::undefined()));
+
+            Ok(ObjectInitializer::new(context)
+                .property(js_string!("matches"), JsValue::from(coincide), Attribute::all())
+                .property(js_string!("media"), js_string!(consulta), Attribute::all())
+                .function(sin_efecto.clone(), js_string!("addEventListener"), 2)
+                .function(sin_efecto.clone(), js_string!("removeEventListener"), 2)
+                .function(sin_efecto.clone(), js_string!("addListener"), 1)
+                .function(sin_efecto, js_string!("removeListener"), 1)
+                .build()
+                .into())
+        },
+        captura.clone(),
+    );
+
+    // `scrollTo`/`scrollBy` aceptan la llamada sin mover nada: mover el scroll
+    // de verdad exige un camino JS -> servidor que todavia no existe (el
+    // scroll lo manda hoy el servidor hacia JS, no al reves). Se registran
+    // porque su AUSENCIA mata el script, y no mover es un resultado que la
+    // pagina puede observar y sobrevivir - al contrario que un observador que
+    // nunca dispara, que la deja esperando. Declarado en
+    // `huecos_sin_resolver.md`.
+    let scroll_to = NativeFunction::from_fn_ptr(|_this, _args, _context| {
+        tracing::info!("[js] window.scrollTo/scrollBy aceptado pero sin efecto todavia");
+        Ok(JsValue::undefined())
+    });
+
+    let global = context.global_object();
+    let window = global.get(js_string!("window"), context)?;
+    let Some(window) = window.as_object().cloned() else {
+        return Ok(());
+    };
+
+    let accessors: [(&str, NativeFunction); 3] = [
+        ("innerWidth", inner_width),
+        ("innerHeight", inner_height),
+        ("scrollY", scroll_y),
+    ];
+    for (nombre, funcion) in accessors {
+        let getter = FunctionObjectBuilder::new(context.realm(), funcion)
+            .name(js_string!(format!("get {nombre}")))
+            .length(0)
+            .constructor(false)
+            .build();
+        let descriptor = boa_engine::property::PropertyDescriptor::builder()
+            .get(getter)
+            .enumerable(true)
+            .configurable(true)
+            .build();
+        window.define_property_or_throw(js_string!(nombre), descriptor, context)?;
+    }
+
+    // `pageYOffset` es el nombre antiguo de `scrollY` y sigue muy usado.
+    let page_y = window.get(js_string!("scrollY"), context)?;
+    window.set(js_string!("pageYOffset"), page_y, false, context)?;
+
+    // `scrollX` es siempre 0: este motor no tiene scroll horizontal. Es un
+    // valor CIERTO, no un relleno.
+    window.set(js_string!("scrollX"), JsValue::from(0.0), false, context)?;
+    window.set(js_string!("pageXOffset"), JsValue::from(0.0), false, context)?;
+    // 1.0 real: el motor rasteriza a 1 pixel fisico por pixel CSS.
+    window.set(js_string!("devicePixelRatio"), JsValue::from(1.0), false, context)?;
+
+    let match_media_fn = FunctionObjectBuilder::new(context.realm(), match_media)
+        .name(js_string!("matchMedia"))
+        .length(1)
+        .constructor(false)
+        .build();
+    window.set(js_string!("matchMedia"), match_media_fn.clone(), false, context)?;
+    context.register_global_property(
+        js_string!("matchMedia"),
+        match_media_fn,
+        Attribute::all(),
+    )?;
+
+    let scroll_to_fn = FunctionObjectBuilder::new(context.realm(), scroll_to)
+        .name(js_string!("scrollTo"))
+        .length(2)
+        .constructor(false)
+        .build();
+    window.set(js_string!("scrollTo"), scroll_to_fn.clone(), false, context)?;
+    window.set(js_string!("scrollBy"), scroll_to_fn.clone(), false, context)?;
+    window.set(js_string!("scroll"), scroll_to_fn, false, context)?;
+
+    Ok(())
 }

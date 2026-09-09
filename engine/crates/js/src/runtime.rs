@@ -116,6 +116,23 @@ impl JsRuntime {
         }
     }
 
+    /// Registra las propiedades de `window` que describen el entorno
+    /// (`innerWidth`, `matchMedia`, `scrollY`...) - Fase 45.
+    ///
+    /// Aparte de `register_window` y DESPUES de `bind_dom` a proposito:
+    /// necesitan el buzon de layout, que nace en `bind_dom`. Sin el, un
+    /// `innerWidth` devolveria siempre cero, y una pagina que reparte espacio
+    /// con `innerWidth` produciria un diseno de ancho cero en vez de fallar de
+    /// forma visible.
+    ///
+    /// No-op honesto si no hay buzon: las propiedades no existen, que es la
+    /// respuesta correcta donde no hay ventana ni layout que describir.
+    pub fn register_window_environment(&mut self) -> Result<(), JsError> {
+        let Some(snapshot) = self.layout_snapshot() else { return Ok(()) };
+        crate::window::register_window_environment(&mut self.context, snapshot)
+            .map_err(|e| JsError::Execution(e.to_string()))
+    }
+
     /// Si este runtime puede ejecutar modulos ES.
     pub fn supports_modules(&self) -> bool {
         self.module_loader.is_some()

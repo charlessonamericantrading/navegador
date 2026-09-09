@@ -14,7 +14,7 @@ aquí. Los identificadores entre corchetes remiten a las tareas de `../plan.md`.
 
 **Última verificación contra el código: 2026-09-09** (actualizado tras la Fase 42). Cada entrada de este fichero
 se comprobó con `grep` sobre `engine/crates/*/src` en esa fecha, no se copió de
-`ARCHITECTURE.md`. Estado de la suite: **874 tests pasando, 0 fallando**.
+`ARCHITECTURE.md`. Estado de la suite: **874 tests pasando, 0 fallando**, más 60 tests estilo-WPT.
 
 ---
 
@@ -101,17 +101,20 @@ un *closure* que captura su nodo. Consecuencia exacta:
 Cerrarlo exige que cada método recupere su nodo desde `this` en vez de desde una
 captura, es decir reescribir las ~675 líneas de `build_element_object`.
 
-### 1.4 Eventos `[plan C4]`
+### 1.4 Eventos `[plan C4]` — cerrado (Fase 45)
 
-`new Event(tipo, {bubbles, cancelable})` **sí** existe (`dom_bindings.rs:663`,
-probado en `tests/wpt-style/events-and-microtasks.html`). Faltan:
+**Ya existen**: `Event`, `CustomEvent` (con `detail`), `KeyboardEvent`,
+`MouseEvent`, `InputEvent`, `FocusEvent`, con sus campos y modificadores.
 
-- `CustomEvent` (con `detail`) y `EventTarget` como constructor
-- `KeyboardEvent`, `MouseEvent`, `InputEvent`, `FocusEvent` con sus campos (`key`,
-  `code`, `clientX/Y`, `button`, `relatedTarget`, `inputType`). Es el mismo hueco
-  que `ARCHITECTURE.md` declara en «Integración con el producto» como «metadatos de
-  tecla todavía no están implementados».
-- Sin verificar: `composedPath()`, `eventPhase`, `timeStamp`, `isTrusted`.
+Falta: `EventTarget` como constructor construible, `composedPath()`,
+`eventPhase`, `timeStamp`, `isTrusted`.
+
+Simplificación declarada: `MouseEvent.pageX`/`pageY` se igualan a
+`clientX`/`clientY`, porque el constructor no tiene acceso al scroll. Correcto
+mientras la página no esté desplazada.
+
+El teclado y el ratón REALES siguen sin rellenar estos tipos: el motor despacha
+sus eventos sin metadatos. Eso es del lado de `core::server`, no del binding.
 
 ### 1.5 Observadores `[plan C8]`
 

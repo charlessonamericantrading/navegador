@@ -100,9 +100,9 @@ Lo que bloquea hoy, comprobado contra el código el 2026-09-09:
   así que `addEventListener(...)` a secas funciona. Aquí no: lanza
   `ReferenceError` y mata el script.
 * **APIs ausentes:** `AbortController`, `structuredClone`, `crypto`,
-  `matchMedia`, `IntersectionObserver`, `ResizeObserver`, `customElements`,
-  `CustomEvent`, `KeyboardEvent`, `MouseEvent`, `DOMParser`, `innerText`,
-  `insertAdjacentHTML`, `document.readyState`, `FormData`, `Blob`.
+  `IntersectionObserver`, `ResizeObserver`, `customElements`, `DOMParser`,
+  `innerText`, `insertAdjacentHTML`, `FormData`, `Blob`, `WebSocket`,
+  `indexedDB`.
 
 **Los módulos ES ya funcionan desde la Fase 43**, que era el bloqueo anterior a
 todo lo demás: `<script type="module">` con `import`/`export` reales,
@@ -119,7 +119,7 @@ al arrancar. Con ella llegaron `matches`, `closest`, `contains`, `remove`,
 `append`, `prepend`, `cloneNode`, `dataset`, `id`, `className`, `outerHTML` y
 un `innerHTML` de verdad.
 
-Hay una sonda que mide lo demás, no es una impresión: **73 de 114** el
+Hay una sonda que mide lo demás, no es una impresión: **85 de 114** el
 2026-09-09.
 Se ejecuta con la suite y un test impide que el número baje.
 
@@ -156,8 +156,8 @@ descargar todos los subrecursos.
 
 La métrica honesta de un motor de navegador es cuántos tests de
 [Web Platform Tests](https://github.com/web-platform-tests/wpt) pasa. Este
-motor **no ejecuta la suite oficial todavía**: los 42 tests estilo-WPT que
-corre están escritos a mano y pasan los 42. Hasta que ese número exista,
+motor **no ejecuta la suite oficial todavía**: los 60 tests estilo-WPT que
+corre están escritos a mano y pasan los 60. Hasta que ese número exista,
 cualquier afirmación sobre "compatibilidad" —incluida la de este README— es
 una impresión, no un dato.
 

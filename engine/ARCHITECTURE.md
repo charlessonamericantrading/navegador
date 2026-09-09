@@ -4425,3 +4425,114 @@ etiqueta de un elemento no cambia nunca pero su `id` y sus clases si.
   daria cadenas distintas entre ejecuciones.
 
 **Tests del Workspace**: 874 pasando, 0 fallando.
+
+### Fase 45: Subclases de Event, entorno de `window` y el resto de `document` (2026-09-09)
+
+Tareas C4, C6 y C7 del `plan.md`. Sonda de APIs: **73 -> 85 de 114**. Tests
+estilo-WPT: **42 -> 60**.
+
+#### Subclases de Event
+
+`CustomEvent`, `KeyboardEvent`, `MouseEvent`, `InputEvent` y `FocusEvent`.
+`CustomEvent` es el canal por el que cualquier libreria de estado avisa de un
+cambio; `KeyboardEvent`/`MouseEvent` son los que un framework SINTETIZA para
+probar o para reemitir. Sin sus constructores, ese codigo lanzaba `TypeError` en
+su primera linea util.
+
+Cierra ademas el hueco que este documento declaraba en «Integracion con el
+producto» como «metadatos de tecla todavia no estan implementados»: el tipo
+existe con sus campos, aunque el teclado REAL siga sin rellenarlos (eso es del
+lado de `core::server`, no del binding).
+
+Dos detalles con test propio porque su ausencia se nota tarde:
+
+- **Los modificadores se ponen siempre**, aunque no vinieran en las opciones. El
+  spec dice que son booleanos, no opcionales; `e.ctrlKey` devolviendo
+  `undefined` haria que un `if (e.ctrlKey)` acertara por accidente pero un
+  `e.ctrlKey === false` fallara.
+- **`CustomEvent.detail` sin opciones es `null`, no `undefined`**, e
+  `InputEvent.data` tambien: el spec distingue "no hubo datos" (borrar) de "los
+  datos eran la cadena vacia".
+
+#### El viewport se publicaba demasiado tarde
+
+`window.innerWidth` no funciono al primer intento, y la causa merece quedar
+escrita porque es un fallo de ORDEN, no de implementacion.
+
+`pipeline::build_page_keeping_runtime` ejecuta los scripts, DESPUES calcula el
+layout y DESPUES publica el snapshot. El viewport iba en esa ultima publicacion
+por comodidad, asi que durante toda la ejecucion de los scripts valia cero -
+justo cuando una pagina lo consulta para repartir espacio.
+
+El viewport no depende del layout: es un dato de ENTRADA, no un resultado. Ahora
+se publica antes de correr ningun script.
+
+Se detecto porque la sonda lo seguia dando como ausente despues de
+implementarlo. Verificar en vez de dar por hecho que un cambio funciono es lo
+que convirtio un bug silencioso en un arreglo de dos lineas.
+
+#### `matchMedia` usa el mismo evaluador que `@media`
+
+`engine_css::parse_media_condition` paso a ser publica para eso. Tener dos
+parsers de media queries seria garantizar que un dia respondan distinto sobre la
+misma consulta, y ese es justo el fallo que nadie diagnostica.
+
+El `MediaQueryList` que devuelve tiene `addEventListener`/`addListener` que **no
+disparan**, y eso es deliberado y distinto del caso de los observadores: el
+motor no reevalua consultas al redimensionar, asi que un listener no se
+ejecutara nunca. La diferencia con `IntersectionObserver` (que se sigue sin
+registrar) es que un listener de media query que no dispara deja a la pagina en
+su estado INICIAL, que es un estado valido; un observador que no dispara la deja
+esperando para siempre. Por eso uno se registra y el otro no.
+
+Mismo criterio para `window.scrollTo`/`scrollBy`: aceptan la llamada sin mover
+nada, porque mover el scroll de verdad exige un camino JS -> servidor que
+todavia no existe (hoy el scroll va del servidor hacia JS, no al reves). No
+mover es un resultado que la pagina puede observar y sobrevivir.
+
+#### `document.readyState` devuelve `"interactive"`, no `"loading"`
+
+La diferencia decide como arranca media web:
+
+```js
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+else init();
+```
+
+Aqui los scripts corren con el documento YA parseado entero, asi que `"loading"`
+seria falso y ese codigo esperaria un `DOMContentLoaded` que ya paso o esta a
+punto de pasar. `"interactive"` describe el estado real y hace que ese arranque
+llame a `init()` directamente.
+
+`document.currentScript` es `null`, que es el valor CORRECTO dentro de un modulo
+ES y el honesto para un script clasico aqui: no hay un "script en curso" dentro
+del parseo al que apuntar. Devolver un elemento cualquiera seria peor, porque
+codigo real lo usa para leer los `data-*` de su PROPIA etiqueta.
+
+`document.activeElement` devuelve `body` mientras no haya foco real, que es lo
+que devuelve un navegador cuando nada esta enfocado - no un relleno. `null`
+seria peor: hay codigo que hace `document.activeElement.blur()` sin comprobar.
+
+#### El arnes de tests corria en otro motor
+
+Al escribir `tests/wpt-style/eventos-y-entorno.html`, cuatro tests fallaron con
+`ReferenceError: window is not defined`. La causa: `execute_inline_scripts_with_harness`
+creaba un `JsRuntime` pelado, sin `window`, sin utilidades de plataforma y sin
+entorno. Los tests estilo-WPT estaban probando un motor distinto del que corre
+de verdad.
+
+Ahora el arnes registra el mismo entorno que una pagina real. Lo que sigue sin
+registrar es la RED (`fetch`/`XHR`): el arnes no debe salir a internet, y su
+ausencia ahi es una decision, no un olvido.
+
+#### Simplificaciones declaradas
+
+- `getElementsByClassName` devuelve un Array, no una `HTMLCollection` VIVA: es
+  una foto del momento de la llamada. Compara por TOKEN completo, igual que el
+  selector `.clase` de CSS - responder distinto entre los dos seria una fuente
+  de fallos sin diagnostico.
+- `MouseEvent.pageX`/`pageY` se igualan a `clientX`/`clientY`: sin acceso al
+  scroll desde el constructor, es correcto mientras la pagina no este desplazada
+  y una aproximacion cuando si.
+
+**Tests del Workspace**: 874 pasando, 0 fallando. **Estilo-WPT**: 60.

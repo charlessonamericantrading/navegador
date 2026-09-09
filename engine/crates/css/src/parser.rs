@@ -390,7 +390,10 @@ fn parse_media_range(body: &str, condition: &mut MediaCondition) -> bool {
 /// interpretar se marca `never_matches`, de modo que sus reglas se
 /// CONSERVAN pero no se aplican - aplicarlas siempre seria peor (meteria
 /// estilos de impresion o de movil en una ventana de escritorio).
-fn parse_media_condition(prelude: &str) -> MediaCondition {
+/// Publica desde la Fase 45 para que `window.matchMedia` evalue la MISMA
+/// condicion que `@media`. Tener dos parsers de media queries seria
+/// garantizar que un dia respondan distinto sobre la misma consulta.
+pub fn parse_media_condition(prelude: &str) -> MediaCondition {
     let text = prelude.trim().to_ascii_lowercase();
     let mut condition = MediaCondition::default();
 

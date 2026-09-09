@@ -106,7 +106,7 @@ pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f
 /// `test`/`assert_equals` como globales.
 pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap) -> (PageResult, Vec<TestResult>) {
     let dom_root = HtmlParser::parse(html);
-    let (script_results, test_results) = scripting::execute_inline_scripts_with_harness(&dom_root, external_scripts);
+    let (script_results, test_results) = scripting::execute_inline_scripts_with_harness(&dom_root, external_scripts, (viewport_width, viewport_height));
 
     let mut combined_css = String::new();
     for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
@@ -157,7 +157,7 @@ pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, vi
 
     let allow_inline_style = storage.as_ref().is_none_or(|ctx| ctx.csp.allows_inline("style-src"));
     let t = std::time::Instant::now();
-    let (script_results, mut runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network, storage);
+    let (script_results, mut runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network, storage, (viewport_width, viewport_height));
     tracing::info!("[tiempo]   JS {:?} ({} script(s))", t.elapsed(), script_results.len());
 
     let mut combined_css = String::new();
@@ -197,6 +197,11 @@ pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, vi
         if let Ok(mut data) = snapshot.write() {
             data.boxes.clear();
             collect_box_metrics(&layout_root, &mut data.boxes);
+            // El viewport va al mismo buzon que la geometria (Fase 45): es lo
+            // que `window.innerWidth` y `matchMedia` consultan, y aqui es
+            // donde se conoce.
+            data.viewport_width = viewport_width;
+            data.viewport_height = viewport_height;
         }
     }
 

@@ -110,6 +110,12 @@ pub struct LayoutSnapshotData {
     /// `core::server` puede actualizar solo este campo sin volver a
     /// recorrer el arbol entero.
     pub scroll_offset_y: f32,
+    /// Tamano del viewport en pixeles CSS (Fase 45). Vive aqui y no en un
+    /// global suelto por lo mismo que el scroll: es un dato del ESTADO de la
+    /// pestana que JS consulta (`window.innerWidth`, `matchMedia`) y que solo
+    /// `core::pipeline` conoce al construir la pagina.
+    pub viewport_width: f32,
+    pub viewport_height: f32,
 }
 
 impl LayoutSnapshotData {
@@ -480,6 +486,7 @@ mod tests {
         let data = LayoutSnapshotData {
             boxes: vec![(one.clone(), BoxMetrics { x: 7.0, ..Default::default() })],
             scroll_offset_y: 0.0,
+            ..Default::default()
         };
 
         assert_eq!(data.metrics_for(&one).map(|m| m.x), Some(7.0));

@@ -414,6 +414,7 @@ impl DomBindings {
         // archivo - ver `cssom::register_computed_style`.
         cssom::register_computed_style(context, bindings.layout.clone(), node_from_js_value)?;
         let capture = DomRootCapture(dom_root.clone(), bindings.clone());
+        let root_capture = capture.clone();
 
         let get_element_by_id = NativeFunction::from_copy_closure_with_captures(
             |_this, args, capture: &DomRootCapture, context| {
@@ -634,6 +635,125 @@ impl DomBindings {
         let document_remove_listener = document_target.get(js_string!("removeEventListener"), context)?;
         let document_dispatch = document_target.get(js_string!("dispatchEvent"), context)?;
 
+        // ---------------------------------------------------------------
+        // Propiedades de `document` anadidas en la Fase 45 (tarea C6)
+        // ---------------------------------------------------------------
+
+        // `document.getElementsByClassName(clase)`. Devuelve un Array normal,
+        // no una `HTMLCollection` VIVA: aqui es una foto del momento de la
+        // llamada. La diferencia se nota si alguien guarda la coleccion y
+        // espera que se actualice sola al mutar el DOM; declarado en
+        // `huecos_sin_resolver.md`. Recorrer y filtrar por `class` es lo que
+        // hace el 99% del codigo que la usa.
+        let get_elements_by_class = NativeFunction::from_copy_closure_with_captures(
+            |_this, args: &[JsValue], capture: &DomRootCapture, context| {
+                let clase = match args.first() {
+                    Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                    None => return Ok(JsArray::new(context).into()),
+                };
+                let mut encontrados = Vec::new();
+                recolectar_por_clase(&capture.0, &clase, &mut encontrados);
+                let objetos: Vec<JsValue> = encontrados
+                    .iter()
+                    .map(|n| element_to_js_object(n, &capture.1, context).into())
+                    .collect();
+                Ok(JsArray::from_iter(objetos, context).into())
+            },
+            root_capture.clone(),
+        );
+
+        // `document.createDocumentFragment()`. Un fragmento es un contenedor
+        // sin representacion propia: se le anaden hijos y al insertarlo se
+        // insertan ellos. Aqui se modela como un nodo `Document` suelto - el
+        // unico tipo de nodo del motor que puede tener hijos sin ser un
+        // elemento, asi que no aparece como etiqueta al serializar.
+        let create_fragment = NativeFunction::from_copy_closure_with_captures(
+            |_this, _args: &[JsValue], capture: &DomRootCapture, context| {
+                let fragmento = Node::new(NodeType::Document);
+                Ok(element_to_js_object(&fragmento, &capture.1, context).into())
+            },
+            root_capture.clone(),
+        );
+
+        // `document.createComment(texto)`.
+        let create_comment = NativeFunction::from_copy_closure_with_captures(
+            |_this, args: &[JsValue], capture: &DomRootCapture, context| {
+                let texto = match args.first() {
+                    Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                    None => String::new(),
+                };
+                let nodo = Node::new(NodeType::Comment(texto));
+                Ok(element_to_js_object(&nodo, &capture.1, context).into())
+            },
+            root_capture.clone(),
+        );
+
+        // `document.readyState`.
+        //
+        // Devuelve `"interactive"` y no `"loading"`, y la diferencia importa
+        // mas de lo que parece. El patron con el que arranca media web es:
+        //
+        //     if (document.readyState === 'loading')
+        //         document.addEventListener('DOMContentLoaded', init);
+        //     else
+        //         init();
+        //
+        // En este motor los scripts corren cuando el documento YA esta
+        // parseado entero (ver la cabecera de `core::scripting`), asi que
+        // `"loading"` seria falso: el codigo esperaria un `DOMContentLoaded`
+        // que ya paso o esta a punto de pasar. `"interactive"` describe el
+        // estado real y hace que ese arranque llame a `init()` directamente,
+        // que es lo correcto aqui.
+        let ready_state_getter = NativeFunction::from_fn_ptr(|_this, _args, _context| {
+            Ok(JsValue::from(js_string!("interactive")))
+        });
+        let ready_state_getter_fn = FunctionObjectBuilder::new(context.realm(), ready_state_getter)
+            .name(js_string!("get readyState"))
+            .length(0)
+            .constructor(false)
+            .build();
+
+        // `document.activeElement`. Devuelve `body` mientras no haya foco
+        // real: es lo que devuelve un navegador cuando nada esta enfocado, no
+        // un relleno. `null` seria peor - hay codigo que hace
+        // `document.activeElement.blur()` sin comprobar.
+        let active_element_getter = NativeFunction::from_copy_closure_with_captures(
+            |_this, _args: &[JsValue], capture: &DomRootCapture, context| {
+                match Node::find_all_by_tag(&capture.0, "body").into_iter().next() {
+                    Some(body) => Ok(element_to_js_object(&body, &capture.1, context).into()),
+                    None => Ok(JsValue::null()),
+                }
+            },
+            root_capture.clone(),
+        );
+        let active_element_getter_fn =
+            FunctionObjectBuilder::new(context.realm(), active_element_getter)
+                .name(js_string!("get activeElement"))
+                .length(0)
+                .constructor(false)
+                .build();
+
+        // `document.currentScript`. Siempre `null`, que es el valor CORRECTO
+        // dentro de un modulo ES segun el spec, y el valor honesto aqui para
+        // un script clasico: los scripts se ejecutan despues de parsear el
+        // documento entero, asi que no hay un "script actualmente en curso"
+        // dentro del parseo al que apuntar. Devolver un elemento cualquiera
+        // seria peor que `null`, porque codigo real lo usa para leer los
+        // `data-*` de su PROPIA etiqueta.
+        let current_script_getter =
+            NativeFunction::from_fn_ptr(|_this, _args, _context| Ok(JsValue::null()));
+        let current_script_getter_fn =
+            FunctionObjectBuilder::new(context.realm(), current_script_getter)
+                .name(js_string!("get currentScript"))
+                .length(0)
+                .constructor(false)
+                .build();
+
+        // `document.hasFocus()`. `true`: si el motor esta ejecutando la
+        // pagina, su ventana es la que hay.
+        let has_focus =
+            NativeFunction::from_fn_ptr(|_this, _args, _context| Ok(JsValue::from(true)));
+
         let document = ObjectInitializer::new(context)
             .property(js_string!("addEventListener"), document_add_listener, Attribute::all())
             .property(js_string!("removeEventListener"), document_remove_listener, Attribute::all())
@@ -647,6 +767,14 @@ impl DomBindings {
             .accessor(js_string!("head"), Some(head_getter_fn), None, Attribute::all())
             .property(js_string!("createTextNode"), create_text_node_fn, Attribute::all())
             .accessor(js_string!("title"), Some(title_getter_fn), Some(title_setter_fn), Attribute::all())
+            // Fase 45 (tarea C6)
+            .function(get_elements_by_class, js_string!("getElementsByClassName"), 1)
+            .function(create_fragment, js_string!("createDocumentFragment"), 0)
+            .function(create_comment, js_string!("createComment"), 1)
+            .function(has_focus, js_string!("hasFocus"), 0)
+            .accessor(js_string!("readyState"), Some(ready_state_getter_fn), None, Attribute::all())
+            .accessor(js_string!("activeElement"), Some(active_element_getter_fn), None, Attribute::all())
+            .accessor(js_string!("currentScript"), Some(current_script_getter_fn), None, Attribute::all())
             .build();
 
         context.register_global_property(js_string!("document"), document, Attribute::all())?;
@@ -680,6 +808,9 @@ impl DomBindings {
             Ok(build_event_object(&event_type, bubbles, cancelable, context))
         });
         context.register_global_callable(js_string!("Event"), 1, event_constructor)?;
+
+        // Subclases de Event (Fase 45) - ver `register_event_subclasses`.
+        register_event_subclasses(context)?;
 
         Ok(bindings)
     }
@@ -3913,6 +4044,191 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
+// Subclases de Event (Fase 45, tarea C4 del plan)
+// ---------------------------------------------------------------------------
+
+/// Lee una propiedad del diccionario de opciones de un constructor de evento.
+///
+/// Devuelve el valor por defecto si el diccionario no vino, si la clave no
+/// esta, o si vino `undefined` - los tres casos significan lo mismo para el
+/// spec y distinguirlos solo produciria fallos raros.
+fn opcion_evento(
+    opciones: Option<&JsObject>,
+    clave: &str,
+    context: &mut Context,
+) -> JsResult<Option<JsValue>> {
+    let Some(opciones) = opciones else { return Ok(None) };
+    let valor = opciones.get(js_string!(clave.to_string()), context)?;
+    if valor.is_undefined() {
+        return Ok(None);
+    }
+    Ok(Some(valor))
+}
+
+fn opcion_bool(opciones: Option<&JsObject>, clave: &str, context: &mut Context) -> JsResult<bool> {
+    Ok(opcion_evento(opciones, clave, context)?
+        .map(|v| v.to_boolean())
+        .unwrap_or(false))
+}
+
+fn opcion_texto(
+    opciones: Option<&JsObject>,
+    clave: &str,
+    context: &mut Context,
+) -> JsResult<String> {
+    match opcion_evento(opciones, clave, context)? {
+        Some(v) => Ok(v.to_string(context)?.to_std_string_escaped()),
+        None => Ok(String::new()),
+    }
+}
+
+fn opcion_numero(
+    opciones: Option<&JsObject>,
+    clave: &str,
+    context: &mut Context,
+) -> JsResult<f64> {
+    match opcion_evento(opciones, clave, context)? {
+        Some(v) => Ok(v.to_number(context)?),
+        None => Ok(0.0),
+    }
+}
+
+/// El `type` y el diccionario de opciones que todo constructor de evento
+/// recibe, ya extraidos.
+fn argumentos_de_evento(
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<(String, Option<JsObject>, bool, bool)> {
+    let tipo = match args.first() {
+        Some(v) => v.to_string(context)?.to_std_string_escaped(),
+        None => "undefined".to_string(),
+    };
+    let opciones = args.get(1).and_then(|v| v.as_object()).cloned();
+    let bubbles = opcion_bool(opciones.as_ref(), "bubbles", context)?;
+    let cancelable = opcion_bool(opciones.as_ref(), "cancelable", context)?;
+    Ok((tipo, opciones, bubbles, cancelable))
+}
+
+/// Anade las banderas de teclas modificadoras, comunes a los eventos de
+/// teclado y de raton. Se ponen SIEMPRE, aunque no vinieran en las opciones:
+/// el spec dice que son booleanos, no opcionales, y `e.ctrlKey` devolviendo
+/// `undefined` haria que un `if (e.ctrlKey)` acertara por accidente pero un
+/// `e.ctrlKey === false` fallara.
+fn anadir_modificadores(
+    objeto: &JsObject,
+    opciones: Option<&JsObject>,
+    context: &mut Context,
+) -> JsResult<()> {
+    for clave in ["altKey", "ctrlKey", "shiftKey", "metaKey"] {
+        let valor = opcion_bool(opciones, clave, context)?;
+        objeto.set(js_string!(clave), valor, false, context)?;
+    }
+    Ok(())
+}
+
+/// Registra `CustomEvent`, `KeyboardEvent`, `MouseEvent`, `InputEvent` y
+/// `FocusEvent` (Fase 45).
+///
+/// Por que hacen falta, mas alla del numero de la sonda: `CustomEvent` es el
+/// canal por el que cualquier libreria de estado avisa de un cambio, y
+/// `KeyboardEvent`/`MouseEvent` son los que un framework SINTETIZA para
+/// probar o para reemitir un evento. Sin sus constructores, ese codigo lanza
+/// `TypeError` en su primera linea util.
+///
+/// Ademas cierra el hueco que `ARCHITECTURE.md` declara en «Integracion con el
+/// producto» como «metadatos de tecla todavia no estan implementados»: ahora el
+/// tipo existe con sus campos, aunque el teclado REAL siga sin rellenarlos (eso
+/// es del lado de `core::server`, no de aqui).
+pub(crate) fn register_event_subclasses(context: &mut Context) -> JsResult<()> {
+    // `CustomEvent(type, {detail})`. `detail` por defecto es `null`, no
+    // `undefined`: es lo que dice el spec y hay codigo que lo comprueba.
+    let custom_event = NativeFunction::from_fn_ptr(|_this, args, context| {
+        let (tipo, opciones, bubbles, cancelable) = argumentos_de_evento(args, context)?;
+        let evento = build_event_object(&tipo, bubbles, cancelable, context);
+        if let Some(obj) = evento.as_object() {
+            let detail = opcion_evento(opciones.as_ref(), "detail", context)?
+                .unwrap_or(JsValue::null());
+            obj.set(js_string!("detail"), detail, false, context)?;
+        }
+        Ok(evento)
+    });
+    context.register_global_callable(js_string!("CustomEvent"), 1, custom_event)?;
+
+    // `KeyboardEvent(type, {key, code, repeat, ...modificadores})`.
+    let keyboard_event = NativeFunction::from_fn_ptr(|_this, args, context| {
+        let (tipo, opciones, bubbles, cancelable) = argumentos_de_evento(args, context)?;
+        let evento = build_event_object(&tipo, bubbles, cancelable, context);
+        if let Some(obj) = evento.as_object() {
+            let key = opcion_texto(opciones.as_ref(), "key", context)?;
+            let code = opcion_texto(opciones.as_ref(), "code", context)?;
+            let repeat = opcion_bool(opciones.as_ref(), "repeat", context)?;
+            obj.set(js_string!("key"), js_string!(key), false, context)?;
+            obj.set(js_string!("code"), js_string!(code), false, context)?;
+            obj.set(js_string!("repeat"), repeat, false, context)?;
+            anadir_modificadores(obj, opciones.as_ref(), context)?;
+        }
+        Ok(evento)
+    });
+    context.register_global_callable(js_string!("KeyboardEvent"), 1, keyboard_event)?;
+
+    // `MouseEvent(type, {clientX, clientY, button, ...})`.
+    let mouse_event = NativeFunction::from_fn_ptr(|_this, args, context| {
+        let (tipo, opciones, bubbles, cancelable) = argumentos_de_evento(args, context)?;
+        let evento = build_event_object(&tipo, bubbles, cancelable, context);
+        if let Some(obj) = evento.as_object() {
+            for clave in ["clientX", "clientY", "screenX", "screenY", "button", "buttons"] {
+                let valor = opcion_numero(opciones.as_ref(), clave, context)?;
+                obj.set(js_string!(clave), valor, false, context)?;
+            }
+            // `pageX`/`pageY` son `client*` mas el scroll. Sin acceso al scroll
+            // desde aqui se igualan a `client*`, que es correcto mientras la
+            // pagina no este desplazada y una aproximacion declarada cuando si.
+            let x = opcion_numero(opciones.as_ref(), "clientX", context)?;
+            let y = opcion_numero(opciones.as_ref(), "clientY", context)?;
+            obj.set(js_string!("pageX"), x, false, context)?;
+            obj.set(js_string!("pageY"), y, false, context)?;
+            obj.set(js_string!("relatedTarget"), JsValue::null(), false, context)?;
+            anadir_modificadores(obj, opciones.as_ref(), context)?;
+        }
+        Ok(evento)
+    });
+    context.register_global_callable(js_string!("MouseEvent"), 1, mouse_event)?;
+
+    // `InputEvent(type, {data, inputType})` - el que emite un campo de texto al
+    // cambiar. Un framework controlado lo lee para saber QUE cambio.
+    let input_event = NativeFunction::from_fn_ptr(|_this, args, context| {
+        let (tipo, opciones, bubbles, cancelable) = argumentos_de_evento(args, context)?;
+        let evento = build_event_object(&tipo, bubbles, cancelable, context);
+        if let Some(obj) = evento.as_object() {
+            let data = match opcion_evento(opciones.as_ref(), "data", context)? {
+                Some(v) => v,
+                // `null`, no cadena vacia: el spec distingue "no hubo datos"
+                // (borrar) de "los datos eran la cadena vacia".
+                None => JsValue::null(),
+            };
+            let input_type = opcion_texto(opciones.as_ref(), "inputType", context)?;
+            obj.set(js_string!("data"), data, false, context)?;
+            obj.set(js_string!("inputType"), js_string!(input_type), false, context)?;
+        }
+        Ok(evento)
+    });
+    context.register_global_callable(js_string!("InputEvent"), 1, input_event)?;
+
+    let focus_event = NativeFunction::from_fn_ptr(|_this, args, context| {
+        let (tipo, opciones, bubbles, cancelable) = argumentos_de_evento(args, context)?;
+        let evento = build_event_object(&tipo, bubbles, cancelable, context);
+        if let Some(obj) = evento.as_object() {
+            let _ = opciones;
+            obj.set(js_string!("relatedTarget"), JsValue::null(), false, context)?;
+        }
+        Ok(evento)
+    });
+    context.register_global_callable(js_string!("FocusEvent"), 1, focus_event)?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Ayudantes de la Fase 44 (tarea C6 del plan): serializacion, clonado y
 // conversion de argumentos.
 // ---------------------------------------------------------------------------
@@ -4168,5 +4484,34 @@ mod tests_fase44 {
         assert_eq!(a_camel_case("user-id"), "userId");
         assert_eq!(a_camel_case("simple"), "simple");
         assert_eq!(a_camel_case("a-b-c"), "aBC");
+    }
+}
+
+/// Recorre el arbol acumulando los elementos cuyo atributo `class` contenga
+/// `clase` como TOKEN completo.
+///
+/// Por token y no por subcadena: `class="botones"` no debe salir en una
+/// busqueda de `boton`. Es el mismo criterio que usa el selector `.boton` de
+/// CSS, y responder distinto entre los dos seria una fuente de fallos sin
+/// diagnostico.
+pub(crate) fn recolectar_por_clase(
+    nodo: &Arc<RwLock<Node>>,
+    clase: &str,
+    salida: &mut Vec<Arc<RwLock<Node>>>,
+) {
+    let hijos = {
+        let n = nodo.read().unwrap();
+        if let NodeType::Element { attributes, .. } = &n.node_type {
+            let coincide = attributes
+                .get("class")
+                .is_some_and(|c| c.split_whitespace().any(|t| t == clase));
+            if coincide {
+                salida.push(nodo.clone());
+            }
+        }
+        n.children.clone()
+    };
+    for hijo in hijos {
+        recolectar_por_clase(&hijo, clase, salida);
     }
 }

@@ -5,10 +5,10 @@
 > ejecutado hoy → **819 tests pasando, 0 fallando** en los 10 crates.
 >
 > **Progreso: bloques A y B cerrados** (Fase 41), salvo A1 (abrir el PR, requiere
-> decisión) y A5 (reevaluada como innecesaria). **Del bloque C: C1 y C3 cerrados,
-> C5, C6 y C9 parcialmente** (Fases 42 a 44). El bloqueo estructural que impedía
-> que cualquier bundle arrancara está resuelto. Superficie de plataforma medida:
-> **73/114**, y 42 tests estilo-WPT.
+> decisión) y A5 (reevaluada como innecesaria). **Del bloque C: C1, C3 y C4
+> cerrados; C5, C6, C7 y C9 parcialmente** (Fases 42 a 45). El bloqueo estructural
+> que impedía que cualquier bundle arrancara está resuelto. Superficie de
+> plataforma medida: **85/114**, y 60 tests estilo-WPT.
 > Ver el [checklist maestro](#15-checklist-maestro).
 >
 > Este documento sigue la misma doctrina que `engine/ARCHITECTURE.md`: cada tarea
@@ -1178,10 +1178,10 @@ Marcar aquí al cerrar. Cada ✅ debe tener su Fase en `ARCHITECTURE.md`.
 - [x] C1 Sonda v2 versionada con **114 comprobaciones**; cifra inicial **48/114**, hoy **56/114**. Test `api_probe` impide que baje y que se borren comprobaciones
 - [ ] C2 Corpus de 5 bundles con tests `#[ignore]`
 - [x] C3 Cadena de prototipos DOM real + constructores globales (Fase 44). `instanceof` y polyfills funcionan. **Salvedad declarada**: los métodos siguen en la instancia, así que un envoltorio sobre un método que el motor ya tiene no llega a ejecutarse
-- [ ] C4 `Event`/`CustomEvent`/`EventTarget` construibles; `KeyboardEvent`/`MouseEvent`/`InputEvent` con metadatos
+- [x] C4 `Event`, `CustomEvent`, `KeyboardEvent`, `MouseEvent`, `InputEvent`, `FocusEvent` con sus campos (Fase 45). Falta `EventTarget` construible y que el teclado/ratón reales rellenen los metadatos
 - [~] C5 **hecho**: `console`, `URL`, `URLSearchParams`, `performance.now`, `atob`/`btoa`, `TextEncoder`/`TextDecoder` (Fase 42). **Pendientes a propósito**: `AbortController` (hasta que cancele el `fetch` de verdad), `crypto` (necesita aleatoriedad real), `structuredClone`
-- [~] C6 **parcialmente** (Fase 44): `matches`, `closest`, `contains`, `remove`, `append`, `prepend`, `cloneNode`, `dataset`, `innerHTML` real, `outerHTML`, `isConnected`, `id`, `className`. **Pendientes**: `readyState`, `currentScript`, `write`, `insertAdjacentHTML`, `innerText`, `focus`, `scrollIntoView`, `offset*`, `client*`
-- [ ] C7 `window.*` de entorno + `matchMedia` + diálogos vía protocolo
+- [~] C6 **parcialmente** (Fases 44-45): `matches`, `closest`, `contains`, `remove`, `append`, `prepend`, `cloneNode`, `dataset`, `innerHTML` real, `outerHTML`, `isConnected`, `id`, `className`, `readyState`, `activeElement`, `currentScript`, `getElementsByClassName`, `createDocumentFragment`, `createComment`, `hasFocus`. **Pendientes**: `write`, `insertAdjacentHTML`, `innerText`, `focus`, `scrollIntoView`, `offset*`, `client*`
+- [~] C7 **mayoritariamente** (Fase 45): `innerWidth`/`innerHeight`, `devicePixelRatio`, `scrollX`/`scrollY`, `matchMedia` con el evaluador real de `@media`. **Pendientes**: `scrollTo` que mueva de verdad, diálogos vía protocolo
 - [ ] C8 `IntersectionObserver` / `ResizeObserver` reales
 - [~] C9 **mayoritariamente hecho** (Fase 43): `type="module"` en línea y externo, `import`/`export` reales, `defer`/`async` con el orden del spec, `nomodule` omitido, `<link rel="modulepreload">` descargado. **Pendientes**: `import()` dinámico, import maps, y resolución relativa al módulo importador (hoy se resuelve contra la página)
 - [ ] C10 Scripts ejecutados durante el parseo (streaming)
