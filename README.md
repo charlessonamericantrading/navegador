@@ -3,10 +3,14 @@
 Un navegador de escritorio con un **motor de renderizado propio escrito desde cero en Rust** — sin Chromium, sin WebKit, sin Gecko.
 
 > **Estado: en desarrollo, no apto para uso general todavía.**
-> El motor renderiza páginas reales por HTTPS, pero le faltan piezas de
-> seguridad imprescindibles (política de mismo origen, aislamiento de
-> procesos). Ver [Qué falta](#qué-falta) antes de usarlo con sitios en los
-> que no confíes.
+> El motor renderiza páginas reales por HTTPS, pero no tiene aislamiento de
+> procesos: todas las pestañas viven en el mismo proceso, sin sandbox del
+> sistema operativo. Ver [Qué falta](#qué-falta) antes de usarlo con sitios
+> en los que no confíes.
+>
+> El plan de trabajo completo, con las tareas pendientes priorizadas, está
+> en [`plan.md`](plan.md). El backlog técnico del motor, verificado contra
+> el código, está en [`engine/huecos_sin_resolver.md`](engine/huecos_sin_resolver.md).
 
 ---
 
@@ -19,7 +23,7 @@ solo compilándolo. Las cifras salen de correr la suite de tests el
 | | |
 |---|---|
 | **Motor** | ~25.800 líneas de Rust, 10 crates |
-| **Tests** | 703 pasando, 0 fallando |
+| **Tests** | 819 pasando, 0 fallando (medido el 2026-09-09) |
 | **Red** | HTTP/1.1 + HTTPS real (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies RFC 6265, CORS y CSP |
 | **HTML** | Parseo con `html5ever` (el de Servo), DOM mutable, `<canvas>` 2D context |
 | **CSS** | Cascada con especificidad real, selectores con combinadores (`selectors`, el de Firefox), pseudo-clases, `@media`, `rem`, porcentajes, shorthands (`padding`/`margin` de 1-4 valores, `flex`) |
@@ -60,8 +64,13 @@ Esto es la parte importante de este README, y está aquí arriba a propósito.
 | **CSP** | ✅ Real (`default-src`, `script-src`, `style-src`, `img-src`, `connect-src`, `font-src`, `media-src`) |
 | **Sandbox de proceso** | ❌ No existe |
 
-Sin política de mismo origen ni sandbox, una página maliciosa no tiene
-barreras. **Úsalo con sitios de confianza o en desarrollo, no como
+Las defensas de origen (cookies aisladas, CORS, CSP, esquemas seguros) son
+reales y están probadas. Lo que no existe es la capa de abajo: **el motor
+corre en un único proceso sin sandbox del sistema operativo**, y todas las
+pestañas lo comparten, así que un pánico en una tumba el navegador entero.
+Rust elimina de raíz la corrupción de memoria, pero no un fallo lógico en el
+intérprete de JavaScript ni en un decodificador de imágenes ante un fichero
+malicioso. **Úsalo con sitios de confianza o en desarrollo, no como
 navegador diario.**
 
 ### Plataforma
@@ -73,11 +82,30 @@ Linux en teoría, pero nunca se ha verificado aquí. Sin versión móvil.
 
 **Lo que falta de verdad y define el techo:** no se ejecutan los *bundles*
 de las aplicaciones web modernas. No es que falte un motor de JavaScript —
-`boa` cubre la sintaxis ES moderna entera, medido con una sonda de 28 APIs
-que el motor pasa 26 — sino que faltan piezas del DOM/BOM sin las cuales el
-bundle muere en su primera línea. Hoy faltan `location.href` y
-`MutationObserver`; la ausencia de *una sola* API lanza un `TypeError` que
-se lleva por delante el script completo.
+`boa` cubre la sintaxis ES moderna entera — sino que faltan piezas del
+DOM/BOM sin las cuales el bundle muere en su primera línea. La ausencia de
+*una sola* API lanza un `TypeError` que se lleva por delante el script
+completo, así que el coste de una API ausente no es proporcional a lo usada
+que sea.
+
+Lo que bloquea hoy, comprobado contra el código el 2026-09-09:
+
+* **Sin módulos ES.** No hay `<script type="module">`, ni `import()`
+  dinámico, ni `defer`/`async` con su orden real. Todo bundle de Vite, Next
+  o Svelte se sirve como módulo, así que **ninguno puede arrancar** por más
+  APIs que se añadan.
+* **Sin cadena de prototipos DOM.** Cada nodo es un objeto suelto, así que
+  `instanceof HTMLElement` es falso y parchear `Element.prototype` no hace
+  nada. Los bundles hacen ambas cosas al arrancar.
+* **APIs ausentes:** `URL`, `URLSearchParams`, `AbortController`,
+  `TextEncoder`, `structuredClone`, `atob`/`btoa`, `performance`, `console`
+  como global, `matchMedia`, `IntersectionObserver`, `ResizeObserver`,
+  `customElements`, `CustomEvent`, `DOMParser`, `closest`, `dataset`,
+  `innerText`, `insertAdjacentHTML`, `document.readyState`.
+
+`location` y `MutationObserver` **sí** existen desde la Fase 39. La lista
+completa y actualizada está en
+[`engine/huecos_sin_resolver.md`](engine/huecos_sin_resolver.md).
 
 Sin `<video>`, `<audio>`, `<iframe>`. Sin WebGL, IndexedDB, Service Workers,
 WebSockets ni Web Workers. Sin HTTP/2 ni caché HTTP. El JavaScript es
@@ -104,9 +132,13 @@ descargar todos los subrecursos.
 La métrica honesta de un motor de navegador es cuántos tests de
 [Web Platform Tests](https://github.com/web-platform-tests/wpt) pasa. Este
 motor **no ejecuta la suite oficial todavía**: los 24 tests estilo-WPT que
-corre están escritos a mano. Hasta que ese número exista, cualquier
-afirmación sobre "compatibilidad" —incluida la de este README— es una
-impresión, no un dato.
+corre están escritos a mano y pasan los 24. Hasta que ese número exista,
+cualquier afirmación sobre "compatibilidad" —incluida la de este README— es
+una impresión, no un dato.
+
+```bash
+cargo run -p engine-core --bin wpt_runner -- tests/wpt-style
+```
 
 ---
 
@@ -161,7 +193,7 @@ npm run start          # frontend (Vite) + aplicación Electron
 
 ```bash
 cd engine
-cargo test --workspace          # los 703 tests
+cargo test --workspace          # los 819 tests
 cargo run -p engine-core --bin engine_server   # servidor NDJSON por stdin/stdout
 ```
 
@@ -181,9 +213,26 @@ SmartScreen mostrará un aviso a quien lo descargue. Ver
 
 El proyecto se llama Navegador IA porque integra un agente que navega por ti.
 **El agente autónomo está conectado a la interfaz** mediante el panel lateral
-*Copiloto IA* (accesible con el botón 🤖 en la barra de navegación), soportando
-tanto modo de simulación rápida como ejecución real impulsada por Gemini 2.0 Flash
-mediante API Key.
+*Copiloto IA* (accesible con el botón 🤖 en la barra de navegación), con un modo
+de simulación rápida y un modo real impulsado por Gemini mediante API Key.
+
+El motor incluye además el crate `engine-ai`, que expone un Árbol de
+Accesibilidad (AOM) con roles y coordenadas reales, pensado para que un modelo
+de lenguaje entienda la página gastando ~80% menos tokens que enviándole el HTML
+crudo.
+
+**Limitaciones actuales del agente, dichas aquí y no enterradas:**
+
+* La clave de Gemini se guarda en el `localStorage` del renderer y las llamadas
+  al modelo salen desde ahí. Debe moverse al proceso principal de Electron con
+  `safeStorage` (cifrado del sistema operativo).
+* Solo Gemini. No hay opción de modelo local ni de otros proveedores.
+* El agente recibe **texto plano** de la página, no el AOM, pese a que el AOM ya
+  existe y el protocolo ya lo expone. Conectarlos es tarea pendiente.
+* Hay dos implementaciones del agente, una en TypeScript y otra en Python, que
+  hacen lo mismo.
+
+Las cuatro están planificadas en [`plan.md`](plan.md), bloque I.
 
 ---
 
