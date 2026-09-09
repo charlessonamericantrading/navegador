@@ -36,6 +36,12 @@ pub struct JsRuntime {
     /// sin temporizadores registrados, donde `setTimeout` ni siquiera
     /// existe como global.
     timers: Option<crate::timers::TimerQueue>,
+    /// `Some` cuando el runtime se construyo con `with_modules` (Fase 43) -
+    /// el cargador que sirve los `import` de un `<script type="module">`
+    /// desde lo que `core::server` ya descargo. `None` en un runtime clasico,
+    /// donde un `<script type="module">` no puede ejecutarse (y se dice, no
+    /// se ejecuta como script normal fingiendo que da igual).
+    module_loader: Option<std::rc::Rc<crate::modules::PageModuleLoader>>,
 }
 
 impl Default for JsRuntime {
@@ -48,7 +54,84 @@ impl JsRuntime {
     pub fn new() -> Self {
         let mut context = Context::default();
         let _ = AsyncEventLoop::register_microtasks(&mut context);
-        Self { context, document_bindings: None, pending_window_opens: None, pending_history_ops: None, pending_navigations: None, mutation_observers: None, timers: None }
+        Self { context, document_bindings: None, pending_window_opens: None, pending_history_ops: None, pending_navigations: None, mutation_observers: None, timers: None, module_loader: None }
+    }
+
+    /// Igual que `new`, pero con soporte de modulos ES (Fase 43).
+    ///
+    /// `page_url` es la base contra la que se resuelven los especificadores de
+    /// los `import`. Se pasa aqui y no en `eval_module` porque el cargador se
+    /// instala al CONSTRUIR el `Context` de Boa: despues ya no se puede
+    /// cambiar.
+    ///
+    /// Que sea un constructor aparte y no un flag es deliberado: sin modulos,
+    /// `Context::default()` sigue siendo exactamente lo que era, asi que
+    /// ningun camino existente cambia de comportamiento por esta fase.
+    pub fn with_modules(page_url: &str) -> Self {
+        let loader = std::rc::Rc::new(crate::modules::PageModuleLoader::new(page_url));
+        let mut context = match Context::builder().module_loader(loader.clone()).build() {
+            Ok(c) => c,
+            Err(e) => {
+                // Un `Context` que no se puede construir con cargador de
+                // modulos no debe dejar la pagina sin JavaScript: se sigue con
+                // uno normal, donde los `<script>` clasicos funcionan igual y
+                // solo los modulos fallaran, con su motivo.
+                tracing::warn!("[js] no se pudo construir el contexto con modulos: {e}");
+                return Self::new();
+            }
+        };
+        let _ = AsyncEventLoop::register_microtasks(&mut context);
+        Self { context, document_bindings: None, pending_window_opens: None, pending_history_ops: None, pending_navigations: None, mutation_observers: None, timers: None, module_loader: Some(loader) }
+    }
+
+    /// Deja disponible el codigo de un modulo para que un `import` lo
+    /// encuentre. No-op si el runtime se construyo sin soporte de modulos.
+    pub fn add_module_source(&self, url: &str, codigo: &str) {
+        if let Some(loader) = &self.module_loader {
+            loader.insertar(url, codigo);
+        }
+    }
+
+    /// Evalua `codigo` como modulo ES (Fase 43).
+    ///
+    /// Un modulo no "devuelve" un valor como un script clasico: su efecto son
+    /// sus exportaciones y lo que haga sobre el DOM. Por eso el `Ok` lleva una
+    /// cadena vacia y no el resultado de la ultima expresion.
+    pub fn eval_module(&mut self, codigo: &str, url: &str) -> Result<String, JsError> {
+        let Some(loader) = self.module_loader.clone() else {
+            return Err(JsError::Execution(
+                "este runtime se construyo sin soporte de modulos: un \
+                 <script type=\"module\"> no puede ejecutarse aqui"
+                    .to_string(),
+            ));
+        };
+        let resultado = crate::modules::evaluar_modulo(codigo, url, &loader, &mut self.context);
+        // Mismo criterio que `eval`: se drenan los microtasks tanto si fue
+        // bien como si no, porque lo encolado antes de un error debe seguir
+        // corriendo.
+        self.drain_jobs();
+        match resultado {
+            crate::modules::ResultadoModulo::Ok => Ok(String::new()),
+            crate::modules::ResultadoModulo::Error(e) => Err(JsError::Execution(e)),
+        }
+    }
+
+    /// Si este runtime puede ejecutar modulos ES.
+    pub fn supports_modules(&self) -> bool {
+        self.module_loader.is_some()
+    }
+
+    /// Resuelve el `src` crudo de un `<script>` contra la URL de la pagina.
+    ///
+    /// Hace falta para que el modulo RAIZ se identifique con la misma URL
+    /// absoluta con la que lo veria un `import`: si no, el mismo fichero
+    /// cargado como `<script src>` y ademas importado por otro modulo se
+    /// parsearia y EVALUARIA dos veces, duplicando su estado.
+    pub fn resolve_module_url(&self, src: &str) -> String {
+        match &self.module_loader {
+            Some(loader) => loader.absoluta(src),
+            None => src.to_string(),
+        }
     }
 
     pub fn bind_dom(&mut self, dom_root: Arc<RwLock<Node>>) -> Result<(), JsError> {

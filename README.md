@@ -23,7 +23,7 @@ solo compilándolo. Las cifras salen de correr la suite de tests el
 | | |
 |---|---|
 | **Motor** | ~25.800 líneas de Rust, 10 crates |
-| **Tests** | 841 pasando, 0 fallando (medido el 2026-09-09) |
+| **Tests** | 856 pasando, 0 fallando (medido el 2026-09-09) |
 | **Red** | HTTP/1.1 + HTTPS real (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies RFC 6265, CORS y CSP |
 | **HTML** | Parseo con `html5ever` (el de Servo), DOM mutable, `<canvas>` 2D context |
 | **CSS** | Cascada con especificidad real, selectores con combinadores (`selectors`, el de Firefox), pseudo-clases, `@media`, `rem`, porcentajes, shorthands (`padding`/`margin` de 1-4 valores, `flex`) |
@@ -39,13 +39,19 @@ autenticación por cookies, e **interactuar con el Agente Copiloto IA**
 autónomo desde la barra lateral.
 
 **Y lo que NO, dicho aquí y no enterrado abajo:** las webs que construyen su
-contenido con JavaScript en el cliente (React, Next, Vue, Shopify — es decir,
-la mayoría de tiendas y aplicaciones web de hoy) **se ven vacías**. El motor
-descarga la página correctamente, pero esa página no trae contenido: lo
-genera un bundle que este motor todavía no ejecuta. Desde 2026-08-27 el
-navegador lo **dice con un aviso claro** en vez de dejar la pantalla en
-blanco, pero decirlo no es arreglarlo. Las webs que envían su contenido ya
-hecho en el HTML (Google, Wikipedia, prensa, documentación) sí se ven.
+contenido con JavaScript en el cliente (React, Next, Vue, Shopify) siguen sin
+verse en general, pero el motivo ya no es el que era. Hasta la Fase 43 el
+bloqueo era estructural: un `<script type="module">` ni siquiera parseaba, así
+que **ningún** bundle podía arrancar. Eso está resuelto y hay un test que
+carga la estructura que emite un empaquetador y comprueba que se ejecuta y
+pinta.
+
+Lo que queda ahora es superficie de plataforma: faltan APIs del DOM que un
+framework toca al arrancar, y la ausencia de una sola lanza un `TypeError` que
+mata el script entero. Es trabajo incremental y medible, no un muro. Cuando la
+página se queda vacía, el navegador lo **dice con un aviso claro** en vez de
+dejar la pantalla en blanco. Las webs que envían su contenido ya hecho en el
+HTML (Google, Wikipedia, prensa, documentación) se ven desde hace tiempo.
 
 ---
 
@@ -90,10 +96,6 @@ que sea.
 
 Lo que bloquea hoy, comprobado contra el código el 2026-09-09:
 
-* **Sin módulos ES.** No hay `<script type="module">`, ni `import()`
-  dinámico, ni `defer`/`async` con su orden real. Todo bundle de Vite, Next
-  o Svelte se sirve como módulo, así que **ninguno puede arrancar** por más
-  APIs que se añadan.
 * **Sin cadena de prototipos DOM.** Cada nodo es un objeto suelto, así que
   `instanceof HTMLElement` es falso y parchear `Element.prototype` no hace
   nada. Los bundles hacen ambas cosas al arrancar.
@@ -105,7 +107,16 @@ Lo que bloquea hoy, comprobado contra el código el 2026-09-09:
   `CustomEvent`, `DOMParser`, `closest`, `matches`, `dataset`, `innerText`,
   `insertAdjacentHTML`, `document.readyState`, `FormData`, `Blob`.
 
-Hay una sonda que mide esto, no es una impresión: **56 de 114** el 2026-09-09.
+**Los módulos ES ya funcionan desde la Fase 43**, que era el bloqueo anterior a
+todo lo demás: `<script type="module">` con `import`/`export` reales,
+`defer`/`async` en su orden, y los fragmentos de `<link rel="modulepreload">`
+disponibles para los `import`. Un bundle con la estructura que emite un
+empaquetador se ejecuta y pinta su contenido, verificado de punta a punta en
+`engine/crates/core/tests/bundle_modulos.rs`. Lo que sigue faltando de ahí es
+`import()` dinámico y los *import maps*.
+
+Hay una sonda que mide lo demás, no es una impresión: **56 de 114** el
+2026-09-09.
 Se ejecuta con la suite y un test impide que el número baje.
 
 ```bash
@@ -203,7 +214,7 @@ npm run start          # frontend (Vite) + aplicación Electron
 
 ```bash
 cd engine
-cargo test --workspace          # los 841 tests
+cargo test --workspace          # los 856 tests
 cargo run -p engine-core --bin engine_server   # servidor NDJSON por stdin/stdout
 ```
 

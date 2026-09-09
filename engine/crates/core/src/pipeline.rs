@@ -279,6 +279,39 @@ pub fn find_external_stylesheet_hrefs(dom_root: &Arc<RwLock<Node>>) -> Vec<Strin
         .collect()
 }
 
+/// Devuelve el `href` CRUDO de cada `<link rel="modulepreload">` del
+/// documento (Fase 43).
+///
+/// Por que existe: un bundle moderno no declara todos sus trozos con
+/// `<script src>`. Declara UNO (`<script type="module" src="/assets/index.js">`)
+/// y los demas con `<link rel="modulepreload" href="...">`, precisamente para
+/// que el navegador los tenga descargados antes de que el primero los importe.
+/// Sin recogerlos aqui, el `import` del modulo raiz no encontraria nada, porque
+/// este motor no va a la red durante la evaluacion (ver `engine_js::modules`).
+///
+/// `rel` se compara por tokens, no como cadena entera: `rel="modulepreload"`
+/// puede venir acompañado, igual que ya pasa con `rel="preload stylesheet"` en
+/// `find_external_stylesheet_hrefs`.
+pub fn find_module_preloads(dom_root: &Arc<RwLock<Node>>) -> Vec<String> {
+    Node::find_all_by_tag(dom_root, "link")
+        .iter()
+        .filter_map(|link_node| {
+            let node = link_node.read().unwrap();
+            let NodeType::Element { attributes, .. } = &node.node_type else {
+                return None;
+            };
+            let es_modulepreload = attributes.get("rel").is_some_and(|rel| {
+                rel.split_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("modulepreload"))
+            });
+            if !es_modulepreload {
+                return None;
+            }
+            attributes.get("href").cloned()
+        })
+        .collect()
+}
+
 /// Devuelve el valor CRUDO del atributo `src` de cada `<script src="...">`
 /// del documento, en orden de documento - el mismo orden en el que
 /// `scripting::run_scripts` recorre `<script>` (inline o externo, sin

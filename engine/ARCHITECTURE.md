@@ -4202,3 +4202,123 @@ Simplificacion declarada: `TextEncoder.encode` devuelve un Array normal, no un
 algo que exija un TypedArray de verdad.
 
 **Tests del Workspace**: 841 pasando, 0 fallando.
+
+### Fase 43: Modulos ES — `<script type="module">` y el orden real de carga (2026-09-09)
+
+El bloqueo estructural que la Fase 41 identifico al verificar los huecos contra
+el codigo. Se creia que el techo del motor eran las APIs del DOM ausentes; era
+anterior a eso.
+
+#### El problema, con su forma exacta
+
+Todo bundle de Vite, Next o Svelte se sirve como `<script type="module">`, y
+este motor lo ejecutaba como un script CLASICO. En un script clasico, `import`
+y `export` son errores de SINTAXIS: el bundle moria en el parseo, antes de la
+primera linea util, y ninguna cantidad de APIs del DOM anadidas despues lo
+habria cambiado.
+
+Por eso esta fase va antes que el resto del bloque C, y no despues.
+
+#### De donde salen los modulos que se importan
+
+De lo que `core::server` ya descargo antes de arrancar el JavaScript, no de la
+red en caliente. Es el mismo patron que el resto del motor (hojas de estilo,
+imagenes, scripts clasicos): descubrir todas las URLs, descargarlas en paralelo
+con el filtro de CSP aplicado, y solo entonces construir la pagina.
+
+Ir a la red DENTRO del cargador tendria dos problemas, no uno: habria que
+bloquear el hilo del interprete en mitad de la evaluacion, y se saltaria el
+filtro de `script-src` que ya se aplico aguas arriba.
+
+Que eso baste para un bundle real no es casualidad. Un `index.html` de Vite
+declara UN modulo raiz con `<script type="module" src>` y sus fragmentos con
+`<link rel="modulepreload" href>`, precisamente para que el navegador los tenga
+antes de necesitarlos. `pipeline::find_module_preloads` los recoge y
+`core::server` los mete en la MISMA lista que los `<script src>`: para el motor
+son codigo JavaScript que un `import` va a pedir, y tratarlos por un camino
+aparte solo abriria la puerta a que un dia uno de los dos aplicara una politica
+distinta.
+
+#### Orden de ejecucion: de una pasada a tres
+
+`run_scripts` recorria todos los `<script>` en orden de documento, ignorando
+`type`, `defer`, `async` y `nomodule`. Ahora clasifica y hace tres pasadas:
+clasicos, luego `defer` y modulos (un modulo es `defer` por defecto segun el
+spec, sin escribirlo), luego `async`.
+
+Tres cosas que la clasificacion arregla y que no eran obvias:
+
+- **`<script nomodule>` se omite.** Marca el respaldo para navegadores sin
+  modulos. Ejecutarlo ADEMAS del modulo montaria la aplicacion dos veces; en una
+  web real eso se manifiesta como contenido duplicado.
+- **`<script type="application/json">` ya no se ejecuta.** Es un contenedor de
+  datos, comunisimo para datos estructurados y estado inicial. Antes se
+  intentaba ejecutar y producia un error de sintaxis que ensuciaba el
+  diagnostico de la pagina.
+- **`defer` espera de verdad.** Codigo real depende de que, cuando corra, el DOM
+  entero exista.
+
+`async` se ejecuta al final y en orden de documento, no "en cuanto llega": aqui
+todo esta descargado antes de evaluar nada, asi que no hay un "cuando llegue"
+que respetar. Es una aproximacion declarada, y la que menos codigo rompe: lo que
+`async` promete es "no bloqueo el parseo", no un orden concreto.
+
+#### Decisiones del cargador
+
+- **La cache de modulos parseados no es una optimizacion, es obligatoria.** El
+  spec exige que dos `import` del mismo especificador devuelvan EL MISMO modulo.
+  Sin ella, un modulo importado dos veces se evaluaria dos veces y su estado (un
+  contador, un registro de componentes) se duplicaria, con sintomas muy lejos de
+  la causa. Tiene test.
+- **El modulo raiz se identifica por su URL ABSOLUTA**, no por el `src` crudo,
+  para que sea el mismo modulo que veria un `import` a esa ruta. Si no, el mismo
+  fichero cargado como `<script src>` y ademas importado se evaluaria dos veces.
+- **Un especificador desnudo (`import x from "react"`) se rechaza diciendo por
+  que.** En la web no tiene significado sin un import map. Resolverlo como ruta
+  produciria una URL inventada, una descarga fallida y un error que apunta al
+  sitio equivocado.
+- **Un import no descargado falla con el nombre del modulo en el mensaje**, no
+  devuelve un modulo vacio. Un modulo vacio haria que el `import` "funcionara" y
+  que el fallo apareciera mucho despues como un `undefined is not a function`
+  sin relacion con la causa.
+- **Una promesa de modulo que queda pendiente tras drenar los trabajos se
+  reporta como error.** Devolver `Ok` dejaria la pagina a medias sin ninguna
+  pista.
+
+`JsRuntime::with_modules` es un constructor aparte y no un flag: el cargador se
+instala al CONSTRUIR el `Context` de Boa y despues ya no se puede cambiar. Sin
+URL de pagina no hay base contra la que resolver, asi que ese camino
+(`core::main`, los tests sin red) se queda con el runtime clasico y un modulo
+falla ahi con su motivo en vez de ejecutarse mal.
+
+#### Simplificacion declarada: resolucion contra la pagina
+
+Los especificadores se resuelven contra la URL de la PAGINA, no contra la del
+modulo que importa. Boa 0.19 no expone donde guardar la URL de cada modulo
+(`host_defined` es inmutable y `path` es un `Path` de disco, no una URL).
+
+Lo que cubre y lo que no: los bundlers emiten rutas ABSOLUTAS
+(`/assets/index-abc.js`), que se resuelven igual contra la pagina que contra el
+importador, asi que el caso que motiva toda la fase funciona. Falla un
+`./vecino.js` entre dos modulos que no esten en el directorio del documento.
+
+Tampoco hay `import()` dinamico ni `<script type="importmap">`.
+
+#### Verificacion
+
+`crates/core/tests/bundle_modulos.rs`, 7 tests contra el binario real, sirviendo
+la estructura de un bundler desde un servidor local con rutas separadas (el
+`TestServer` compartido gano soporte de rutas para esto: probar varios ficheros
+contra un servidor que devuelve lo mismo para todo no probaria nada).
+
+El test principal comprueba el TEXTO que llega al arbol de LAYOUT, no una
+variable global. Que el script corra sin lanzar no significa que la pagina se
+vea; comprobar una global pasaria aunque el DOM se hubiera quedado sin tocar.
+
+Un fallo del primer intento que merece quedar escrito, porque el diagnostico
+inicial fue equivocado: `requires_javascript` seguia en `true` sobre un bundle
+que SI se habia ejecutado. No era un bug del motor - el umbral son 40 caracteres
+de texto visible (`MIN_VISIBLE_TEXT_CHARS`) y el bundle del test producia 31. La
+heuristica hacia exactamente lo que documenta; lo poco realista era el test.
+
+**Tests del Workspace**: 856 pasando, 0 fallando.

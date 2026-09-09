@@ -5,7 +5,7 @@
 //! el layout con tiny-skia y devuelve la captura PNG en Base64. La salida
 //! estándar contiene exclusivamente JSON; los logs van a stderr.
 
-use crate::pipeline::{build_page_keeping_runtime, find_background_image_urls, find_external_script_srcs, find_external_stylesheet_hrefs, find_image_srcs, find_inline_style_css, PageResult};
+use crate::pipeline::{build_page_keeping_runtime, find_background_image_urls, find_external_script_srcs, find_external_stylesheet_hrefs, find_image_srcs, find_inline_style_css, find_module_preloads, PageResult};
 use crate::protocol::{
     ElementAttributes, ElementRect, EngineRequest, EngineResponse, InteractiveElement, TabInfo,
     PROTOCOL_VERSION,
@@ -539,7 +539,14 @@ impl EngineServer {
         let page_origin = engine_net::storage::origin_of(&page_url);
 
         let stylesheet_hrefs = find_external_stylesheet_hrefs(&discovery_dom);
-        let script_srcs = find_external_script_srcs(&discovery_dom);
+        // Los fragmentos que un bundle declara con `<link rel="modulepreload">`
+        // se descargan junto a los `<script src>` y por el MISMO camino
+        // (mismo filtro de CSP `script-src`, mismo pool paralelo, mismo mapa):
+        // para el motor son codigo JavaScript que un `import` va a pedir, y
+        // tratarlos aparte solo abriria la puerta a que un dia uno de los dos
+        // caminos aplicara una politica distinta.
+        let mut script_srcs = find_external_script_srcs(&discovery_dom);
+        script_srcs.extend(find_module_preloads(&discovery_dom));
 
         // CSP se aplica ANTES de descargar, no despues: el objetivo es no
         // pedirle nada a un origen no autorizado, no descartar lo que ya

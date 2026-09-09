@@ -6,6 +6,7 @@ pub mod event_loop;
 pub mod fetch;
 pub mod history;
 pub mod location;
+pub mod modules;
 pub mod mutation_observer;
 pub mod platform;
 pub mod storage;

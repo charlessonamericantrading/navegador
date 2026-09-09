@@ -14,7 +14,7 @@ aquí. Los identificadores entre corchetes remiten a las tareas de `../plan.md`.
 
 **Última verificación contra el código: 2026-09-09** (actualizado tras la Fase 42). Cada entrada de este fichero
 se comprobó con `grep` sobre `engine/crates/*/src` en esa fecha, no se copió de
-`ARCHITECTURE.md`. Estado de la suite: **841 tests pasando, 0 fallando**.
+`ARCHITECTURE.md`. Estado de la suite: **856 tests pasando, 0 fallando**.
 
 ---
 
@@ -94,19 +94,24 @@ propósito**, por la misma razón que la Fase 39 no puso un stub de
 `MutationObserver`: un observador que nunca dispara deja al código esperando para
 siempre, que es peor que fallar rápido.
 
-### 1.6 Carga de scripts `[plan C9]`
+### 1.6 Carga de scripts `[plan C9]` — mayoritariamente cerrado (Fase 43)
 
-Los `<script src>` externos **sí** se descargan (`find_external_script_srcs` en
-`pipeline.rs`). Lo que no existe:
+**Ya funciona**: `<script type="module">` (en línea y externo) con `import`/
+`export` reales, `defer`/`async` con el orden del spec, `nomodule` omitido, los
+`type` de datos (`application/json`) sin ejecutarse, y los fragmentos declarados
+con `<link rel="modulepreload">` descargados y disponibles para los `import`.
+Probado de punta a punta con la estructura que emite un bundler
+(`tests/bundle_modulos.rs`).
 
-- `type="module"` y la semántica de módulo (`import`/`export`, loader que resuelva
-  especificadores contra la URL del documento)
-- `import()` dinámico
-- `defer` y `async` con su orden real
-- `<script type="importmap">`, `nomodule`
+Lo que sigue faltando:
 
-**Este es el hueco que impide que cualquier bundle de Vite o Next se ejecute**,
-aunque todas las APIs de los apartados anteriores existieran.
+| Pieza | Notas |
+|---|---|
+| Resolución relativa al módulo importador | Los especificadores se resuelven contra la URL de la **página**, no contra la del módulo que importa. Los bundlers emiten rutas absolutas (`/assets/x.js`), que salen igual; falla un `./vecino.js` entre módulos que no estén en el directorio del documento. Boa 0.19 no expone dónde guardar la URL de cada módulo (`host_defined` es inmutable, `path` es de disco) |
+| `import()` dinámico | Sin implementar |
+| `<script type="importmap">` | Sin él, un especificador desnudo (`import x from "react"`) se rechaza con su motivo, en vez de inventar una URL |
+| Descarga de módulos en caliente | El motor no va a la red durante la evaluación. Un `import` a algo que no se descubrió antes falla con un mensaje que lo dice. Un módulo importado dinámicamente o con una ruta calculada no se descubre |
+| `async` real | Se ejecuta al final y en orden de documento, no «en cuanto llega»: todo está descargado antes de evaluar nada, así que no hay un «cuando llegue» que respetar |
 
 ### 1.7 Orden de ejecución `[plan C10]`
 

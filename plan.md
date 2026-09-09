@@ -5,8 +5,9 @@
 > ejecutado hoy → **819 tests pasando, 0 fallando** en los 10 crates.
 >
 > **Progreso: bloques A y B cerrados** (Fase 41), salvo A1 (abrir el PR, requiere
-> decisión) y A5 (reevaluada como innecesaria). **Del bloque C: C1 cerrado y C5
-> mayoritariamente** (Fase 42). Superficie de plataforma medida: **56/114**.
+> decisión) y A5 (reevaluada como innecesaria). **Del bloque C: C1 cerrado, C5 y
+> C9 mayoritariamente** (Fases 42 y 43). El bloqueo estructural que impedía que
+> cualquier bundle arrancara está resuelto. Superficie de plataforma: **56/114**.
 > Ver el [checklist maestro](#15-checklist-maestro).
 >
 > Este documento sigue la misma doctrina que `engine/ARCHITECTURE.md`: cada tarea
@@ -77,7 +78,7 @@
 
 | # | Hueco | Prioridad | Bloque |
 |---|---|---|---|
-| 1 | Las webs construidas con JS en cliente (React/Next/Vue/Shopify) se ven vacías. **Causa raíz identificada el 2026-09-09: no hay `<script type="module">`**, así que ningún bundle moderno llega a ejecutar su primera línea | **P0** | C9 |
+| 1 | Las webs construidas con JS en cliente se ven vacías. ~~Causa raíz: no hay `<script type="module">`~~ **resuelto** (Fase 43). Lo que queda es superficie de plataforma: APIs del DOM que un framework toca al arrancar | **P0** | C3, C6 |
 | 2 | Sin sandbox de proceso | P1 | F |
 | 3 | ~~Sin CI~~ **hecho** (Fase 41): `engine.yml` y `app.yml` | ~~P0~~ | B |
 | 4 | ~~README con datos falsos y `huecos_sin_resolver.md` inexistente~~ **hecho** (Fase 41). Queda solo la rama sin fusionar en `main` | P1 | A |
@@ -1181,7 +1182,7 @@ Marcar aquí al cerrar. Cada ✅ debe tener su Fase en `ARCHITECTURE.md`.
 - [ ] C6 `document.*` y `Element.*` que faltan (readyState, currentScript, write, closest, insertAdjacentHTML, innerText, dataset, focus, scrollIntoView, offset*, client*, scroll*…)
 - [ ] C7 `window.*` de entorno + `matchMedia` + diálogos vía protocolo
 - [ ] C8 `IntersectionObserver` / `ResizeObserver` reales
-- [ ] C9 `type=module`, `defer`, `async`, `import()`, loader de módulos
+- [~] C9 **mayoritariamente hecho** (Fase 43): `type="module"` en línea y externo, `import`/`export` reales, `defer`/`async` con el orden del spec, `nomodule` omitido, `<link rel="modulepreload">` descargado. **Pendientes**: `import()` dinámico, import maps, y resolución relativa al módulo importador (hoy se resuelve contra la página)
 - [ ] C10 Scripts ejecutados durante el parseo (streaming)
 - [ ] C11 Formularios desde JS + `FormData` + `SubmitForm` en protocolo
 - [ ] C12 Selección de texto y portapapeles

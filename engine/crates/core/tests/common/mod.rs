@@ -27,13 +27,6 @@ pub const TIMEOUT: Duration = Duration::from_secs(60);
 // Servidor HTTP minimo
 // ---------------------------------------------------------------------------
 
-/// Sirve el mismo cuerpo a cada peticion que reciba, hasta que se le suelta.
-///
-/// No usa `hyper` a proposito aunque ya sea dependencia: aqui hace falta lo
-/// contrario de un cliente HTTP correcto — un servidor tonto y predecible, de
-/// treinta lineas, que no comparta ni una linea de codigo con el que se esta
-/// probando. Si el test usara la misma pila que el motor, un fallo en esa pila
-/// podria cancelarse consigo mismo y pasar desapercibido.
 pub struct TestServer {
     pub puerto: u16,
     /// Se conserva para que el hilo siga vivo mientras el test lo use; al
@@ -41,8 +34,74 @@ pub struct TestServer {
     _hilo: std::thread::JoinHandle<()>,
 }
 
+/// Construye una respuesta HTTP completa.
+///
+/// Los saltos de linea del protocolo se escriben como `\r\n` de verdad: un
+/// servidor que mande solo `\n` funciona con clientes tolerantes y falla con
+/// los estrictos, y aqui el cliente es justo el que se esta probando.
+fn respuesta_http(estado: &str, tipo: Option<&str>, cuerpo: &str) -> String {
+    let mut r = String::new();
+    r.push_str("HTTP/1.1 ");
+    r.push_str(estado);
+    r.push_str("\r\n");
+    if let Some(tipo) = tipo {
+        r.push_str("Content-Type: ");
+        r.push_str(tipo);
+        r.push_str("\r\n");
+    }
+    r.push_str("Content-Length: ");
+    r.push_str(&cuerpo.len().to_string());
+    r.push_str("\r\nConnection: close\r\n\r\n");
+    r.push_str(cuerpo);
+    r
+}
+
+/// El tipo MIME que corresponde a una ruta. Importa de verdad: ningun
+/// navegador ejecuta como modulo algo servido con `text/html`.
+fn tipo_de(ruta: &str) -> &'static str {
+    if ruta.ends_with(".js") || ruta.ends_with(".mjs") {
+        "text/javascript; charset=utf-8"
+    } else if ruta.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else {
+        "text/html; charset=utf-8"
+    }
+}
+
+/// Lee la ruta de la primera linea de una peticion HTTP (`GET /x HTTP/1.1`).
+fn ruta_pedida(peticion: &str) -> String {
+    peticion
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("/")
+        .to_string()
+}
+
 impl TestServer {
+    /// Sirve el mismo cuerpo a cada peticion que reciba, hasta que se le suelta.
+    ///
+    /// No usa `hyper` a proposito aunque ya sea dependencia: aqui hace falta lo
+    /// contrario de un cliente HTTP correcto — un servidor tonto y predecible,
+    /// que no comparta ni una linea de codigo con el que se esta probando. Si
+    /// el test usara la misma pila que el motor, un fallo en esa pila podria
+    /// cancelarse consigo mismo y pasar desapercibido.
     pub fn nuevo(cuerpo: &'static str) -> Self {
+        Self::con_rutas_internas(None, cuerpo)
+    }
+
+    /// Sirve rutas distintas: `(ruta, cuerpo)`. Una peticion a una ruta que no
+    /// este en la lista responde 404, no el cuerpo de otra: servir cualquier
+    /// cosa ante una URL equivocada haria pasar tests que deberian fallar.
+    ///
+    /// Hace falta desde la Fase 43: un bundle real son VARIOS ficheros
+    /// (`index.html`, el modulo raiz, sus fragmentos), y probarlo contra un
+    /// servidor que devuelve lo mismo para todo no probaria nada.
+    pub fn con_rutas(rutas: Vec<(&'static str, &'static str)>) -> Self {
+        Self::con_rutas_internas(Some(rutas), "")
+    }
+
+    fn con_rutas_internas(rutas: Option<Vec<(&'static str, &'static str)>>, unico: &'static str) -> Self {
         // Puerto 0 = que el sistema operativo elija uno libre. Fijar un puerto
         // haria que dos tests en paralelo (que es como corre `cargo test`) se
         // pelearan por el.
@@ -52,30 +111,27 @@ impl TestServer {
         let hilo = std::thread::spawn(move || {
             for flujo in listener.incoming() {
                 let Ok(mut flujo) = flujo else { break };
-                // Leer la peticion entera no hace falta: basta con vaciar la
-                // primera linea para que el cliente no vea un reset.
-                let mut buffer = [0u8; 2048];
-                let _ = flujo.read(&mut buffer);
+                let mut buffer = [0u8; 4096];
+                let leidos = flujo.read(&mut buffer).unwrap_or(0);
+                let peticion = String::from_utf8_lossy(&buffer[..leidos]).to_string();
 
-                let respuesta = format!(
-                    "HTTP/1.1 200 OK\r\n\
-                     Content-Type: text/html; charset=utf-8\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\
-                     \r\n\
-                     {}",
-                    cuerpo.len(),
-                    cuerpo
-                );
+                let respuesta = match &rutas {
+                    Some(rutas) => {
+                        let ruta = ruta_pedida(&peticion);
+                        match rutas.iter().find(|(r, _)| *r == ruta) {
+                            Some((r, cuerpo)) => respuesta_http("200 OK", Some(tipo_de(r)), cuerpo),
+                            None => respuesta_http("404 Not Found", None, ""),
+                        }
+                    }
+                    None => respuesta_http("200 OK", Some("text/html; charset=utf-8"), unico),
+                };
+
                 let _ = flujo.write_all(respuesta.as_bytes());
                 let _ = flujo.flush();
             }
         });
 
-        Self {
-            puerto,
-            _hilo: hilo,
-        }
+        Self { puerto, _hilo: hilo }
     }
 
     pub fn url(&self, ruta: &str) -> String {
