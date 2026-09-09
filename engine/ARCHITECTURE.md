@@ -4009,3 +4009,107 @@ que su caja dentro de un `overflow: hidden` mas pequeño todavia - las tres
 capturas correctas, sin derrame.
 
 **Tests del Workspace**: 805 pasando, 0 fallando, en los 10 crates.
+
+### Fase 41: Puerta de calidad automatica y test de humo del protocolo (2026-09-09)
+
+Esta fase no añade capacidad de motor: añade la infraestructura que impide que
+las 40 anteriores se degraden sin que nadie se entere. Hasta hoy los tests solo
+corrian cuando alguien se acordaba de lanzarlos a mano.
+
+#### La cifra de tests que nadie habia recontado
+
+El README decia 703, la Fase 40 decia 805. Recontado hoy: **805 era correcto**
+(13 binarios de test, 10 de doc-tests vacios). El 703 llevaba obsoleto desde la
+propia Fase 40 y se corrigio. Tras esta fase son **819**.
+
+Merece la pena apuntar por que la discrepancia sobrevivio tanto: `cargo test`
+imprime un `test result` por binario, no un total. Cualquiera que mire el final
+de la salida ve solo el ultimo. La unica forma de tener el numero es sumarlos, y
+por eso el numero se escribia a ojo y envejecia.
+
+#### `huecos_sin_resolver.md`: el fichero que la Fase 40 cito sin crear
+
+La Fase 40 lo referencia dos veces. No existia. Ahora existe, y no es una copia
+de las declaraciones "NO implementado" de este documento: **se verifico cada
+entrada con `grep` contra el codigo**, porque la mayoria de aquellas
+declaraciones ya no eran ciertas — la fase siguiente las cerro y el texto
+historico se quedo (correctamente: esto es un registro, no un estado).
+
+Dos ejemplos de lo que la verificacion corrigio:
+
+- El README afirmaba que faltaban `location.href` y `MutationObserver`. Ambos
+  existen desde la Fase 39/`8a0ea7f`.
+- El borrador del propio `huecos_sin_resolver.md` daba `Event` por ausente.
+  Esta registrado en `dom_bindings.rs:663` y probado en
+  `tests/wpt-style/events-and-microtasks.html`. Lo que falta es `CustomEvent`,
+  `EventTarget` como constructor y los eventos con metadatos
+  (`KeyboardEvent`/`MouseEvent`).
+
+El hallazgo que mas cambia el plan de trabajo: **no hay `<script type="module">`,
+ni `import()`, ni `defer`/`async`**. Se creia que el techo eran las APIs del DOM
+que faltaban; es anterior a eso. Todo bundle de Vite/Next/Svelte se sirve como
+modulo, asi que ninguno puede arrancar por muchas APIs que se añadan. Es la
+tarea C9 del `plan.md` y es la que desbloquea el resto del bloque.
+
+#### Politica de lints, con motivo escrito
+
+`cargo clippy -D warnings` es ahora una puerta de CI. Para llegar a cero avisos
+se arreglaron 7 cosas reales y se permitieron 3 categorias en
+`[workspace.lints.clippy]`, cada una con su razon al lado — un `allow` sin
+motivo escrito convierte la puerta en decorado.
+
+El arreglo que no era cosmetico: en `scripting.rs`, un bloque de 19 lineas de
+documentacion de `execute_inline_scripts_keeping_runtime` habia quedado
+**huerfano**. La definicion de `StorageContext` se colo entre el comentario y su
+funcion, asi que documentaba la nada y no salia en `cargo doc`. Lo detecto
+`empty_line_after_doc_comments`; ningun test podia verlo. Se movio la struct
+por encima.
+
+Lo que se decidio NO exigir: `cargo fmt --check`. rustfmt reordenaria ~1.400
+tramos de un codigo cuyos comentarios llevan el razonamiento de cada decision;
+haria ilegible `git blame` justo donde mas se consulta, a cambio de nada
+funcional. Corre igualmente como paso informativo.
+
+#### Test de humo NDJSON: la capa que ningun test tocaba
+
+`crates/core/tests/ndjson_smoke.rs`, 14 tests. Los tests que ya existian en
+`server.rs` construyen un `EngineServer` en memoria y llaman a `handle()`. Eso
+prueba la logica y se salta justo la capa que el producto usa: el proceso
+aparte, su stdin/stdout, el serde de ida y vuelta, y la regla de que **nada que
+no sea JSON puede salir por stdout**. Un `println!` de depuracion mal puesto no
+lo veia ningun test y rompe la aplicacion entera.
+
+- Arranca el binario `engine_server` real (`env!("CARGO_BIN_EXE_engine_server")`)
+  y habla con el por tuberias, como hace Electron.
+- Sirve el HTML desde un `TcpListener` propio de 30 lineas, **sin `hyper`**
+  aunque ya sea dependencia: si el test usara la misma pila HTTP que el motor,
+  un fallo en esa pila podria cancelarse consigo mismo.
+- Cubre las 16 variantes de `EngineRequest` mas las lineas invalidas y vacias.
+  `todas_las_variantes_del_protocolo_estan_cubiertas` lee el enum del fuente y
+  falla si mañana se añade una variante sin test, para que la cobertura no se
+  degrade en silencio.
+- Comprueba efectos, no solo que la respuesta llegue: que la captura empieza por
+  la firma real de PNG (la Fase 39 encontro justo lo contrario, un PNG declarado
+  como JPEG), que `back` vuelve a la URL anterior, que cada pestaña conserva la
+  suya, que `scroll` mueve de verdad, y que tras `type_text` el `value` del
+  `<input>` contiene el texto.
+- Que una linea basura devuelva `error` **y el proceso siga vivo** tiene test
+  propio: un parser que muere ante entrada invalida convertiria cualquier fallo
+  del cliente en una caida del navegador.
+
+#### Integracion continua
+
+`.github/workflows/engine.yml` (build, tests, clippy, los 24 tests estilo-WPT,
+auditoria de dependencias) y `app.yml` (tipos, build de la interfaz,
+empaquetado de Electron). Solo `windows-latest`: es la unica plataforma donde el
+motor se ha verificado. Ambos comandos se ejecutaron en local antes de
+escribirlos, para que el CI no naciera en rojo.
+
+Un hallazgo colateral de montarlo: **`npm run lint` de la interfaz esta roto**.
+La interfaz declara TypeScript 7 y `typescript-eslint` —incluida su ultima
+version, 8.70— solo soporta `<6.1.0`; el parser revienta antes de leer un
+fichero. No es codigo mal escrito: la pieza compatible aun no existe. `tsc` si
+comprueba los tipos y eso si bloquea; ESLint queda informativo hasta que se
+decida bajar TypeScript a 5.x o aparezca soporte.
+
+**Tests del Workspace**: 819 pasando, 0 fallando, en los 10 crates.
