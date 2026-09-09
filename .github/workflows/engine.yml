@@ -92,3 +92,7 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # El workspace de Rust vive en `engine/`, no en la raiz. Sin esto la
+          # accion busca `./Cargo.lock`, no lo encuentra y falla con un error
+          # que parece de red pero es de ruta.
+          working-directory: engine
