@@ -16,8 +16,13 @@ engine-css = { path = "../css" }
 # `fetch()` real (Fase 4.3, ver fetch.rs) - peticiones HTTP de verdad desde
 # JS, no un mock. Primera dependencia de red de este crate.
 engine-net = { path = "../net" }
-# `location` trocea la URL de la pagina en sus partes (protocol/host/...).
+# `location` trocea la URL de la pagina en sus partes (protocol/host/...),
+# y `URL`/`URLSearchParams` (Fase 42, ver platform.rs) reusan el MISMO parser
+# para que una URL se resuelva igual desde JS que desde la capa de red.
 url.workspace = true
+# `atob`/`btoa` (Fase 42). Ya es dependencia de `engine-core` para la captura
+# PNG, asi que no entra nada nuevo en el arbol.
+base64.workspace = true
 # `XMLHttpRequest` sincrono (Fase 9, ver xhr.rs): necesita esperar a que la
 # peticion HTTP termine ANTES de devolver el control al script. Es el mismo
 # ejecutor minimo que la cola de trabajos por defecto de Boa

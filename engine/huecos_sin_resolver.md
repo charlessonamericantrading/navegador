@@ -12,9 +12,9 @@ lo que sigue abierto y solo eso.
 en `ARCHITECTURE.md`. Al declarar una simplificación nueva en una fase: se añade
 aquí. Los identificadores entre corchetes remiten a las tareas de `../plan.md`.
 
-**Última verificación contra el código: 2026-09-09.** Cada entrada de este fichero
+**Última verificación contra el código: 2026-09-09** (actualizado tras la Fase 42). Cada entrada de este fichero
 se comprobó con `grep` sobre `engine/crates/*/src` en esa fecha, no se copió de
-`ARCHITECTURE.md`. Estado de la suite ese día: **805 tests pasando, 0 fallando**.
+`ARCHITECTURE.md`. Estado de la suite: **841 tests pasando, 0 fallando**.
 
 ---
 
@@ -24,19 +24,26 @@ Ninguna de estas existe en `engine/crates/js/src`. Cada ausencia lanza un
 `TypeError` que mata el script entero, así que el coste no es proporcional a lo
 usada que sea la API. Verificado con `grep` una por una.
 
-### 1.1 Utilidades de plataforma `[plan C5]`
+### 1.1 Utilidades de plataforma `[plan C5]` — parcialmente cerrado (Fase 42)
+
+**Ya implementadas** en `js/src/platform.rs`: `console` (familia completa, salida
+a `tracing`), `URL`, `URLSearchParams`, `performance.now`, `atob`/`btoa`,
+`TextEncoder`/`TextDecoder`.
+
+Lo que sigue faltando:
 
 | API | Notas |
 |---|---|
-| `URL` (constructor) | El crate `url` ya es dependencia de `net` |
-| `URLSearchParams` | Idem |
-| `TextEncoder` / `TextDecoder` | Solo UTF-8; otras codificaciones deben lanzar `RangeError` real |
-| `atob` / `btoa` | Crate `base64` |
-| `AbortController` / `AbortSignal` | Debe cancelar el `fetch` de verdad, no solo marcar |
+| `AbortController` / `AbortSignal` | **No se pone hasta que cancele el `fetch` de verdad.** Uno que solo marque una bandera es el stub que la doctrina prohíbe: el código cree haber cancelado y la petición sigue viva |
 | `structuredClone` | Bloquea IndexedDB y Workers, que lo necesitan para pasar datos |
-| `crypto.getRandomValues` / `crypto.randomUUID` | |
-| `performance.now` / `mark` / `measure` | |
-| `console` como objeto global | Hoy existe `printEngineLog` como apaño. La salida debe ir a `tracing`, **nunca a stdout**: rompería el protocolo NDJSON (`engine_server.rs:15`) |
+| `crypto.getRandomValues` / `crypto.randomUUID` | Necesita una fuente de aleatoriedad real (`getrandom`). Rellenarlo con números no criptográficos sería peor que la ausencia |
+| `performance.getEntries` | `mark`/`measure` existen pero no registran. `getEntries` NO se registra a propósito: devolver una lista vacía fingiría que se midió |
+| `Intl` | `boa` lo trae detrás de una *feature* que está desactivada |
+
+Simplificación declarada de la Fase 42: `TextEncoder.encode` devuelve un **Array
+normal, no un `Uint8Array`**. Se indexa y se recorre igual, que es lo que hace
+casi todo el código; lo que no funcionará es pasárselo a algo que exija un
+TypedArray de verdad.
 
 ### 1.2 DOM: métodos y propiedades `[plan C6]`
 
@@ -108,7 +115,25 @@ Los scripts se ejecutan **todos seguidos después de parsear el documento entero
 script que espere que el DOM «de abajo» aún no exista. Requiere pausar el
 `TreeSink` de `html5ever` en `</script>`.
 
-### 1.8 Otros
+### 1.8 `window` no es el objeto global
+
+Medido con la sonda el 2026-09-09. En un navegador `window === globalThis`, así
+que `addEventListener(...)` a secas y `window.addEventListener(...)` son lo
+mismo, igual que `innerWidth` y `window.innerWidth`.
+
+Aquí `window` es un objeto normal registrado como una propiedad global más, así
+que **la forma corta lanza `ReferenceError`** y se lleva por delante el script
+entero. Muchísimo código real la usa.
+
+Consecuencia práctica que ya obliga a duplicar trabajo: cada global que además
+deba verse en `window.*` hay que ponerlo en los dos sitios a mano (ver
+`colgar_de_window` en `platform.rs`).
+
+Cerrarlo exige que el objeto global de `boa` sea un proxy con semántica de
+`WindowProxy`. Está declarado desde la Fase 6.4 en la cabecera de `window.rs`;
+lo que aporta esta entrada es la medida de cuánto cuesta.
+
+### 1.9 Otros
 
 - `XMLHttpRequest` es **siempre síncrono** (`xhr.rs`), aunque acepte `async: true`.
   Cualquier test o código que dependa del orden asíncrono real falla.

@@ -180,6 +180,14 @@ pub fn execute_inline_scripts_keeping_runtime(
     if let Err(e) = runtime.register_window() {
         tracing::warn!("[js] no se pudo registrar window: {e}");
     }
+    // DESPUES de `register_window` a proposito (Fase 42): `console` y
+    // `performance` se cuelgan tambien de `window` si ya existe, porque en
+    // este motor `window` no ES el objeto global (ver la cabecera de
+    // `engine_js::window`), asi que un global suelto no aparece en `window.*`
+    // y hay codigo real que usa las dos formas.
+    if let Err(e) = runtime.register_platform() {
+        tracing::warn!("[js] no se pudieron registrar las utilidades de plataforma: {e}");
+    }
     // DESPUES de `bind_dom` y `register_window` a proposito (Fase 7):
     // `register_history` engancha ademas `window.addEventListener`
     // delegando en `document.documentElement`, asi que necesita que los

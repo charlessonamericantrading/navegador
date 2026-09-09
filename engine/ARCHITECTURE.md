@@ -4113,3 +4113,92 @@ comprueba los tipos y eso si bloquea; ESLint queda informativo hasta que se
 decida bajar TypeScript a 5.x o aparezca soporte.
 
 **Tests del Workspace**: 819 pasando, 0 fallando, en los 10 crates.
+
+### Fase 42: Sonda de APIs medible y utilidades de plataforma (2026-09-09)
+
+Primer trabajo del bloque C del `plan.md`, el que decide si las webs modernas se
+ven. La regla de esta fase fue medir antes de implementar, porque la historia
+del proyecto dice que la intuicion falla aqui: la Fase 39 creia que faltaba
+medio motor de JavaScript y faltaban seis funciones sueltas.
+
+#### La sonda: 48/114, y por que es un test y no un script
+
+`engine/tests/probes/api-probe.html` prueba 114 APIs; `crates/core/tests/
+api_probe.rs` la ejecuta por el camino REAL (proceso `engine_server` + HTTP, no
+`pipeline::build_page`, que no registra red ni almacenamiento y daria un numero
+pesimista) y convierte el resultado en un numero vigilado.
+
+La sonda de la Fase 39 midio 26/28 y no quedo en el repositorio, asi que aquel
+numero no se pudo volver a comprobar ni comparar. Un dato que no se puede
+reproducir es una anecdota.
+
+El test **no exige que la sonda pase entera** — fallaria hoy y seguiria fallando
+meses, y un test rojo permanente deja de leerse. Exige que el numero no BAJE, y
+ademas que el total de comprobaciones no cambie: sin esa segunda guarda, se
+podria "subir el porcentaje" borrando las comprobaciones incomodas.
+
+Reglas de la propia sonda, que no son obvias: no puede morirse con lo que mide
+(todo va en try/catch, y preguntar por un global inexistente solo es posible con
+`typeof`), y no usa ninguna API que este midiendo en su propia infraestructura.
+
+#### Hallazgo: `window` no es el objeto global
+
+La primera pasada dio `window.addEventListener` como ausente, cuando la Fase 40
+lo implemento. La sonda lo probaba como identificador suelto, y ahi estaba el
+hallazgo de verdad.
+
+En un navegador `window === globalThis`, asi que `addEventListener(...)` a secas
+y `window.addEventListener(...)` son lo mismo, igual que `innerWidth` y
+`window.innerWidth`. Aqui `window` es un objeto normal, asi que **la forma corta
+lanza `ReferenceError`** y se lleva por delante el script entero. Muchisimo
+codigo real la usa.
+
+La limitacion estaba declarada desde la Fase 6.4 en la cabecera de `window.rs`;
+lo nuevo es la medida de cuanto cuesta. Su primera consecuencia practica ya se
+nota en esta misma fase: cada global que ademas deba verse en `window.*` hay que
+ponerlo en los dos sitios a mano (`colgar_de_window` en `platform.rs`).
+
+#### `platform.rs`: 48 -> 56
+
+`console`, `URL`, `URLSearchParams`, `performance.now`, `atob`/`btoa` y
+`TextEncoder`/`TextDecoder`. Se eligieron por lo que rompen al faltar, no por lo
+completas que quedan.
+
+`console` es el caso extremo del principio de la Fase 39. Practicamente todo
+codigo de produccion conserva algun `console.warn`, y muchos frameworks avisan
+por ahi en desarrollo: sin el objeto, ese aviso —que deberia ser informativo—
+mataba la pagina. La salida va a `tracing` y JAMAS a stdout, que es el canal
+NDJSON.
+
+Detalles que costaron mas de lo que parecen y que un test cubre cada uno:
+
+- **`console.log` no serializa con `JSON.stringify`.** Cualquier nodo del DOM
+  tiene `parentNode`, asi que `console.log(elemento)` pasa un ciclo y
+  `stringify` lanzaria. Un log que LANZA es exactamente el problema que este
+  modulo viene a quitar.
+- **`btoa` lanza con caracteres fuera de Latin-1** en vez de truncar: truncar
+  produce datos corruptos que nadie detecta.
+- **`atob` ignora los espacios** porque el Base64 partido en lineas es comun.
+- **`URL` lanza con una cadena invalida.** Codigo real envuelve `new URL` en
+  try/catch para decidir si algo es una URL; devolver un objeto a medias romperia
+  ese patron.
+- **`URL` tiene `toString`.** Sin el, concatenar una URL daria `[object Object]`
+  y el fallo apareceria mucho mas tarde, en la peticion.
+- **`URLSearchParams.get` devuelve el PRIMER valor** con claves repetidas, y
+  `null` (no `undefined`) si no esta.
+- **`TextDecoder` rechaza codificaciones que no soporta** en vez de fingir.
+
+Se resuelven con el crate `url`, el mismo que la capa de red, para que una URL se
+resuelva igual desde JS que desde el motor.
+
+**Lo que NO se registro, a proposito**: `AbortController` (uno que solo marque
+una bandera sin cancelar el `fetch` es el stub que la doctrina prohibe: el codigo
+cree haber cancelado y la peticion sigue viva), `crypto.getRandomValues`
+(rellenarlo con numeros no criptograficos es peor que la ausencia) y
+`performance.getEntries` (devolver una lista vacia fingiria que se midio).
+
+Simplificacion declarada: `TextEncoder.encode` devuelve un Array normal, no un
+`Uint8Array`. Se indexa y se recorre igual; lo que no funcionara es pasarselo a
+algo que exija un TypedArray de verdad.
+
+**Tests del Workspace**: 841 pasando, 0 fallando.

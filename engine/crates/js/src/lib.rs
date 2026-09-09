@@ -7,6 +7,7 @@ pub mod fetch;
 pub mod history;
 pub mod location;
 pub mod mutation_observer;
+pub mod platform;
 pub mod storage;
 pub mod test_harness;
 pub mod timers;

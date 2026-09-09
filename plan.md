@@ -4,8 +4,9 @@
 > (11 commits por delante de `main`). Estado medido, no leído: `cargo test --workspace`
 > ejecutado hoy → **819 tests pasando, 0 fallando** en los 10 crates.
 >
-> **Progreso: bloque A y bloque B cerrados** (Fase 41 en `ARCHITECTURE.md`), salvo
-> A1 (abrir el PR, requiere decisión) y A5 (limpieza, reevaluada como innecesaria).
+> **Progreso: bloques A y B cerrados** (Fase 41), salvo A1 (abrir el PR, requiere
+> decisión) y A5 (reevaluada como innecesaria). **Del bloque C: C1 cerrado y C5
+> mayoritariamente** (Fase 42). Superficie de plataforma medida: **56/114**.
 > Ver el [checklist maestro](#15-checklist-maestro).
 >
 > Este documento sigue la misma doctrina que `engine/ARCHITECTURE.md`: cada tarea
@@ -1172,11 +1173,11 @@ Marcar aquí al cerrar. Cada ✅ debe tener su Fase en `ARCHITECTURE.md`.
 - [x] B4 Test de humo NDJSON: 14 tests contra el binario real, cubren las 16 variantes más entrada inválida, con guardia anti-regresión de cobertura
 
 ### C — Web moderna
-- [ ] C1 Sonda v2 (≥60 APIs) versionada; cifra inicial: ___/___
+- [x] C1 Sonda v2 versionada con **114 comprobaciones**; cifra inicial **48/114**, hoy **56/114**. Test `api_probe` impide que baje y que se borren comprobaciones
 - [ ] C2 Corpus de 5 bundles con tests `#[ignore]`
 - [ ] C3 Cadena de prototipos DOM real + constructores globales
 - [ ] C4 `Event`/`CustomEvent`/`EventTarget` construibles; `KeyboardEvent`/`MouseEvent`/`InputEvent` con metadatos
-- [ ] C5 `URL`, `URLSearchParams`, `TextEncoder/Decoder`, `atob/btoa`, `AbortController`, `structuredClone`, `crypto`, `performance`, `console`
+- [~] C5 **hecho**: `console`, `URL`, `URLSearchParams`, `performance.now`, `atob`/`btoa`, `TextEncoder`/`TextDecoder` (Fase 42). **Pendientes a propósito**: `AbortController` (hasta que cancele el `fetch` de verdad), `crypto` (necesita aleatoriedad real), `structuredClone`
 - [ ] C6 `document.*` y `Element.*` que faltan (readyState, currentScript, write, closest, insertAdjacentHTML, innerText, dataset, focus, scrollIntoView, offset*, client*, scroll*…)
 - [ ] C7 `window.*` de entorno + `matchMedia` + diálogos vía protocolo
 - [ ] C8 `IntersectionObserver` / `ResizeObserver` reales

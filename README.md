@@ -23,7 +23,7 @@ solo compilándolo. Las cifras salen de correr la suite de tests el
 | | |
 |---|---|
 | **Motor** | ~25.800 líneas de Rust, 10 crates |
-| **Tests** | 819 pasando, 0 fallando (medido el 2026-09-09) |
+| **Tests** | 841 pasando, 0 fallando (medido el 2026-09-09) |
 | **Red** | HTTP/1.1 + HTTPS real (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies RFC 6265, CORS y CSP |
 | **HTML** | Parseo con `html5ever` (el de Servo), DOM mutable, `<canvas>` 2D context |
 | **CSS** | Cascada con especificidad real, selectores con combinadores (`selectors`, el de Firefox), pseudo-clases, `@media`, `rem`, porcentajes, shorthands (`padding`/`margin` de 1-4 valores, `flex`) |
@@ -97,14 +97,24 @@ Lo que bloquea hoy, comprobado contra el código el 2026-09-09:
 * **Sin cadena de prototipos DOM.** Cada nodo es un objeto suelto, así que
   `instanceof HTMLElement` es falso y parchear `Element.prototype` no hace
   nada. Los bundles hacen ambas cosas al arrancar.
-* **APIs ausentes:** `URL`, `URLSearchParams`, `AbortController`,
-  `TextEncoder`, `structuredClone`, `atob`/`btoa`, `performance`, `console`
-  como global, `matchMedia`, `IntersectionObserver`, `ResizeObserver`,
-  `customElements`, `CustomEvent`, `DOMParser`, `closest`, `dataset`,
-  `innerText`, `insertAdjacentHTML`, `document.readyState`.
+* **`window` no es el objeto global.** En un navegador `window === globalThis`,
+  así que `addEventListener(...)` a secas funciona. Aquí no: lanza
+  `ReferenceError` y mata el script.
+* **APIs ausentes:** `AbortController`, `structuredClone`, `crypto`,
+  `matchMedia`, `IntersectionObserver`, `ResizeObserver`, `customElements`,
+  `CustomEvent`, `DOMParser`, `closest`, `matches`, `dataset`, `innerText`,
+  `insertAdjacentHTML`, `document.readyState`, `FormData`, `Blob`.
 
-`location` y `MutationObserver` **sí** existen desde la Fase 39. La lista
-completa y actualizada está en
+Hay una sonda que mide esto, no es una impresión: **56 de 114** el 2026-09-09.
+Se ejecuta con la suite y un test impide que el número baje.
+
+```bash
+cargo test -p engine-core --test api_probe -- --nocapture
+```
+
+`location` y `MutationObserver` **sí** existen desde la Fase 39, y `console`,
+`URL`, `URLSearchParams`, `performance`, `atob`/`btoa` y `TextEncoder` desde la
+Fase 42. La lista completa y actualizada está en
 [`engine/huecos_sin_resolver.md`](engine/huecos_sin_resolver.md).
 
 Sin `<video>`, `<audio>`, `<iframe>`. Sin WebGL, IndexedDB, Service Workers,
@@ -193,7 +203,7 @@ npm run start          # frontend (Vite) + aplicación Electron
 
 ```bash
 cd engine
-cargo test --workspace          # los 819 tests
+cargo test --workspace          # los 841 tests
 cargo run -p engine-core --bin engine_server   # servidor NDJSON por stdin/stdout
 ```
 

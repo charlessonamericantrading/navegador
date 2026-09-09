@@ -119,6 +119,22 @@ impl JsRuntime {
         Ok(())
     }
 
+    /// Registra las utilidades de plataforma que no son DOM ni red: `console`,
+    /// `URL`, `URLSearchParams`, `performance`, `atob`/`btoa` y
+    /// `TextEncoder`/`TextDecoder` (Fase 42, ver `platform.rs`).
+    ///
+    /// Mismo criterio de separacion que `register_fetch`/`register_window`:
+    /// sin llamar a esto no existen, que es la respuesta honesta en un
+    /// `Context` que nadie preparo para una pagina.
+    ///
+    /// Conviene llamarlo DESPUES de `register_window`: `console` y
+    /// `performance` se cuelgan tambien de `window` si existe, porque en este
+    /// motor `window` no es el objeto global (ver la cabecera de `window.rs`)
+    /// y registrar un global no los hace aparecer en `window.*`.
+    pub fn register_platform(&mut self) -> Result<(), JsError> {
+        crate::platform::register_platform(&mut self.context).map_err(|e| JsError::Execution(e.to_string()))
+    }
+
     /// Saca (y VACIA) las URLs que `window.open(...)` haya pedido abrir
     /// desde la ultima vez (Fase 6.4). Vaciar es parte del contrato: si no,
     /// cada clic reabriria tambien las pestañas pedidas por los clics
