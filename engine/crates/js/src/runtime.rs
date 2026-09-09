@@ -29,22 +29,136 @@ pub struct JsRuntime {
     /// Igual que `pending_window_opens` pero para `history.pushState`/
     /// `history.replaceState` (Fase 7) - ver `crate::history`.
     pending_history_ops: Option<crate::history::PendingHistoryOps>,
+    pending_navigations: Option<crate::location::PendingNavigations>,
+    mutation_observers: Option<crate::mutation_observer::ObserverRegistry>,
     /// `Some` una vez que `register_timers` haya corrido (Fase 14) - la
     /// cola de `setTimeout`/`setInterval` pendientes. `None` en un runtime
     /// sin temporizadores registrados, donde `setTimeout` ni siquiera
     /// existe como global.
     timers: Option<crate::timers::TimerQueue>,
+    /// `Some` cuando el runtime se construyo con `with_modules` (Fase 43) -
+    /// el cargador que sirve los `import` de un `<script type="module">`
+    /// desde lo que `core::server` ya descargo. `None` en un runtime clasico,
+    /// donde un `<script type="module">` no puede ejecutarse (y se dice, no
+    /// se ejecuta como script normal fingiendo que da igual).
+    module_loader: Option<std::rc::Rc<crate::modules::PageModuleLoader>>,
+}
+
+impl Default for JsRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JsRuntime {
     pub fn new() -> Self {
         let mut context = Context::default();
         let _ = AsyncEventLoop::register_microtasks(&mut context);
-        Self { context, document_bindings: None, pending_window_opens: None, pending_history_ops: None, timers: None }
+        Self { context, document_bindings: None, pending_window_opens: None, pending_history_ops: None, pending_navigations: None, mutation_observers: None, timers: None, module_loader: None }
+    }
+
+    /// Igual que `new`, pero con soporte de modulos ES (Fase 43).
+    ///
+    /// `page_url` es la base contra la que se resuelven los especificadores de
+    /// los `import`. Se pasa aqui y no en `eval_module` porque el cargador se
+    /// instala al CONSTRUIR el `Context` de Boa: despues ya no se puede
+    /// cambiar.
+    ///
+    /// Que sea un constructor aparte y no un flag es deliberado: sin modulos,
+    /// `Context::default()` sigue siendo exactamente lo que era, asi que
+    /// ningun camino existente cambia de comportamiento por esta fase.
+    pub fn with_modules(page_url: &str) -> Self {
+        let loader = std::rc::Rc::new(crate::modules::PageModuleLoader::new(page_url));
+        let mut context = match Context::builder().module_loader(loader.clone()).build() {
+            Ok(c) => c,
+            Err(e) => {
+                // Un `Context` que no se puede construir con cargador de
+                // modulos no debe dejar la pagina sin JavaScript: se sigue con
+                // uno normal, donde los `<script>` clasicos funcionan igual y
+                // solo los modulos fallaran, con su motivo.
+                tracing::warn!("[js] no se pudo construir el contexto con modulos: {e}");
+                return Self::new();
+            }
+        };
+        let _ = AsyncEventLoop::register_microtasks(&mut context);
+        Self { context, document_bindings: None, pending_window_opens: None, pending_history_ops: None, pending_navigations: None, mutation_observers: None, timers: None, module_loader: Some(loader) }
+    }
+
+    /// Deja disponible el codigo de un modulo para que un `import` lo
+    /// encuentre. No-op si el runtime se construyo sin soporte de modulos.
+    pub fn add_module_source(&self, url: &str, codigo: &str) {
+        if let Some(loader) = &self.module_loader {
+            loader.insertar(url, codigo);
+        }
+    }
+
+    /// Evalua `codigo` como modulo ES (Fase 43).
+    ///
+    /// Un modulo no "devuelve" un valor como un script clasico: su efecto son
+    /// sus exportaciones y lo que haga sobre el DOM. Por eso el `Ok` lleva una
+    /// cadena vacia y no el resultado de la ultima expresion.
+    pub fn eval_module(&mut self, codigo: &str, url: &str) -> Result<String, JsError> {
+        let Some(loader) = self.module_loader.clone() else {
+            return Err(JsError::Execution(
+                "este runtime se construyo sin soporte de modulos: un \
+                 <script type=\"module\"> no puede ejecutarse aqui"
+                    .to_string(),
+            ));
+        };
+        let resultado = crate::modules::evaluar_modulo(codigo, url, &loader, &mut self.context);
+        // Mismo criterio que `eval`: se drenan los microtasks tanto si fue
+        // bien como si no, porque lo encolado antes de un error debe seguir
+        // corriendo.
+        self.drain_jobs();
+        match resultado {
+            crate::modules::ResultadoModulo::Ok => Ok(String::new()),
+            crate::modules::ResultadoModulo::Error(e) => Err(JsError::Execution(e)),
+        }
+    }
+
+    /// Registra las propiedades de `window` que describen el entorno
+    /// (`innerWidth`, `matchMedia`, `scrollY`...) - Fase 45.
+    ///
+    /// Aparte de `register_window` y DESPUES de `bind_dom` a proposito:
+    /// necesitan el buzon de layout, que nace en `bind_dom`. Sin el, un
+    /// `innerWidth` devolveria siempre cero, y una pagina que reparte espacio
+    /// con `innerWidth` produciria un diseno de ancho cero en vez de fallar de
+    /// forma visible.
+    ///
+    /// No-op honesto si no hay buzon: las propiedades no existen, que es la
+    /// respuesta correcta donde no hay ventana ni layout que describir.
+    pub fn register_window_environment(&mut self) -> Result<(), JsError> {
+        let Some(snapshot) = self.layout_snapshot() else { return Ok(()) };
+        crate::window::register_window_environment(&mut self.context, snapshot)
+            .map_err(|e| JsError::Execution(e.to_string()))
+    }
+
+    /// Si este runtime puede ejecutar modulos ES.
+    pub fn supports_modules(&self) -> bool {
+        self.module_loader.is_some()
+    }
+
+    /// Resuelve el `src` crudo de un `<script>` contra la URL de la pagina.
+    ///
+    /// Hace falta para que el modulo RAIZ se identifique con la misma URL
+    /// absoluta con la que lo veria un `import`: si no, el mismo fichero
+    /// cargado como `<script src>` y ademas importado por otro modulo se
+    /// parsearia y EVALUARIA dos veces, duplicando su estado.
+    pub fn resolve_module_url(&self, src: &str) -> String {
+        match &self.module_loader {
+            Some(loader) => loader.absoluta(src),
+            None => src.to_string(),
+        }
     }
 
     pub fn bind_dom(&mut self, dom_root: Arc<RwLock<Node>>) -> Result<(), JsError> {
         let registry = DomBindings::register(&mut self.context, dom_root).map_err(|e| JsError::Execution(e.to_string()))?;
+        // `MutationObserver` necesita el mismo `DocumentBindings` que acaba
+        // de nacer: es ahi donde viven las mutaciones que los elementos
+        // apuntan al cambiar.
+        let observers = crate::mutation_observer::register_mutation_observer(&mut self.context, registry.clone())
+            .map_err(|e| JsError::Execution(e.to_string()))?;
+        self.mutation_observers = Some(observers);
         self.document_bindings = Some(registry);
         Ok(())
     }
@@ -105,6 +219,22 @@ impl JsRuntime {
         Ok(())
     }
 
+    /// Registra las utilidades de plataforma que no son DOM ni red: `console`,
+    /// `URL`, `URLSearchParams`, `performance`, `atob`/`btoa` y
+    /// `TextEncoder`/`TextDecoder` (Fase 42, ver `platform.rs`).
+    ///
+    /// Mismo criterio de separacion que `register_fetch`/`register_window`:
+    /// sin llamar a esto no existen, que es la respuesta honesta en un
+    /// `Context` que nadie preparo para una pagina.
+    ///
+    /// Conviene llamarlo DESPUES de `register_window`: `console` y
+    /// `performance` se cuelgan tambien de `window` si existe, porque en este
+    /// motor `window` no es el objeto global (ver la cabecera de `window.rs`)
+    /// y registrar un global no los hace aparecer en `window.*`.
+    pub fn register_platform(&mut self) -> Result<(), JsError> {
+        crate::platform::register_platform(&mut self.context).map_err(|e| JsError::Execution(e.to_string()))
+    }
+
     /// Saca (y VACIA) las URLs que `window.open(...)` haya pedido abrir
     /// desde la ultima vez (Fase 6.4). Vaciar es parte del contrato: si no,
     /// cada clic reabriria tambien las pestañas pedidas por los clics
@@ -137,11 +267,14 @@ impl JsRuntime {
     /// se invocaron - cero si no hay ninguno vencido o si
     /// `register_timers` nunca corrio.
     ///
-    /// Este motor no tiene un reloj de fondo propio: es esta llamada la
-    /// que hace avanzar el tiempo de los temporizadores, y quien la hace
-    /// es `core::server` tras cada operacion real (cargar, clic, escribir,
-    /// tecla). Ver el doc-comment de `crate::timers` para la consecuencia
-    /// exacta de esa simplificacion.
+    /// Este `JsRuntime` no tiene un reloj de fondo propio - la fuente de
+    /// tiempo real vive en `core::server`, no aqui: ademas de tras cada
+    /// operacion real (cargar, clic, escribir, tecla), `run_stdio` llama a
+    /// esto cada 250ms via `EngineServer::tick_active_tab_timers`
+    /// (`tokio::select!` contra el temporizador, sin bloquear la lectura
+    /// de comandos NDJSON) - asi que un `setInterval` SI dispara por si
+    /// solo en el producto real, sin depender de que llegue otro comando
+    /// mientras tanto.
     ///
     /// El valor devuelto le sirve a quien llama para saber si merece la
     /// pena rehacer el layout: si no disparo ningun callback, nada pudo
@@ -168,6 +301,25 @@ impl JsRuntime {
     /// (Fase 7), y engancha `window.addEventListener` al elemento raiz si
     /// hay `window` y DOM ya registrados - por eso conviene llamarlo
     /// DESPUES de `bind_dom` y `register_window` (ver `crate::history`).
+    /// Registra `location` (y `window.location`) con la URL real de la
+    /// pagina; `None` en un documento sin origen, que reporta
+    /// `about:blank`. DESPUES de `register_window`, para poder colgar
+    /// `window.location` del objeto `window` ya existente.
+    pub fn register_location(&mut self, page_url: Option<String>) -> Result<(), JsError> {
+        let pending = crate::location::register_location(&mut self.context, page_url).map_err(|e| JsError::Execution(e.to_string()))?;
+        self.pending_navigations = Some(pending);
+        Ok(())
+    }
+
+    /// Saca (y VACIA) las navegaciones que un script haya pedido
+    /// (`location.href = ...`, `assign`, `replace`, `reload`) - mismo
+    /// contrato que `take_pending_history_ops`: el runtime solo las apunta,
+    /// quien navega de verdad es `core::server`.
+    pub fn take_pending_navigations(&mut self) -> Vec<crate::location::PendingNavigation> {
+        let Some(pending) = &self.pending_navigations else { return Vec::new() };
+        std::mem::take(&mut *pending.lock().unwrap())
+    }
+
     pub fn register_history(&mut self) -> Result<(), JsError> {
         let pending = crate::history::register_history(&mut self.context).map_err(|e| JsError::Execution(e.to_string()))?;
         self.pending_history_ops = Some(pending);
@@ -195,16 +347,35 @@ impl JsRuntime {
         self.document_bindings.as_ref().map(DocumentBindings::layout_snapshot)
     }
 
+    /// El registro de `scrollTop`/`scrollLeft` del documento (ver su
+    /// doc-comment en `DocumentBindings`). Lo necesita `core::pipeline`
+    /// tras cada layout, para desplazar de verdad el contenido de cada
+    /// contenedor con scroll.
+    pub fn scroll_offsets(&self) -> Option<crate::dom_bindings::ScrollOffsets> {
+        self.document_bindings.as_ref().map(|b| b.scroll_offsets().clone())
+    }
+
     /// Dispara `event_type` sobre `node` de verdad, invocando los
     /// listeners reales registrados via `addEventListener` - SIN pasar
     /// por texto JS (`eval`). Pensada para invocarse desde codigo Rust
     /// cuando el motor tiene una fuente de eventos real que traducir a un
-    /// nodo del DOM: el clic del raton ya esta cableado asi de punta a
-    /// punta (`gfx::window` reporta `MouseInput`/`CursorMoved`,
+    /// nodo del DOM. Para el arnes de pruebas standalone (`core::main`,
+    /// NO el camino real del producto): solo el clic esta cableado asi de
+    /// punta a punta (`gfx::window` reporta `MouseInput`/`CursorMoved`,
     /// `core::main` hace hit-test sobre el `LayoutBox` real y llama aqui,
-    /// ver ARCHITECTURE.md "Clic real del SO cableado de punta a punta") -
-    /// scroll/teclado todavia no tienen fuente equivalente. No-op honesto
-    /// (no un panic, `Ok(false)`) si `bind_dom` no se ha llamado todavia.
+    /// ver ARCHITECTURE.md "Clic real del SO cableado de punta a punta").
+    ///
+    /// Para el producto real (`engine_server.exe` via NDJSON,
+    /// `core::server`): clic, teclado (`PressKey` -> `dispatch_keyboard_event`,
+    /// con `.key` real puesto) Y scroll (`Scroll` -> este metodo con
+    /// `event_type: "scroll"` sobre `document`) SI estan cableados de
+    /// punta a punta. Lo que sigue faltando es que `window` sea un
+    /// `EventTarget` completo (`window.addEventListener('scroll'|'resize',
+    /// ...)` no existe todavia, ver `crate::window`) - `document.
+    /// addEventListener(...)` si funciona para esos mismos eventos.
+    ///
+    /// No-op honesto (no un panic, `Ok(false)`) si `bind_dom` no se ha
+    /// llamado todavia.
     ///
     /// Devuelve si algun listener llamo `event.preventDefault()` (Fase
     /// 4.2) - ver el doc-comment de `DomBindings::dispatch_event`.
@@ -252,6 +423,37 @@ impl JsRuntime {
     /// y el `eval` que lo envuelve ya se encarga al terminar.
     fn drain_jobs(&mut self) {
         self.context.run_jobs();
+        self.deliver_mutations();
+    }
+
+    /// Entrega a los `MutationObserver` lo que haya cambiado en el DOM.
+    ///
+    /// Va en `drain_jobs` y no en cada mutacion a proposito: el spec entrega
+    /// al terminar la tarea, con todas las mutaciones AGRUPADAS, que es lo
+    /// que hace que un bucle de cien `appendChild` produzca una sola llamada
+    /// al callback y no cien. `drain_jobs` es justo ese punto: ya se llama
+    /// tras cada evaluacion y tras cada evento despachado.
+    ///
+    /// Se repite mientras haya mutaciones nuevas porque un callback puede
+    /// mutar el DOM a su vez; el tope corta un observador que se realimente
+    /// a si mismo sin fin.
+    fn deliver_mutations(&mut self) {
+        let (Some(observers), Some(bindings)) = (self.mutation_observers.clone(), self.document_bindings.clone()) else {
+            return;
+        };
+        for _ in 0..8 {
+            let entregados = crate::mutation_observer::deliver_mutations(
+                &observers,
+                bindings.mutations(),
+                &bindings,
+                &mut self.context,
+            );
+            if entregados == 0 {
+                return;
+            }
+            self.context.run_jobs();
+        }
+        tracing::warn!("[js] un MutationObserver sigue generando mutaciones tras 8 rondas, se corta");
     }
 
     #[cfg(test)]
@@ -274,7 +476,11 @@ impl JsRuntime {
         // en un navegador real. Se drena tanto si el script tuvo éxito como
         // si no: lo que ya se encolo antes de un error a mitad de script
         // deberia seguir corriendo, igual que el spec.
-        self.context.run_jobs();
+        //
+        // `drain_jobs` y no `run_jobs` a secas: ese es ademas el punto donde
+        // se entregan las mutaciones a los `MutationObserver`, y "termina la
+        // tarea actual" es exactamente cuando el spec dice que se entregan.
+        self.drain_jobs();
         result
     }
 }

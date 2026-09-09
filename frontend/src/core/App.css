@@ -888,3 +888,65 @@ input:focus {
   border-color: transparent;
 }
 
+
+/* ---------------------------------------------------------------------------
+   Aviso de página dependiente de JavaScript (Fase 39)
+
+   El motor descarga la página sin error, pero el servidor la manda vacía y su
+   contenido lo construye JavaScript en el cliente. Antes esto se veía como un
+   área en blanco sin un solo mensaje, indistinguible de una app rota. El aviso
+   se superpone a la captura (que es legítimamente blanca) en vez de sustituirla:
+   así se sigue viendo lo poco que el motor SÍ haya pintado.
+   --------------------------------------------------------------------------- */
+.js-required-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  /* No captura el ratón: si el motor pintó algo real debajo, el usuario debe
+     poder seguir haciendo clic en ello. Solo la tarjeta es opaca. */
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(248, 250, 252, 0) 0%, rgba(248, 250, 252, 0.75) 45%);
+}
+
+.js-required-card {
+  pointer-events: auto;
+  max-width: 460px;
+  text-align: center;
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: 14px;
+  padding: 28px 30px;
+  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.12);
+}
+
+.js-required-icon {
+  font-size: 2rem;
+  display: block;
+  margin-bottom: 10px;
+  opacity: 0.85;
+}
+
+.js-required-card h3 {
+  margin: 0 0 10px;
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.js-required-card p {
+  margin: 0;
+  font-size: 0.86rem;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+.js-required-hint {
+  margin-top: 12px !important;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-light);
+  color: var(--text-dim) !important;
+  font-size: 0.8rem !important;
+}

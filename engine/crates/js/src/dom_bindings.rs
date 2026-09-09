@@ -265,6 +265,53 @@ pub struct DocumentBindings {
     /// documento, compartido por todas las consultas.
     #[unsafe_ignore_trace]
     layout: LayoutSnapshot,
+    /// Mutaciones del DOM ocurridas y todavia sin entregar a los
+    /// `MutationObserver` (ver `crate::mutation_observer`). Vive aqui por lo
+    /// mismo que los listeners: es UNA por documento y ya se propaga sola a
+    /// todos los objetos de elemento, que son quienes mutan.
+    #[unsafe_ignore_trace]
+    mutations: crate::mutation_observer::MutationLog,
+    /// Cache de identidad de `element_to_js_object`: puntero de nodo ->
+    /// objeto JS ya construido para el. Ver su doc-comment para el porque.
+    #[unsafe_ignore_trace]
+    element_objects: Arc<Mutex<HashMap<usize, JsObject>>>,
+    /// Los prototipos de la jerarquia del DOM (Fase 44, ver
+    /// `crate::dom_classes`). Vive aqui por lo mismo que los listeners: son
+    /// UNOS por documento y `build_element_object` los necesita para colgar
+    /// cada elemento del suyo. `None` si el registro fallo - en ese caso los
+    /// elementos se construyen sin cadena, exactamente como antes de la Fase
+    /// 44, en vez de dejar la pagina sin DOM.
+    #[unsafe_ignore_trace]
+    prototypes: Option<crate::dom_classes::DomPrototypes>,
+    /// `scrollTop`/`scrollLeft` de cada elemento con `overflow: auto/
+    /// scroll` que los haya recibido - puntero de nodo -> (scrollLeft,
+    /// scrollTop) en pixeles. `core::pipeline` lo lee tras cada layout
+    /// (`engine_layout::apply_scroll_offsets`) para desplazar de verdad el
+    /// contenido del contenedor - ver el doc-comment de esa funcion para
+    /// el porque scroll de verdad no vive aqui, en `engine-js`, sino en el
+    /// arbol de layout.
+    #[unsafe_ignore_trace]
+    scroll_offsets: ScrollOffsets,
+}
+
+/// Ver `DocumentBindings::scroll_offsets`.
+pub type ScrollOffsets = Arc<Mutex<HashMap<usize, (f32, f32)>>>;
+
+impl DocumentBindings {
+    /// El registro de mutaciones de este documento.
+    pub fn mutations(&self) -> &crate::mutation_observer::MutationLog {
+        &self.mutations
+    }
+
+    /// Apunta una mutacion. Se llama desde cada funcion que toca el DOM.
+    fn record_mutation(&self, mutation: crate::mutation_observer::PendingMutation) {
+        self.mutations.lock().unwrap().push(mutation);
+    }
+
+    /// El registro de scroll de este documento - ver `scroll_offsets`.
+    pub fn scroll_offsets(&self) -> &ScrollOffsets {
+        &self.scroll_offsets
+    }
 }
 
 /// Envoltorio para poder capturar `Arc<RwLock<Node>>` en un closure nativo
@@ -348,14 +395,26 @@ impl DomBindings {
 
         context.register_global_builtin_callable(js_string!("printEngineLog"), 1, print_fn)?;
 
-        let bindings = DocumentBindings { listeners: Arc::new(Mutex::new(HashMap::new())), layout: cssom::new_layout_snapshot() };
+        // La jerarquia de clases se registra ANTES de construir ningun objeto de
+        // elemento: `build_element_object` la consulta para colgar cada uno de su
+        // prototipo. Si fallara, se sigue sin ella (elementos sin cadena, como
+        // antes de la Fase 44) en vez de dejar la pagina entera sin DOM.
+        let prototypes = match crate::dom_classes::register_dom_classes(context) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!("[js] no se pudo registrar la jerarquia del DOM: {e}");
+                None
+            }
+        };
+        let bindings = DocumentBindings { listeners: Arc::new(Mutex::new(HashMap::new())), layout: cssom::new_layout_snapshot(), mutations: Arc::new(Mutex::new(Vec::new())), element_objects: Arc::new(Mutex::new(HashMap::new())), scroll_offsets: Arc::new(Mutex::new(HashMap::new())), prototypes };
         // `getComputedStyle` es un GLOBAL (no un metodo de elemento), asi
         // que se registra aqui, donde nace el snapshot que consulta. Se le
         // pasa `node_from_js_value` porque el tipo que lleva los datos
         // nativos del elemento (`ElementCapture`) es privado de este
         // archivo - ver `cssom::register_computed_style`.
         cssom::register_computed_style(context, bindings.layout.clone(), node_from_js_value)?;
-        let capture = DomRootCapture(dom_root, bindings.clone());
+        let capture = DomRootCapture(dom_root.clone(), bindings.clone());
+        let root_capture = capture.clone();
 
         let get_element_by_id = NativeFunction::from_copy_closure_with_captures(
             |_this, args, capture: &DomRootCapture, context| {
@@ -516,14 +575,206 @@ impl DomBindings {
             .constructor(false)
             .build();
 
+        // `document.head` (Fase 39) - espejo exacto de `document.body`.
+        // Falta banal en apariencia y muy cara en la practica: casi todo
+        // bundle de framework hace `document.head.appendChild(style)` al
+        // arrancar para inyectar sus estilos, y sin `head` eso lanzaba
+        // TypeError y mataba el script ENTERO en su primera linea util.
+        let head_getter = NativeFunction::from_copy_closure_with_captures(
+            |_this, _args, capture: &DomRootCapture, context| {
+                Ok(match Node::find_all_by_tag(&capture.0, "head").into_iter().next() {
+                    Some(node) => element_to_js_object(&node, &capture.1, context).into(),
+                    None => JsValue::null(),
+                })
+            },
+            capture.clone(),
+        );
+        let head_getter_fn = FunctionObjectBuilder::new(context.realm(), head_getter)
+            .name(js_string!("get head"))
+            .length(0)
+            .constructor(false)
+            .build();
+
+        // `document.createTextNode(texto)` (Fase 39) - el companero de
+        // `createElement` que faltaba. Devuelve un nodo de TEXTO
+        // desconectado, listo para `appendChild`. Se envuelve con el mismo
+        // `element_to_js_object` que un elemento: sus metodos operan sobre
+        // el `Node` real, y para un nodo de texto `tagName` sale vacio -
+        // que es lo honesto, un nodo de texto no tiene etiqueta.
+        let create_text_node = NativeFunction::from_copy_closure_with_captures(
+            |_this, args: &[JsValue], capture: &DomRootCapture, context| {
+                let text = match args.first() {
+                    Some(value) => value.to_string(context)?.to_std_string_escaped(),
+                    None => String::new(),
+                };
+                let node = Node::new(NodeType::Text(text));
+                Ok(element_to_js_object(&node, &capture.1, context).into())
+            },
+            capture.clone(),
+        );
+        let create_text_node_fn = FunctionObjectBuilder::new(context.realm(), create_text_node)
+            .name(js_string!("createTextNode"))
+            .length(1)
+            .constructor(false)
+            .build();
+
+        // `document.addEventListener` / `removeEventListener` /
+        // `dispatchEvent`.
+        //
+        // No son una copia de la maquinaria de elementos: son LA MISMA. El
+        // registro de listeners se indexa por puntero de nodo DOM, asi que
+        // basta construir el objeto de elemento del nodo RAIZ y quedarse con
+        // sus tres funciones - `document` pasa a ser un objetivo de eventos
+        // mas, con el mismo registro y el mismo despachador.
+        //
+        // Importa tenerlo: `document.addEventListener('DOMContentLoaded',
+        // ...)` es como arranca casi cualquier pagina real. Sin el, ese
+        // registro no existia y el script de arranque entero se perdia.
+        let document_target = element_to_js_object(&dom_root, &bindings, context);
+        let document_add_listener = document_target.get(js_string!("addEventListener"), context)?;
+        let document_remove_listener = document_target.get(js_string!("removeEventListener"), context)?;
+        let document_dispatch = document_target.get(js_string!("dispatchEvent"), context)?;
+
+        // ---------------------------------------------------------------
+        // Propiedades de `document` anadidas en la Fase 45 (tarea C6)
+        // ---------------------------------------------------------------
+
+        // `document.getElementsByClassName(clase)`. Devuelve un Array normal,
+        // no una `HTMLCollection` VIVA: aqui es una foto del momento de la
+        // llamada. La diferencia se nota si alguien guarda la coleccion y
+        // espera que se actualice sola al mutar el DOM; declarado en
+        // `huecos_sin_resolver.md`. Recorrer y filtrar por `class` es lo que
+        // hace el 99% del codigo que la usa.
+        let get_elements_by_class = NativeFunction::from_copy_closure_with_captures(
+            |_this, args: &[JsValue], capture: &DomRootCapture, context| {
+                let clase = match args.first() {
+                    Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                    None => return Ok(JsArray::new(context).into()),
+                };
+                let mut encontrados = Vec::new();
+                recolectar_por_clase(&capture.0, &clase, &mut encontrados);
+                let objetos: Vec<JsValue> = encontrados
+                    .iter()
+                    .map(|n| element_to_js_object(n, &capture.1, context).into())
+                    .collect();
+                Ok(JsArray::from_iter(objetos, context).into())
+            },
+            root_capture.clone(),
+        );
+
+        // `document.createDocumentFragment()`. Un fragmento es un contenedor
+        // sin representacion propia: se le anaden hijos y al insertarlo se
+        // insertan ellos. Aqui se modela como un nodo `Document` suelto - el
+        // unico tipo de nodo del motor que puede tener hijos sin ser un
+        // elemento, asi que no aparece como etiqueta al serializar.
+        let create_fragment = NativeFunction::from_copy_closure_with_captures(
+            |_this, _args: &[JsValue], capture: &DomRootCapture, context| {
+                let fragmento = Node::new(NodeType::Document);
+                Ok(element_to_js_object(&fragmento, &capture.1, context).into())
+            },
+            root_capture.clone(),
+        );
+
+        // `document.createComment(texto)`.
+        let create_comment = NativeFunction::from_copy_closure_with_captures(
+            |_this, args: &[JsValue], capture: &DomRootCapture, context| {
+                let texto = match args.first() {
+                    Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                    None => String::new(),
+                };
+                let nodo = Node::new(NodeType::Comment(texto));
+                Ok(element_to_js_object(&nodo, &capture.1, context).into())
+            },
+            root_capture.clone(),
+        );
+
+        // `document.readyState`.
+        //
+        // Devuelve `"interactive"` y no `"loading"`, y la diferencia importa
+        // mas de lo que parece. El patron con el que arranca media web es:
+        //
+        //     if (document.readyState === 'loading')
+        //         document.addEventListener('DOMContentLoaded', init);
+        //     else
+        //         init();
+        //
+        // En este motor los scripts corren cuando el documento YA esta
+        // parseado entero (ver la cabecera de `core::scripting`), asi que
+        // `"loading"` seria falso: el codigo esperaria un `DOMContentLoaded`
+        // que ya paso o esta a punto de pasar. `"interactive"` describe el
+        // estado real y hace que ese arranque llame a `init()` directamente,
+        // que es lo correcto aqui.
+        let ready_state_getter = NativeFunction::from_fn_ptr(|_this, _args, _context| {
+            Ok(JsValue::from(js_string!("interactive")))
+        });
+        let ready_state_getter_fn = FunctionObjectBuilder::new(context.realm(), ready_state_getter)
+            .name(js_string!("get readyState"))
+            .length(0)
+            .constructor(false)
+            .build();
+
+        // `document.activeElement`. Devuelve `body` mientras no haya foco
+        // real: es lo que devuelve un navegador cuando nada esta enfocado, no
+        // un relleno. `null` seria peor - hay codigo que hace
+        // `document.activeElement.blur()` sin comprobar.
+        let active_element_getter = NativeFunction::from_copy_closure_with_captures(
+            |_this, _args: &[JsValue], capture: &DomRootCapture, context| {
+                match Node::find_all_by_tag(&capture.0, "body").into_iter().next() {
+                    Some(body) => Ok(element_to_js_object(&body, &capture.1, context).into()),
+                    None => Ok(JsValue::null()),
+                }
+            },
+            root_capture.clone(),
+        );
+        let active_element_getter_fn =
+            FunctionObjectBuilder::new(context.realm(), active_element_getter)
+                .name(js_string!("get activeElement"))
+                .length(0)
+                .constructor(false)
+                .build();
+
+        // `document.currentScript`. Siempre `null`, que es el valor CORRECTO
+        // dentro de un modulo ES segun el spec, y el valor honesto aqui para
+        // un script clasico: los scripts se ejecutan despues de parsear el
+        // documento entero, asi que no hay un "script actualmente en curso"
+        // dentro del parseo al que apuntar. Devolver un elemento cualquiera
+        // seria peor que `null`, porque codigo real lo usa para leer los
+        // `data-*` de su PROPIA etiqueta.
+        let current_script_getter =
+            NativeFunction::from_fn_ptr(|_this, _args, _context| Ok(JsValue::null()));
+        let current_script_getter_fn =
+            FunctionObjectBuilder::new(context.realm(), current_script_getter)
+                .name(js_string!("get currentScript"))
+                .length(0)
+                .constructor(false)
+                .build();
+
+        // `document.hasFocus()`. `true`: si el motor esta ejecutando la
+        // pagina, su ventana es la que hay.
+        let has_focus =
+            NativeFunction::from_fn_ptr(|_this, _args, _context| Ok(JsValue::from(true)));
+
         let document = ObjectInitializer::new(context)
+            .property(js_string!("addEventListener"), document_add_listener, Attribute::all())
+            .property(js_string!("removeEventListener"), document_remove_listener, Attribute::all())
+            .property(js_string!("dispatchEvent"), document_dispatch, Attribute::all())
             .function(get_element_by_id, js_string!("getElementById"), 1)
             .function(query_selector, js_string!("querySelector"), 1)
             .function(query_selector_all, js_string!("querySelectorAll"), 1)
             .function(create_element, js_string!("createElement"), 1)
             .accessor(js_string!("documentElement"), Some(document_element_getter_fn), None, Attribute::all())
             .accessor(js_string!("body"), Some(body_getter_fn), None, Attribute::all())
+            .accessor(js_string!("head"), Some(head_getter_fn), None, Attribute::all())
+            .property(js_string!("createTextNode"), create_text_node_fn, Attribute::all())
             .accessor(js_string!("title"), Some(title_getter_fn), Some(title_setter_fn), Attribute::all())
+            // Fase 45 (tarea C6)
+            .function(get_elements_by_class, js_string!("getElementsByClassName"), 1)
+            .function(create_fragment, js_string!("createDocumentFragment"), 0)
+            .function(create_comment, js_string!("createComment"), 1)
+            .function(has_focus, js_string!("hasFocus"), 0)
+            .accessor(js_string!("readyState"), Some(ready_state_getter_fn), None, Attribute::all())
+            .accessor(js_string!("activeElement"), Some(active_element_getter_fn), None, Attribute::all())
+            .accessor(js_string!("currentScript"), Some(current_script_getter_fn), None, Attribute::all())
             .build();
 
         context.register_global_property(js_string!("document"), document, Attribute::all())?;
@@ -557,6 +808,9 @@ impl DomBindings {
             Ok(build_event_object(&event_type, bubbles, cancelable, context))
         });
         context.register_global_callable(js_string!("Event"), 1, event_constructor)?;
+
+        // Subclases de Event (Fase 45) - ver `register_event_subclasses`.
+        register_event_subclasses(context)?;
 
         Ok(bindings)
     }
@@ -701,7 +955,7 @@ fn dispatch_event_to_listeners(
         .map(|listeners| {
             listeners
                 .iter()
-                .filter(|(t, _, c)| t == event_type && phase_capture.map_or(true, |want| *c == want))
+                .filter(|(t, _, c)| t == event_type && phase_capture.is_none_or(|want| *c == want))
                 .map(|(_, l, _)| l.clone())
                 .collect()
         })
@@ -709,7 +963,7 @@ fn dispatch_event_to_listeners(
 
     for listener in matching {
         if let Some(func) = JsFunction::from_object(listener) {
-            func.call(this_value, &[event_value.clone()], context)?;
+            func.call(this_value, std::slice::from_ref(event_value), context)?;
         }
     }
     Ok(())
@@ -827,6 +1081,37 @@ fn event_listener_options_capture(arg: Option<&JsValue>, context: &mut Context) 
     }
 }
 
+/// Devuelve el objeto JS de `node`, construyendolo la PRIMERA vez y
+/// reutilizando el MISMO objeto en cualquier consulta posterior sobre el
+/// mismo nodo (`registry.element_objects`, indexado por puntero de nodo).
+///
+/// Antes cada llamada fabricaba un `JsObject` nuevo, asi que la igualdad de
+/// Boa (por identidad de puntero, no de contenido) nunca coincidia entre
+/// dos lecturas del mismo elemento: `document.body === document.body` daba
+/// `false`, y `mutation.target === miElemento` (el patron con el que
+/// practicamente todo codigo real correlaciona un `MutationRecord` con un
+/// elemento que ya tenia a mano) daba `false` SIEMPRE, por bien que
+/// funcionara el resto de `MutationObserver`.
+///
+/// El cache mantiene vivo el nodo mientras exista una entrada suya (el
+/// `JsObject` guarda su propio `Arc<RwLock<Node>>` en cada closure) - un
+/// nodo desconectado del DOM pero todavia referenciado desde JS (por
+/// ejemplo, en `removedNodes` de un `MutationRecord`) sigue siendo un
+/// objeto valido y estable, igual que en un navegador real. Nunca se saca
+/// nada del cache: mismo criterio ya declarado para `ListenerMap` (una
+/// entrada por nodo, por la vida del documento) - una pagina real tiene
+/// miles de nodos, no millones, y el cache muere entero con el
+/// `JsRuntime` al navegar.
+pub(crate) fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, context: &mut Context) -> JsObject {
+    let key = Arc::as_ptr(node) as usize;
+    if let Some(existing) = registry.element_objects.lock().unwrap().get(&key) {
+        return existing.clone();
+    }
+    let object = build_element_object(node, registry, context);
+    registry.element_objects.lock().unwrap().insert(key, object.clone());
+    object
+}
+
 /// Construye el objeto JS de un elemento - `tagName` es foto,
 /// `getAttribute`/`setAttribute`/`textContent`/`appendChild` son vivos; ver
 /// el aviso al principio del archivo para la distincion completa. `registry`
@@ -834,7 +1119,7 @@ fn event_listener_options_capture(arg: Option<&JsValue>, context: &mut Context) 
 /// se pasa explicito en vez de crearse aqui para que `addEventListener`
 /// registrado desde una consulta y `dispatchEvent` desde otra sigan viendo
 /// el mismo registro.
-fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, context: &mut Context) -> JsObject {
+fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, context: &mut Context) -> JsObject {
     let tag_name = {
         let n = node.read().unwrap();
         match &n.node_type {
@@ -872,9 +1157,26 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
                 None => "undefined".to_string(),
             };
             let mut n = capture.0.write().unwrap();
-            if let NodeType::Element { attributes, .. } = &mut n.node_type {
-                attributes.insert(name, value);
-            }
+            let old_value = if let NodeType::Element { attributes, .. } = &mut n.node_type {
+                // Se captura ANTES de sobrescribir - es el valor "viejo"
+                // que un `MutationObserver` con `attributeOldValue: true`
+                // espera ver en su registro.
+                attributes.insert(name.clone(), value)
+            } else {
+                None
+            };
+            // El lock se suelta ANTES de apuntar la mutacion: el registro
+            // tiene su propio candado y anidarlos es la receta de un
+            // interbloqueo.
+            drop(n);
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "attributes",
+                target: capture.0.clone(),
+                attribute_name: Some(name),
+                old_value,
+                added: Vec::new(),
+                removed: Vec::new(),
+            });
             Ok(JsValue::undefined())
         },
         capture.clone(),
@@ -903,10 +1205,22 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
             // Reemplaza TODOS los hijos por un unico nodo de texto - la
             // semantica real de `textContent`, no un append.
             let mut n = capture.0.write().unwrap();
-            n.children.clear();
+            let quitados: Vec<_> = std::mem::take(&mut n.children);
             let text_node = Node::new(NodeType::Text(value));
             text_node.write().unwrap().parent = Some(Arc::downgrade(&capture.0));
-            n.children.push(text_node);
+            n.children.push(text_node.clone());
+            drop(n);
+            // `textContent` reemplaza TODO el contenido: para un observador
+            // eso es una mutacion de lista de hijos, con lo que entra y lo
+            // que sale.
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "childList",
+                target: capture.0.clone(),
+                attribute_name: None,
+                old_value: None,
+                added: vec![text_node],
+                removed: quitados,
+            });
             Ok(JsValue::undefined())
         },
         capture.clone(),
@@ -935,7 +1249,15 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
 
             detach_from_parent(&child_node);
             child_node.write().unwrap().parent = Some(Arc::downgrade(&capture.0));
-            capture.0.write().unwrap().children.push(child_node);
+            capture.0.write().unwrap().children.push(child_node.clone());
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "childList",
+                target: capture.0.clone(),
+                attribute_name: None,
+                old_value: None,
+                added: vec![child_node],
+                removed: Vec::new(),
+            });
             Ok(child_value.clone())
         },
         capture.clone(),
@@ -961,6 +1283,14 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
                 return Ok(JsValue::null());
             }
             child_node.write().unwrap().parent = None;
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "childList",
+                target: capture.0.clone(),
+                attribute_name: None,
+                old_value: None,
+                added: Vec::new(),
+                removed: vec![child_node],
+            });
             Ok(child_value.clone())
         },
         capture.clone(),
@@ -1006,10 +1336,22 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
 
             let mut parent = capture.0.write().unwrap();
             match insert_at {
-                Some(index) => parent.children.insert(index, new_node),
-                None => parent.children.push(new_node),
+                Some(index) => parent.children.insert(index, new_node.clone()),
+                None => parent.children.push(new_node.clone()),
             }
             drop(parent);
+            // Faltaba: a diferencia de appendChild/removeChild/setAttribute/
+            // textContent, esta funcion mutaba la lista de hijos sin
+            // apuntarlo - un `MutationObserver` con `childList:true` no veia
+            // NUNCA un insertBefore, aunque si un appendChild identico.
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "childList",
+                target: capture.0.clone(),
+                attribute_name: None,
+                old_value: None,
+                added: vec![new_node],
+                removed: Vec::new(),
+            });
             Ok(new_value.clone())
         },
         capture.clone(),
@@ -1045,10 +1387,19 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
                 drop(parent);
                 return Ok(JsValue::null());
             };
-            parent.children[index] = new_node;
+            parent.children[index] = new_node.clone();
             drop(parent);
 
             old_node.write().unwrap().parent = None;
+            // Mismo motivo que en insertBefore: faltaba apuntar la mutacion.
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "childList",
+                target: capture.0.clone(),
+                attribute_name: None,
+                old_value: None,
+                added: vec![new_node],
+                removed: vec![old_node],
+            });
             Ok(old_value.clone())
         },
         capture.clone(),
@@ -1225,6 +1576,66 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         .constructor(false)
         .build();
 
+    // `scrollTop`/`scrollLeft`: get/set reales, respaldados por el registro
+    // de `DocumentBindings` (una entrada por nodo, no por consulta - leer
+    // desde una consulta y escribir desde otra ven el mismo valor). Escribir
+    // aqui SOLO apunta el numero; el desplazamiento real del contenido
+    // ocurre despues, en `core::pipeline`, cuando el layout siguiente
+    // consulta este mismo registro (`engine_layout::apply_scroll_offsets`) -
+    // por eso el efecto visible de asignar `scrollTop` no es instantaneo
+    // dentro del MISMO script, sino en el proximo layout.
+    fn scroll_accessor(
+        context: &mut Context,
+        capture: &ElementCapture,
+        eje: usize,
+        nombre: &str,
+    ) -> (boa_engine::object::builtins::JsFunction, boa_engine::object::builtins::JsFunction) {
+        let getter = NativeFunction::from_copy_closure_with_captures(
+            move |_this, _args, capture: &ElementCapture, _context| {
+                let key = Arc::as_ptr(&capture.0) as usize;
+                let valor = capture.1.scroll_offsets().lock().unwrap().get(&key).map(|xy| if eje == 0 { xy.0 } else { xy.1 }).unwrap_or(0.0);
+                Ok(JsValue::from(valor))
+            },
+            capture.clone(),
+        );
+        let getter = FunctionObjectBuilder::new(context.realm(), getter)
+            .name(js_string!(format!("get {nombre}")))
+            .length(0)
+            .constructor(false)
+            .build();
+        let setter = NativeFunction::from_copy_closure_with_captures(
+            move |_this, args, capture: &ElementCapture, context| {
+                let Some(value) = args.first() else { return Ok(JsValue::undefined()) };
+                let numero = value.to_number(context)?;
+                if !numero.is_finite() {
+                    return Ok(JsValue::undefined());
+                }
+                // Negativo no tiene sentido (no hay "scroll hacia atras del
+                // principio") - se recorta a cero, igual que un navegador
+                // real.
+                let numero = (numero as f32).max(0.0);
+                let key = Arc::as_ptr(&capture.0) as usize;
+                let mut registro = capture.1.scroll_offsets().lock().unwrap();
+                let entrada = registro.entry(key).or_insert((0.0, 0.0));
+                if eje == 0 {
+                    entrada.0 = numero;
+                } else {
+                    entrada.1 = numero;
+                }
+                Ok(JsValue::undefined())
+            },
+            capture.clone(),
+        );
+        let setter = FunctionObjectBuilder::new(context.realm(), setter)
+            .name(js_string!(format!("set {nombre}")))
+            .length(1)
+            .constructor(false)
+            .build();
+        (getter, setter)
+    }
+    let (scroll_left_get, scroll_left_set) = scroll_accessor(context, &capture, 0, "scrollLeft");
+    let (scroll_top_get, scroll_top_set) = scroll_accessor(context, &capture, 1, "scrollTop");
+
     // addEventListener(tipo, listener): valida que `listener` sea invocable
     // (`JsValue::as_callable`, mismo mecanismo que ya usa `test_harness.rs`
     // para `test(fn, name)`) - si no, no-op honesto, nada que registrar. Lo
@@ -1348,6 +1759,398 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         Ok(JsValue::from(js_string!("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")))
     });
 
+    // ---------------------------------------------------------------------
+    // Metodos de Element que faltaban (Fase 44, tarea C6 del plan).
+    //
+    // Se eligieron por lo que rompen al faltar, medido con la sonda de APIs:
+    // `matches`/`closest` son la base de la delegacion de eventos, que es como
+    // funciona todo framework; `contains` decide "el clic fue dentro o fuera"
+    // en cualquier menu desplegable; `innerHTML` es como se monta contenido en
+    // casi todo el codigo real.
+    // ---------------------------------------------------------------------
+
+    // `matches(selector)` con el matcher REAL del crate `css` (el de Firefox),
+    // el mismo que usa la cascada. Reusarlo en vez de escribir otro comparador
+    // es lo que garantiza que `el.matches('.a > .b')` responda igual que si esa
+    // regla estuviera en una hoja de estilos.
+    let matches_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let Some(arg) = args.first() else { return Ok(JsValue::from(false)) };
+            let selector = arg.to_string(context)?.to_std_string_escaped();
+            Ok(JsValue::from(SelectorMatcher::matches(&selector, &capture.0)))
+        },
+        capture.clone(),
+    );
+
+    // `closest(selector)` sube por los ancestros EMPEZANDO POR EL PROPIO
+    // elemento, que es lo que dice el spec y lo que hace util al metodo:
+    // `e.target.closest('button')` acierta tanto si se pulso el boton como si
+    // se pulso el icono de dentro.
+    let closest_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let Some(arg) = args.first() else { return Ok(JsValue::null()) };
+            let selector = arg.to_string(context)?.to_std_string_escaped();
+
+            let mut actual = Some(capture.0.clone());
+            while let Some(nodo) = actual {
+                let es_elemento =
+                    matches!(nodo.read().unwrap().node_type, NodeType::Element { .. });
+                if es_elemento && SelectorMatcher::matches(&selector, &nodo) {
+                    return Ok(element_to_js_object(&nodo, &capture.1, context).into());
+                }
+                let padre = nodo.read().unwrap().parent.as_ref().and_then(Weak::upgrade);
+                actual = padre;
+            }
+            Ok(JsValue::null())
+        },
+        capture.clone(),
+    );
+
+    // `contains(otro)`. Devuelve `true` tambien para el propio elemento, igual
+    // que el spec: es el detalle que hace correcto el patron "cerrar si el clic
+    // fue fuera" - sin el, pulsar el propio menu lo cerraria.
+    let contains_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, _context| {
+            let Some(valor) = args.first() else { return Ok(JsValue::from(false)) };
+            let Some(otro) = node_from_js_value(valor) else {
+                return Ok(JsValue::from(false));
+            };
+            Ok(JsValue::from(nodo_contiene(&capture.0, &otro)))
+        },
+        capture.clone(),
+    );
+
+    // `remove()` se quita a si mismo de su padre. Sustituye al
+    // `el.parentNode.removeChild(el)` de antes y es lo que escribe el codigo
+    // moderno.
+    let remove_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, _context| {
+            let padre = capture.0.read().unwrap().parent.as_ref().and_then(Weak::upgrade);
+            detach_from_parent(&capture.0);
+            capture.0.write().unwrap().parent = None;
+            if let Some(padre) = padre {
+                capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                    kind: "childList",
+                    target: padre,
+                    attribute_name: None,
+                    old_value: None,
+                    added: Vec::new(),
+                    removed: vec![capture.0.clone()],
+                });
+            }
+            Ok(JsValue::undefined())
+        },
+        capture.clone(),
+    );
+
+    // `append(...)` acepta VARIOS argumentos y ademas cadenas, que se
+    // convierten en nodos de TEXTO. Esa es toda la diferencia con
+    // `appendChild`, y la razon de que el codigo moderno lo prefiera: ademas de
+    // caber en una linea, `el.append(nombreDelUsuario)` no puede inyectar
+    // etiquetas, al contrario que `innerHTML`.
+    let append_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let mut anadidos = Vec::new();
+            for arg in args {
+                let nodo = argumento_a_nodo(arg, context)?;
+                detach_from_parent(&nodo);
+                nodo.write().unwrap().parent = Some(Arc::downgrade(&capture.0));
+                capture.0.write().unwrap().children.push(nodo.clone());
+                anadidos.push(nodo);
+            }
+            if !anadidos.is_empty() {
+                capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                    kind: "childList",
+                    target: capture.0.clone(),
+                    attribute_name: None,
+                    old_value: None,
+                    added: anadidos,
+                    removed: Vec::new(),
+                });
+            }
+            Ok(JsValue::undefined())
+        },
+        capture.clone(),
+    );
+
+    // `prepend(...)` inserta al principio conservando el orden de los
+    // argumentos: `prepend(a, b)` deja `a` antes que `b`, igual que el spec.
+    let prepend_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let mut anadidos = Vec::new();
+            for (i, arg) in args.iter().enumerate() {
+                let nodo = argumento_a_nodo(arg, context)?;
+                detach_from_parent(&nodo);
+                nodo.write().unwrap().parent = Some(Arc::downgrade(&capture.0));
+                let mut padre = capture.0.write().unwrap();
+                let pos = i.min(padre.children.len());
+                padre.children.insert(pos, nodo.clone());
+                drop(padre);
+                anadidos.push(nodo);
+            }
+            if !anadidos.is_empty() {
+                capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                    kind: "childList",
+                    target: capture.0.clone(),
+                    attribute_name: None,
+                    old_value: None,
+                    added: anadidos,
+                    removed: Vec::new(),
+                });
+            }
+            Ok(JsValue::undefined())
+        },
+        capture.clone(),
+    );
+
+    // `cloneNode(profundo)`. La copia es un arbol NUEVO sin padre: no comparte
+    // estado con el original, que es lo que hace util al metodo (clonar una
+    // plantilla y montarla en otro sitio).
+    let clone_node_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let profundo = args.first().map(|v| v.to_boolean()).unwrap_or(false);
+            let copia = clonar_nodo(&capture.0, profundo);
+            Ok(element_to_js_object(&copia, &capture.1, context).into())
+        },
+        capture.clone(),
+    );
+
+    // `innerHTML` de verdad. Antes NO existia, pero la sonda lo daba por
+    // presente: asignar una propiedad cualquiera a un objeto JS siempre
+    // "funciona" y devuelve lo asignado, asi que la comprobacion pasaba sin que
+    // el DOM cambiara. Es el motivo de que ahora la sonda mida el EFECTO.
+    let inner_html_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, _context| {
+            let hijos = capture.0.read().unwrap().children.clone();
+            Ok(JsValue::from(js_string!(serializar_hijos(&hijos))))
+        },
+        capture.clone(),
+    );
+    let inner_html_getter_fn = FunctionObjectBuilder::new(context.realm(), inner_html_getter)
+        .name(js_string!("get innerHTML"))
+        .length(0)
+        .constructor(false)
+        .build();
+
+    let inner_html_setter = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let html = match args.first() {
+                Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                None => String::new(),
+            };
+            let removidos = capture.0.read().unwrap().children.clone();
+            reemplazar_hijos_con_html(&capture.0, &html);
+            let anadidos = capture.0.read().unwrap().children.clone();
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "childList",
+                target: capture.0.clone(),
+                attribute_name: None,
+                old_value: None,
+                added: anadidos,
+                removed: removidos,
+            });
+            Ok(JsValue::undefined())
+        },
+        capture.clone(),
+    );
+    let inner_html_setter_fn = FunctionObjectBuilder::new(context.realm(), inner_html_setter)
+        .name(js_string!("set innerHTML"))
+        .length(1)
+        .constructor(false)
+        .build();
+
+    // `outerHTML`, solo getter. El setter reemplazaria el nodo dentro de su
+    // padre y necesita parseo de HTML EN CONTEXTO (un `<td>` suelto se parsea
+    // distinto fuera de una tabla), que este motor todavia no hace desde JS.
+    // Sin setter, un intento de escribirlo no hace nada visible; con un setter
+    // a medias, produciria un arbol equivocado en silencio.
+    let outer_html_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, _context| {
+            Ok(JsValue::from(js_string!(serializar_nodo(&capture.0))))
+        },
+        capture.clone(),
+    );
+    let outer_html_getter_fn = FunctionObjectBuilder::new(context.realm(), outer_html_getter)
+        .name(js_string!("get outerHTML"))
+        .length(0)
+        .constructor(false)
+        .build();
+
+    // `isConnected`: si el nodo sigue colgando de un documento. Codigo real lo
+    // consulta antes de tocar un elemento que pudo desmontarse mientras
+    // esperaba a una promesa.
+    let is_connected_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, _context| {
+            let mut actual = Some(capture.0.clone());
+            while let Some(nodo) = actual {
+                if matches!(nodo.read().unwrap().node_type, NodeType::Document) {
+                    return Ok(JsValue::from(true));
+                }
+                let padre = nodo.read().unwrap().parent.as_ref().and_then(Weak::upgrade);
+                match padre {
+                    Some(p) => actual = Some(p),
+                    None => return Ok(JsValue::from(false)),
+                }
+            }
+            Ok(JsValue::from(false))
+        },
+        capture.clone(),
+    );
+    let is_connected_getter_fn = FunctionObjectBuilder::new(context.realm(), is_connected_getter)
+        .name(js_string!("get isConnected"))
+        .length(0)
+        .constructor(false)
+        .build();
+
+    // `dataset`: los `data-*` con el nombre en camelCase (`data-user-id` pasa a
+    // `dataset.userId`). Se construye una FOTO en cada lectura, no un proxy
+    // vivo: escribir en `dataset` no cambia el atributo. Declarado en
+    // `huecos_sin_resolver.md`; leerlo, que es el uso mayoritario, funciona.
+    let dataset_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, context| {
+            let pares: Vec<(String, String)> = {
+                let n = capture.0.read().unwrap();
+                match &n.node_type {
+                    NodeType::Element { attributes, .. } => attributes
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            k.strip_prefix("data-").map(|r| (a_camel_case(r), v.clone()))
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            };
+            let mut init = ObjectInitializer::new(context);
+            for (k, v) in pares {
+                init.property(js_string!(k), js_string!(v), Attribute::all());
+            }
+            Ok(init.build().into())
+        },
+        capture.clone(),
+    );
+    let dataset_getter_fn = FunctionObjectBuilder::new(context.realm(), dataset_getter)
+        .name(js_string!("get dataset"))
+        .length(0)
+        .constructor(false)
+        .build();
+
+    // `id` y `className` como accessors VIVOS sobre sus atributos (Fase 44).
+    //
+    // No estaban, y son de lo mas usado que hay: `el.id` aparece en cualquier
+    // codigo que recorra elementos, y `el.className` es la forma clasica de
+    // leer o reemplazar las clases de golpe (`classList` ya existia, pero no
+    // sustituye a poder asignar la cadena entera).
+    //
+    // Vivos y no una foto, al contrario que `tagName`: la etiqueta de un
+    // elemento no cambia nunca, pero su `id` y sus clases si, y devolver el
+    // valor que tenian al construir el objeto JS daria respuestas obsoletas en
+    // cuanto alguien las tocara.
+    let id_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, _context| {
+            let n = capture.0.read().unwrap();
+            let valor = match &n.node_type {
+                NodeType::Element { attributes, .. } => {
+                    attributes.get("id").cloned().unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            // Cadena vacia, no `null`: el spec dice que `el.id` es siempre una
+            // cadena. Devolver `null` romperia cualquier `el.id.startsWith(...)`.
+            Ok(JsValue::from(js_string!(valor)))
+        },
+        capture.clone(),
+    );
+    let id_getter_fn = FunctionObjectBuilder::new(context.realm(), id_getter)
+        .name(js_string!("get id"))
+        .length(0)
+        .constructor(false)
+        .build();
+
+    let id_setter = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let valor = match args.first() {
+                Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                None => String::new(),
+            };
+            let anterior = {
+                let mut n = capture.0.write().unwrap();
+                match &mut n.node_type {
+                    NodeType::Element { attributes, .. } => {
+                        attributes.insert("id".to_string(), valor)
+                    }
+                    _ => None,
+                }
+            };
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "attributes",
+                target: capture.0.clone(),
+                attribute_name: Some("id".to_string()),
+                old_value: anterior,
+                added: Vec::new(),
+                removed: Vec::new(),
+            });
+            Ok(JsValue::undefined())
+        },
+        capture.clone(),
+    );
+    let id_setter_fn = FunctionObjectBuilder::new(context.realm(), id_setter)
+        .name(js_string!("set id"))
+        .length(1)
+        .constructor(false)
+        .build();
+
+    let class_name_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, _context| {
+            let n = capture.0.read().unwrap();
+            let valor = match &n.node_type {
+                NodeType::Element { attributes, .. } => {
+                    attributes.get("class").cloned().unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            Ok(JsValue::from(js_string!(valor)))
+        },
+        capture.clone(),
+    );
+    let class_name_getter_fn = FunctionObjectBuilder::new(context.realm(), class_name_getter)
+        .name(js_string!("get className"))
+        .length(0)
+        .constructor(false)
+        .build();
+
+    let class_name_setter = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let valor = match args.first() {
+                Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                None => String::new(),
+            };
+            let anterior = {
+                let mut n = capture.0.write().unwrap();
+                match &mut n.node_type {
+                    NodeType::Element { attributes, .. } => {
+                        attributes.insert("class".to_string(), valor)
+                    }
+                    _ => None,
+                }
+            };
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "attributes",
+                target: capture.0.clone(),
+                attribute_name: Some("class".to_string()),
+                old_value: anterior,
+                added: Vec::new(),
+                removed: Vec::new(),
+            });
+            Ok(JsValue::undefined())
+        },
+        capture.clone(),
+    );
+    let class_name_setter_fn = FunctionObjectBuilder::new(context.realm(), class_name_setter)
+        .name(js_string!("set className"))
+        .length(1)
+        .constructor(false)
+        .build();
+
     let mut obj_init = ObjectInitializer::with_native_data(capture.clone(), context);
     obj_init
         .property(js_string!("tagName"), js_string!(tag_name.to_uppercase()), Attribute::all())
@@ -1360,6 +2163,8 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         .accessor(js_string!("nextElementSibling"), Some(next_element_sibling_getter_fn), None, Attribute::all())
         .accessor(js_string!("previousElementSibling"), Some(previous_element_sibling_getter_fn), None, Attribute::all())
         .accessor(js_string!("style"), Some(style_getter_fn), None, Attribute::all())
+        .accessor(js_string!("scrollLeft"), Some(scroll_left_get), Some(scroll_left_set), Attribute::all())
+        .accessor(js_string!("scrollTop"), Some(scroll_top_get), Some(scroll_top_set), Attribute::all())
         .function(get_attribute, js_string!("getAttribute"), 1)
         .function(set_attribute, js_string!("setAttribute"), 2)
         .function(append_child, js_string!("appendChild"), 1)
@@ -1372,7 +2177,21 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         .function(get_bounding_client_rect, js_string!("getBoundingClientRect"), 0)
         .function(get_client_rects, js_string!("getClientRects"), 0)
         .function(get_context, js_string!("getContext"), 1)
-        .function(to_data_url, js_string!("toDataURL"), 0);
+        .function(to_data_url, js_string!("toDataURL"), 0)
+        // Fase 44 (tarea C6)
+        .function(matches_fn, js_string!("matches"), 1)
+        .function(closest_fn, js_string!("closest"), 1)
+        .function(contains_fn, js_string!("contains"), 1)
+        .function(remove_fn, js_string!("remove"), 0)
+        .function(append_fn, js_string!("append"), 0)
+        .function(prepend_fn, js_string!("prepend"), 0)
+        .function(clone_node_fn, js_string!("cloneNode"), 1)
+        .accessor(js_string!("innerHTML"), Some(inner_html_getter_fn), Some(inner_html_setter_fn), Attribute::all())
+        .accessor(js_string!("outerHTML"), Some(outer_html_getter_fn), None, Attribute::all())
+        .accessor(js_string!("isConnected"), Some(is_connected_getter_fn), None, Attribute::all())
+        .accessor(js_string!("dataset"), Some(dataset_getter_fn), None, Attribute::all())
+        .accessor(js_string!("id"), Some(id_getter_fn), Some(id_setter_fn), Attribute::all())
+        .accessor(js_string!("className"), Some(class_name_getter_fn), Some(class_name_setter_fn), Attribute::all());
 
     if tag_name.eq_ignore_ascii_case("canvas") {
         obj_init
@@ -1380,7 +2199,22 @@ fn element_to_js_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
             .property(js_string!("height"), JsValue::from(150.0), Attribute::all());
     }
 
-    obj_init.build()
+    let objeto = obj_init.build();
+
+    // Colgar el elemento de su prototipo (Fase 44). Es lo que hace que
+    // `el instanceof HTMLElement` responda `true` y que un polyfill instalado
+    // en `Element.prototype` lo vean los elementos ya creados - los dos
+    // patrones que un bundle real ejecuta al arrancar y que antes fallaban en
+    // silencio.
+    //
+    // Los metodos que este objeto ya trae puestos siguen tapando a los del
+    // prototipo; la simplificacion esta declarada en la cabecera de
+    // `crate::dom_classes`.
+    if let Some(prototipos) = &registry.prototypes {
+        objeto.set_prototype(Some(prototipos.para_etiqueta(&tag_name)));
+    }
+
+    objeto
 }
 
 /// Construye un objeto CanvasRenderingContext2D compatible con las APIs estándar del W3C.
@@ -1772,6 +2606,174 @@ mod tests {
         let mut runtime = JsRuntime::new();
         runtime.bind_dom(dom).expect("bind_dom no deberia fallar en estos tests");
         runtime.eval(script).expect("el script de test deberia ser JS valido")
+    }
+
+    /// Ejecuta `script` y DESPUES lee `expresion` en una evaluacion aparte.
+    ///
+    /// Hace falta para probar `MutationObserver`: la entrega ocurre al
+    /// terminar la tarea, no dentro de ella, asi que leer el contador en la
+    /// misma evaluacion que provoca las mutaciones lo veria siempre a cero -
+    /// y el test pasaria aunque el observador no funcionara.
+    fn eval_then_read(html: &str, script: &str, expresion: &str) -> String {
+        let dom = HtmlParser::parse(html);
+        let mut runtime = JsRuntime::new();
+        runtime.bind_dom(dom).expect("bind_dom no deberia fallar en estos tests");
+        runtime.eval(script).expect("el script de test deberia ser JS valido");
+        runtime.eval(expresion).expect("la expresion de lectura deberia ser JS valido")
+    }
+
+    /// `scrollTop`/`scrollLeft` se leen y escriben de verdad, y el valor es
+    /// del NODO (compartido entre consultas distintas al mismo elemento),
+    /// no de la consulta - mismo criterio que el resto de estado por nodo
+    /// de este archivo (listeners, atributos...).
+    #[test]
+    fn scroll_top_y_scroll_left_se_leen_y_escriben() {
+        let result = eval_with_dom(
+            r#"<html><body><div id="caja"></div></body></html>"#,
+            "var a = document.getElementById('caja');              var inicial = a.scrollTop + ',' + a.scrollLeft;              a.scrollTop = 40;              a.scrollLeft = 15;              var b = document.getElementById('caja');              inicial + '|' + a.scrollTop + ',' + a.scrollLeft + '|' + b.scrollTop + ',' + b.scrollLeft",
+        );
+        assert_eq!(
+            result, "\"0,0|40,15|40,15\"",
+            "sin asignar, deberia empezar en 0,0; tras asignar, una consulta DISTINTA al mismo nodo deberia ver el mismo valor"
+        );
+    }
+
+    /// Un valor negativo no tiene sentido (no hay "scroll antes del
+    /// principio") - se recorta a cero, igual que un navegador real.
+    #[test]
+    fn scroll_top_negativo_se_recorta_a_cero() {
+        let result = eval_with_dom(
+            r#"<html><body><div id="caja"></div></body></html>"#,
+            "var a = document.getElementById('caja'); a.scrollTop = -50; a.scrollTop",
+        );
+        assert_eq!(result, "0");
+    }
+
+    /// `MutationObserver` entrega AGRUPADO al final de la tarea, no en cada
+    /// mutacion: tres cambios seguidos son UNA llamada con tres registros.
+    /// Es lo que hace que un bucle que añade cien nodos no dispare cien
+    /// callbacks.
+    #[test]
+    fn mutation_observer_agrupa_las_mutaciones_en_una_sola_entrega() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja"><span id="viejo">v</span></div></body></html>"#,
+            "var llamadas = 0; var tipos = [];              var mo = new MutationObserver(function(registros) {                  llamadas = llamadas + 1;                  for (var i = 0; i < registros.length; i++) { tipos.push(registros[i].type); }              });              var caja = document.getElementById('caja');              mo.observe(caja, { childList: true, attributes: true, subtree: true });              caja.setAttribute('a', '1');              caja.appendChild(document.createElement('p'));              document.getElementById('viejo').setAttribute('b', '2');",
+            "llamadas + ':' + tipos.join(',')",
+        );
+        assert_eq!(
+            result, "\"1:attributes,childList,attributes\"",
+            "las tres mutaciones deberian llegar en UNA sola llamada, y la tercera solo porque se pidio subtree"
+        );
+    }
+
+    /// `disconnect()` deja de observar de verdad. Se comprueba contra un
+    /// observador GEMELO que sigue conectado, para que el test no pueda
+    /// pasar simplemente porque no se entregue nada.
+    #[test]
+    fn mutation_observer_disconnect_deja_de_entregar() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja"></div></body></html>"#,
+            "var desconectado = false; var conectado = false;              var caja = document.getElementById('caja');              var a = new MutationObserver(function() { desconectado = true; });              var b = new MutationObserver(function() { conectado = true; });              a.observe(caja, { attributes: true });              b.observe(caja, { attributes: true });              a.disconnect();              caja.setAttribute('a', '1');",
+            "desconectado + '/' + conectado",
+        );
+        assert_eq!(result, "\"false/true\"", "el desconectado no deberia recibir nada; el que sigue conectado, si");
+    }
+
+    /// Un observador que NO pidio `subtree` no debe ver los cambios de sus
+    /// descendientes - pero SI los suyos propios.
+    #[test]
+    fn mutation_observer_sin_subtree_ignora_a_los_descendientes() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja"><span id="hijo">h</span></div></body></html>"#,
+            "var vistos = [];              var mo = new MutationObserver(function(r) { for (var i = 0; i < r.length; i++) { vistos.push(r[i].attributeName); } });              mo.observe(document.getElementById('caja'), { attributes: true });              document.getElementById('hijo').setAttribute('delHijo', '1');              document.getElementById('caja').setAttribute('propio', '1');",
+            "vistos.join(',')",
+        );
+        assert_eq!(result, "\"propio\"", "sin subtree solo se ve el atributo del propio nodo observado");
+    }
+
+    /// `document` es un objetivo de eventos como cualquier elemento -
+    /// `document.addEventListener('DOMContentLoaded', ...)` es como arranca
+    /// casi toda pagina real, y sin esto ese registro no existia.
+    #[test]
+    fn document_es_un_objetivo_de_eventos() {
+        let result = eval_with_dom(
+            r#"<html><body><p>x</p></body></html>"#,
+            "var visto = '';              document.addEventListener('prueba', function() { visto = 'si'; });              document.dispatchEvent(new Event('prueba'));              visto",
+        );
+        assert_eq!(result, "\"si\"");
+    }
+
+    /// `attributeOldValue` expone el valor REAL de antes de la mutacion, y
+    /// SOLO al observador que lo pidio - otro observador sobre el mismo
+    /// nodo, sin esa bandera, ve `oldValue: null` para la misma mutacion.
+    /// `attributeFilter` reduce ademas que atributos le llegan a ESE
+    /// registro en concreto.
+    #[test]
+    fn attribute_old_value_y_attribute_filter_funcionan_por_observador() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja" data-x="original" data-y="tambien"></div></body></html>"#,
+            "var log = [];              var mo1 = new MutationObserver(function (r) { for (var i = 0; i < r.length; i++) { log.push('mo1:' + r[i].attributeName + '=' + r[i].oldValue); } });              var mo2 = new MutationObserver(function (r) { for (var i = 0; i < r.length; i++) { log.push('mo2:' + r[i].attributeName + '=' + r[i].oldValue); } });              var caja = document.getElementById('caja');              mo1.observe(caja, { attributeOldValue: true, attributeFilter: ['data-x'] });              mo2.observe(caja, { attributes: true });              caja.setAttribute('data-x', 'nuevo');              caja.setAttribute('data-y', 'otro');",
+            "log.join('|')",
+        );
+        assert_eq!(
+            result, "\"mo1:data-x=original|mo2:data-x=null|mo2:data-y=null\"",
+            "mo1 (con filtro) solo deberia ver data-x, con su valor viejo real; mo2 (sin attributeOldValue) deberia ver los dos cambios pero con oldValue null"
+        );
+    }
+
+    /// Dos lecturas del MISMO nodo (por `getElementById`, o `document.body`
+    /// dos veces) tienen que devolver el mismo objeto JS, no dos envoltorios
+    /// distintos - Boa compara objetos por identidad de puntero, no por
+    /// contenido. Sin cache, `document.body === document.body` daba
+    /// `false`, y peor: `mutation.target === miElementoConocido` (la forma
+    /// mas comun de correlacionar un MutationRecord con un elemento que ya
+    /// se tenia a mano) daba `false` SIEMPRE.
+    #[test]
+    fn dos_lecturas_del_mismo_nodo_devuelven_el_mismo_objeto() {
+        let result = eval_with_dom(
+            r#"<html><body><div id="caja"></div></body></html>"#,
+            "(document.getElementById('caja') === document.getElementById('caja')) + ':' + (document.body === document.body)",
+        );
+        assert_eq!(result, "\"true:true\"");
+    }
+
+    /// La identidad estable tiene que verse tambien en `MutationRecord`: el
+    /// `target` que llega al callback debe ser el MISMO objeto que ya se
+    /// tenia por otra via, no un envoltorio nuevo que nunca compara igual.
+    #[test]
+    fn el_target_de_una_mutacion_es_identico_al_elemento_ya_conocido() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja"></div></body></html>"#,
+            "var caja = document.getElementById('caja'); var coincide = false;              var mo = new MutationObserver(function(r) { coincide = (r[0].target === caja); });              mo.observe(caja, { attributes: true });              caja.setAttribute('a', '1');",
+            "coincide",
+        );
+        assert_eq!(result, "true");
+    }
+
+    /// `insertBefore` mutaba la lista de hijos sin apuntarlo - a diferencia
+    /// de appendChild/removeChild/setAttribute/textContent, que si lo
+    /// hacen. Un observador con `childList:true` no veia NUNCA un
+    /// insertBefore.
+    #[test]
+    fn insert_before_dispara_mutation_observer() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja"><span id="ref"></span></div></body></html>"#,
+            "var disparo = false;              var mo = new MutationObserver(function() { disparo = true; });              mo.observe(document.getElementById('caja'), { childList: true });              var nuevo = document.createElement('p');              document.getElementById('caja').insertBefore(nuevo, document.getElementById('ref'));",
+            "disparo",
+        );
+        assert_eq!(result, "true");
+    }
+
+    /// Mismo motivo que `insertBefore`: `replaceChild` tampoco apuntaba su
+    /// mutacion.
+    #[test]
+    fn replace_child_dispara_mutation_observer() {
+        let result = eval_then_read(
+            r#"<html><body><div id="caja"><span id="viejo"></span></div></body></html>"#,
+            "var disparo = false;              var mo = new MutationObserver(function() { disparo = true; });              mo.observe(document.getElementById('caja'), { childList: true });              document.getElementById('caja').replaceChild(document.createElement('p'), document.getElementById('viejo'));",
+            "disparo",
+        );
+        assert_eq!(result, "true");
     }
 
     /// La prueba real de esta tarea: el `JsRuntime` (y con el, los
@@ -3038,5 +4040,478 @@ mod tests {
              canvas.tagName + ',' + (ctx !== null) + ',' + (m.width > 0)",
         );
         assert_eq!(result, "\"CANVAS,true,true\"");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subclases de Event (Fase 45, tarea C4 del plan)
+// ---------------------------------------------------------------------------
+
+/// Lee una propiedad del diccionario de opciones de un constructor de evento.
+///
+/// Devuelve el valor por defecto si el diccionario no vino, si la clave no
+/// esta, o si vino `undefined` - los tres casos significan lo mismo para el
+/// spec y distinguirlos solo produciria fallos raros.
+fn opcion_evento(
+    opciones: Option<&JsObject>,
+    clave: &str,
+    context: &mut Context,
+) -> JsResult<Option<JsValue>> {
+    let Some(opciones) = opciones else { return Ok(None) };
+    let valor = opciones.get(js_string!(clave.to_string()), context)?;
+    if valor.is_undefined() {
+        return Ok(None);
+    }
+    Ok(Some(valor))
+}
+
+fn opcion_bool(opciones: Option<&JsObject>, clave: &str, context: &mut Context) -> JsResult<bool> {
+    Ok(opcion_evento(opciones, clave, context)?
+        .map(|v| v.to_boolean())
+        .unwrap_or(false))
+}
+
+fn opcion_texto(
+    opciones: Option<&JsObject>,
+    clave: &str,
+    context: &mut Context,
+) -> JsResult<String> {
+    match opcion_evento(opciones, clave, context)? {
+        Some(v) => Ok(v.to_string(context)?.to_std_string_escaped()),
+        None => Ok(String::new()),
+    }
+}
+
+fn opcion_numero(
+    opciones: Option<&JsObject>,
+    clave: &str,
+    context: &mut Context,
+) -> JsResult<f64> {
+    match opcion_evento(opciones, clave, context)? {
+        Some(v) => Ok(v.to_number(context)?),
+        None => Ok(0.0),
+    }
+}
+
+/// El `type` y el diccionario de opciones que todo constructor de evento
+/// recibe, ya extraidos.
+fn argumentos_de_evento(
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<(String, Option<JsObject>, bool, bool)> {
+    let tipo = match args.first() {
+        Some(v) => v.to_string(context)?.to_std_string_escaped(),
+        None => "undefined".to_string(),
+    };
+    let opciones = args.get(1).and_then(|v| v.as_object()).cloned();
+    let bubbles = opcion_bool(opciones.as_ref(), "bubbles", context)?;
+    let cancelable = opcion_bool(opciones.as_ref(), "cancelable", context)?;
+    Ok((tipo, opciones, bubbles, cancelable))
+}
+
+/// Anade las banderas de teclas modificadoras, comunes a los eventos de
+/// teclado y de raton. Se ponen SIEMPRE, aunque no vinieran en las opciones:
+/// el spec dice que son booleanos, no opcionales, y `e.ctrlKey` devolviendo
+/// `undefined` haria que un `if (e.ctrlKey)` acertara por accidente pero un
+/// `e.ctrlKey === false` fallara.
+fn anadir_modificadores(
+    objeto: &JsObject,
+    opciones: Option<&JsObject>,
+    context: &mut Context,
+) -> JsResult<()> {
+    for clave in ["altKey", "ctrlKey", "shiftKey", "metaKey"] {
+        let valor = opcion_bool(opciones, clave, context)?;
+        objeto.set(js_string!(clave), valor, false, context)?;
+    }
+    Ok(())
+}
+
+/// Registra `CustomEvent`, `KeyboardEvent`, `MouseEvent`, `InputEvent` y
+/// `FocusEvent` (Fase 45).
+///
+/// Por que hacen falta, mas alla del numero de la sonda: `CustomEvent` es el
+/// canal por el que cualquier libreria de estado avisa de un cambio, y
+/// `KeyboardEvent`/`MouseEvent` son los que un framework SINTETIZA para
+/// probar o para reemitir un evento. Sin sus constructores, ese codigo lanza
+/// `TypeError` en su primera linea util.
+///
+/// Ademas cierra el hueco que `ARCHITECTURE.md` declara en «Integracion con el
+/// producto» como «metadatos de tecla todavia no estan implementados»: ahora el
+/// tipo existe con sus campos, aunque el teclado REAL siga sin rellenarlos (eso
+/// es del lado de `core::server`, no de aqui).
+pub(crate) fn register_event_subclasses(context: &mut Context) -> JsResult<()> {
+    // `CustomEvent(type, {detail})`. `detail` por defecto es `null`, no
+    // `undefined`: es lo que dice el spec y hay codigo que lo comprueba.
+    let custom_event = NativeFunction::from_fn_ptr(|_this, args, context| {
+        let (tipo, opciones, bubbles, cancelable) = argumentos_de_evento(args, context)?;
+        let evento = build_event_object(&tipo, bubbles, cancelable, context);
+        if let Some(obj) = evento.as_object() {
+            let detail = opcion_evento(opciones.as_ref(), "detail", context)?
+                .unwrap_or(JsValue::null());
+            obj.set(js_string!("detail"), detail, false, context)?;
+        }
+        Ok(evento)
+    });
+    context.register_global_callable(js_string!("CustomEvent"), 1, custom_event)?;
+
+    // `KeyboardEvent(type, {key, code, repeat, ...modificadores})`.
+    let keyboard_event = NativeFunction::from_fn_ptr(|_this, args, context| {
+        let (tipo, opciones, bubbles, cancelable) = argumentos_de_evento(args, context)?;
+        let evento = build_event_object(&tipo, bubbles, cancelable, context);
+        if let Some(obj) = evento.as_object() {
+            let key = opcion_texto(opciones.as_ref(), "key", context)?;
+            let code = opcion_texto(opciones.as_ref(), "code", context)?;
+            let repeat = opcion_bool(opciones.as_ref(), "repeat", context)?;
+            obj.set(js_string!("key"), js_string!(key), false, context)?;
+            obj.set(js_string!("code"), js_string!(code), false, context)?;
+            obj.set(js_string!("repeat"), repeat, false, context)?;
+            anadir_modificadores(obj, opciones.as_ref(), context)?;
+        }
+        Ok(evento)
+    });
+    context.register_global_callable(js_string!("KeyboardEvent"), 1, keyboard_event)?;
+
+    // `MouseEvent(type, {clientX, clientY, button, ...})`.
+    let mouse_event = NativeFunction::from_fn_ptr(|_this, args, context| {
+        let (tipo, opciones, bubbles, cancelable) = argumentos_de_evento(args, context)?;
+        let evento = build_event_object(&tipo, bubbles, cancelable, context);
+        if let Some(obj) = evento.as_object() {
+            for clave in ["clientX", "clientY", "screenX", "screenY", "button", "buttons"] {
+                let valor = opcion_numero(opciones.as_ref(), clave, context)?;
+                obj.set(js_string!(clave), valor, false, context)?;
+            }
+            // `pageX`/`pageY` son `client*` mas el scroll. Sin acceso al scroll
+            // desde aqui se igualan a `client*`, que es correcto mientras la
+            // pagina no este desplazada y una aproximacion declarada cuando si.
+            let x = opcion_numero(opciones.as_ref(), "clientX", context)?;
+            let y = opcion_numero(opciones.as_ref(), "clientY", context)?;
+            obj.set(js_string!("pageX"), x, false, context)?;
+            obj.set(js_string!("pageY"), y, false, context)?;
+            obj.set(js_string!("relatedTarget"), JsValue::null(), false, context)?;
+            anadir_modificadores(obj, opciones.as_ref(), context)?;
+        }
+        Ok(evento)
+    });
+    context.register_global_callable(js_string!("MouseEvent"), 1, mouse_event)?;
+
+    // `InputEvent(type, {data, inputType})` - el que emite un campo de texto al
+    // cambiar. Un framework controlado lo lee para saber QUE cambio.
+    let input_event = NativeFunction::from_fn_ptr(|_this, args, context| {
+        let (tipo, opciones, bubbles, cancelable) = argumentos_de_evento(args, context)?;
+        let evento = build_event_object(&tipo, bubbles, cancelable, context);
+        if let Some(obj) = evento.as_object() {
+            let data = match opcion_evento(opciones.as_ref(), "data", context)? {
+                Some(v) => v,
+                // `null`, no cadena vacia: el spec distingue "no hubo datos"
+                // (borrar) de "los datos eran la cadena vacia".
+                None => JsValue::null(),
+            };
+            let input_type = opcion_texto(opciones.as_ref(), "inputType", context)?;
+            obj.set(js_string!("data"), data, false, context)?;
+            obj.set(js_string!("inputType"), js_string!(input_type), false, context)?;
+        }
+        Ok(evento)
+    });
+    context.register_global_callable(js_string!("InputEvent"), 1, input_event)?;
+
+    let focus_event = NativeFunction::from_fn_ptr(|_this, args, context| {
+        let (tipo, opciones, bubbles, cancelable) = argumentos_de_evento(args, context)?;
+        let evento = build_event_object(&tipo, bubbles, cancelable, context);
+        if let Some(obj) = evento.as_object() {
+            let _ = opciones;
+            obj.set(js_string!("relatedTarget"), JsValue::null(), false, context)?;
+        }
+        Ok(evento)
+    });
+    context.register_global_callable(js_string!("FocusEvent"), 1, focus_event)?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Ayudantes de la Fase 44 (tarea C6 del plan): serializacion, clonado y
+// conversion de argumentos.
+// ---------------------------------------------------------------------------
+
+/// Serializa un nodo a HTML, incluyendo su propia etiqueta (`outerHTML`).
+///
+/// No usa `html5ever` para serializar aunque lo use para parsear: el adaptador
+/// `TreeSink` de este motor no guarda lo necesario para una reserializacion
+/// fiel (orden original de atributos, comillas usadas, mayusculas del fuente).
+/// Escribir el serializador a mano aqui es honesto sobre eso; lo que produce
+/// es HTML equivalente, no un calco del original.
+pub(crate) fn serializar_nodo(node: &Arc<RwLock<Node>>) -> String {
+    let n = node.read().unwrap();
+    match &n.node_type {
+        NodeType::Text(texto) => escapar_texto(texto),
+        NodeType::Comment(texto) => format!("<!--{texto}-->"),
+        NodeType::Document => serializar_hijos(&n.children),
+        NodeType::Element { tag_name, attributes } => {
+            let mut atributos: Vec<_> = attributes.iter().collect();
+            // Orden estable: un `HashMap` no lo tiene, y sin ordenar el mismo
+            // elemento produciria cadenas distintas entre ejecuciones, lo que
+            // haria imposible cualquier test sobre `outerHTML`.
+            atributos.sort_by(|a, b| a.0.cmp(b.0));
+            let attrs: String = atributos
+                .iter()
+                .map(|(k, v)| format!(" {}=\"{}\"", k, escapar_atributo(v)))
+                .collect();
+
+            // Los elementos vacios del spec no llevan cierre. Escribir
+            // `<img></img>` produciria HTML que, reparseado, da un arbol
+            // distinto.
+            const SIN_CIERRE: [&str; 14] = [
+                "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+                "param", "source", "track", "wbr",
+            ];
+            if SIN_CIERRE.contains(&tag_name.to_ascii_lowercase().as_str()) {
+                return format!("<{tag_name}{attrs}>");
+            }
+            format!("<{tag_name}{attrs}>{}</{tag_name}>", serializar_hijos(&n.children))
+        }
+    }
+}
+
+/// Serializa solo los hijos de un nodo (`innerHTML`).
+pub(crate) fn serializar_hijos(hijos: &[Arc<RwLock<Node>>]) -> String {
+    hijos.iter().map(serializar_nodo).collect()
+}
+
+/// Escapa lo que no puede aparecer crudo en texto HTML.
+fn escapar_texto(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Escapa lo que no puede aparecer crudo dentro de un atributo entre comillas.
+fn escapar_atributo(s: &str) -> String {
+    s.replace('&', "&amp;").replace('"', "&quot;")
+}
+
+/// Copia un nodo. Con `profundo`, tambien todo su subarbol.
+///
+/// La copia es un arbol NUEVO sin padre: no comparte estado con el original,
+/// que es lo que el spec promete y lo que hace util al metodo (clonar una
+/// plantilla y montarla en otro sitio).
+pub(crate) fn clonar_nodo(node: &Arc<RwLock<Node>>, profundo: bool) -> Arc<RwLock<Node>> {
+    let n = node.read().unwrap();
+    let copia = Node::new(n.node_type.clone());
+    if profundo {
+        for hijo in &n.children {
+            let hijo_copia = clonar_nodo(hijo, true);
+            Node::append_child(&copia, hijo_copia);
+        }
+    }
+    copia
+}
+
+/// Comprueba si `posible` esta dentro de `raiz`, incluyendo la propia `raiz`.
+///
+/// Que se incluya a si mismo no es un descuido: el spec lo dice, y es lo que
+/// hace correcto el patron mas comun del metodo ("cerrar el menu si el clic
+/// fue fuera"). Sin ello, pulsar el propio menu lo cerraria.
+pub(crate) fn nodo_contiene(raiz: &Arc<RwLock<Node>>, posible: &Arc<RwLock<Node>>) -> bool {
+    if Arc::ptr_eq(raiz, posible) {
+        return true;
+    }
+    let hijos = raiz.read().unwrap().children.clone();
+    hijos.iter().any(|hijo| nodo_contiene(hijo, posible))
+}
+
+/// Convierte un argumento de `append`/`prepend` en un nodo.
+///
+/// Una cadena se convierte en nodo de TEXTO, no se parsea como HTML: es lo que
+/// dice el spec y es ademas la propiedad que hace seguros a estos metodos
+/// frente a `innerHTML` (`el.append(nombreDelUsuario)` no puede inyectar
+/// etiquetas).
+pub(crate) fn argumento_a_nodo(
+    valor: &JsValue,
+    context: &mut Context,
+) -> JsResult<Arc<RwLock<Node>>> {
+    if let Some(nodo) = node_from_js_value(valor) {
+        return Ok(nodo);
+    }
+    let texto = valor.to_string(context)?.to_std_string_escaped();
+    Ok(Node::new(NodeType::Text(texto)))
+}
+
+/// `data-user-id` a `userId`, la conversion que el spec define para `dataset`.
+pub(crate) fn a_camel_case(s: &str) -> String {
+    let mut salida = String::with_capacity(s.len());
+    let mut siguiente_mayuscula = false;
+    for c in s.chars() {
+        if c == '-' {
+            siguiente_mayuscula = true;
+        } else if siguiente_mayuscula {
+            salida.extend(c.to_uppercase());
+            siguiente_mayuscula = false;
+        } else {
+            salida.push(c);
+        }
+    }
+    salida
+}
+
+/// Reemplaza todos los hijos de `node` por lo que produzca parsear `html`.
+///
+/// El fragmento se parsea con `html5ever` (el parser real, el mismo que la
+/// pagina) y se extraen los hijos de su `<body>`: parsear a mano seria una
+/// segunda fuente de verdad sobre que es HTML valido, y ademas la
+/// recuperacion de errores del spec es justo lo que hace que `innerHTML`
+/// funcione con fragmentos mal formados, que es como llegan casi siempre.
+pub(crate) fn reemplazar_hijos_con_html(node: &Arc<RwLock<Node>>, html: &str) {
+    let documento = engine_dom::HtmlParser::parse(html);
+    let cuerpo = Node::find_all_by_tag(&documento, "body").into_iter().next();
+
+    let nuevos: Vec<Arc<RwLock<Node>>> = match cuerpo {
+        Some(cuerpo) => cuerpo.read().unwrap().children.clone(),
+        // Sin `<body>` (no deberia pasar con html5ever, que siempre lo crea)
+        // se cuelga lo que haya en la raiz: mejor que perder el contenido.
+        None => documento.read().unwrap().children.clone(),
+    };
+
+    {
+        let mut n = node.write().unwrap();
+        for hijo in &n.children {
+            hijo.write().unwrap().parent = None;
+        }
+        n.children.clear();
+    }
+    for nuevo in nuevos {
+        nuevo.write().unwrap().parent = Some(Arc::downgrade(node));
+        node.write().unwrap().children.push(nuevo);
+    }
+}
+
+#[cfg(test)]
+mod tests_fase44 {
+    use super::*;
+    use engine_dom::HtmlParser;
+
+    fn primer(tag: &str, html: &str) -> Arc<RwLock<Node>> {
+        let dom = HtmlParser::parse(html);
+        Node::find_all_by_tag(&dom, tag).into_iter().next().expect("no se encontro el tag")
+    }
+
+    #[test]
+    fn serializar_incluye_la_etiqueta_propia_y_sus_atributos() {
+        let div = primer("div", r#"<html><body><div id="a" class="b">hola</div></body></html>"#);
+        let html = serializar_nodo(&div);
+        assert!(html.starts_with("<div "), "debe incluir su propia etiqueta: {html}");
+        assert!(html.contains(r#"id="a""#) && html.contains(r#"class="b""#));
+        assert!(html.ends_with("</div>"));
+    }
+
+    #[test]
+    fn serializar_no_cierra_los_elementos_vacios() {
+        // `<img></img>` reparseado da un arbol distinto del original.
+        let img = primer("img", r#"<html><body><img src="x.png"></body></html>"#);
+        let html = serializar_nodo(&img);
+        assert!(!html.contains("</img>"), "un <img> no lleva cierre: {html}");
+    }
+
+    #[test]
+    fn serializar_escapa_lo_que_romperia_el_html() {
+        let div = primer("div", "<html><body><div>a &lt; b &amp; c</div></body></html>");
+        let html = serializar_nodo(&div);
+        assert!(html.contains("&lt;") && html.contains("&amp;"), "sin escapar: {html}");
+    }
+
+    #[test]
+    fn el_orden_de_atributos_es_estable() {
+        // Un HashMap no lo garantiza; sin ordenar, el mismo elemento daria
+        // cadenas distintas entre ejecuciones.
+        let div = primer("div", r#"<html><body><div c="3" a="1" b="2"></div></body></html>"#);
+        assert_eq!(serializar_nodo(&div), serializar_nodo(&div));
+        let html = serializar_nodo(&div);
+        assert!(html.find(r#"a="1""#) < html.find(r#"b="2""#));
+    }
+
+    #[test]
+    fn clonar_superficial_no_lleva_los_hijos() {
+        let div = primer("div", "<html><body><div><span>x</span></div></body></html>");
+        let copia = clonar_nodo(&div, false);
+        assert!(copia.read().unwrap().children.is_empty());
+    }
+
+    #[test]
+    fn clonar_profundo_copia_el_subarbol_sin_compartirlo() {
+        let div = primer("div", "<html><body><div><span>x</span></div></body></html>");
+        let copia = clonar_nodo(&div, true);
+        assert_eq!(copia.read().unwrap().children.len(), 1);
+        // Si la copia compartiera nodos con el original, tocar la copia
+        // cambiaria el documento.
+        let original_hijo = div.read().unwrap().children[0].clone();
+        let copia_hijo = copia.read().unwrap().children[0].clone();
+        assert!(!Arc::ptr_eq(&original_hijo, &copia_hijo));
+    }
+
+    #[test]
+    fn contiene_se_incluye_a_si_mismo() {
+        let div = primer("div", "<html><body><div><span>x</span></div></body></html>");
+        assert!(nodo_contiene(&div, &div), "el spec dice que un nodo se contiene a si mismo");
+    }
+
+    #[test]
+    fn contiene_encuentra_nietos_y_rechaza_hermanos() {
+        let dom = HtmlParser::parse("<html><body><div><p><span>x</span></p></div><i>y</i></body></html>");
+        let div = Node::find_all_by_tag(&dom, "div").into_iter().next().unwrap();
+        let span = Node::find_all_by_tag(&dom, "span").into_iter().next().unwrap();
+        let i = Node::find_all_by_tag(&dom, "i").into_iter().next().unwrap();
+        assert!(nodo_contiene(&div, &span), "un nieto sigue estando dentro");
+        assert!(!nodo_contiene(&div, &i), "un hermano no esta dentro");
+    }
+
+    #[test]
+    fn reemplazar_hijos_parsea_html_de_verdad() {
+        let div = primer("div", "<html><body><div>viejo</div></body></html>");
+        reemplazar_hijos_con_html(&div, "<b>nuevo</b><i>tambien</i>");
+        let hijos = div.read().unwrap().children.clone();
+        assert_eq!(hijos.len(), 2, "deberian ser dos elementos, no texto plano");
+        assert!(serializar_hijos(&hijos).contains("<b>nuevo</b>"));
+    }
+
+    #[test]
+    fn reemplazar_hijos_tolera_html_mal_formado() {
+        // Es como llega casi siempre. La recuperacion de errores es de
+        // html5ever, no nuestra: por eso se parsea con el y no a mano.
+        let div = primer("div", "<html><body><div>x</div></body></html>");
+        reemplazar_hijos_con_html(&div, "<b>sin cerrar");
+        assert_eq!(div.read().unwrap().children.len(), 1);
+    }
+
+    #[test]
+    fn camel_case_convierte_como_el_spec() {
+        assert_eq!(a_camel_case("user-id"), "userId");
+        assert_eq!(a_camel_case("simple"), "simple");
+        assert_eq!(a_camel_case("a-b-c"), "aBC");
+    }
+}
+
+/// Recorre el arbol acumulando los elementos cuyo atributo `class` contenga
+/// `clase` como TOKEN completo.
+///
+/// Por token y no por subcadena: `class="botones"` no debe salir en una
+/// busqueda de `boton`. Es el mismo criterio que usa el selector `.boton` de
+/// CSS, y responder distinto entre los dos seria una fuente de fallos sin
+/// diagnostico.
+pub(crate) fn recolectar_por_clase(
+    nodo: &Arc<RwLock<Node>>,
+    clase: &str,
+    salida: &mut Vec<Arc<RwLock<Node>>>,
+) {
+    let hijos = {
+        let n = nodo.read().unwrap();
+        if let NodeType::Element { attributes, .. } = &n.node_type {
+            let coincide = attributes
+                .get("class")
+                .is_some_and(|c| c.split_whitespace().any(|t| t == clase));
+            if coincide {
+                salida.push(nodo.clone());
+            }
+        }
+        n.children.clone()
+    };
+    for hijo in hijos {
+        recolectar_por_clase(&hijo, clase, salida);
     }
 }

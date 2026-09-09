@@ -1,0 +1,122 @@
+# Puerta de calidad del motor Rust.
+#
+# Lo que esta puerta garantiza (y por tanto lo que NO hace falta comprobar a
+# mano antes de fusionar): que el workspace compila, que los 805 tests pasan,
+# que `clippy` no tiene ni un aviso, y que los tests estilo-WPT siguen en verde.
+#
+# Lo que deliberadamente NO se exige aqui es `cargo fmt --check`. El motor
+# tiene ~1.400 tramos que rustfmt reordenaria, en un codigo cuyos comentarios
+# llevan el razonamiento de diseño de cada decision. Reformatear todo de golpe
+# haria ilegible `git blame` justo donde mas se consulta, a cambio de nada
+# funcional. `fmt` corre igualmente mas abajo como paso informativo: si algun
+# dia se decide hacer la pasada, el numero ya esta a la vista.
+name: engine
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Un push nuevo sobre la misma rama cancela el CI anterior: no tiene sentido
+# gastar minutos en un commit que ya esta superado.
+concurrency:
+  group: engine-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Un fallo en CI sin la traza completa obliga a reproducir en local.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    # Windows es la unica plataforma donde el motor se ha verificado de verdad
+    # (ver "Plataforma" en el README). Linux y macOS entraran en la matriz
+    # cuando la tarea J1 del plan los deje compilando.
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache de compilacion
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      # `--locked` obliga a que Cargo.lock sea suficiente: si alguien añadio
+      # una dependencia sin actualizar el lock, aqui se ve, no en la maquina
+      # de otro.
+      - name: Compilar
+        working-directory: engine
+        run: cargo build --workspace --locked --all-targets
+
+      - name: Tests
+        working-directory: engine
+        run: cargo test --workspace --locked
+
+      # La politica de lints vive en el Cargo.toml del workspace, con el
+      # motivo escrito al lado de cada `allow`. Aqui solo se aplica.
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Los 24 tests estilo-WPT no son la suite oficial (ver la tarea H2 del
+      # plan), pero son los unicos que ejercitan el pipeline COMPLETO —
+      # parseo, cascada, layout y JS sobre HTML real — en vez de una capa
+      # suelta. El binario sale con codigo 1 si alguno falla.
+      - name: Tests estilo-WPT
+        working-directory: engine
+        run: cargo run -p engine-core --bin wpt_runner --locked -- tests/wpt-style
+
+      # Informativo, nunca bloqueante. Ver la cabecera de este fichero.
+      - name: Formato (informativo)
+        working-directory: engine
+        continue-on-error: true
+        run: cargo fmt --all --check
+
+  # Auditoria de dependencias (tarea F7 del plan). Va en un job aparte para
+  # que un aviso de seguridad recien publicado no oculte un fallo de tests:
+  # son dos senales distintas y se leen por separado.
+  #
+  # Funciona como TRINQUETE, igual que el lint de la interfaz y la sonda de
+  # APIs del motor: los avisos ya conocidos se listan abajo con su motivo, y
+  # cualquiera NUEVO tumba el job. Lo que no se hace es apagar la puerta.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auditar dependencias
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # El workspace de Rust vive en `engine/`, no en la raiz. Sin esto la
+          # accion busca `./Cargo.lock`, no lo encuentra y falla con un error
+          # que parece de red pero es de ruta.
+          working-directory: engine
+          # Avisos conocidos el 2026-09-09. Cada uno con su razon: ninguno se
+          # silencia sin explicar por que. Estan anotados como deuda en
+          # `engine/huecos_sin_resolver.md` y como tarea en `plan.md`.
+          #
+          # RUSTSEC-2025-0003 y RUSTSEC-2024-0379 (`fast-float` 0.2.0): estos
+          #   dos SI son fallos reales, no de mantenimiento - uno es un fallo
+          #   de segmentacion por falta de comprobacion de limites. Llegan a
+          #   traves de `boa_engine` 0.19, el motor de JavaScript, asi que lo
+          #   que los alcanza es codigo de cualquier pagina. Cerrarlo exige
+          #   subir boa de 0.19 a 0.22: tres versiones menores de un crate
+          #   pre-1.0, o sea una migracion de API real (cambian el cargador de
+          #   modulos y las firmas de `NativeFunction`). Es una tarea propia,
+          #   no un cambio de una linea. Mientras tanto el README ya advierte
+          #   que este navegador no es apto para uso diario y no tiene sandbox.
+          # RUSTSEC-2026-0192 (`ttf-parser`) y RUSTSEC-2026-0206 (`rustybuzz`):
+          #   sin mantenimiento, NO vulnerables. Son las dos piezas de
+          #   tipografia del motor y no hay sustituto equivalente hoy.
+          # RUSTSEC-2024-0436 (`paste`): sin mantenimiento. Es una macro de
+          #   compilacion; no llega al binario.
+          ignore: RUSTSEC-2025-0003,RUSTSEC-2024-0379,RUSTSEC-2026-0192,RUSTSEC-2026-0206,RUSTSEC-2024-0436

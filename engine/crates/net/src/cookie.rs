@@ -26,13 +26,13 @@
 //! - Identidad `(name, domain, path)` (§5.3.11): un `Set-Cookie` con la
 //!   misma terna SUSTITUYE al anterior en vez de acumularse.
 //!
+//! - **Lista de sufijos publicos (PSL)**: un `Domain=co.uk`/`Domain=com`
+//!   (el sufijo entero, no un dominio bajo el) se rechaza via el crate
+//!   `psl` (tabla de Mozilla embebida, sin red) - sin esto, un sitio
+//!   alojado bajo un sufijo publico podria poner una cookie valida para
+//!   CUALQUIER OTRO sitio bajo ese mismo sufijo.
+//!
 //! Simplificaciones declaradas (no implementado a proposito):
-//! - **Sin lista de sufijos publicos (PSL)**: no se rechaza un `Domain=
-//!   .co.uk` o `.com`, que un navegador real bloquea para impedir que un
-//!   sitio ponga una cookie a todo un TLD. Se mitiga parcialmente exigiendo
-//!   que el `Domain` declarado cubra de verdad al host de la peticion (un
-//!   sitio no puede poner cookies a un dominio ajeno), pero un dominio
-//!   demasiado ancho de su propio arbol si se aceptaria.
 //! - **`SameSite` SI se aplica, pero SOLO para `fetch()`/`XMLHttpRequest`
 //!   de origen cruzado** (Fase 30): `header_for_cross_site` (usada por
 //!   `NetworkEngine::fetch_once` cuando `req.origin` es de otro origen Y
@@ -67,9 +67,23 @@
 //!   un script no puede crear una cookie a la que el mismo no pueda acceder
 //!   despues, igual que un navegador real (Chrome/Firefox no rechazan la
 //!   cookie entera, simplemente no la marcan `HttpOnly`).
-//! - Sin persistencia a disco: el almacen vive en memoria, asi que las
-//!   sesiones no sobreviven a cerrar la aplicacion.
+//! - **SI persiste a disco** (misma tecnica que `WebStorage` en
+//!   `engine-net::storage`, ver su aviso): `CookieStore::load_from_disk`
+//!   (la que usa `core::server` en produccion via
+//!   `NetworkEngine::with_persistent_cookies`) carga
+//!   `dirs::data_dir()/navegador-ia/cookies.json` de una sesion anterior.
+//!   Solo se persisten cookies con `expires` CONOCIDO - una cookie de
+//!   SESION (`expires: None`) no deberia sobrevivir a cerrar la
+//!   aplicacion por definicion del spec, asi que ni se intenta volcar.
+//!   `SystemTime` no implementa `Serialize`/`Deserialize` de fabrica, asi
+//!   que se guarda como segundos UNIX (`PersistedCookie`). `CookieStore::
+//!   new()` (sin persistencia, `persist_path: None`) sigue siendo la que
+//!   usan TODOS los tests de este modulo y de `engine-js` - cargar/escribir
+//!   el `%APPDATA%` REAL del usuario en cada `cargo test` seria tan
+//!   peligroso como lento.
 
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use url::Url;
 
@@ -104,6 +118,93 @@ pub struct Cookie {
 impl Cookie {
     fn is_expired(&self, now: SystemTime) -> bool {
         self.expires.is_some_and(|exp| exp <= now)
+    }
+}
+
+/// Version serializable de `SameSite` - `Serialize`/`Deserialize` no se
+/// derivan directamente en `SameSite` para no ensuciar el tipo que usa
+/// todo el resto del modulo con una dependencia de formato de disco.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum PersistedSameSite {
+    Strict,
+    Lax,
+    None,
+}
+
+impl From<SameSite> for PersistedSameSite {
+    fn from(value: SameSite) -> Self {
+        match value {
+            SameSite::Strict => Self::Strict,
+            SameSite::Lax => Self::Lax,
+            SameSite::None => Self::None,
+        }
+    }
+}
+
+impl From<PersistedSameSite> for SameSite {
+    fn from(value: PersistedSameSite) -> Self {
+        match value {
+            PersistedSameSite::Strict => Self::Strict,
+            PersistedSameSite::Lax => Self::Lax,
+            PersistedSameSite::None => Self::None,
+        }
+    }
+}
+
+/// Version serializable de una `Cookie` (ver el aviso del modulo) -
+/// `expires` es `u64` (segundos UNIX), no `Option<SystemTime>`: solo
+/// existe una `PersistedCookie` para una cookie que SI tiene fecha de
+/// caducidad conocida (`Cookie::to_persisted` devuelve `None` para una de
+/// sesion, que no deberia persistir en absoluto).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedCookie {
+    name: String,
+    value: String,
+    domain: String,
+    host_only: bool,
+    path: String,
+    expires_unix_secs: u64,
+    secure: bool,
+    http_only: bool,
+    same_site: PersistedSameSite,
+}
+
+impl Cookie {
+    /// `None` para una cookie de sesion (`expires: None`) - no tiene
+    /// sentido persistirla, desaparece por definicion del spec al cerrar
+    /// la aplicacion. Tambien `None` si `expires` fuera anterior a
+    /// `UNIX_EPOCH` (no deberia ocurrir nunca en la practica - este motor
+    /// solo produce `SystemTime::UNIX_EPOCH` como centinela de "ya
+    /// caducada" y fechas reales futuras, nunca negativas).
+    fn to_persisted(&self) -> Option<PersistedCookie> {
+        let expires_unix_secs = self.expires?.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+        Some(PersistedCookie {
+            name: self.name.clone(),
+            value: self.value.clone(),
+            domain: self.domain.clone(),
+            host_only: self.host_only,
+            path: self.path.clone(),
+            expires_unix_secs,
+            secure: self.secure,
+            http_only: self.http_only,
+            same_site: self.same_site.into(),
+        })
+    }
+}
+
+impl From<PersistedCookie> for Cookie {
+    fn from(p: PersistedCookie) -> Self {
+        Cookie {
+            name: p.name,
+            value: p.value,
+            domain: p.domain,
+            host_only: p.host_only,
+            path: p.path,
+            expires: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(p.expires_unix_secs)),
+            secure: p.secure,
+            http_only: p.http_only,
+            same_site: p.same_site.into(),
+        }
     }
 }
 
@@ -280,6 +381,19 @@ pub fn parse_set_cookie(header: &str, url: &Url) -> Option<Cookie> {
                 if !domain_matches(&host, &declared) && host != declared {
                     return None;
                 }
+                // Lista de sufijos publicos (PSL): un `Domain=` que sea EL
+                // SUFIJO ENTERO (`co.uk`, `com`...) se rechaza, igual que un
+                // navegador real - sin esto, un sitio alojado bajo un
+                // sufijo publico podria poner una cookie valida para
+                // CUALQUIER OTRO sitio bajo ese mismo sufijo (`a.co.uk` y
+                // `b.co.uk` no deberian poder verse las cookies entre si).
+                // `psl::suffix_str` devuelve el sufijo DENTRO de `declared`
+                // (p.ej. "test" para "ejemplo.test") - se compara con
+                // igualdad exacta, no basta con que termine en un sufijo,
+                // eso describiria a casi cualquier dominio normal.
+                if psl::suffix_str(&declared).is_some_and(|suffix| suffix == declared) {
+                    return None;
+                }
                 cookie.domain = declared;
                 cookie.host_only = false;
             }
@@ -317,11 +431,77 @@ pub fn parse_set_cookie(header: &str, url: &Url) -> Option<Cookie> {
 #[derive(Debug, Clone, Default)]
 pub struct CookieStore {
     cookies: Vec<Cookie>,
+    /// Ruta donde volcar el almacen tras cada `insert` (ver el aviso del
+    /// modulo), o `None` para quedarse solo en memoria. Solo
+    /// `load_from_disk`/`load_from_path` la rellenan.
+    persist_path: Option<PathBuf>,
 }
 
 impl CookieStore {
+    /// Version en memoria pura, SIN persistencia - la que usan todos los
+    /// tests de este modulo y de `engine-js`.
     pub fn new() -> Self {
-        Self { cookies: Vec::new() }
+        Self { cookies: Vec::new(), persist_path: None }
+    }
+
+    /// El directorio de datos del perfil segun el SO - mismo criterio que
+    /// `WebStorage::default_persist_path`, `None` si `dirs` no logra
+    /// determinarlo.
+    fn default_persist_path() -> Option<PathBuf> {
+        Some(dirs::data_dir()?.join("navegador-ia").join("cookies.json"))
+    }
+
+    /// La version que usa `NetworkEngine::with_persistent_cookies` en
+    /// produccion: carga las cookies de una sesion anterior si el fichero
+    /// ya existia, y deja `persist_path` listo para que las mutaciones
+    /// siguientes se vuelquen ahi solas. Un fichero ausente, ilegible o
+    /// con JSON invalido no es un error - mismo criterio que
+    /// `WebStorage::load_from_disk`.
+    pub fn load_from_disk() -> Self {
+        match Self::default_persist_path() {
+            Some(path) => Self::load_from_path(path),
+            None => {
+                tracing::warn!("[cookie] no se pudo determinar el directorio de datos del sistema operativo; las cookies no persistiran a disco esta sesion");
+                Self::new()
+            }
+        }
+    }
+
+    /// Nucleo de `load_from_disk`, separado para poder probarlo contra una
+    /// ruta de prueba en vez del `%APPDATA%` REAL del usuario.
+    fn load_from_path(path: PathBuf) -> Self {
+        let cookies = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<PersistedCookie>>(&bytes).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(Cookie::from)
+            .collect();
+        Self { cookies, persist_path: Some(path) }
+    }
+
+    /// Vuelca el almacen ENTERO a disco - no incremental, mismo criterio de
+    /// simplicidad que `WebStorage::persist`. Solo las cookies con
+    /// `expires` conocido sobreviven la vuelta por `to_persisted` (las de
+    /// sesion se quedan fuera a proposito, ver el aviso del modulo).
+    /// No-op silencioso sin `persist_path` o si algo falla escribiendo.
+    fn persist(&self) {
+        let Some(path) = &self.persist_path else { return };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!("[cookie] no se pudo crear el directorio de persistencia {parent:?}: {e}");
+                return;
+            }
+        }
+        let persisted: Vec<PersistedCookie> = self.cookies.iter().filter_map(Cookie::to_persisted).collect();
+        match serde_json::to_vec(&persisted) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, bytes) {
+                    tracing::warn!("[cookie] no se pudo escribir las cookies en disco: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("[cookie] no se pudo serializar las cookies: {e}"),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -352,9 +532,11 @@ impl CookieStore {
         self.cookies
             .retain(|c| !(c.name == cookie.name && c.domain == cookie.domain && c.path == cookie.path));
         if cookie.is_expired(SystemTime::now()) {
+            self.persist();
             return;
         }
         self.cookies.push(cookie);
+        self.persist();
     }
 
     /// Nucleo compartido de `header_for`/`header_for_js`/
@@ -398,7 +580,7 @@ impl CookieStore {
         // Orden del spec (§5.4.2): ruta mas especifica primero. Algunos
         // servidores reales leen solo el primer valor de un nombre repetido,
         // asi que el orden importa de verdad, no es cosmetico.
-        matching.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        matching.sort_by_key(|c| std::cmp::Reverse(c.path.len()));
         Some(matching)
     }
 
@@ -493,6 +675,25 @@ mod tests {
     #[test]
     fn a_set_cookie_for_an_unrelated_domain_is_rejected() {
         assert!(parse_set_cookie("robo=1; Domain=otrositio.test", &url("https://ejemplo.test/")).is_none());
+    }
+
+    /// Lista de sufijos publicos (PSL): un sitio alojado bajo `co.uk` no
+    /// puede poner una cookie valida para TODO `co.uk` - eso la haria
+    /// visible para cualquier otro sitio del mismo sufijo (`otro.co.uk`).
+    #[test]
+    fn a_set_cookie_for_an_entire_public_suffix_is_rejected() {
+        assert!(parse_set_cookie("robo=1; Domain=co.uk", &url("https://ejemplo.co.uk/")).is_none(), "co.uk es un sufijo publico entero, no un dominio registrable");
+        assert!(parse_set_cookie("robo=1; Domain=com", &url("https://ejemplo.com/")).is_none(), "com tambien es un sufijo publico entero");
+    }
+
+    /// La otra mitad: un dominio NORMAL bajo un sufijo publico (que es
+    /// practicamente cualquier dominio real, `ejemplo.test`/`ejemplo.co.uk`)
+    /// tiene que seguir aceptandose - el PSL rechaza el sufijo EXACTO, no
+    /// todo lo que lo contenga.
+    #[test]
+    fn a_set_cookie_for_a_normal_domain_under_a_public_suffix_is_still_accepted() {
+        let c = parse_set_cookie("a=1; Domain=ejemplo.co.uk", &url("https://www.ejemplo.co.uk/")).expect("un dominio registrable normal deberia aceptarse");
+        assert_eq!(c.domain, "ejemplo.co.uk");
     }
 
     #[test]
@@ -697,5 +898,78 @@ mod tests {
         store.store_from_response(&["publica=1; SameSite=None; Secure".to_string(), "privada=1; SameSite=Strict".to_string()], &url("https://ejemplo.test/"));
         let header = store.header_for_cross_site(&url("https://ejemplo.test/")).expect("deberia quedar al menos la SameSite=None");
         assert!(header.contains("publica=1") && !header.contains("privada=1"));
+    }
+
+    /// Ruta de prueba UNICA por test bajo el directorio temporal del SO -
+    /// nunca el `%APPDATA%` real del usuario, mismo criterio que
+    /// `WebStorage` (ver el aviso del modulo).
+    fn test_path(nombre: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("navegador-ia-cookie-test-{nombre}.json"));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn a_cookie_with_expires_persists_and_reloads_from_disk() {
+        let path = test_path("round-trip");
+        let mut store = CookieStore::load_from_path(path.clone());
+        store.store_from_response(&["sesion=abc123; Max-Age=3600".to_string()], &url("https://ejemplo.test/"));
+
+        let mut reloaded = CookieStore::load_from_path(path.clone());
+        assert_eq!(reloaded.header_for(&url("https://ejemplo.test/")).as_deref(), Some("sesion=abc123"), "una sesion nueva deberia recuperar la cookie de la anterior");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// La mitad que hace que una cookie de SESION siga siendo de sesion:
+    /// sin `Expires`/`Max-Age`, no deberia sobrevivir a cerrar la
+    /// aplicacion - igual que un navegador real.
+    #[test]
+    fn a_session_cookie_without_expires_does_not_survive_a_reload() {
+        let path = test_path("sesion-no-persiste");
+        let mut store = CookieStore::load_from_path(path.clone());
+        store.store_from_response(&["temporal=1".to_string()], &url("https://ejemplo.test/"));
+
+        let mut reloaded = CookieStore::load_from_path(path.clone());
+        assert!(reloaded.header_for(&url("https://ejemplo.test/")).is_none(), "una cookie de sesion no deberia persistir a disco");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// El mecanismo real de "cerrar sesion" (ver
+    /// `re_sending_an_expired_cookie_deletes_the_stored_one` mas arriba)
+    /// tiene que persistir tambien el BORRADO, no solo las escrituras.
+    #[test]
+    fn deleting_a_cookie_via_max_age_zero_persists_the_deletion() {
+        let path = test_path("borrado-persiste");
+        let mut store = CookieStore::load_from_path(path.clone());
+        store.store_from_response(&["sesion=abc; Max-Age=3600".to_string()], &url("https://ejemplo.test/"));
+        store.store_from_response(&["sesion=; Max-Age=0".to_string()], &url("https://ejemplo.test/"));
+
+        let mut reloaded = CookieStore::load_from_path(path.clone());
+        assert!(reloaded.header_for(&url("https://ejemplo.test/")).is_none(), "el cierre de sesion deberia haberse persistido, no solo aplicado en memoria");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn loading_from_a_path_that_does_not_exist_yet_is_empty_not_an_error() {
+        let path = test_path("no-existe-todavia");
+        let store = CookieStore::load_from_path(path);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn loading_a_corrupt_cookie_file_is_treated_as_no_previous_data() {
+        let path = test_path("corrupto");
+        std::fs::write(&path, b"esto no es JSON valido en absoluto {{{").unwrap();
+
+        let store = CookieStore::load_from_path(path.clone());
+        assert!(store.is_empty(), "un cache corrupto no deberia impedir arrancar, solo perder lo guardado");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_cookie_store_without_a_persist_path_never_touches_disk() {
+        let mut store = CookieStore::new();
+        store.store_from_response(&["a=1; Max-Age=3600".to_string()], &url("https://ejemplo.test/"));
+        assert!(store.persist_path.is_none());
     }
 }

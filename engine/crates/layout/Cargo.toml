@@ -14,3 +14,6 @@ engine-text = { path = "../text" }
 engine-image = { path = "../image" }
 # Algoritmo de Flexbox y CSS Grid real (Fase 3.2 y Fase 3.6)
 taffy = { version = "0.13", default-features = false, features = ["flexbox", "grid", "std", "taffy_tree", "content_size"] }
+
+[lints]
+workspace = true

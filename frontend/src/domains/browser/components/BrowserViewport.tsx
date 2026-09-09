@@ -28,6 +28,10 @@ interface BrowserViewportProps {
   screenshot: string;
   url: string;
   elements: InteractiveElement[];
+  /// Fase 39: el motor descargo la pagina sin error, pero venia sin
+  /// contenido visible y con `<script>` que lo habrian generado. Se pinta
+  /// un aviso encima en vez de dejar el area en blanco sin explicacion.
+  requiresJavascript: boolean;
   onManualNavigate: (url: string) => void;
   onManualClick: (x: number, y: number) => void;
   onManualType: (x: number, y: number, text: string) => void;
@@ -55,6 +59,7 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   screenshot,
   url,
   elements,
+  requiresJavascript,
   onManualNavigate,
   onManualClick,
   onManualType,
@@ -410,7 +415,7 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
           <div ref={stageRef} style={{ position: 'relative', width: '100%', height: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
             <img
               ref={imgRef}
-              src={`data:image/jpeg;base64,${screenshot}`}
+              src={`data:image/png;base64,${screenshot}`}
               alt="Browser Viewport"
               className="screenshot-image"
               onClick={handleImageClick}
@@ -427,6 +432,23 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
                 }
               }}
             />
+
+            {requiresJavascript && (
+              <div className="js-required-overlay" role="status">
+                <div className="js-required-card">
+                  <span className="js-required-icon" aria-hidden="true">📄</span>
+                  <h3>Esta página llega vacía</h3>
+                  <p>
+                    El servidor la ha enviado correctamente, pero sin contenido: lo construye
+                    JavaScript en tu equipo, y el motor todavía no ejecuta ese tipo de código.
+                  </p>
+                  <p className="js-required-hint">
+                    Le pasa a la mayoría de tiendas y aplicaciones web modernas. Las páginas que
+                    envían su contenido ya hecho sí se ven bien.
+                  </p>
+                </div>
+              </div>
+            )}
 
             {inputTextPopup && (() => {
               const { left, top } = toStagePx(inputTextPopup.mx, inputTextPopup.my);

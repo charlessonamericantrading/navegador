@@ -46,6 +46,23 @@ use std::sync::{Arc, RwLock};
 /// orden interno (especificidad) pero en dos momentos distintos (UA antes,
 /// autor despues), sin duplicar la logica de matching+orden entre ambas.
 fn apply_matching_rules(computed: &mut HashMap<String, String>, stylesheet: &StyleSheet, dom_node: &Arc<RwLock<Node>>, viewport_width: f32) {
+    // Identidad del elemento, leida UNA vez por nodo (no una por regla):
+    // es lo que hace que el prefiltro `RuleKey` salga a cuenta. Un nodo que
+    // no sea un elemento no puede matchear nada, pero se deja pasar al
+    // matcher real para no cambiar el comportamiento observable.
+    let (tag_name, id_attr, class_attr) = {
+        let node = dom_node.read().unwrap();
+        match &node.node_type {
+            engine_dom::NodeType::Element { tag_name, attributes } => (
+                tag_name.to_ascii_lowercase(),
+                attributes.get("id").cloned(),
+                attributes.get("class").cloned(),
+            ),
+            _ => (String::new(), None, None),
+        }
+    };
+    let classes: Vec<&str> = class_attr.as_deref().map(|c| c.split_whitespace().collect()).unwrap_or_default();
+
     let mut matched: Vec<&Rule> = stylesheet
         .rules
         .iter()
@@ -56,6 +73,12 @@ fn apply_matching_rules(computed: &mut HashMap<String, String>, stylesheet: &Sty
         // evaluarla - la hoja se parsea una sola vez por pagina, pero
         // `resolve_style` corre en cada relayout.
         .filter(|rule| rule.media.as_ref().is_none_or(|m| m.matches(viewport_width)))
+        // Descarte BARATO antes del matcher real (Fase 39): mirar si el
+        // simple-selector clave de la regla puede siquiera corresponder a
+        // este elemento. Conservador por construccion - `RuleKey::Any`
+        // deja pasar todo, asi que esto no puede cambiar que reglas
+        // acaban aplicandose, solo cuantas se llegan a probar.
+        .filter(|rule| rule.key.could_match(&tag_name, id_attr.as_deref(), &classes))
         .filter(|rule| SelectorMatcher::matches(&rule.selector, dom_node))
         .collect();
     matched.sort_by_key(|rule| SelectorMatcher::calculate_specificity(&rule.selector));

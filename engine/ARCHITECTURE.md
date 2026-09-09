@@ -3769,3 +3769,829 @@ existe, Python mantiene el mensaje de motor no disponible.
   - Estructuras `AccessibilityTree`, `AccessibleNode` y `AccessibleRole` para extracción semántica limpia del árbol DOM/layout con coordenadas de pantalla reales.
   - Método `to_llm_representation` que genera un prompt ultra-compacto optimizado para modelos de lenguaje, ahorrando ~80% de tokens frente al envío de HTML crudo.
 - **Tests del Workspace**: 683 tests pasando al 100% en los 10 crates de Rust (`cargo test --workspace`).
+
+### Fase 39: Aviso de pagina dependiente de JavaScript, rendimiento y shorthands CSS (2026-08-27)
+
+Esta fase no salio de leer el codigo sino de EJECUTAR el navegador contra
+webs reales y mirar las capturas. El sintoma reportado fue "el navegador no
+funciona, ninguna URL carga". El motor cargaba las URLs perfectamente: lo
+que fallaba era todo lo demas.
+
+#### El diagnostico: la pagina en blanco muda
+
+Medido en vivo contra una web real (`ignislove.com`): 14 KB de HTML, 7
+`<script>`, y **cero caracteres de texto visible**. El servidor manda una
+cascara vacia y el contenido lo construye JavaScript en el cliente, que es
+como esta hecha la mayoria de la web moderna (React/Next/Vue/Shopify). El
+motor descargaba esa cascara, no encontraba nada dentro y pintaba blanco.
+
+Lo importante es POR QUE no habia ningun error: no habia fallado nada. La
+descarga fue correcta, el parseo fue correcto, el layout fue correcto. El
+resultado legitimo de todo eso era una pagina vacia. La interfaz mostraba
+avisos de error correctamente (comprobado), pero no habia error que mostrar.
+
+Contraste medido el mismo dia: Google (que si manda su texto en el HTML)
+carga y se ve bien en 457 ms.
+
+- **`requires_javascript` en el protocolo NDJSON** (`core/protocol.rs`,
+  `core/server.rs::page_content_requires_javascript`): se marca cuando el
+  arbol de LAYOUT no tiene practicamente texto visible Y el documento trae
+  `<script>`. Se reusa `collect_visible_text` (que ya filtra `<script>`/
+  `<noscript>`) en vez de mirar el DOM crudo - si no, el codigo fuente de un
+  bundle grande contaria como "contenido" y el aviso no saltaria nunca.
+- Las dos condiciones son necesarias A PROPOSITO: una pagina vacia SIN
+  scripts esta vacia de verdad, y decir "necesita JavaScript" seria mentir.
+  El umbral (40 caracteres) es un juicio, no un valor del spec, y se elige
+  bajo para preferir callar de mas antes que acusar en falso.
+- **Lo que NO afirma**: no dice que la pagina funcionaria con un motor de JS
+  completo, ni distingue "el script no se ejecuto" de "se ejecuto y no pinto
+  nada". Da un falso positivo en una pagina legitimamente casi vacia que
+  ademas lleve un script de analitica - se acepta: el coste es un aviso de
+  mas en una pagina que igualmente se ve vacia.
+
+#### Rendimiento: dos cuellos distintos, aislados con paginas sinteticas
+
+El articulo "Espana" de Wikipedia (1,77 MB) tardaba 150 s. Aislado midiendo
+por separado nodos, reglas y texto:
+
+| Pagina sintetica | Antes |
+|---|---|
+| 13.000 nodos + 5 reglas | 1,8 s |
+| 200 nodos + 2.000 reglas | 0,5 s |
+| 13.000 nodos + 2.000 reglas | **69,7 s** |
+| 13.000 parrafos con texto real | 1,7 s |
+
+Ni los nodos ni las reglas ni el texto por separado: el cuello era el
+PRODUCTO nodos x reglas, la firma de un bucle anidado.
+
+1. **`SelectorMatcher::matches` reparseaba el selector desde la cadena en
+   CADA comparacion** (`css/src/selector.rs`). La cascada compara cada nodo
+   contra cada regla, asi que eran del orden de 26 millones de parseos de un
+   punado de cadenas. Cache `thread_local` de selectores parseados
+   (`with_parsed_selector`), que cachea tambien el FALLO - un selector no
+   soportado se reintentaba igual de veces que uno valido. Es
+   `thread_local` y no un `static` con candado porque los tipos del crate
+   `selectors` no son `Sync`, y ademas evita cualquier bloqueo en el camino
+   mas caliente del motor.
+2. **Prefiltro por selector clave** (`css/src/stylesheet.rs::RuleKey`): cada
+   regla lleva precalculado su simple-selector mas a la derecha (id, clase o
+   tag), y la cascada descarta sin invocar al matcher completo. Es el mismo
+   truco que usan Chromium y Firefox. **Conservador por construccion**: ante
+   cualquier duda (`[`, `(`, comillas, `*`, una rama no descartable de una
+   lista) devuelve `Any`, que significa "pruebala igual" - por eso este
+   atajo no puede perder un estilo, y esa propiedad esta cubierta por tests.
+3. **Los subrecursos se descargaban EN SERIE**
+   (`core/server.rs::fetch_subresources`). Wikipedia trae 161 `<img>` de
+   `upload.wikimedia.org`; a ~200 ms cada una eso solo eran ~38 s. Ahora
+   `futures_util::buffered(6)` - seis es el limite clasico de conexiones por
+   host de un navegador real. Se usa `buffered` y NO `buffer_unordered`
+   porque el orden del documento es obligatorio para las hojas de estilo
+   (donde "la que viene despues gana a igual especificidad"): devolverlas
+   segun quien contestara antes haria que el aspecto de la pagina dependiera
+   de la latencia de la red.
+
+Resultado medido: sintetica 13k x 2k **69,7 s -> 1,8 s**; Wikipedia solo CPU
+**38,9 s -> 4,0 s**; Google 0,46 s -> 0,37 s (sin regresion).
+
+Al medir hay que servir la pagina en LOCAL: la variabilidad de red enmascara
+por completo el efecto (la misma pagina por internet dio 150 s y 215 s en
+dos pasadas del mismo binario).
+
+#### Maquetacion: los shorthands que se ignoraban enteros
+
+Aislado caja a caja con una pagina de prueba y mirando el PNG:
+
+- **`padding`/`margin` de 2, 3 y 4 valores se ignoraban ENTEROS y resolvian
+  a CERO.** Solo funcionaba la forma de un valor. La causa era que
+  `engine-layout` leia la propiedad abreviada como si fuera una longitud
+  suelta, asi que `parse_css_length("20px 60px")` fallaba y devolvia el
+  valor por defecto. No es un caso exotico: es la forma mas comun de
+  escribir padding en CSS real. Ahora se expanden a longhands en el parser
+  (`expand_box_shorthand`, mismo sitio donde ya vivia la expansion de
+  `background`) y `resolve_box_edges` los lee.
+- **`flex: 1` no hacia nada**: el layout solo leia los longhands. Ahora
+  `expand_flex_shorthand` lo expande, con la trampa clasica del spec:
+  `flex: 1` significa `1 1 0`, NO `1 1 auto`.
+- **`gap` se leia solo en `grid_container_style`**, nunca en flex, asi que
+  los items de un contenedor flex salian pegados.
+- **El fondo de `<html>`/`<body>` no se propagaba al lienzo**
+  (`layout::canvas_background`, consumido por `gfx/raster.rs`). Sin esto,
+  cualquier web con tema oscuro se veia como una franja de color del alto
+  del contenido sobre un fondo gris claro - el sintoma clasico de "esto esta
+  roto". NO implementado: que `<body>` deje de pintar su propio fondo cuando
+  se ha propagado (el spec dice que cede el fondo al lienzo); como se pinta
+  el mismo color en ambos sitios el resultado visible es identico, solo se
+  notaria con fondos semitransparentes superpuestos.
+- Valores con `calc()`/`var()` se dejan SIN expandir a proposito: trocearlos
+  por espacios los romperia. Ahi el longhand no se genera y el layout
+  resuelve a cero, igual que antes.
+
+#### APIs de JavaScript: medidas una a una, no supuestas
+
+Se escribio una pagina sonda que prueba 28 APIs y devuelve el resultado por
+`document.title`. El resultado corrige una suposicion equivocada: **el motor
+ya soportaba 22 de 28**. `async`/`await`, clases, arrow functions, template
+literals, destructuring, spread, `Map`/`Set`, `Symbol.iterator`, `Promise`,
+`JSON`, `fetch`, `getComputedStyle`, `addEventListener`, `innerHTML`,
+`querySelector`, `classList` - `boa` cubre la sintaxis moderna entera. No
+faltaba un motor de JavaScript: faltaban funciones sueltas.
+
+El detalle que importa: **la ausencia de UNA sola de ellas lanzaba
+TypeError en la primera linea util del bundle y mataba el script ENTERO**,
+dejando la pagina en blanco. El coste de una API ausente no es proporcional
+a lo usada que sea.
+
+Anadidas (sonda 22/28 -> 26/28):
+- `document.head` - espejo de `document.body`. Casi todo bundle hace
+  `document.head.appendChild(style)` al arrancar para inyectar sus estilos.
+- `document.createTextNode` - el companero de `createElement` que faltaba.
+- `navigator.userAgent`/`language`/`platform`/`onLine`. El User-Agent
+  declara lo que este motor ES; no imita a Chrome a proposito: una pagina
+  que creyera estar hablando con Chrome usaria APIs que aqui no existen y
+  fallaria mas adelante y de forma mas confusa.
+- `requestAnimationFrame`/`cancelAnimationFrame` sobre la MISMA cola que
+  `setTimeout(fn, 0)`. Sin sincronizacion con el refresco de pantalla y sin
+  la marca de tiempo del fotograma - es lo que puede prometer honestamente
+  un motor sin bucle de fotogramas propio. Se registra porque su AUSENCIA
+  era peor que su aproximacion.
+
+**Siguen faltando, y por que no se pusieron:**
+- `location.href` - necesita llevar la URL de la pagina hasta el runtime de
+  JS, lo que cambia la firma de `pipeline::build_page_keeping_runtime` y sus
+  llamadas. Registrarlo DESPUES de construir la pagina no sirve: los scripts
+  inline ya se ejecutaron.
+- `MutationObserver` - no se puso un stub a proposito. Uno que nunca dispara
+  puede ser PEOR que su ausencia: el codigo cree haberse suscrito y espera
+  para siempre, en vez de fallar rapido y visiblemente.
+
+#### Otros
+
+- La captura se declaraba `data:image/jpeg` siendo PNG (`89504e47`
+  comprobado). Chromium lo decodificaba igual por olfateo de contenido - se
+  verifico en un Chrome real antes de descartarlo como causa del problema
+  original - pero declarar mal el tipo es falso y rompe cualquier consumidor
+  mas estricto.
+- `futures-util` pasa a ser dependencia explicita de `engine-core`. Ya venia
+  en el arbol via `hyper`, asi que declararlo no anade codigo al binario;
+  escribir a mano un limitador de concurrencia correcto (orden preservado,
+  cancelacion, backpressure) es justo lo que la doctrina de dependencias de
+  este documento dice que no hay que reimplementar.
+
+**Tests del Workspace**: 703 pasando, 0 fallando, en los 10 crates.
+
+### Fase 40: `background-image` real, y `window` como `EventTarget` completo (2026-08-27)
+
+Cierre de los huecos que quedaron documentados tras la auditoria de 47
+simplificaciones (ver `huecos_sin_resolver.md`): dos hallazgos concretos, no
+una fase de exploracion.
+
+#### `window` no era un `EventTarget` completo
+
+`document.addEventListener('scroll', ...)` ya disparaba de verdad, pero
+`window.addEventListener('scroll'|'resize', ...)` y `window.dispatchEvent`
+no. La causa: `history.rs` (Fase 7) ya reasignaba `window.addEventListener`/
+`removeEventListener` para delegar en `document.documentElement` (lo que
+necesitaba `popstate`), pero `core::server` disparaba los eventos de scroll/
+resize sobre `dom_root`, que nunca hace bubbling hasta `documentElement` (es
+un HIJO suyo, no un ancestro). Arreglado retargeteando el dispatch a
+`documentElement` - el mismo nodo que `fire_popstate` ya usaba - para que la
+burbuja llegue a los dos sitios (`window` y `document`) a la vez.
+
+#### `background-image`: nunca existio, ni el longhand ni el shorthand
+
+Verificado antes de tocar nada: cero referencias a `background-image` en
+`engine-gfx`/`engine-layout` - ni siquiera el longhand se pintaba, aunque el
+parser ya lo guardara como cualquier propiedad no reconocida.
+
+- **`engine-css/parser.rs`**: `insert_declaration` ahora tambien extrae un
+  `url(...)` del shorthand `background` (antes solo extraia color) -
+  `background_image_candidate` busca el tramo entre `url(` y su `)` tal
+  cual, no por token partido por espacios (una URL entre comillas puede
+  llevar espacios dentro). `@supports (background-image: url(...))`
+  actualizado a la vez - antes habria mentido diciendo que no se soportaba.
+- **Descubrimiento y descarga**: mismo patron que `<img src>`
+  (`find_image_srcs`/`fetch_images`), pero las URLs de fondo no estan en el
+  DOM sino en el CSS YA ENSAMBLADO (`<style>` en linea + hojas externas) -
+  por eso `find_background_image_urls`/`find_inline_style_css`
+  (`pipeline.rs`) solo pueden correr DESPUES de que `core::server` descargue
+  las hojas externas, al reves que el resto del descubrimiento (que ocurre
+  todo de golpe antes de descargar nada). Se añaden a la MISMA lista que
+  `<img src>` para reusar el mismo `ImageMap`, el mismo decode y el mismo
+  filtro `img-src` de CSP (una imagen de fondo es tan "imagen" como un
+  `<img>` para el spec).
+- **Pintado** (`DisplayItem::BackgroundImage`, `image_paint::
+  paint_background_image`): tamaño NATURAL en mosaico infinito
+  (`background-repeat: repeat` + `background-size: auto`, los dos valores
+  iniciales reales - no se leen otros valores de ninguna de las dos
+  propiedades). El detalle que no era obvio: un mosaico tiene que recortarse
+  a SU PROPIA caja, no solo a la de un `overflow: hidden` ancestro - a
+  diferencia de `fill_rect`/`paint_image` (que nunca pintan mas alla de su
+  propio `rect` aunque no haya mascara activa), `draw_pixmap` pinta el tile
+  entero sin respetar ningun borde. Se reconstruye la mascara con el propio
+  `rect` metido en la pila de recorte activa antes de pintar. Tope de 8192
+  tiles por caja (no hipotetico: una textura de pocos pixeles repetida sobre
+  una caja grande es un patron real de fondos baratos).
+- **No implementado, a proposito**: `background-position`,
+  `background-size` con valores explicitos, `background-repeat` con
+  variantes (`repeat-x`/`no-repeat`/...), multiples capas de fondo, y
+  funciones de imagen que no sean `url()` (`linear-gradient()`...). El
+  candidato real siguiente es `background-image` sobre `linear-gradient()`
+  o `background-size`/`background-position` explicitos - no `list-style-
+  image` (evaluado y descartado, ver `huecos_sin_resolver.md`: necesitaria
+  esta MISMA infraestructura, que ahora ya existe, pero es un caso mucho mas
+  raro en CSS real).
+
+Verificado en vivo contra `engine_server.exe` (release): shorthand
+`background: <color> url(...) no-repeat` (el color queda tapado por la
+imagen, correcto - la imagen pinta ENCIMA), longhand `background-color` +
+`background-image` por separado, y un mosaico deliberadamente mas grande
+que su caja dentro de un `overflow: hidden` mas pequeño todavia - las tres
+capturas correctas, sin derrame.
+
+**Tests del Workspace**: 805 pasando, 0 fallando, en los 10 crates.
+
+### Fase 41: Puerta de calidad automatica y test de humo del protocolo (2026-09-09)
+
+Esta fase no añade capacidad de motor: añade la infraestructura que impide que
+las 40 anteriores se degraden sin que nadie se entere. Hasta hoy los tests solo
+corrian cuando alguien se acordaba de lanzarlos a mano.
+
+#### La cifra de tests que nadie habia recontado
+
+El README decia 703, la Fase 40 decia 805. Recontado hoy: **805 era correcto**
+(13 binarios de test, 10 de doc-tests vacios). El 703 llevaba obsoleto desde la
+propia Fase 40 y se corrigio. Tras esta fase son **819**.
+
+Merece la pena apuntar por que la discrepancia sobrevivio tanto: `cargo test`
+imprime un `test result` por binario, no un total. Cualquiera que mire el final
+de la salida ve solo el ultimo. La unica forma de tener el numero es sumarlos, y
+por eso el numero se escribia a ojo y envejecia.
+
+#### `huecos_sin_resolver.md`: el fichero que la Fase 40 cito sin crear
+
+La Fase 40 lo referencia dos veces. No existia. Ahora existe, y no es una copia
+de las declaraciones "NO implementado" de este documento: **se verifico cada
+entrada con `grep` contra el codigo**, porque la mayoria de aquellas
+declaraciones ya no eran ciertas — la fase siguiente las cerro y el texto
+historico se quedo (correctamente: esto es un registro, no un estado).
+
+Dos ejemplos de lo que la verificacion corrigio:
+
+- El README afirmaba que faltaban `location.href` y `MutationObserver`. Ambos
+  existen desde la Fase 39/`8a0ea7f`.
+- El borrador del propio `huecos_sin_resolver.md` daba `Event` por ausente.
+  Esta registrado en `dom_bindings.rs:663` y probado en
+  `tests/wpt-style/events-and-microtasks.html`. Lo que falta es `CustomEvent`,
+  `EventTarget` como constructor y los eventos con metadatos
+  (`KeyboardEvent`/`MouseEvent`).
+
+El hallazgo que mas cambia el plan de trabajo: **no hay `<script type="module">`,
+ni `import()`, ni `defer`/`async`**. Se creia que el techo eran las APIs del DOM
+que faltaban; es anterior a eso. Todo bundle de Vite/Next/Svelte se sirve como
+modulo, asi que ninguno puede arrancar por muchas APIs que se añadan. Es la
+tarea C9 del `plan.md` y es la que desbloquea el resto del bloque.
+
+#### Politica de lints, con motivo escrito
+
+`cargo clippy -D warnings` es ahora una puerta de CI. Para llegar a cero avisos
+se arreglaron 7 cosas reales y se permitieron 3 categorias en
+`[workspace.lints.clippy]`, cada una con su razon al lado — un `allow` sin
+motivo escrito convierte la puerta en decorado.
+
+El arreglo que no era cosmetico: en `scripting.rs`, un bloque de 19 lineas de
+documentacion de `execute_inline_scripts_keeping_runtime` habia quedado
+**huerfano**. La definicion de `StorageContext` se colo entre el comentario y su
+funcion, asi que documentaba la nada y no salia en `cargo doc`. Lo detecto
+`empty_line_after_doc_comments`; ningun test podia verlo. Se movio la struct
+por encima.
+
+Lo que se decidio NO exigir: `cargo fmt --check`. rustfmt reordenaria ~1.400
+tramos de un codigo cuyos comentarios llevan el razonamiento de cada decision;
+haria ilegible `git blame` justo donde mas se consulta, a cambio de nada
+funcional. Corre igualmente como paso informativo.
+
+#### Test de humo NDJSON: la capa que ningun test tocaba
+
+`crates/core/tests/ndjson_smoke.rs`, 14 tests. Los tests que ya existian en
+`server.rs` construyen un `EngineServer` en memoria y llaman a `handle()`. Eso
+prueba la logica y se salta justo la capa que el producto usa: el proceso
+aparte, su stdin/stdout, el serde de ida y vuelta, y la regla de que **nada que
+no sea JSON puede salir por stdout**. Un `println!` de depuracion mal puesto no
+lo veia ningun test y rompe la aplicacion entera.
+
+- Arranca el binario `engine_server` real (`env!("CARGO_BIN_EXE_engine_server")`)
+  y habla con el por tuberias, como hace Electron.
+- Sirve el HTML desde un `TcpListener` propio de 30 lineas, **sin `hyper`**
+  aunque ya sea dependencia: si el test usara la misma pila HTTP que el motor,
+  un fallo en esa pila podria cancelarse consigo mismo.
+- Cubre las 16 variantes de `EngineRequest` mas las lineas invalidas y vacias.
+  `todas_las_variantes_del_protocolo_estan_cubiertas` lee el enum del fuente y
+  falla si mañana se añade una variante sin test, para que la cobertura no se
+  degrade en silencio.
+- Comprueba efectos, no solo que la respuesta llegue: que la captura empieza por
+  la firma real de PNG (la Fase 39 encontro justo lo contrario, un PNG declarado
+  como JPEG), que `back` vuelve a la URL anterior, que cada pestaña conserva la
+  suya, que `scroll` mueve de verdad, y que tras `type_text` el `value` del
+  `<input>` contiene el texto.
+- Que una linea basura devuelva `error` **y el proceso siga vivo** tiene test
+  propio: un parser que muere ante entrada invalida convertiria cualquier fallo
+  del cliente en una caida del navegador.
+
+#### Integracion continua
+
+`.github/workflows/engine.yml` (build, tests, clippy, los 24 tests estilo-WPT,
+auditoria de dependencias) y `app.yml` (tipos, build de la interfaz,
+empaquetado de Electron). Solo `windows-latest`: es la unica plataforma donde el
+motor se ha verificado. Ambos comandos se ejecutaron en local antes de
+escribirlos, para que el CI no naciera en rojo.
+
+Un hallazgo colateral de montarlo: **`npm run lint` de la interfaz esta roto**.
+La interfaz declara TypeScript 7 y `typescript-eslint` —incluida su ultima
+version, 8.70— solo soporta `<6.1.0`; el parser revienta antes de leer un
+fichero. No es codigo mal escrito: la pieza compatible aun no existe. `tsc` si
+comprueba los tipos y eso si bloquea; ESLint queda informativo hasta que se
+decida bajar TypeScript a 5.x o aparezca soporte.
+
+**Tests del Workspace**: 819 pasando, 0 fallando, en los 10 crates.
+
+### Fase 42: Sonda de APIs medible y utilidades de plataforma (2026-09-09)
+
+Primer trabajo del bloque C del `plan.md`, el que decide si las webs modernas se
+ven. La regla de esta fase fue medir antes de implementar, porque la historia
+del proyecto dice que la intuicion falla aqui: la Fase 39 creia que faltaba
+medio motor de JavaScript y faltaban seis funciones sueltas.
+
+#### La sonda: 48/114, y por que es un test y no un script
+
+`engine/tests/probes/api-probe.html` prueba 114 APIs; `crates/core/tests/
+api_probe.rs` la ejecuta por el camino REAL (proceso `engine_server` + HTTP, no
+`pipeline::build_page`, que no registra red ni almacenamiento y daria un numero
+pesimista) y convierte el resultado en un numero vigilado.
+
+La sonda de la Fase 39 midio 26/28 y no quedo en el repositorio, asi que aquel
+numero no se pudo volver a comprobar ni comparar. Un dato que no se puede
+reproducir es una anecdota.
+
+El test **no exige que la sonda pase entera** — fallaria hoy y seguiria fallando
+meses, y un test rojo permanente deja de leerse. Exige que el numero no BAJE, y
+ademas que el total de comprobaciones no cambie: sin esa segunda guarda, se
+podria "subir el porcentaje" borrando las comprobaciones incomodas.
+
+Reglas de la propia sonda, que no son obvias: no puede morirse con lo que mide
+(todo va en try/catch, y preguntar por un global inexistente solo es posible con
+`typeof`), y no usa ninguna API que este midiendo en su propia infraestructura.
+
+#### Hallazgo: `window` no es el objeto global
+
+La primera pasada dio `window.addEventListener` como ausente, cuando la Fase 40
+lo implemento. La sonda lo probaba como identificador suelto, y ahi estaba el
+hallazgo de verdad.
+
+En un navegador `window === globalThis`, asi que `addEventListener(...)` a secas
+y `window.addEventListener(...)` son lo mismo, igual que `innerWidth` y
+`window.innerWidth`. Aqui `window` es un objeto normal, asi que **la forma corta
+lanza `ReferenceError`** y se lleva por delante el script entero. Muchisimo
+codigo real la usa.
+
+La limitacion estaba declarada desde la Fase 6.4 en la cabecera de `window.rs`;
+lo nuevo es la medida de cuanto cuesta. Su primera consecuencia practica ya se
+nota en esta misma fase: cada global que ademas deba verse en `window.*` hay que
+ponerlo en los dos sitios a mano (`colgar_de_window` en `platform.rs`).
+
+#### `platform.rs`: 48 -> 56
+
+`console`, `URL`, `URLSearchParams`, `performance.now`, `atob`/`btoa` y
+`TextEncoder`/`TextDecoder`. Se eligieron por lo que rompen al faltar, no por lo
+completas que quedan.
+
+`console` es el caso extremo del principio de la Fase 39. Practicamente todo
+codigo de produccion conserva algun `console.warn`, y muchos frameworks avisan
+por ahi en desarrollo: sin el objeto, ese aviso —que deberia ser informativo—
+mataba la pagina. La salida va a `tracing` y JAMAS a stdout, que es el canal
+NDJSON.
+
+Detalles que costaron mas de lo que parecen y que un test cubre cada uno:
+
+- **`console.log` no serializa con `JSON.stringify`.** Cualquier nodo del DOM
+  tiene `parentNode`, asi que `console.log(elemento)` pasa un ciclo y
+  `stringify` lanzaria. Un log que LANZA es exactamente el problema que este
+  modulo viene a quitar.
+- **`btoa` lanza con caracteres fuera de Latin-1** en vez de truncar: truncar
+  produce datos corruptos que nadie detecta.
+- **`atob` ignora los espacios** porque el Base64 partido en lineas es comun.
+- **`URL` lanza con una cadena invalida.** Codigo real envuelve `new URL` en
+  try/catch para decidir si algo es una URL; devolver un objeto a medias romperia
+  ese patron.
+- **`URL` tiene `toString`.** Sin el, concatenar una URL daria `[object Object]`
+  y el fallo apareceria mucho mas tarde, en la peticion.
+- **`URLSearchParams.get` devuelve el PRIMER valor** con claves repetidas, y
+  `null` (no `undefined`) si no esta.
+- **`TextDecoder` rechaza codificaciones que no soporta** en vez de fingir.
+
+Se resuelven con el crate `url`, el mismo que la capa de red, para que una URL se
+resuelva igual desde JS que desde el motor.
+
+**Lo que NO se registro, a proposito**: `AbortController` (uno que solo marque
+una bandera sin cancelar el `fetch` es el stub que la doctrina prohibe: el codigo
+cree haber cancelado y la peticion sigue viva), `crypto.getRandomValues`
+(rellenarlo con numeros no criptograficos es peor que la ausencia) y
+`performance.getEntries` (devolver una lista vacia fingiria que se midio).
+
+Simplificacion declarada: `TextEncoder.encode` devuelve un Array normal, no un
+`Uint8Array`. Se indexa y se recorre igual; lo que no funcionara es pasarselo a
+algo que exija un TypedArray de verdad.
+
+**Tests del Workspace**: 841 pasando, 0 fallando.
+
+### Fase 43: Modulos ES — `<script type="module">` y el orden real de carga (2026-09-09)
+
+El bloqueo estructural que la Fase 41 identifico al verificar los huecos contra
+el codigo. Se creia que el techo del motor eran las APIs del DOM ausentes; era
+anterior a eso.
+
+#### El problema, con su forma exacta
+
+Todo bundle de Vite, Next o Svelte se sirve como `<script type="module">`, y
+este motor lo ejecutaba como un script CLASICO. En un script clasico, `import`
+y `export` son errores de SINTAXIS: el bundle moria en el parseo, antes de la
+primera linea util, y ninguna cantidad de APIs del DOM anadidas despues lo
+habria cambiado.
+
+Por eso esta fase va antes que el resto del bloque C, y no despues.
+
+#### De donde salen los modulos que se importan
+
+De lo que `core::server` ya descargo antes de arrancar el JavaScript, no de la
+red en caliente. Es el mismo patron que el resto del motor (hojas de estilo,
+imagenes, scripts clasicos): descubrir todas las URLs, descargarlas en paralelo
+con el filtro de CSP aplicado, y solo entonces construir la pagina.
+
+Ir a la red DENTRO del cargador tendria dos problemas, no uno: habria que
+bloquear el hilo del interprete en mitad de la evaluacion, y se saltaria el
+filtro de `script-src` que ya se aplico aguas arriba.
+
+Que eso baste para un bundle real no es casualidad. Un `index.html` de Vite
+declara UN modulo raiz con `<script type="module" src>` y sus fragmentos con
+`<link rel="modulepreload" href>`, precisamente para que el navegador los tenga
+antes de necesitarlos. `pipeline::find_module_preloads` los recoge y
+`core::server` los mete en la MISMA lista que los `<script src>`: para el motor
+son codigo JavaScript que un `import` va a pedir, y tratarlos por un camino
+aparte solo abriria la puerta a que un dia uno de los dos aplicara una politica
+distinta.
+
+#### Orden de ejecucion: de una pasada a tres
+
+`run_scripts` recorria todos los `<script>` en orden de documento, ignorando
+`type`, `defer`, `async` y `nomodule`. Ahora clasifica y hace tres pasadas:
+clasicos, luego `defer` y modulos (un modulo es `defer` por defecto segun el
+spec, sin escribirlo), luego `async`.
+
+Tres cosas que la clasificacion arregla y que no eran obvias:
+
+- **`<script nomodule>` se omite.** Marca el respaldo para navegadores sin
+  modulos. Ejecutarlo ADEMAS del modulo montaria la aplicacion dos veces; en una
+  web real eso se manifiesta como contenido duplicado.
+- **`<script type="application/json">` ya no se ejecuta.** Es un contenedor de
+  datos, comunisimo para datos estructurados y estado inicial. Antes se
+  intentaba ejecutar y producia un error de sintaxis que ensuciaba el
+  diagnostico de la pagina.
+- **`defer` espera de verdad.** Codigo real depende de que, cuando corra, el DOM
+  entero exista.
+
+`async` se ejecuta al final y en orden de documento, no "en cuanto llega": aqui
+todo esta descargado antes de evaluar nada, asi que no hay un "cuando llegue"
+que respetar. Es una aproximacion declarada, y la que menos codigo rompe: lo que
+`async` promete es "no bloqueo el parseo", no un orden concreto.
+
+#### Decisiones del cargador
+
+- **La cache de modulos parseados no es una optimizacion, es obligatoria.** El
+  spec exige que dos `import` del mismo especificador devuelvan EL MISMO modulo.
+  Sin ella, un modulo importado dos veces se evaluaria dos veces y su estado (un
+  contador, un registro de componentes) se duplicaria, con sintomas muy lejos de
+  la causa. Tiene test.
+- **El modulo raiz se identifica por su URL ABSOLUTA**, no por el `src` crudo,
+  para que sea el mismo modulo que veria un `import` a esa ruta. Si no, el mismo
+  fichero cargado como `<script src>` y ademas importado se evaluaria dos veces.
+- **Un especificador desnudo (`import x from "react"`) se rechaza diciendo por
+  que.** En la web no tiene significado sin un import map. Resolverlo como ruta
+  produciria una URL inventada, una descarga fallida y un error que apunta al
+  sitio equivocado.
+- **Un import no descargado falla con el nombre del modulo en el mensaje**, no
+  devuelve un modulo vacio. Un modulo vacio haria que el `import` "funcionara" y
+  que el fallo apareciera mucho despues como un `undefined is not a function`
+  sin relacion con la causa.
+- **Una promesa de modulo que queda pendiente tras drenar los trabajos se
+  reporta como error.** Devolver `Ok` dejaria la pagina a medias sin ninguna
+  pista.
+
+`JsRuntime::with_modules` es un constructor aparte y no un flag: el cargador se
+instala al CONSTRUIR el `Context` de Boa y despues ya no se puede cambiar. Sin
+URL de pagina no hay base contra la que resolver, asi que ese camino
+(`core::main`, los tests sin red) se queda con el runtime clasico y un modulo
+falla ahi con su motivo en vez de ejecutarse mal.
+
+#### Simplificacion declarada: resolucion contra la pagina
+
+Los especificadores se resuelven contra la URL de la PAGINA, no contra la del
+modulo que importa. Boa 0.19 no expone donde guardar la URL de cada modulo
+(`host_defined` es inmutable y `path` es un `Path` de disco, no una URL).
+
+Lo que cubre y lo que no: los bundlers emiten rutas ABSOLUTAS
+(`/assets/index-abc.js`), que se resuelven igual contra la pagina que contra el
+importador, asi que el caso que motiva toda la fase funciona. Falla un
+`./vecino.js` entre dos modulos que no esten en el directorio del documento.
+
+Tampoco hay `import()` dinamico ni `<script type="importmap">`.
+
+#### Verificacion
+
+`crates/core/tests/bundle_modulos.rs`, 7 tests contra el binario real, sirviendo
+la estructura de un bundler desde un servidor local con rutas separadas (el
+`TestServer` compartido gano soporte de rutas para esto: probar varios ficheros
+contra un servidor que devuelve lo mismo para todo no probaria nada).
+
+El test principal comprueba el TEXTO que llega al arbol de LAYOUT, no una
+variable global. Que el script corra sin lanzar no significa que la pagina se
+vea; comprobar una global pasaria aunque el DOM se hubiera quedado sin tocar.
+
+Un fallo del primer intento que merece quedar escrito, porque el diagnostico
+inicial fue equivocado: `requires_javascript` seguia en `true` sobre un bundle
+que SI se habia ejecutado. No era un bug del motor - el umbral son 40 caracteres
+de texto visible (`MIN_VISIBLE_TEXT_CHARS`) y el bundle del test producia 31. La
+heuristica hacia exactamente lo que documenta; lo poco realista era el test.
+
+**Tests del Workspace**: 856 pasando, 0 fallando.
+
+### Fase 44: Jerarquia de clases del DOM y los metodos de Element que faltaban (2026-09-09)
+
+Tareas C3 y C6 del `plan.md`. Con los modulos ES resueltos (Fase 43), el techo
+pasa a ser la superficie de plataforma, y esto es el primer trozo grande de ella.
+
+Sonda de APIs: **56 -> 73 de 114**. Tests estilo-WPT: **24 -> 42**.
+
+#### `instanceof` y los polyfills, los dos patrones que fallaban en silencio
+
+Cada objeto de elemento era un objeto suelto sin ninguna cadena de prototipos.
+Eso rompia dos cosas que un bundle real hace al arrancar:
+
+1. `el instanceof HTMLElement` era `false`. Es la comprobacion con la que media
+   web decide si algo es un nodo o un objeto de configuracion, y una respuesta
+   equivocada manda al codigo por la rama que no es.
+2. `Element.prototype.matches = ...` no hacia nada. Ese es literalmente como se
+   instala un polyfill: se anade al prototipo y se espera que lo vean los
+   elementos ya creados. Sin cadena, el polyfill se instalaba "bien" y el metodo
+   seguia sin existir.
+
+`dom_classes.rs` construye la jerarquia real (`EventTarget` -> `Node` ->
+`Element` -> `HTMLElement` -> subclases) y registra cada clase como global con su
+`prototype` y su `constructor` enlazados en los dos sentidos - sin ese enlace,
+toda la jerarquia existiria y `instanceof` seguiria dando `false`, porque es
+`Clase.prototype` lo que busca.
+
+Los constructores LANZAN con `new`. No es una limitacion: el spec dice
+`TypeError: Illegal constructor` y los elementos se crean con
+`document.createElement`. Devolver un objeto seria peor - pareceria un elemento
+y no estaria en ningun documento.
+
+**Lo que esta fase NO cierra, y por que**: los metodos siguen en la instancia, no
+en el prototipo, porque `build_element_object` los construye con closures que
+capturan su nodo. Un metodo que el motor YA tiene tapa al del prototipo, asi que
+un envoltorio de `Element.prototype.appendChild` se instala y nunca se ejecuta.
+Un metodo que el motor NO tiene si se hereda, que es el caso de todo polyfill.
+Cerrarlo del todo exige que cada metodo recupere su nodo desde `this`, es decir
+reescribir las ~675 lineas de `build_element_object`.
+
+#### El falso positivo que llevaba dos fases dando verde
+
+`innerHTML` **no existia**. La sonda lo daba por presente porque comprobaba
+`el.innerHTML = x; el.innerHTML.indexOf(...)`, y asignar una propiedad
+cualquiera a un objeto JS siempre funciona y devuelve lo asignado. La
+comprobacion pasaba sin que el DOM cambiara, y el mismo fallo estaba en la sonda
+de la Fase 39.
+
+Corregido en los dos sitios: la sonda ahora comprueba el EFECTO
+(`el.firstElementChild.tagName`), e `innerHTML` esta implementado de verdad, con
+getter que reserializa e setter que parsea con `html5ever` - el parser real, no
+uno a mano: su recuperacion de errores es justo lo que hace que `innerHTML`
+funcione con fragmentos mal formados, que es como llegan casi siempre.
+
+Es el mejor argumento a favor de la regla de la sonda que dice que una
+comprobacion debe medir capacidad real y no ausencia de excepcion.
+
+#### Metodos anadidos, elegidos por lo que rompen al faltar
+
+`matches` y `closest` usan el matcher REAL del crate `css` (el de Firefox), el
+mismo que la cascada: reusarlo y no escribir otro comparador es lo que garantiza
+que `el.matches('.a > .b')` responda igual que si esa regla estuviera en una
+hoja de estilos. Son la base de la delegacion de eventos, que es como funciona
+todo framework.
+
+Detalles del spec que tienen test propio porque su ausencia se nota tarde:
+
+- **`closest` empieza por el propio elemento.** Es lo que hace util al metodo:
+  `e.target.closest('button')` acierta tanto si se pulso el boton como si se
+  pulso el icono de dentro.
+- **`contains` se incluye a si mismo.** Es lo que hace correcto el patron
+  "cerrar el menu si el clic fue fuera": sin ello, pulsar el propio menu lo
+  cerraria.
+- **`append` convierte cadenas en nodos de TEXTO**, no las parsea como HTML.
+  Esa es la propiedad que lo hace seguro frente a `innerHTML`:
+  `el.append(nombreDelUsuario)` no puede inyectar etiquetas.
+- **`prepend(a, b)` deja `a` antes que `b`**, no al reves.
+- **`cloneNode` produce un arbol nuevo sin compartir nodos** con el original; si
+  los compartiera, tocar la copia cambiaria el documento.
+
+#### Un hueco que encontro el propio test
+
+Al escribir `tests/wpt-style/element-methods.html`, dos casos fallaron porque
+`boton.id` era `undefined`: los elementos exponian `tagName` pero **no `id` ni
+`className`**, que son de lo mas usado que hay. Se anadieron como accessors
+VIVOS sobre sus atributos - vivos y no una foto como `tagName`, porque la
+etiqueta de un elemento no cambia nunca pero su `id` y sus clases si.
+
+#### Simplificaciones declaradas
+
+- `dataset` es una foto en cada lectura, no un proxy vivo: escribir en el no
+  cambia el atributo. Leerlo, que es el uso mayoritario, funciona.
+- `outerHTML` no tiene setter: reemplazar el nodo dentro de su padre exige
+  parseo de HTML EN CONTEXTO (un `<td>` suelto se parsea distinto fuera de una
+  tabla). Un setter a medias produciria un arbol equivocado en silencio.
+- El serializador esta escrito a mano y no lo hace `html5ever`: el adaptador
+  `TreeSink` no guarda lo necesario para una reserializacion fiel (orden
+  original de atributos, comillas, mayusculas del fuente). Produce HTML
+  equivalente, no un calco. El orden de atributos se ordena alfabeticamente a
+  proposito: un `HashMap` no tiene orden y sin ordenarlo el mismo elemento
+  daria cadenas distintas entre ejecuciones.
+
+**Tests del Workspace**: 874 pasando, 0 fallando.
+
+### Fase 45: Subclases de Event, entorno de `window` y el resto de `document` (2026-09-09)
+
+Tareas C4, C6 y C7 del `plan.md`. Sonda de APIs: **73 -> 85 de 114**. Tests
+estilo-WPT: **42 -> 60**.
+
+#### Subclases de Event
+
+`CustomEvent`, `KeyboardEvent`, `MouseEvent`, `InputEvent` y `FocusEvent`.
+`CustomEvent` es el canal por el que cualquier libreria de estado avisa de un
+cambio; `KeyboardEvent`/`MouseEvent` son los que un framework SINTETIZA para
+probar o para reemitir. Sin sus constructores, ese codigo lanzaba `TypeError` en
+su primera linea util.
+
+Cierra ademas el hueco que este documento declaraba en «Integracion con el
+producto» como «metadatos de tecla todavia no estan implementados»: el tipo
+existe con sus campos, aunque el teclado REAL siga sin rellenarlos (eso es del
+lado de `core::server`, no del binding).
+
+Dos detalles con test propio porque su ausencia se nota tarde:
+
+- **Los modificadores se ponen siempre**, aunque no vinieran en las opciones. El
+  spec dice que son booleanos, no opcionales; `e.ctrlKey` devolviendo
+  `undefined` haria que un `if (e.ctrlKey)` acertara por accidente pero un
+  `e.ctrlKey === false` fallara.
+- **`CustomEvent.detail` sin opciones es `null`, no `undefined`**, e
+  `InputEvent.data` tambien: el spec distingue "no hubo datos" (borrar) de "los
+  datos eran la cadena vacia".
+
+#### El viewport se publicaba demasiado tarde
+
+`window.innerWidth` no funciono al primer intento, y la causa merece quedar
+escrita porque es un fallo de ORDEN, no de implementacion.
+
+`pipeline::build_page_keeping_runtime` ejecuta los scripts, DESPUES calcula el
+layout y DESPUES publica el snapshot. El viewport iba en esa ultima publicacion
+por comodidad, asi que durante toda la ejecucion de los scripts valia cero -
+justo cuando una pagina lo consulta para repartir espacio.
+
+El viewport no depende del layout: es un dato de ENTRADA, no un resultado. Ahora
+se publica antes de correr ningun script.
+
+Se detecto porque la sonda lo seguia dando como ausente despues de
+implementarlo. Verificar en vez de dar por hecho que un cambio funciono es lo
+que convirtio un bug silencioso en un arreglo de dos lineas.
+
+#### `matchMedia` usa el mismo evaluador que `@media`
+
+`engine_css::parse_media_condition` paso a ser publica para eso. Tener dos
+parsers de media queries seria garantizar que un dia respondan distinto sobre la
+misma consulta, y ese es justo el fallo que nadie diagnostica.
+
+El `MediaQueryList` que devuelve tiene `addEventListener`/`addListener` que **no
+disparan**, y eso es deliberado y distinto del caso de los observadores: el
+motor no reevalua consultas al redimensionar, asi que un listener no se
+ejecutara nunca. La diferencia con `IntersectionObserver` (que se sigue sin
+registrar) es que un listener de media query que no dispara deja a la pagina en
+su estado INICIAL, que es un estado valido; un observador que no dispara la deja
+esperando para siempre. Por eso uno se registra y el otro no.
+
+Mismo criterio para `window.scrollTo`/`scrollBy`: aceptan la llamada sin mover
+nada, porque mover el scroll de verdad exige un camino JS -> servidor que
+todavia no existe (hoy el scroll va del servidor hacia JS, no al reves). No
+mover es un resultado que la pagina puede observar y sobrevivir.
+
+#### `document.readyState` devuelve `"interactive"`, no `"loading"`
+
+La diferencia decide como arranca media web:
+
+```js
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+else init();
+```
+
+Aqui los scripts corren con el documento YA parseado entero, asi que `"loading"`
+seria falso y ese codigo esperaria un `DOMContentLoaded` que ya paso o esta a
+punto de pasar. `"interactive"` describe el estado real y hace que ese arranque
+llame a `init()` directamente.
+
+`document.currentScript` es `null`, que es el valor CORRECTO dentro de un modulo
+ES y el honesto para un script clasico aqui: no hay un "script en curso" dentro
+del parseo al que apuntar. Devolver un elemento cualquiera seria peor, porque
+codigo real lo usa para leer los `data-*` de su PROPIA etiqueta.
+
+`document.activeElement` devuelve `body` mientras no haya foco real, que es lo
+que devuelve un navegador cuando nada esta enfocado - no un relleno. `null`
+seria peor: hay codigo que hace `document.activeElement.blur()` sin comprobar.
+
+#### El arnes de tests corria en otro motor
+
+Al escribir `tests/wpt-style/eventos-y-entorno.html`, cuatro tests fallaron con
+`ReferenceError: window is not defined`. La causa: `execute_inline_scripts_with_harness`
+creaba un `JsRuntime` pelado, sin `window`, sin utilidades de plataforma y sin
+entorno. Los tests estilo-WPT estaban probando un motor distinto del que corre
+de verdad.
+
+Ahora el arnes registra el mismo entorno que una pagina real. Lo que sigue sin
+registrar es la RED (`fetch`/`XHR`): el arnes no debe salir a internet, y su
+ausencia ahi es una decision, no un olvido.
+
+#### Simplificaciones declaradas
+
+- `getElementsByClassName` devuelve un Array, no una `HTMLCollection` VIVA: es
+  una foto del momento de la llamada. Compara por TOKEN completo, igual que el
+  selector `.clase` de CSS - responder distinto entre los dos seria una fuente
+  de fallos sin diagnostico.
+- `MouseEvent.pageX`/`pageY` se igualan a `clientX`/`clientY`: sin acceso al
+  scroll desde el constructor, es correcto mientras la pagina no este desplazada
+  y una aproximacion cuando si.
+
+**Tests del Workspace**: 874 pasando, 0 fallando. **Estilo-WPT**: 60.
+
+### Fase 46: El lint de la interfaz vuelve a funcionar, y pasa a bloquear (2026-09-09)
+
+No toca el motor. Cierra el hallazgo colateral de la Fase 41: `npm run lint`
+llevaba roto y nadie lo sabia porque el CI lo tenia marcado como informativo.
+
+#### La causa: una incompatibilidad que no se arregla escribiendo mejor codigo
+
+La interfaz declaraba TypeScript 7 (el port nativo en Go) y `typescript-eslint`
+solo soporta `>=4.8.4 <6.1.0`, incluida su ultima version. Con TS 7 el parser
+revienta antes de analizar un solo fichero:
+
+```
+TypeError: Cannot read properties of undefined (reading 'Cjs')
+```
+
+No habia forma de arreglarlo desde este repositorio: la pieza compatible no
+existe todavia.
+
+#### La decision: bajar TypeScript a 5.9
+
+Se eligio bajar el compilador y recuperar el lint, y no al reves, midiendo lo
+que cuesta cada lado:
+
+- **Lo que se pierde**: la velocidad del compilador nativo. La interfaz son 21
+  modulos y compila en menos de medio segundo con las dos versiones. A esta
+  escala la ventaja de TS 7 no es observable.
+- **Lo que se gana**: las reglas de `react-hooks`, que cazan clases de error
+  reales - dependencias que faltan en un efecto (cierres obsoletos), `setState`
+  dentro de un efecto (bucles de render), lectura de una `ref` durante el
+  render.
+
+Es reversible con una linea en cuanto `typescript-eslint` soporte TS 7.
+
+#### 20 hallazgos de golpe, y por que no se arreglaron todos
+
+Al volver a funcionar, el lint encontro 20 problemas: 9 `no-explicit-any`, 5
+`react-hooks/refs`, 2 `react-hooks/exhaustive-deps`, y cuatro sueltos.
+
+Arreglar los de `react-hooks` a ciegas puede CAMBIAR el comportamiento de la
+interfaz: el "arreglo" de un `exhaustive-deps` es anadir una dependencia, y eso
+altera cuando se re-ejecuta el efecto. No es una limpieza cosmetica.
+
+Asi que el lint pasa a bloquear como TRINQUETE
+(`frontend/scripts/lint-ratchet.mjs`): falla si el numero SUBE, no si es mayor
+que cero. Exigir cero habria dejado la puerta en rojo durante semanas, y un CI
+rojo permanente deja de leerse - que es peor que no tenerlo.
+
+Es el mismo patron que `crates/core/tests/api_probe.rs` usa para la sonda de
+APIs del motor, y por la misma razon: convierte una deuda grande en una que solo
+puede menguar.
+
+El trinquete se probo en las dos direcciones antes de darlo por bueno (falla con
+la base a 19, pasa con la base a 20). Uno que no se ha visto fallar no se sabe
+si funciona.
+
+Detalle de implementacion: usa la API de `eslint` en vez de lanzar `npx`.
+Lanzar un `.cmd` desde Node en Windows falla con `EINVAL`, y el proceso extra no
+aportaba nada.

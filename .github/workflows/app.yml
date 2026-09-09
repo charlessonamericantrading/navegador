@@ -1,0 +1,111 @@
+# Puerta de calidad de la aplicacion: interfaz React y envoltorio Electron.
+#
+# El motor tiene su propia puerta (`engine.yml`). Esta cubre lo que vive fuera
+# de Rust: que la interfaz compila con tipos correctos, que el bundle de
+# produccion se genera, y que `electron-builder` sigue sabiendo empaquetar.
+#
+# Sobre ESLint: bloquea, pero como TRINQUETE. Falla si el numero de hallazgos
+# SUBE, no si es mayor que cero (ver `frontend/scripts/lint-ratchet.mjs`).
+#
+# El motivo esta en la Fase 46: el lint llevaba roto porque la interfaz
+# declaraba TypeScript 7 y `typescript-eslint` --incluida su ultima version--
+# solo soporta `<6.1.0`. Al bajar TypeScript a 5.9 volvio a funcionar y
+# aparecieron 20 hallazgos de golpe. Exigir cero habria dejado esta puerta en
+# rojo hasta arreglarlos todos, y varios son de `react-hooks/exhaustive-deps`,
+# cuyo arreglo puede cambiar el comportamiento de la interfaz. Un CI rojo
+# permanente deja de leerse, que es peor que no tenerlo.
+
+name: app
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: app-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Instalar dependencias
+        working-directory: frontend
+        run: npm ci
+
+      # `tsc -b` es la comprobacion que de verdad atrapa errores; va aparte
+      # del build para que el log diga si fallo el tipado o el empaquetado.
+      - name: Comprobar tipos
+        working-directory: frontend
+        run: npx tsc -b
+
+      - name: Compilar
+        working-directory: frontend
+        run: npm run build
+
+      # Trinquete, no exigencia de cero. Ver la cabecera de este fichero.
+      - name: Lint (sin regresiones)
+        working-directory: frontend
+        run: npm run lint:ci
+
+  desktop:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Instalar dependencias de la interfaz
+        working-directory: frontend
+        run: npm ci
+
+      # `electron-builder` copia `frontend/dist` como recurso extra, asi que
+      # sin este build el empaquetado fallaria por una razon que no tiene nada
+      # que ver con Electron.
+      - name: Compilar la interfaz
+        working-directory: frontend
+        run: npm run build
+
+      - name: Instalar dependencias de Electron
+        working-directory: desktop
+        run: npm ci
+
+      # El motor compilado y el backend viven en `desktop/build-resources/`,
+      # que esta en .gitignore porque son binarios de 50 MB. En CI no existen,
+      # y `electron-builder` aborta si un `extraResources` apunta a un
+      # directorio que no esta.
+      #
+      # Se crean vacios en vez de desactivar `extraResources` por linea de
+      # comandos. La primera version usaba `-c.extraResources=null` y fallaba
+      # solo en CI: el paso corre bajo PowerShell, que parte ese argumento en
+      # `-c` mas una ruta, y `electron-builder` intentaba abrir un fichero de
+      # configuracion llamado `.extraResources=null`. Ademas, con los
+      # directorios presentes se valida la configuracion REAL, que es lo que
+      # este job existe para comprobar.
+      - name: Preparar recursos vacios
+        working-directory: desktop
+        run: |
+          New-Item -ItemType Directory -Force -Path build-resources/engine | Out-Null
+          New-Item -ItemType Directory -Force -Path build-resources/backend-server | Out-Null
+
+      # `--dir` empaqueta sin generar el instalador NSIS: comprueba que la
+      # configuracion es valida y que los recursos que declara existen, sin
+      # gastar los minutos de construir el .exe ni necesitar certificado.
+      - name: Empaquetar (sin instalador)
+        working-directory: desktop
+        run: npx electron-builder --dir

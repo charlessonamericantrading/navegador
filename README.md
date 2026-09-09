@@ -3,10 +3,14 @@
 Un navegador de escritorio con un **motor de renderizado propio escrito desde cero en Rust** — sin Chromium, sin WebKit, sin Gecko.
 
 > **Estado: en desarrollo, no apto para uso general todavía.**
-> El motor renderiza páginas reales por HTTPS, pero le faltan piezas de
-> seguridad imprescindibles (política de mismo origen, aislamiento de
-> procesos). Ver [Qué falta](#qué-falta) antes de usarlo con sitios en los
-> que no confíes.
+> El motor renderiza páginas reales por HTTPS, pero no tiene aislamiento de
+> procesos: todas las pestañas viven en el mismo proceso, sin sandbox del
+> sistema operativo. Ver [Qué falta](#qué-falta) antes de usarlo con sitios
+> en los que no confíes.
+>
+> El plan de trabajo completo, con las tareas pendientes priorizadas, está
+> en [`plan.md`](plan.md). El backlog técnico del motor, verificado contra
+> el código, está en [`engine/huecos_sin_resolver.md`](engine/huecos_sin_resolver.md).
 
 ---
 
@@ -14,17 +18,17 @@ Un navegador de escritorio con un **motor de renderizado propio escrito desde ce
 
 Todo lo de esta lista está implementado y verificado ejecutando el motor, no
 solo compilándolo. Las cifras salen de correr la suite de tests el
-2026-08-20.
+2026-08-27.
 
 | | |
 |---|---|
-| **Motor** | ~23.000 líneas de Rust, 10 crates |
-| **Tests** | 683 pasando, 0 fallando |
+| **Motor** | ~25.800 líneas de Rust, 10 crates |
+| **Tests** | 874 pasando, 0 fallando (medido el 2026-09-09) |
 | **Red** | HTTP/1.1 + HTTPS real (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies RFC 6265, CORS y CSP |
 | **HTML** | Parseo con `html5ever` (el de Servo), DOM mutable, `<canvas>` 2D context |
-| **CSS** | Cascada con especificidad real, selectores con combinadores (`selectors`, el de Firefox), pseudo-clases, `@media`, `rem`, porcentajes |
+| **CSS** | Cascada con especificidad real, selectores con combinadores (`selectors`, el de Firefox), pseudo-clases, `@media`, `rem`, porcentajes, shorthands (`padding`/`margin` de 1-4 valores, `flex`) |
 | **Layout** | Bloque, inline, `box-sizing: border-box`, flexbox con *intrinsic sizing*, CSS Grid, tablas, `float`, `position` (sticky/relative/absolute) |
-| **JavaScript** | Motor `boa`, DOM bindings, eventos con burbujeo, `fetch`, `XMLHttpRequest`, `setTimeout`, `localStorage`, Canvas 2D API |
+| **JavaScript** | Motor `boa` (sintaxis ES moderna completa: `async`/`await`, clases, spread, `Map`/`Set`, `Promise`), DOM bindings, eventos con burbujeo, `fetch`, `XMLHttpRequest`, `setTimeout`, `requestAnimationFrame`, `localStorage`, `navigator`, Canvas 2D API |
 | **Pintado** | Rasterizado con `tiny-skia`, gráficos vectoriales SVG con `resvg`/`usvg`, fuentes con glifos reales, `border-radius`, sombras |
 | **IA Nativa** | Crate `engine-ai` con Árbol de Accesibilidad Semántico (AOM) con coordenadas espaciales optimizado para LLMs |
 
@@ -33,6 +37,21 @@ HTTPS, navegar por enlaces, usar el historial, abrir pestañas, rellenar y
 **enviar formularios** (GET y POST), **iniciar sesión** en un sitio con
 autenticación por cookies, e **interactuar con el Agente Copiloto IA**
 autónomo desde la barra lateral.
+
+**Y lo que NO, dicho aquí y no enterrado abajo:** las webs que construyen su
+contenido con JavaScript en el cliente (React, Next, Vue, Shopify) siguen sin
+verse en general, pero el motivo ya no es el que era. Hasta la Fase 43 el
+bloqueo era estructural: un `<script type="module">` ni siquiera parseaba, así
+que **ningún** bundle podía arrancar. Eso está resuelto y hay un test que
+carga la estructura que emite un empaquetador y comprueba que se ejecuta y
+pinta.
+
+Lo que queda ahora es superficie de plataforma: faltan APIs del DOM que un
+framework toca al arrancar, y la ausencia de una sola lanza un `TypeError` que
+mata el script entero. Es trabajo incremental y medible, no un muro. Cuando la
+página se queda vacía, el navegador lo **dice con un aviso claro** en vez de
+dejar la pantalla en blanco. Las webs que envían su contenido ya hecho en el
+HTML (Google, Wikipedia, prensa, documentación) se ven desde hace tiempo.
 
 ---
 
@@ -50,10 +69,25 @@ Esto es la parte importante de este README, y está aquí arriba a propósito.
 | **CORS** | ✅ Real (`Access-Control-Allow-Origin`, preflight OPTIONS, credenciales) |
 | **CSP** | ✅ Real (`default-src`, `script-src`, `style-src`, `img-src`, `connect-src`, `font-src`, `media-src`) |
 | **Sandbox de proceso** | ❌ No existe |
+| **Dependencias sin avisos** | ❌ Dos fallos reales en el parser de números de `boa` |
 
-Sin política de mismo origen ni sandbox, una página maliciosa no tiene
-barreras. **Úsalo con sitios de confianza o en desarrollo, no como
-navegador diario.**
+Las defensas de origen (cookies aisladas, CORS, CSP, esquemas seguros) son
+reales y están probadas. Lo que no existe es la capa de abajo: **el motor
+corre en un único proceso sin sandbox del sistema operativo**, y todas las
+pestañas lo comparten, así que un pánico en una tumba el navegador entero.
+Rust elimina de raíz la corrupción de memoria, pero no un fallo lógico en el
+intérprete de JavaScript ni en un decodificador de imágenes ante un fichero
+malicioso.
+
+La auditoría de dependencias encuentra además **dos fallos reales**, no de
+mantenimiento, en `fast-float`: un fallo de segmentación por falta de
+comprobación de límites y varios problemas de *soundness*. Llegan a través de
+`boa`, el motor de JavaScript, así que lo que los alcanza es código de
+cualquier página. Cerrarlos exige subir `boa` de 0.19 a 0.22, una migración de
+API que está planificada. El CI los tiene listados como conocidos y bloquea
+cualquier aviso nuevo.
+
+**Úsalo con sitios de confianza o en desarrollo, no como navegador diario.**
 
 ### Plataforma
 
@@ -62,19 +96,84 @@ Linux en teoría, pero nunca se ha verificado aquí. Sin versión móvil.
 
 ### Web moderna
 
-Sin `<canvas>`, `<video>`, `<audio>`, `<iframe>`, `<svg>`. Sin WebGL,
-IndexedDB, Service Workers, WebSockets ni Web Workers. Sin HTTP/2 ni caché
-HTTP. El JavaScript es interpretado (sin JIT), así que es bastante más
-lento que un navegador comercial.
+**Lo que falta de verdad y define el techo:** no se ejecutan los *bundles*
+de las aplicaciones web modernas. No es que falte un motor de JavaScript —
+`boa` cubre la sintaxis ES moderna entera — sino que faltan piezas del
+DOM/BOM sin las cuales el bundle muere en su primera línea. La ausencia de
+*una sola* API lanza un `TypeError` que se lleva por delante el script
+completo, así que el coste de una API ausente no es proporcional a lo usada
+que sea.
+
+Lo que bloquea hoy, comprobado contra el código el 2026-09-09:
+
+* **`window` no es el objeto global.** En un navegador `window === globalThis`,
+  así que `addEventListener(...)` a secas funciona. Aquí no: lanza
+  `ReferenceError` y mata el script.
+* **APIs ausentes:** `AbortController`, `structuredClone`, `crypto`,
+  `IntersectionObserver`, `ResizeObserver`, `customElements`, `DOMParser`,
+  `innerText`, `insertAdjacentHTML`, `FormData`, `Blob`, `WebSocket`,
+  `indexedDB`.
+
+**Los módulos ES ya funcionan desde la Fase 43**, que era el bloqueo anterior a
+todo lo demás: `<script type="module">` con `import`/`export` reales,
+`defer`/`async` en su orden, y los fragmentos de `<link rel="modulepreload">`
+disponibles para los `import`. Un bundle con la estructura que emite un
+empaquetador se ejecuta y pinta su contenido, verificado de punta a punta en
+`engine/crates/core/tests/bundle_modulos.rs`. Lo que sigue faltando de ahí es
+`import()` dinámico y los *import maps*.
+
+**La jerarquía de clases del DOM funciona desde la Fase 44**: `instanceof
+HTMLElement` responde bien y un polyfill instalado en `Element.prototype` lo
+ven los elementos ya creados, que son los dos patrones que un framework ejecuta
+al arrancar. Con ella llegaron `matches`, `closest`, `contains`, `remove`,
+`append`, `prepend`, `cloneNode`, `dataset`, `id`, `className`, `outerHTML` y
+un `innerHTML` de verdad.
+
+Hay una sonda que mide lo demás, no es una impresión: **85 de 114** el
+2026-09-09.
+Se ejecuta con la suite y un test impide que el número baje.
+
+```bash
+cargo test -p engine-core --test api_probe -- --nocapture
+```
+
+`location` y `MutationObserver` **sí** existen desde la Fase 39, y `console`,
+`URL`, `URLSearchParams`, `performance`, `atob`/`btoa` y `TextEncoder` desde la
+Fase 42. La lista completa y actualizada está en
+[`engine/huecos_sin_resolver.md`](engine/huecos_sin_resolver.md).
+
+Sin `<video>`, `<audio>`, `<iframe>`. Sin WebGL, IndexedDB, Service Workers,
+WebSockets ni Web Workers. Sin HTTP/2 ni caché HTTP. El JavaScript es
+interpretado (sin JIT), así que es bastante más lento que un navegador
+comercial.
+
+`<canvas>` 2D y `<svg>` **sí** están soportados desde las Fases 37-38 (ver
+`engine/ARCHITECTURE.md`).
+
+### Rendimiento
+
+Medido el 2026-08-27 sobre páginas reales y sintéticas. Una página grande
+con mucho CSS (13.000 nodos contra 2.000 reglas) tardaba **69,7 s** y ahora
+tarda **1,8 s**; el artículo "España" de Wikipedia costaba **38,9 s** de CPU
+y ahora **4,0 s**. Las tres causas —selectores reparseados en cada
+comparación, ausencia de prefiltro por selector clave, y subrecursos
+descargados en serie— están documentadas en `ARCHITECTURE.md` (Fase 39).
+
+Sigue sin haber caché HTTP ni HTTP/2, así que cada navegación vuelve a
+descargar todos los subrecursos.
 
 ### Compatibilidad
 
 La métrica honesta de un motor de navegador es cuántos tests de
 [Web Platform Tests](https://github.com/web-platform-tests/wpt) pasa. Este
-motor **no ejecuta la suite oficial todavía**: los 21 tests estilo-WPT que
-corre están escritos a mano. Hasta que ese número exista, cualquier
-afirmación sobre "compatibilidad" —incluida la de este README— es una
-impresión, no un dato.
+motor **no ejecuta la suite oficial todavía**: los 60 tests estilo-WPT que
+corre están escritos a mano y pasan los 60. Hasta que ese número exista,
+cualquier afirmación sobre "compatibilidad" —incluida la de este README— es
+una impresión, no un dato.
+
+```bash
+cargo run -p engine-core --bin wpt_runner -- tests/wpt-style
+```
 
 ---
 
@@ -82,7 +181,7 @@ impresión, no un dato.
 
 ```text
 navegador-ia/
-├── engine/           Motor de renderizado en Rust (9 crates)
+├── engine/           Motor de renderizado en Rust (10 crates)
 │   ├── crates/net/       HTTP/HTTPS, cookies, almacenamiento web
 │   ├── crates/dom/       Parseo HTML y árbol DOM
 │   ├── crates/css/       Parseo, selectores y cascada
@@ -91,6 +190,7 @@ navegador-ia/
 │   ├── crates/image/     Decodificación de imágenes
 │   ├── crates/js/        Runtime JavaScript y bindings del DOM
 │   ├── crates/gfx/       Display list, rasterizado y ventana
+│   ├── crates/ai/        Árbol de accesibilidad (AOM) para el agente IA
 │   └── crates/core/      Pipeline y servidor NDJSON (engine_server)
 ├── frontend/         Interfaz en React + Vite
 ├── desktop/          Envoltorio Electron
@@ -128,7 +228,7 @@ npm run start          # frontend (Vite) + aplicación Electron
 
 ```bash
 cd engine
-cargo test --workspace          # los 676 tests
+cargo test --workspace          # los 874 tests
 cargo run -p engine-core --bin engine_server   # servidor NDJSON por stdin/stdout
 ```
 
@@ -148,9 +248,26 @@ SmartScreen mostrará un aviso a quien lo descargue. Ver
 
 El proyecto se llama Navegador IA porque integra un agente que navega por ti.
 **El agente autónomo está conectado a la interfaz** mediante el panel lateral
-*Copiloto IA* (accesible con el botón 🤖 en la barra de navegación), soportando
-tanto modo de simulación rápida como ejecución real impulsada por Gemini 2.0 Flash
-mediante API Key.
+*Copiloto IA* (accesible con el botón 🤖 en la barra de navegación), con un modo
+de simulación rápida y un modo real impulsado por Gemini mediante API Key.
+
+El motor incluye además el crate `engine-ai`, que expone un Árbol de
+Accesibilidad (AOM) con roles y coordenadas reales, pensado para que un modelo
+de lenguaje entienda la página gastando ~80% menos tokens que enviándole el HTML
+crudo.
+
+**Limitaciones actuales del agente, dichas aquí y no enterradas:**
+
+* La clave de Gemini se guarda en el `localStorage` del renderer y las llamadas
+  al modelo salen desde ahí. Debe moverse al proceso principal de Electron con
+  `safeStorage` (cifrado del sistema operativo).
+* Solo Gemini. No hay opción de modelo local ni de otros proveedores.
+* El agente recibe **texto plano** de la página, no el AOM, pese a que el AOM ya
+  existe y el protocolo ya lo expone. Conectarlos es tarea pendiente.
+* Hay dos implementaciones del agente, una en TypeScript y otra en Python, que
+  hacen lo mismo.
+
+Las cuatro están planificadas en [`plan.md`](plan.md), bloque I.
 
 ---
 

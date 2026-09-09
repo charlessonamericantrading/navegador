@@ -46,6 +46,21 @@ impl<'i> AtRuleParser<'i> for RuleParser {
         name: cssparser::CowRcStr<'i>,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::Prelude, ParseError<'i, Self::Error>> {
+        if name.eq_ignore_ascii_case("supports") {
+            // `@supports` se evalua AQUI, en el preludio, y se traduce al
+            // mismo `MediaCondition` que ya gobierna `@media`: si la
+            // condicion no se cumple, sus reglas se conservan pero no se
+            // aplican jamas. Reusar el mismo mecanismo evita un segundo
+            // sistema de compuertas en la cascada.
+            //
+            // Antes se rechazaba aqui y `StyleSheetParser` se saltaba el
+            // bloque ENTERO: todo lo que una pagina pusiera dentro de un
+            // `@supports` no existia para el motor.
+            let start = input.position();
+            while input.next().is_ok() {}
+            let cumple = evaluate_supports(input.slice_from(start));
+            return Ok(MediaCondition { never_matches: !cumple, ..Default::default() });
+        }
         if !name.eq_ignore_ascii_case("media") {
             return Err(input.new_custom_error(()));
         }
@@ -71,26 +86,314 @@ impl<'i> AtRuleParser<'i> for RuleParser {
     ) -> Result<Self::AtRule, ParseError<'i, Self::Error>> {
         let mut nested_parser = RuleParser;
         let mut rules = Vec::new();
-        for result in StyleSheetParser::new(input, &mut nested_parser) {
-            if let Ok(inner) = result {
-                for mut rule in inner {
-                    rule.media.get_or_insert_with(|| prelude.clone());
-                    rules.push(rule);
-                }
+        for inner in StyleSheetParser::new(input, &mut nested_parser).flatten() {
+            for mut rule in inner {
+                rule.media.get_or_insert_with(|| prelude.clone());
+                rules.push(rule);
             }
         }
         Ok(rules)
     }
 }
 
+/// Propiedades CSS que este motor aplica de verdad. Es la lista contra la
+/// que se responde `@supports`.
+///
+/// Se declara explicitamente en vez de responder "si" a todo: una pagina
+/// usa `@supports` justo para dar un camino alternativo al navegador que no
+/// entiende algo, y mentirle le hace tomar el camino equivocado. Lo que no
+/// este aqui se responde honestamente como no soportado.
+const SUPPORTED_PROPERTIES: &[&str] = &[
+    "display",
+    "position",
+    "top",
+    "right",
+    "bottom",
+    "left",
+    "width",
+    "height",
+    "min-width",
+    "max-width",
+    "min-height",
+    "max-height",
+    "margin",
+    "margin-top",
+    "margin-right",
+    "margin-bottom",
+    "margin-left",
+    "padding",
+    "padding-top",
+    "padding-right",
+    "padding-bottom",
+    "padding-left",
+    "color",
+    "background",
+    "background-color",
+    "background-image",
+    "border",
+    "border-width",
+    "border-color",
+    "border-style",
+    "border-radius",
+    "box-shadow",
+    "box-sizing",
+    "font-size",
+    "font-weight",
+    "font-style",
+    "font-family",
+    "line-height",
+    "text-align",
+    "text-decoration",
+    "letter-spacing",
+    "visibility",
+    "overflow",
+    "overflow-x",
+    "overflow-y",
+    "float",
+    "clear",
+    "z-index",
+    "flex",
+    "flex-grow",
+    "flex-shrink",
+    "flex-basis",
+    "flex-direction",
+    "flex-wrap",
+    "justify-content",
+    "align-items",
+    "gap",
+    "grid-template-columns",
+    "grid-template-rows",
+];
+
+/// Valores concretos que este motor NO sabe producir aunque si entienda la
+/// propiedad. Sin esta lista, `@supports (display: grid)` y
+/// `@supports (color: light-dark(a, b))` responderian lo mismo.
+fn supports_value(property: &str, value: &str) -> bool {
+    let v = value.trim();
+    // Cualquier funcion CSS que no sepamos evaluar invalida la respuesta -
+    // `light-dark()`, `color-mix()`, `oklch()`... Se permiten las que si
+    // resolvemos.
+    if let Some(abre) = v.find('(') {
+        let funcion = v[..abre].trim().rsplit(|c: char| c.is_whitespace() || c == ',').next().unwrap_or("");
+        if !matches!(funcion, "calc" | "var" | "rgb" | "rgba" | "hsl" | "hsla" | "url") {
+            return false;
+        }
+    }
+    if property == "display" {
+        return matches!(v, "block" | "inline" | "inline-block" | "flex" | "grid" | "none" | "table" | "table-row" | "table-cell" | "list-item");
+    }
+    if property == "position" {
+        return matches!(v, "static" | "relative" | "absolute" | "fixed" | "sticky");
+    }
+    true
+}
+
+/// Evalua el preludio de un `@supports`. Devuelve `true` si el motor
+/// declara soportar lo que pide.
+///
+/// Entiende `(prop: valor)`, `not (...)`, y las cadenas con `and` / `or`.
+/// Cualquier forma que no sepa leer responde `false`, que es la respuesta
+/// conservadora: la pagina tomara su camino alternativo.
+fn evaluate_supports(prelude: &str) -> bool {
+    let texto = prelude.trim();
+    // Las palabras clave de CSS (`not`/`and`/`or`) distinguen mayusculas
+    // tan poco como `@media` - `@supports NOT (...)` es tan valido como en
+    // minusculas. Comparar `texto` (sin normalizar) contra el literal
+    // "not " en minusculas dejaba pasar sin negar cualquier `NOT`/`Not`,
+    // justo lo contrario de lo que la pagina pedia.
+    let en_minusculas = texto.to_ascii_lowercase();
+    if let Some(resto) = en_minusculas.strip_prefix("not ").or_else(|| en_minusculas.strip_prefix("not(")) {
+        // El resto se toma del texto ORIGINAL (misma longitud, se preservan
+        // mayusculas/valores) recortando el mismo numero de bytes que
+        // `strip_prefix` quito de la version en minusculas.
+        let recortados = texto.len() - resto.len();
+        let resto_original = &texto[recortados..];
+        let resto = if en_minusculas.starts_with("not(") { format!("({resto_original}") } else { resto_original.to_string() };
+        return !evaluate_supports(&resto);
+    }
+
+    // Se trocean las condiciones de primer nivel respetando los parentesis.
+    let mut condiciones: Vec<String> = Vec::new();
+    let mut operadores: Vec<String> = Vec::new();
+    let mut actual = String::new();
+    let mut nivel = 0usize;
+    let bytes: Vec<char> = texto.chars().collect();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            '(' => {
+                nivel += 1;
+                actual.push(c);
+            }
+            ')' => {
+                nivel = nivel.saturating_sub(1);
+                actual.push(c);
+            }
+            _ if nivel == 0 => {
+                let resto: String = bytes[i..].iter().collect();
+                let bajo = resto.to_ascii_lowercase();
+                if bajo.starts_with("and ") || bajo.starts_with("or ") {
+                    let op = if bajo.starts_with("and ") { "and" } else { "or" };
+                    condiciones.push(std::mem::take(&mut actual));
+                    operadores.push(op.to_string());
+                    i += op.len();
+                    continue;
+                }
+                actual.push(c);
+            }
+            _ => actual.push(c),
+        }
+        i += 1;
+    }
+    condiciones.push(actual);
+
+    let evaluar_simple = |cond: &str| -> bool {
+        let c = cond.trim();
+        let Some(interior) = c.strip_prefix('(').and_then(|r| r.strip_suffix(')')) else {
+            return false;
+        };
+        let interior = interior.trim();
+        // Anidado: `((a: b) and (c: d))`.
+        if interior.starts_with('(') || interior.to_ascii_lowercase().starts_with("not ") {
+            return evaluate_supports(interior);
+        }
+        let Some((prop, valor)) = interior.split_once(':') else { return false };
+        let prop = prop.trim().to_ascii_lowercase();
+        // Una propiedad personalizada siempre se "soporta": el spec dice que
+        // `@supports (--x: y)` es cierto en cualquier navegador que entienda
+        // propiedades personalizadas, y este ya las entiende.
+        if prop.starts_with("--") {
+            return true;
+        }
+        SUPPORTED_PROPERTIES.contains(&prop.as_str()) && supports_value(&prop, valor)
+    };
+
+    let mut resultado = evaluar_simple(&condiciones[0]);
+    for (indice, op) in operadores.iter().enumerate() {
+        let siguiente = evaluar_simple(&condiciones[indice + 1]);
+        resultado = if op == "and" { resultado && siguiente } else { resultado || siguiente };
+    }
+    resultado
+}
+
+/// Longitud en pixeles de un valor de media query (`769px`, `0`).
+/// Deliberadamente solo `px`: `em`/`rem` dependerian del tamano de letra de
+/// la raiz, que en una media query es el del NAVEGADOR y no el de la
+/// pagina, y `calc()` habria que evaluarlo entero.
+fn parse_media_px(value: &str) -> Option<f32> {
+    let v = value.trim();
+    if v == "0" {
+        return Some(0.0);
+    }
+    // `em`/`rem` son tan comunes en breakpoints como `px` - de hecho mas
+    // tradicionales (escalan con el zoom/tamaño de letra del usuario, que
+    // es la razon de ser de accesibilidad por la que muchos sitios los
+    // prefieren). Antes solo se entendia `px`: cualquier `@media
+    // (min-width: 30em)` se marcaba como NO evaluable y el bloque entero
+    // se descartaba - en rust-lang.org eso desactivaba el padding mas
+    // ancho de su barra de navegacion (`ph4-ns`, detras de un
+    // `min-width:30em`), dejando sus items demasiado juntos y solapando.
+    //
+    // Una media query no tiene "el font-size de un elemento" contra el que
+    // medir `em` - el spec lo define relativo al valor INICIAL de
+    // font-size, que es la misma base de 16px que ya usa `rem` en el resto
+    // del motor (ver `parse_css_length`), asi que `em`/`rem` valen lo
+    // mismo aqui.
+    if let Some(n) = v.strip_suffix("rem").or_else(|| v.strip_suffix("em")) {
+        return n.trim().parse::<f32>().ok().map(|n| n * 16.0);
+    }
+    v.strip_suffix("px")?.trim().parse::<f32>().ok()
+}
+
+/// Interpreta una caracteristica escrita con la SINTAXIS DE RANGOS de Media
+/// Queries nivel 4 - `(width > 769px)`, `(width <= 1044px)`, y tambien las
+/// formas con el valor a la izquierda (`(769px < width)`) y las de doble
+/// extremo (`(400px <= width <= 900px)`).
+///
+/// No es una comodidad moderna prescindible: es como escribe hoy sus puntos
+/// de ruptura una parte grande de la web (MDN, por ejemplo, mete AHI toda
+/// la maquetacion de su cabecera). Sin entenderla, el bloque entero se
+/// marcaba como no evaluable y se descartaba - la pagina se veia con la
+/// disposicion de movil en una ventana de escritorio.
+///
+/// Devuelve `true` si reconocio la caracteristica (y ya escribio los
+/// limites en `condition`), `false` si no es una comparacion de `width`.
+fn parse_media_range(body: &str, condition: &mut MediaCondition) -> bool {
+    if !body.contains('<') && !body.contains('>') {
+        return false;
+    }
+    // Se normaliza a una lista [operando, operador, operando, ...].
+    let mut partes: Vec<String> = Vec::new();
+    let mut actual = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '<' || c == '>' {
+            partes.push(actual.trim().to_string());
+            actual.clear();
+            let mut op = c.to_string();
+            if chars.peek() == Some(&'=') {
+                chars.next();
+                op.push('=');
+            }
+            partes.push(op);
+        } else {
+            actual.push(c);
+        }
+    }
+    partes.push(actual.trim().to_string());
+
+    // `a OP b` o `a OP b OP c`. Cualquier otra forma no se sabe leer.
+    let comparaciones: Vec<(&str, &str, &str)> = match partes.len() {
+        3 => vec![(partes[0].as_str(), partes[1].as_str(), partes[2].as_str())],
+        5 => vec![
+            (partes[0].as_str(), partes[1].as_str(), partes[2].as_str()),
+            (partes[2].as_str(), partes[3].as_str(), partes[4].as_str()),
+        ],
+        _ => return false,
+    };
+
+    for (izq, op, der) in comparaciones {
+        // Se reescribe siempre como `width OP valor`, dando la vuelta al
+        // operador cuando el valor viene primero (`769px < width`).
+        let (op, valor) = if izq == "width" {
+            (op.to_string(), der)
+        } else if der == "width" {
+            let volteado = match op {
+                "<" => ">",
+                "<=" => ">=",
+                ">" => "<",
+                ">=" => "<=",
+                _ => return false,
+            };
+            (volteado.to_string(), izq)
+        } else {
+            return false;
+        };
+        let Some(px) = parse_media_px(valor) else { return false };
+        match op.as_str() {
+            ">" => condition.min_width_exclusive = Some(px),
+            ">=" => condition.min_width = Some(px),
+            "<" => condition.max_width_exclusive = Some(px),
+            "<=" => condition.max_width = Some(px),
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Interpreta el preludio de un `@media` (`screen and (max-width: 600px)`).
 ///
-/// Solo entiende `min-width`/`max-width` en pixeles y el tipo de medio; ver
-/// `MediaCondition` para por que ese subconjunto. Lo que no sepa
+/// Entiende `min-width`/`max-width` en pixeles, la sintaxis de rangos de
+/// nivel 4 (`width > 600px`, ver `parse_media_range`) y el tipo de medio;
+/// ver `MediaCondition` para por que ese subconjunto. Lo que no sepa
 /// interpretar se marca `never_matches`, de modo que sus reglas se
 /// CONSERVAN pero no se aplican - aplicarlas siempre seria peor (meteria
 /// estilos de impresion o de movil en una ventana de escritorio).
-fn parse_media_condition(prelude: &str) -> MediaCondition {
+/// Publica desde la Fase 45 para que `window.matchMedia` evalue la MISMA
+/// condicion que `@media`. Tener dos parsers de media queries seria
+/// garantizar que un dia respondan distinto sobre la misma consulta.
+pub fn parse_media_condition(prelude: &str) -> MediaCondition {
     let text = prelude.trim().to_ascii_lowercase();
     let mut condition = MediaCondition::default();
 
@@ -103,13 +406,23 @@ fn parse_media_condition(prelude: &str) -> MediaCondition {
     let mut saw_supported_feature = false;
     for feature in text.split('(').skip(1) {
         let Some(body) = feature.split(')').next() else { continue };
+        // Sintaxis de rangos de nivel 4 antes que nada: `(width > 769px)`
+        // no lleva dos puntos, asi que sin esto caeria en "caracteristica
+        // sin valor" y anularia la consulta entera.
+        if parse_media_range(body, &mut condition) {
+            saw_supported_feature = true;
+            continue;
+        }
         let Some((name, value)) = body.split_once(':') else {
             // Una caracteristica sin valor (`(hover)`, `(color)`) no se
             // sabe evaluar.
             condition.never_matches = true;
             continue;
         };
-        let px = value.trim().strip_suffix("px").and_then(|n| n.trim().parse::<f32>().ok());
+        // Misma conversion de unidades que la sintaxis de rangos
+        // (`parse_media_px`, ver su doc-comment): `em`/`rem` cuentan igual
+        // que `px` aqui, no solo en `(width > 30em)`.
+        let px = parse_media_px(value.trim());
         match (name.trim(), px) {
             ("min-width", Some(v)) => {
                 condition.min_width = Some(v);
@@ -119,8 +432,8 @@ fn parse_media_condition(prelude: &str) -> MediaCondition {
                 condition.max_width = Some(v);
                 saw_supported_feature = true;
             }
-            // `min-width: 40em` o `(orientation: landscape)`: reconocida la
-            // forma pero no el valor/caracteristica - no se puede evaluar.
+            // `(orientation: landscape)` o similar: reconocida la forma
+            // pero no la caracteristica en si - no se puede evaluar.
             _ => condition.never_matches = true,
         }
     }
@@ -159,7 +472,13 @@ impl<'i> QualifiedRuleParser<'i> for RuleParser {
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::QualifiedRule, ParseError<'i, Self::Error>> {
         let (declarations, important) = parse_declaration_list(input);
-        Ok(vec![Rule { selector: prelude, declarations, important, media: None }])
+        Ok(vec![Rule {
+            key: crate::stylesheet::RuleKey::from_selector(&prelude),
+            selector: prelude,
+            declarations,
+            important,
+            media: None,
+        }])
     }
 }
 
@@ -248,11 +567,12 @@ fn split_important(value: &str) -> (String, bool) {
 /// el shorthand lo resetea - tambien el orden natural de insercion, sin
 /// logica aparte.
 ///
-/// Solo `background` esta expandido hoy, y solo se extrae de el un COLOR
-/// (el unico sub-valor que `engine-gfx` pinta - ver
-/// `display_list::build_items`, que solo lee `background-color`, nunca
-/// `background`): posicion/repeticion/imagen del shorthand se ignoran sin
-/// error, igual que cualquier propiedad no soportada.
+/// Solo `background` esta expandido hoy, y solo se extraen de el un COLOR
+/// y una IMAGEN (`url(...)`, Fase 40) - los dos sub-valores que
+/// `engine-gfx` pinta (ver `display_list::build_items`, que lee
+/// `background-color`/`background-image`, nunca `background` en si):
+/// posicion/repeticion/tamaño del shorthand se ignoran sin error, igual
+/// que cualquier propiedad no soportada.
 ///
 /// **Este modulo no sabe que es un color, y a proposito**: la tabla de
 /// nombres y el parseo de `rgb()`/hex viven en `engine-gfx`
@@ -267,8 +587,86 @@ fn insert_declaration(declarations: &mut HashMap<String, String>, name: String, 
         if let Some(color) = background_color_candidate(&value) {
             declarations.insert("background-color".to_string(), color);
         }
+        if let Some(image) = background_image_candidate(&value) {
+            declarations.insert("background-image".to_string(), image);
+        }
+    }
+    if name == "padding" || name == "margin" {
+        expand_box_shorthand(declarations, &name, &value);
+    }
+    if name == "flex" {
+        expand_flex_shorthand(declarations, &value);
     }
     declarations.insert(name, value);
+}
+
+/// Expande `padding`/`margin` a sus cuatro longhands con las formas de 1, 2,
+/// 3 y 4 valores del spec.
+///
+/// Antes solo existia la forma de UN valor, y no porque estuviera modelada:
+/// `engine-layout` leia la propiedad abreviada como si fuera una longitud
+/// suelta, asi que `padding: 16px 24px` no fallaba con un aviso - parseaba
+/// como invalido y resolvia a CERO en los cuatro lados. Es decir, la forma
+/// mas comun de escribir padding en CSS real se ignoraba en silencio.
+/// Verificado en vivo: `padding: 20px` se veia y `padding: 20px 60px` no.
+///
+/// Un valor con parentesis (`calc(...)`, `var(...)`) se deja pasar sin
+/// expandir: trocearlo por espacios lo romperia. En ese caso el longhand no
+/// se genera y el layout resuelve a cero, igual que antes - no es una
+/// regresion, es el mismo limite de siempre acotado a un caso mucho menor.
+fn expand_box_shorthand(declarations: &mut HashMap<String, String>, name: &str, value: &str) {
+    if value.contains('(') {
+        return;
+    }
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    let (top, right, bottom, left) = match parts.as_slice() {
+        [all] => (*all, *all, *all, *all),
+        [vertical, horizontal] => (*vertical, *horizontal, *vertical, *horizontal),
+        [top, horizontal, bottom] => (*top, *horizontal, *bottom, *horizontal),
+        [top, right, bottom, left] => (*top, *right, *bottom, *left),
+        _ => return,
+    };
+    for (side, side_value) in [("top", top), ("right", right), ("bottom", bottom), ("left", left)] {
+        declarations.insert(format!("{name}-{side}"), side_value.to_string());
+    }
+}
+
+/// Expande el shorthand `flex` a `flex-grow`/`flex-shrink`/`flex-basis`.
+///
+/// `flex: 1` es la forma en que se escribe flexbox en la practica, y no
+/// estaba soportada: `engine-layout` leia unicamente los longhands, asi que
+/// los items no crecian y se quedaban al ancho de su contenido. Verificado
+/// en vivo: `flex-grow: 1; flex-basis: 0` funcionaba y `flex: 1` no.
+///
+/// Los valores iniciales al expandir NO son los mismos que cuando la
+/// propiedad no esta puesta, que es la trampa clasica de este shorthand:
+/// `flex: 1` significa `1 1 0%`, no `1 1 auto`. Se emite `0px` en vez de
+/// `0%` porque es lo que el layout sabe resolver hoy, y para una base de
+/// cero ambos significan lo mismo.
+fn expand_flex_shorthand(declarations: &mut HashMap<String, String>, value: &str) {
+    let trimmed = value.trim();
+    let (grow, shrink, basis) = match trimmed.to_ascii_lowercase().as_str() {
+        "none" => ("0", "0", "auto"),
+        "auto" => ("1", "1", "auto"),
+        "initial" => ("0", "1", "auto"),
+        _ => {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            let is_number = |token: &str| token.parse::<f32>().is_ok();
+            match parts.as_slice() {
+                // `flex: <grow>` -> 1 de shrink y base CERO (no `auto`).
+                [grow] if is_number(grow) => (*grow, "1", "0px"),
+                // `flex: <basis>` (una longitud suelta) -> crece y encoge.
+                [basis] => ("1", "1", *basis),
+                [grow, second] if is_number(grow) && is_number(second) => (*grow, *second, "0px"),
+                [grow, basis] if is_number(grow) => (*grow, "1", *basis),
+                [grow, shrink, basis] if is_number(grow) && is_number(shrink) => (*grow, *shrink, *basis),
+                _ => return,
+            }
+        }
+    };
+    declarations.insert("flex-grow".to_string(), grow.to_string());
+    declarations.insert("flex-shrink".to_string(), shrink.to_string());
+    declarations.insert("flex-basis".to_string(), basis.to_string());
 }
 
 /// Palabras clave del shorthand `background` que NUNCA son un color -
@@ -316,6 +714,20 @@ fn background_color_candidate(value: &str) -> Option<String> {
     }
 
     trimmed.split_whitespace().find(|token| token.starts_with('#')).map(str::to_string)
+}
+
+/// Extrae el `url(...)` de un valor `background` (Fase 40) - a diferencia
+/// de `background_color_candidate`, que solo busca un TOKEN completo
+/// (partido por espacios), aqui hace falta el tramo entre `url(` y su `)`
+/// tal cual, porque una URL entre comillas puede contener espacios
+/// (`url("mi imagen.png")`). No distingue `url(...)` de `linear-gradient(...)`
+/// ni otras funciones de imagen - solo `url()` esta soportado, igual que
+/// `background-image` longhand (ver `insert_declaration`).
+fn background_image_candidate(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let start = lower.find("url(")?;
+    let rel_end = value[start..].find(')')?;
+    Some(value[start..start + rel_end + 1].to_string())
 }
 
 pub struct CssParser;
@@ -380,11 +792,30 @@ mod tests {
     /// Un valor de `background` sin ningun color hex (posicion/repeticion/
     /// una imagen sin color de respaldo) no deberia inventarse un
     /// `background-color` de la nada - simplemente no hay color que
-    /// extraer, igual que hoy no hay soporte de `background-image`.
+    /// extraer.
     #[test]
     fn background_shorthand_without_a_hex_color_does_not_fabricate_one() {
         let sheet = CssParser::parse("div { background: no-repeat center; }");
         assert_eq!(sheet.rules[0].declarations.get("background-color"), None);
+    }
+
+    /// `background-image` (Fase 40): el shorthand tambien extrae el
+    /// `url(...)`, no solo el color - es lo que permite que `background:
+    /// url(x.png) no-repeat;` (sin ningun color de respaldo) pinte la
+    /// imagen igual que si el autor hubiera escrito el longhand.
+    #[test]
+    fn background_shorthand_extracts_a_url_even_without_any_color() {
+        let sheet = CssParser::parse("div { background: url(x.png) no-repeat; }");
+        assert_eq!(sheet.rules[0].declarations.get("background-image").map(String::as_str), Some("url(x.png)"));
+        assert_eq!(sheet.rules[0].declarations.get("background-color"), None);
+    }
+
+    /// Una URL entre comillas puede llevar espacios dentro - partir por
+    /// espacios (como hace la busqueda de color) la destrozaria.
+    #[test]
+    fn background_shorthand_url_keeps_spaces_inside_quotes_intact() {
+        let sheet = CssParser::parse(r#"div { background: url("mi imagen.png") repeat; }"#);
+        assert_eq!(sheet.rules[0].declarations.get("background-image").map(String::as_str), Some(r#"url("mi imagen.png")"#));
     }
 
     /// Desde que `engine-gfx` entiende nombres de color, el shorthand
@@ -425,6 +856,7 @@ mod tests {
     fn background_shorthand_with_an_image_still_finds_a_hex_color() {
         let sheet = CssParser::parse("div { background: #ff0000 url(x.png) no-repeat; }");
         assert_eq!(sheet.rules[0].declarations.get("background-color").map(String::as_str), Some("#ff0000"));
+        assert_eq!(sheet.rules[0].declarations.get("background-image").map(String::as_str), Some("url(x.png)"), "el color y la imagen se extraen los dos del mismo shorthand, no uno a costa del otro");
     }
 
     /// Dentro de la MISMA regla, la propiedad declarada DESPUES gana -
@@ -503,6 +935,116 @@ mod tests {
         let h1 = sheet.rules.iter().find(|r| r.selector == "h1").expect("la regla posterior al bloque deberia parsearse intacta");
         assert_eq!(h1.declarations.get("color").map(String::as_str), Some("red"));
         assert!(h1.media.is_none());
+    }
+
+    /// `@supports` se evalua de verdad. Antes se rechazaba el bloque entero,
+    /// asi que TODO lo que una pagina pusiera dentro no existia para el
+    /// motor - incluidos sus caminos alternativos.
+    #[test]
+    fn supports_responde_segun_lo_que_el_motor_soporta_de_verdad() {
+        let cond = |css: &str| CssParser::parse(css).rules[0].media.clone().expect("condicion");
+
+        assert!(!cond("@supports (display: flex) { a { color: red; } }").never_matches, "display:flex si se soporta");
+        assert!(
+            cond("@supports (color: light-dark(red, blue)) { a { color: red; } }").never_matches,
+            "una funcion de color que el motor no evalua no se debe declarar soportada"
+        );
+        assert!(
+            !cond("@supports not (color: light-dark(red, blue)) { a { color: red; } }").never_matches,
+            "y su negacion, por tanto, si se cumple"
+        );
+        assert!(
+            cond("@supports (mask-image: none) { a { color: red; } }").never_matches,
+            "una propiedad que el motor no aplica se responde honestamente como no soportada"
+        );
+        assert!(
+            !cond("@supports (background-image: url(x.png)) { a { color: red; } }").never_matches,
+            "background-image con url() (Fase 40) ya se soporta de verdad"
+        );
+    }
+
+    /// `and` y `or` combinan condiciones al nivel de arriba.
+    #[test]
+    fn supports_combina_condiciones_con_and_y_or() {
+        let cond = |css: &str| CssParser::parse(css).rules[0].media.clone().expect("condicion");
+
+        assert!(!cond("@supports (display: flex) and (position: sticky) { a { color: red; } }").never_matches);
+        assert!(cond("@supports (display: flex) and (mask-image: none) { a { color: red; } }").never_matches, "`and` exige las dos");
+        assert!(!cond("@supports (display: flex) or (mask-image: none) { a { color: red; } }").never_matches, "`or` basta con una");
+    }
+
+    /// Las palabras clave de CSS distinguen mayusculas tan poco como
+    /// `@media`: `@supports NOT (...)` es tan valido como en minusculas.
+    /// Comparar el prefijo sin normalizar dejaba pasar sin negar cualquier
+    /// `NOT`/`Not`, justo lo contrario de lo que la condicion pedia.
+    #[test]
+    fn supports_not_no_distingue_mayusculas() {
+        let cond = |css: &str| CssParser::parse(css).rules[0].media.clone().expect("condicion");
+
+        assert!(
+            !cond("@supports NOT (mask-image: none) { a { color: red; } }").never_matches,
+            "NOT en mayusculas deberia negar igual que \"not\" en minusculas"
+        );
+        assert!(
+            !cond("@supports Not (mask-image: none) { a { color: red; } }").never_matches,
+            "tambien en formas mixtas como \"Not\""
+        );
+    }
+
+    /// `em`/`rem` en un `@media (min-width: ...)` clasico, no solo en la
+    /// sintaxis de rangos: antes solo se entendia `px`, asi que cualquier
+    /// breakpoint en `em` (tradicional para que escale con el tamaño de
+    /// letra del usuario) se marcaba NO evaluable y el bloque entero se
+    /// descartaba. En rust-lang.org eso desactivaba el padding ancho de su
+    /// nav (`min-width: 30em`), y sus items quedaban demasiado juntos.
+    #[test]
+    fn los_media_queries_clasicos_entienden_em_y_rem() {
+        let cond = |css: &str| CssParser::parse(css).rules[0].media.clone().expect("condicion");
+
+        let en_em = cond("@media (min-width: 30em) { a { color: red; } }");
+        assert!(!en_em.never_matches, "min-width en em deberia poder evaluarse");
+        assert!(en_em.matches(500.0), "500px es mayor que 30em (480px)");
+        assert!(!en_em.matches(400.0), "400px es menor que 30em (480px)");
+
+        let en_rem = cond("@media (max-width: 20rem) { a { color: red; } }");
+        assert!(en_rem.matches(300.0), "300px es menor que 20rem (320px)");
+        assert!(!en_rem.matches(400.0));
+    }
+
+    /// La sintaxis de RANGOS de Media Queries nivel 4 (`(width > 769px)`)
+    /// es como escribe hoy sus puntos de ruptura una parte grande de la web
+    /// - MDN mete ahi toda la maquetacion de su cabecera. Antes no llevaba
+    /// dos puntos, asi que caia en "caracteristica sin valor" y anulaba el
+    /// bloque entero: la pagina se veia con la disposicion de movil en una
+    /// ventana de escritorio.
+    #[test]
+    fn la_sintaxis_de_rangos_de_media_queries_se_entiende() {
+        let sheet = CssParser::parse("@media (width > 769px) { nav { display: flex; } }");
+        let cond = sheet.rules[0].media.as_ref().expect("deberia llevar condicion");
+        assert!(!cond.never_matches, "un rango de anchura SI se sabe evaluar");
+        assert!(cond.matches(1280.0), "1280px es mayor que 769px");
+        assert!(!cond.matches(700.0), "700px no es mayor que 769px");
+        assert!(!cond.matches(769.0), "`>` es ESTRICTO: justo en el punto de ruptura no aplica");
+    }
+
+    /// Las cuatro comparaciones, el valor a la izquierda, y la forma de
+    /// doble extremo.
+    #[test]
+    fn los_rangos_cubren_las_dos_direcciones_y_el_doble_extremo() {
+        let cond = |css: &str| CssParser::parse(css).rules[0].media.clone().expect("condicion");
+
+        let menor_igual = cond("@media (width <= 1044px) { a { color: red; } }");
+        assert!(menor_igual.matches(1044.0), "`<=` es inclusivo en su punto de ruptura");
+        assert!(!menor_igual.matches(1045.0));
+
+        let volteado = cond("@media (769px < width) { a { color: red; } }");
+        assert!(volteado.matches(1280.0), "`769px < width` es lo mismo que `width > 769px`");
+        assert!(!volteado.matches(700.0));
+
+        let intervalo = cond("@media (400px <= width <= 900px) { a { color: red; } }");
+        assert!(intervalo.matches(600.0));
+        assert!(!intervalo.matches(300.0));
+        assert!(!intervalo.matches(1000.0));
     }
 
     /// Antes, TODO bloque `@media` se descartaba entero - las reglas de
@@ -607,5 +1149,76 @@ mod tests {
     #[test]
     fn parse_inline_style_of_an_empty_string_is_empty() {
         assert!(CssParser::parse_inline_style("").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shorthand_expansion_tests {
+    use super::*;
+
+    fn decls(css: &str) -> HashMap<String, String> {
+        CssParser::parse(css).rules[0].declarations.clone()
+    }
+
+    /// El caso medido en vivo: `padding: 20px` se veia y `padding: 20px 60px`
+    /// no, porque el layout leia la abreviada como una longitud suelta y
+    /// "20px 60px" resolvia a CERO en los cuatro lados.
+    #[test]
+    fn the_two_value_padding_form_expands_to_vertical_and_horizontal() {
+        let d = decls("div { padding: 20px 60px; }");
+        assert_eq!(d.get("padding-top").map(String::as_str), Some("20px"));
+        assert_eq!(d.get("padding-bottom").map(String::as_str), Some("20px"));
+        assert_eq!(d.get("padding-left").map(String::as_str), Some("60px"));
+        assert_eq!(d.get("padding-right").map(String::as_str), Some("60px"));
+    }
+
+    #[test]
+    fn the_one_three_and_four_value_forms_follow_the_spec() {
+        let one = decls("div { margin: 5px; }");
+        assert_eq!(one.get("margin-left").map(String::as_str), Some("5px"));
+
+        let three = decls("div { padding: 1px 2px 3px; }");
+        assert_eq!(three.get("padding-top").map(String::as_str), Some("1px"));
+        assert_eq!(three.get("padding-right").map(String::as_str), Some("2px"));
+        assert_eq!(three.get("padding-bottom").map(String::as_str), Some("3px"));
+        assert_eq!(three.get("padding-left").map(String::as_str), Some("2px"), "izquierda copia a derecha en la forma de 3");
+
+        let four = decls("div { padding: 1px 2px 3px 4px; }");
+        assert_eq!(four.get("padding-left").map(String::as_str), Some("4px"));
+    }
+
+    /// `flex: 1` es como se escribe flexbox en la practica y no se soportaba:
+    /// solo se leian los longhands, asi que los items no crecian.
+    #[test]
+    fn flex_one_expands_to_grow_one_shrink_one_and_a_zero_basis() {
+        let d = decls("div { flex: 1; }");
+        assert_eq!(d.get("flex-grow").map(String::as_str), Some("1"));
+        assert_eq!(d.get("flex-shrink").map(String::as_str), Some("1"));
+        assert_eq!(d.get("flex-basis").map(String::as_str), Some("0px"), "la trampa del shorthand: la base es 0, no auto");
+    }
+
+    #[test]
+    fn the_flex_keywords_follow_the_spec() {
+        assert_eq!(decls("div { flex: none; }").get("flex-grow").map(String::as_str), Some("0"));
+        assert_eq!(decls("div { flex: none; }").get("flex-basis").map(String::as_str), Some("auto"));
+        assert_eq!(decls("div { flex: auto; }").get("flex-grow").map(String::as_str), Some("1"));
+        assert_eq!(decls("div { flex: auto; }").get("flex-basis").map(String::as_str), Some("auto"));
+    }
+
+    /// Un longhand explicito declarado DESPUES sigue ganando al shorthand,
+    /// que es lo que la cascada espera - la expansion no puede romper eso.
+    #[test]
+    fn an_explicit_longhand_after_the_shorthand_still_wins() {
+        let d = decls("div { padding: 10px; padding-left: 99px; }");
+        assert_eq!(d.get("padding-left").map(String::as_str), Some("99px"));
+        assert_eq!(d.get("padding-top").map(String::as_str), Some("10px"));
+    }
+
+    /// `calc()`/`var()` no se trocean: se deja sin expandir en vez de
+    /// partirlos por espacios y generar longhands sin sentido.
+    #[test]
+    fn values_with_parentheses_are_left_alone_instead_of_being_split() {
+        let d = decls("div { padding: calc(10px + 2px) 4px; }");
+        assert!(!d.contains_key("padding-top"), "no deberia inventar longhands a partir de un calc()");
     }
 }

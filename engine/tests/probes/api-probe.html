@@ -1,0 +1,461 @@
+<!doctype html>
+<html>
+<head><title>sonda-sin-ejecutar</title></head>
+<body>
+<p>Sonda de APIs. El resultado se publica en <code>document.title</code>.</p>
+
+<!--
+  Sonda de superficie de plataforma (tarea C1 del plan.md).
+
+  Que mide: cuantas de las APIs que un bundle real toca al arrancar existen en
+  este motor. NO mide si funcionan bien - solo si estan. Es a proposito: la
+  Fase 39 establecio que la ausencia de UNA sola API lanza un TypeError que se
+  lleva por delante el script entero, asi que "existe o no existe" es la
+  pregunta que decide si una web se ve o se queda en blanco.
+
+  Por que no se confia en la memoria ni en el README: la sonda de la Fase 39
+  corrigio la suposicion de que faltaba medio motor de JavaScript (faltaban 6
+  funciones sueltas), y al preparar esta se descubrio que `Event` -que se daba
+  por ausente- llevaba fases registrado. Se mide, no se supone.
+
+  Reglas de escritura de este fichero, que importan mas de lo que parecen:
+
+  1. La sonda no puede morirse con lo que mide. Cada comprobacion va dentro de
+     un try/catch y el acceso al global se hace con `typeof`, que es la unica
+     forma de preguntar por un identificador inexistente sin lanzar
+     ReferenceError.
+  2. No usa ninguna API que este midiendo. Nada de `console`, `URL` ni
+     `structuredClone` en la infraestructura: solo sintaxis del lenguaje, que
+     `boa` cubre entera, y `document.title` para publicar el resultado.
+  3. Una comprobacion devuelve true solo si la API esta DE VERDAD utilizable,
+     no si el identificador existe. Por eso varias construyen algo y miran el
+     resultado, en vez de conformarse con `typeof X !== 'undefined'`: un stub
+     que existe y no hace nada es peor que una ausencia (deja al bundle
+     esperando en vez de fallar rapido), y esta sonda tiene que poder
+     distinguirlos.
+-->
+<script>
+(function () {
+  var resultados = [];
+
+  function comprobar(nombre, fn) {
+    var ok = false;
+    try { ok = fn() === true; } catch (e) { ok = false; }
+    resultados.push({ nombre: nombre, ok: ok });
+  }
+
+  // `typeof` sobre un identificador suelto es la unica forma de preguntar por
+  // un global inexistente sin que salte ReferenceError.
+  function existeGlobal(nombre) {
+    try { return eval('typeof ' + nombre) !== 'undefined'; } catch (e) { return false; }
+  }
+
+  function g(nombre) {
+    try { return eval(nombre); } catch (e) { return undefined; }
+  }
+
+  // ---------------------------------------------------------------------
+  // Sintaxis del lenguaje. Se mide para que el numero global no engañe: si
+  // un dia bajara, hay que saber si fue el motor de JS o la plataforma.
+  // ---------------------------------------------------------------------
+  comprobar('sintaxis: arrow + let/const', function () {
+    const f = (x) => x * 2;
+    return f(2) === 4;
+  });
+  comprobar('sintaxis: clases', function () {
+    class A { constructor() { this.v = 1; } get doble() { return this.v * 2; } }
+    return new A().doble === 2;
+  });
+  comprobar('sintaxis: template literal', function () {
+    const n = 3; return `v${n}` === 'v3';
+  });
+  comprobar('sintaxis: destructuring + spread', function () {
+    const { a, ...resto } = { a: 1, b: 2, c: 3 };
+    return a === 1 && resto.b === 2 && [...[1, 2]].length === 2;
+  });
+  comprobar('sintaxis: async/await', function () {
+    return typeof (async function () {})().then === 'function';
+  });
+  comprobar('sintaxis: generadores', function () {
+    function* gen() { yield 1; }
+    return gen().next().value === 1;
+  });
+  comprobar('sintaxis: optional chaining + nullish', function () {
+    const o = { a: null };
+    return o?.b?.c === undefined && (o.a ?? 'x') === 'x';
+  });
+
+  // ---------------------------------------------------------------------
+  // Objetos estandar del lenguaje
+  // ---------------------------------------------------------------------
+  comprobar('Promise.allSettled', function () { return typeof Promise.allSettled === 'function'; });
+  comprobar('Object.hasOwn', function () { return typeof Object.hasOwn === 'function'; });
+  comprobar('Array.prototype.at', function () { return [1, 2].at(-1) === 2; });
+  comprobar('String.prototype.replaceAll', function () { return 'aa'.replaceAll('a', 'b') === 'bb'; });
+  comprobar('Map/Set', function () { return new Map([[1, 2]]).get(1) === 2 && new Set([1]).has(1); });
+  comprobar('Symbol.iterator', function () { return typeof [][Symbol.iterator] === 'function'; });
+  comprobar('JSON', function () { return JSON.parse(JSON.stringify({ a: 1 })).a === 1; });
+  comprobar('globalThis', function () { return typeof globalThis === 'object'; });
+  comprobar('WeakRef', function () { return existeGlobal('WeakRef'); });
+  comprobar('Intl.NumberFormat', function () {
+    return existeGlobal('Intl') && typeof Intl.NumberFormat === 'function';
+  });
+  comprobar('queueMicrotask', function () { return typeof queueMicrotask === 'function'; });
+
+  // ---------------------------------------------------------------------
+  // Utilidades de plataforma (plan C5)
+  // ---------------------------------------------------------------------
+  comprobar('URL', function () {
+    if (!existeGlobal('URL')) return false;
+    return new URL('/a?b=1', 'https://x.dev/').href === 'https://x.dev/a?b=1';
+  });
+  comprobar('URLSearchParams', function () {
+    if (!existeGlobal('URLSearchParams')) return false;
+    return new URLSearchParams('a=1').get('a') === '1';
+  });
+  comprobar('TextEncoder', function () {
+    if (!existeGlobal('TextEncoder')) return false;
+    return new TextEncoder().encode('a')[0] === 97;
+  });
+  comprobar('TextDecoder', function () { return existeGlobal('TextDecoder'); });
+  comprobar('atob/btoa', function () {
+    if (!existeGlobal('btoa')) return false;
+    return btoa('a') === 'YQ==' && atob('YQ==') === 'a';
+  });
+  comprobar('structuredClone', function () {
+    if (!existeGlobal('structuredClone')) return false;
+    var o = { a: [1, 2] };
+    var c = structuredClone(o);
+    return c.a[1] === 2 && c !== o;
+  });
+  comprobar('AbortController', function () {
+    if (!existeGlobal('AbortController')) return false;
+    var c = new AbortController();
+    return c.signal && c.signal.aborted === false;
+  });
+  comprobar('crypto.getRandomValues', function () {
+    return existeGlobal('crypto') && typeof crypto.getRandomValues === 'function';
+  });
+  comprobar('crypto.randomUUID', function () {
+    return existeGlobal('crypto') && typeof crypto.randomUUID === 'function';
+  });
+  comprobar('performance.now', function () {
+    return existeGlobal('performance') && typeof performance.now === 'function';
+  });
+  comprobar('console.log', function () {
+    return existeGlobal('console') && typeof console.log === 'function';
+  });
+  comprobar('console (familia completa)', function () {
+    if (!existeGlobal('console')) return false;
+    var m = ['log', 'info', 'warn', 'error', 'debug', 'group', 'groupEnd', 'table', 'time', 'timeEnd'];
+    for (var i = 0; i < m.length; i++) { if (typeof console[m[i]] !== 'function') return false; }
+    return true;
+  });
+
+  // ---------------------------------------------------------------------
+  // Prototipos y constructores del DOM (plan C3)
+  // ---------------------------------------------------------------------
+  comprobar('EventTarget (global)', function () { return existeGlobal('EventTarget'); });
+  comprobar('Node (global + constantes)', function () {
+    return existeGlobal('Node') && g('Node').ELEMENT_NODE === 1;
+  });
+  comprobar('Element (global)', function () { return existeGlobal('Element'); });
+  comprobar('HTMLElement (global)', function () { return existeGlobal('HTMLElement'); });
+  comprobar('instanceof HTMLElement', function () {
+    if (!existeGlobal('HTMLElement')) return false;
+    return document.createElement('div') instanceof HTMLElement;
+  });
+  comprobar('Element.prototype parcheable', function () {
+    if (!existeGlobal('Element')) return false;
+    // Patron real de todo polyfill: añadir al prototipo y esperar que lo vean
+    // los elementos ya creados.
+    var el = document.createElement('div');
+    Element.prototype.__sonda = function () { return 42; };
+    var ok = typeof el.__sonda === 'function' && el.__sonda() === 42;
+    delete Element.prototype.__sonda;
+    return ok;
+  });
+  comprobar('HTMLDivElement (global)', function () { return existeGlobal('HTMLDivElement'); });
+  comprobar('HTMLInputElement (global)', function () { return existeGlobal('HTMLInputElement'); });
+  comprobar('DocumentFragment', function () { return existeGlobal('DocumentFragment'); });
+  comprobar('customElements', function () {
+    return existeGlobal('customElements') && typeof customElements.define === 'function';
+  });
+  comprobar('DOMParser', function () { return existeGlobal('DOMParser'); });
+
+  // ---------------------------------------------------------------------
+  // Eventos (plan C4)
+  // ---------------------------------------------------------------------
+  comprobar('new Event', function () {
+    if (!existeGlobal('Event')) return false;
+    return new Event('x', { bubbles: true }).bubbles === true;
+  });
+  comprobar('new CustomEvent (con detail)', function () {
+    if (!existeGlobal('CustomEvent')) return false;
+    return new CustomEvent('x', { detail: 7 }).detail === 7;
+  });
+  comprobar('addEventListener + dispatchEvent', function () {
+    var visto = false;
+    var el = document.createElement('div');
+    el.addEventListener('sonda', function () { visto = true; });
+    el.dispatchEvent(new Event('sonda'));
+    return visto;
+  });
+  comprobar('KeyboardEvent', function () {
+    if (!existeGlobal('KeyboardEvent')) return false;
+    return new KeyboardEvent('keydown', { key: 'a' }).key === 'a';
+  });
+  comprobar('MouseEvent', function () {
+    if (!existeGlobal('MouseEvent')) return false;
+    return new MouseEvent('click', { clientX: 5 }).clientX === 5;
+  });
+
+  // ---------------------------------------------------------------------
+  // document (plan C6)
+  // ---------------------------------------------------------------------
+  comprobar('document.body', function () { return !!document.body; });
+  comprobar('document.head', function () { return !!document.head; });
+  comprobar('document.documentElement', function () { return !!document.documentElement; });
+  comprobar('document.createElement', function () {
+    return document.createElement('div').tagName.toLowerCase() === 'div';
+  });
+  comprobar('document.createTextNode', function () { return !!document.createTextNode('a'); });
+  comprobar('document.createDocumentFragment', function () {
+    return typeof document.createDocumentFragment === 'function';
+  });
+  comprobar('document.querySelector', function () { return !!document.querySelector('body'); });
+  comprobar('document.querySelectorAll', function () {
+    var l = document.querySelectorAll('p');
+    return l && typeof l.length === 'number';
+  });
+  comprobar('document.getElementsByClassName', function () {
+    return typeof document.getElementsByClassName === 'function';
+  });
+  comprobar('document.readyState', function () {
+    return typeof document.readyState === 'string' && document.readyState.length > 0;
+  });
+  comprobar('document.currentScript', function () {
+    return typeof document.currentScript !== 'undefined';
+  });
+  comprobar('document.activeElement', function () {
+    return typeof document.activeElement !== 'undefined';
+  });
+  comprobar('document.write', function () { return typeof document.write === 'function'; });
+  comprobar('document.cookie', function () { return typeof document.cookie === 'string'; });
+
+  // ---------------------------------------------------------------------
+  // Element: metodos y propiedades (plan C6)
+  // ---------------------------------------------------------------------
+  function conElemento(fn) {
+    return function () {
+      var el = document.createElement('div');
+      el.className = 'sonda';
+      return fn(el);
+    };
+  }
+
+  comprobar('el.classList', conElemento(function (el) {
+    el.classList.add('x'); return el.classList.contains('x');
+  }));
+  comprobar('el.style', conElemento(function (el) {
+    el.style.color = 'red'; return el.style.color === 'red';
+  }));
+  // Se comprueba el EFECTO sobre el DOM, no que la asignacion no lance.
+  // Asignar una propiedad cualquiera a un objeto JS siempre "funciona" y
+  // devuelve lo asignado, asi que `el.innerHTML = x; el.innerHTML === x` daba
+  // verde incluso sin que `innerHTML` existiera. Fue un falso positivo real de
+  // esta sonda (y de la de la Fase 39), detectado el 2026-09-09.
+  comprobar('el.innerHTML', conElemento(function (el) {
+    el.innerHTML = '<b>x</b>';
+    return !!el.firstElementChild &&
+           el.firstElementChild.tagName.toLowerCase() === 'b';
+  }));
+  comprobar('el.textContent', conElemento(function (el) {
+    el.textContent = 'hola'; return el.textContent === 'hola';
+  }));
+  comprobar('el.innerText', conElemento(function (el) {
+    return typeof el.innerText !== 'undefined';
+  }));
+  comprobar('el.outerHTML', conElemento(function (el) {
+    return typeof el.outerHTML === 'string';
+  }));
+  comprobar('el.setAttribute/getAttribute', conElemento(function (el) {
+    el.setAttribute('data-x', '1'); return el.getAttribute('data-x') === '1';
+  }));
+  comprobar('el.dataset', conElemento(function (el) {
+    el.setAttribute('data-x', '1'); return el.dataset && el.dataset.x === '1';
+  }));
+  comprobar('el.matches', conElemento(function (el) {
+    return typeof el.matches === 'function' && el.matches('.sonda') === true;
+  }));
+  comprobar('el.closest', conElemento(function (el) {
+    if (typeof el.closest !== 'function') return false;
+    var padre = document.createElement('section');
+    padre.appendChild(el);
+    return el.closest('section') === padre;
+  }));
+  comprobar('el.append/prepend', conElemento(function (el) {
+    if (typeof el.append !== 'function') return false;
+    el.append(document.createElement('i'));
+    return el.childNodes.length === 1;
+  }));
+  comprobar('el.remove', conElemento(function (el) { return typeof el.remove === 'function'; }));
+  comprobar('el.replaceWith', conElemento(function (el) { return typeof el.replaceWith === 'function'; }));
+  comprobar('el.insertAdjacentHTML', conElemento(function (el) {
+    return typeof el.insertAdjacentHTML === 'function';
+  }));
+  comprobar('el.children (solo elementos)', conElemento(function (el) {
+    el.appendChild(document.createTextNode('t'));
+    el.appendChild(document.createElement('b'));
+    return el.children && el.children.length === 1;
+  }));
+  comprobar('el.firstElementChild', conElemento(function (el) {
+    el.appendChild(document.createElement('b'));
+    return !!el.firstElementChild;
+  }));
+  comprobar('el.nextElementSibling', conElemento(function (el) {
+    return typeof el.nextElementSibling !== 'undefined';
+  }));
+  comprobar('el.contains', conElemento(function (el) {
+    if (typeof el.contains !== 'function') return false;
+    var h = document.createElement('b'); el.appendChild(h);
+    return el.contains(h) === true;
+  }));
+  comprobar('el.cloneNode', conElemento(function (el) {
+    return typeof el.cloneNode === 'function' && !!el.cloneNode(true);
+  }));
+  comprobar('el.isConnected', conElemento(function (el) {
+    return typeof el.isConnected === 'boolean';
+  }));
+  comprobar('el.getBoundingClientRect', function () {
+    var r = document.body.getBoundingClientRect();
+    return r && typeof r.width === 'number';
+  });
+  comprobar('el.scrollIntoView', conElemento(function (el) {
+    return typeof el.scrollIntoView === 'function';
+  }));
+  comprobar('el.focus', conElemento(function (el) { return typeof el.focus === 'function'; }));
+  comprobar('el.offsetWidth', conElemento(function (el) {
+    return typeof el.offsetWidth === 'number';
+  }));
+  comprobar('el.clientWidth', conElemento(function (el) {
+    return typeof el.clientWidth === 'number';
+  }));
+  comprobar('NodeList iterable', function () {
+    var l = document.querySelectorAll('p');
+    return typeof l.forEach === 'function';
+  });
+
+  // ---------------------------------------------------------------------
+  // window (plan C7)
+  // ---------------------------------------------------------------------
+  comprobar('window.location.href', function () {
+    return typeof location.href === 'string' && location.href.length > 0;
+  });
+  comprobar('window.history.pushState', function () {
+    return typeof history.pushState === 'function';
+  });
+  comprobar('window.navigator.userAgent', function () {
+    return typeof navigator.userAgent === 'string';
+  });
+  comprobar('window.localStorage', function () {
+    localStorage.setItem('sonda', '1');
+    return localStorage.getItem('sonda') === '1';
+  });
+  comprobar('window.innerWidth', function () {
+    return typeof window.innerWidth === 'number' && window.innerWidth > 0;
+  });
+  comprobar('window.devicePixelRatio', function () {
+    return typeof window.devicePixelRatio === 'number';
+  });
+  comprobar('window.scrollTo', function () { return typeof window.scrollTo === 'function'; });
+  comprobar('window.matchMedia', function () {
+    if (!existeGlobal('matchMedia')) return false;
+    var m = matchMedia('(min-width: 1px)');
+    return m && typeof m.matches === 'boolean';
+  });
+  comprobar('window.getComputedStyle', function () {
+    return !!getComputedStyle(document.body);
+  });
+  comprobar('window.requestAnimationFrame', function () {
+    return typeof requestAnimationFrame === 'function';
+  });
+  comprobar('window.setTimeout', function () { return typeof setTimeout === 'function'; });
+  comprobar('window.addEventListener', function () {
+    return typeof window.addEventListener === 'function';
+  });
+
+  // El global es `window`: en un navegador `window === globalThis`, asi que
+  // `addEventListener(...)` a secas y `window.addEventListener(...)` son lo
+  // mismo, igual que `innerWidth` y `window.innerWidth`. Muchisimo codigo real
+  // usa la forma corta. Si aqui `window` fuese un objeto normal colgado del
+  // global en vez de SER el global, esa forma corta fallaria con
+  // ReferenceError y se llevaria por delante el script entero - por eso se
+  // mide aparte y no se da por supuesto.
+  comprobar('window === globalThis', function () {
+    return typeof globalThis !== 'undefined' && window === globalThis;
+  });
+  comprobar('global suelto: addEventListener', function () {
+    return existeGlobal('addEventListener');
+  });
+  comprobar('global suelto: innerWidth', function () {
+    return existeGlobal('innerWidth');
+  });
+
+  // ---------------------------------------------------------------------
+  // Observadores (plan C8). Se comprueba que se puedan CONSTRUIR: un
+  // constructor que existe y nunca dispara es justo el caso que el plan
+  // prohibe introducir, y esta sonda no debe darlo por bueno.
+  // ---------------------------------------------------------------------
+  comprobar('MutationObserver', function () {
+    if (!existeGlobal('MutationObserver')) return false;
+    return !!new MutationObserver(function () {});
+  });
+  comprobar('IntersectionObserver', function () {
+    if (!existeGlobal('IntersectionObserver')) return false;
+    return !!new IntersectionObserver(function () {});
+  });
+  comprobar('ResizeObserver', function () {
+    if (!existeGlobal('ResizeObserver')) return false;
+    return !!new ResizeObserver(function () {});
+  });
+
+  // ---------------------------------------------------------------------
+  // Red (plan C5, E)
+  // ---------------------------------------------------------------------
+  comprobar('fetch', function () { return typeof fetch === 'function'; });
+  comprobar('XMLHttpRequest', function () { return existeGlobal('XMLHttpRequest'); });
+  comprobar('Headers', function () { return existeGlobal('Headers'); });
+  comprobar('Request/Response', function () {
+    return existeGlobal('Request') && existeGlobal('Response');
+  });
+  comprobar('FormData', function () { return existeGlobal('FormData'); });
+  comprobar('Blob', function () { return existeGlobal('Blob'); });
+  comprobar('WebSocket', function () { return existeGlobal('WebSocket'); });
+
+  // ---------------------------------------------------------------------
+  // Almacenamiento y trabajadores (plan G)
+  // ---------------------------------------------------------------------
+  comprobar('indexedDB', function () { return existeGlobal('indexedDB'); });
+  comprobar('Worker', function () { return existeGlobal('Worker'); });
+  comprobar('navigator.serviceWorker', function () {
+    return typeof navigator.serviceWorker !== 'undefined';
+  });
+
+  // ---------------------------------------------------------------------
+  // Publicacion del resultado
+  // ---------------------------------------------------------------------
+  var faltan = [];
+  var pasan = 0;
+  for (var i = 0; i < resultados.length; i++) {
+    if (resultados[i].ok) { pasan++; } else { faltan.push(resultados[i].nombre); }
+  }
+
+  // Formato estable, porque lo parsea un test de Rust:
+  //   SONDA pasan/total | faltan: a, b, c
+  document.title = 'SONDA ' + pasan + '/' + resultados.length +
+    ' | faltan: ' + (faltan.length ? faltan.join(', ') : '(ninguna)');
+})();
+</script>
+</body>
+</html>

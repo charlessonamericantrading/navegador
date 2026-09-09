@@ -52,16 +52,36 @@ pub enum DisplayItem {
     /// en `engine-layout::tree` - no necesariamente el tamaño natural de la
     /// imagen).
     Image { rect: Rect, image: Arc<DecodedImage> },
+    /// `background-image`/`background: url(...)` (Fase 40) - a diferencia
+    /// de `Image` (un `<img>`, que ESCALA la imagen al tamaño resuelto por
+    /// el layout, ver su doc-comment), esto pinta la imagen en su TAMAÑO
+    /// NATURAL repetida en mosaico hasta cubrir `rect` entero
+    /// (`background-repeat: repeat` y `background-size: auto`, los dos
+    /// valores iniciales reales del spec - no se leen otros valores de
+    /// ninguna de las dos propiedades todavia). `rect` es el border-box
+    /// completo de la caja (misma superficie que ya pinta
+    /// `background-color`, mismo criterio de `background-clip: border-box`
+    /// por defecto documentado alli), y el mosaico empieza en su esquina
+    /// superior-izquierda (aproxima `background-position: 0% 0%` sobre el
+    /// padding-box, el origen real por defecto - no distingue border-box
+    /// de padding-box). Se pinta DESPUES de `background-color` y ANTES de
+    /// `Border`, igual que el spec real (una imagen de fondo tapa el color
+    /// solido que haya debajo).
+    BackgroundImage { rect: Rect, image: Arc<DecodedImage> },
     /// `box-shadow` (Fase 3.5) - `rect` YA lleva el desplazamiento
     /// (`offset-x`/`offset-y`) aplicado (ver `parse_css_box_shadow`), asi
     /// que quien pinta esto solo rellena `rect` con `color`, ni sabe que
     /// existio un desplazamiento por separado. Se pinta ANTES que
     /// `SolidRect`/`Border` de la misma caja (orden real del spec: la
-    /// sombra queda DETRAS del fondo/border). Simplificacion declarada:
-    /// sombra "dura" sin difuminado - el tercer valor de `box-shadow`
-    /// (blur radius) se PARSEA (para no romper el resto de tokens) pero se
-    /// descarta, un blur gaussiano real no esta implementado.
-    Shadow { rect: Rect, color: [u8; 4], radius: f32 },
+    /// sombra queda DETRAS del fondo/border). `blur` (el tercer valor de
+    /// `box-shadow`, en px) SI se difumina de verdad (ver `paint_blurred_shadow`
+    /// en `engine-gfx::paint`: se rellena en un lienzo aparte y se le
+    /// aplican 3 pasadas de blur de caja horizontal+vertical, la misma
+    /// tecnica de "cajas repetidas" que aproxima un gaussiano real en la
+    /// mayoria de motores de render) - `0.0` (sin blur declarado) pinta la
+    /// sombra "dura" de siempre, sin lienzo aparte. El spread-radius (4o
+    /// valor) sigue sin soportarse.
+    Shadow { rect: Rect, color: [u8; 4], radius: f32, blur: f32 },
     /// `overflow: hidden` (Fase 3.5) - todo lo que se pinte entre un
     /// `PushClip` y su `PopClip` correspondiente (mismo anidamiento que el
     /// arbol de cajas: `build_items` los emite envolviendo la recursion en
@@ -104,7 +124,7 @@ impl DisplayList {
     pub fn build(layout_root: &LayoutBox, images: &ImageMap) -> Self {
         let mut list = Self::default();
         let mut z_layers: Vec<(i32, Vec<DisplayItem>)> = Vec::new();
-        Self::build_items(layout_root, &mut list.items, images, &mut z_layers);
+        Self::build_items(layout_root, &mut list.items, images, &mut z_layers, &Vec::new());
         z_layers.sort_by_key(|(z, _)| *z);
         for (_, items) in z_layers {
             list.items.extend(items);
@@ -112,7 +132,13 @@ impl DisplayList {
         list
     }
 
-    fn build_items(layout_box: &LayoutBox, target: &mut Vec<DisplayItem>, images: &ImageMap, z_layers: &mut Vec<(i32, Vec<DisplayItem>)>) {
+    fn build_items(
+        layout_box: &LayoutBox,
+        target: &mut Vec<DisplayItem>,
+        images: &ImageMap,
+        z_layers: &mut Vec<(i32, Vec<DisplayItem>)>,
+        active_clips: &[Rect],
+    ) {
         // `visibility: hidden` (a diferencia de `display: none`, ver
         // `engine-layout::tree::build_node`) SI genera caja - sigue
         // ocupando su espacio en el layout, solo no se pinta. Es heredable
@@ -128,18 +154,18 @@ impl DisplayList {
         // propio pintado con su propio `computed_style`.
         let hidden = layout_box.computed_style.get("visibility").map(String::as_str) == Some("hidden");
         if hidden {
-            return Self::build_clipped_children(layout_box, target, images, z_layers);
+            return Self::build_clipped_children(layout_box, target, images, z_layers, active_clips);
         }
         match &layout_box.box_type {
             BoxType::Block | BoxType::Inline => {
                 let radius = parse_css_border_radius(&layout_box.computed_style).unwrap_or(0.0);
                 // `box-shadow` se pinta ANTES que fondo/border (orden real
                 // del spec - ver el doc-comment de `DisplayItem::Shadow`).
-                if let Some((dx, dy, color)) = parse_css_box_shadow(&layout_box.computed_style) {
+                if let Some((dx, dy, color, blur)) = parse_css_box_shadow(&layout_box.computed_style) {
                     let mut rect = layout_box.dimensions.clone();
                     rect.x += dx;
                     rect.y += dy;
-                    target.push(DisplayItem::Shadow { rect, color, radius });
+                    target.push(DisplayItem::Shadow { rect, color, radius, blur });
                 }
                 // Sin background-color explicito en la cascada, las cajas de
                 // bloque no pintan fondo propio (transparente = se ve el
@@ -152,20 +178,26 @@ impl DisplayList {
                 if let Some(color) = layout_box.computed_style.get("background-color").and_then(|v| parse_css_color(v)) {
                     target.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color, radius });
                 }
+                if let Some(image) = parse_css_background_image(&layout_box.computed_style).and_then(|url| images.get(&url)) {
+                    target.push(DisplayItem::BackgroundImage { rect: layout_box.dimensions.clone(), image: image.clone() });
+                }
                 if let Some((width, color)) = parse_css_border(&layout_box.computed_style) {
                     target.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color, radius });
                 }
             }
             BoxType::Replaced => {
                 let radius = parse_css_border_radius(&layout_box.computed_style).unwrap_or(0.0);
-                if let Some((dx, dy, color)) = parse_css_box_shadow(&layout_box.computed_style) {
+                if let Some((dx, dy, color, blur)) = parse_css_box_shadow(&layout_box.computed_style) {
                     let mut rect = layout_box.dimensions.clone();
                     rect.x += dx;
                     rect.y += dy;
-                    target.push(DisplayItem::Shadow { rect, color, radius });
+                    target.push(DisplayItem::Shadow { rect, color, radius, blur });
                 }
                 if let Some(color) = layout_box.computed_style.get("background-color").and_then(|v| parse_css_color(v)) {
                     target.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color, radius });
+                }
+                if let Some(image) = parse_css_background_image(&layout_box.computed_style).and_then(|url| images.get(&url)) {
+                    target.push(DisplayItem::BackgroundImage { rect: layout_box.dimensions.clone(), image: image.clone() });
                 }
                 let border_width = if let Some((width, color)) = parse_css_border(&layout_box.computed_style) {
                     target.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color, radius });
@@ -249,7 +281,7 @@ impl DisplayList {
             }
         }
 
-        Self::build_clipped_children(layout_box, target, images, z_layers);
+        Self::build_clipped_children(layout_box, target, images, z_layers, active_clips);
     }
 
     /// `overflow: hidden` (Fase 3.5) envuelve TODO el subarbol de hijos
@@ -266,25 +298,101 @@ impl DisplayList {
     /// sigue recortando y recursando en sus hijos igual que si fuera
     /// visible (un hijo puede reactivar su propio pintado con `visibility:
     /// visible`, ver el doc-comment de esa rama).
-    fn build_clipped_children(layout_box: &LayoutBox, target: &mut Vec<DisplayItem>, images: &ImageMap, z_layers: &mut Vec<(i32, Vec<DisplayItem>)>) {
-        let clips = layout_box.computed_style.get("overflow").map(String::as_str) == Some("hidden");
+    fn build_clipped_children(
+        layout_box: &LayoutBox,
+        target: &mut Vec<DisplayItem>,
+        images: &ImageMap,
+        z_layers: &mut Vec<(i32, Vec<DisplayItem>)>,
+        active_clips: &[Rect],
+    ) {
+        let clips = establishes_clip(&layout_box.computed_style);
         if clips {
             target.push(DisplayItem::PushClip { rect: layout_box.dimensions.clone() });
         }
+        // Recorte(s) activos que un descendiente diverted a `z_layers`
+        // deberia seguir respetando - ver mas abajo. Solo se clona cuando
+        // hace falta (esta caja SI recorta): en el caso comun, sin ningun
+        // `overflow` recortando por el camino, es un slice vacio prestado
+        // sin ninguna asignacion.
+        let clips_para_hijos: Vec<Rect>;
+        let clips_para_hijos: &[Rect] = if clips {
+            clips_para_hijos = active_clips.iter().cloned().chain(std::iter::once(layout_box.dimensions.clone())).collect();
+            &clips_para_hijos
+        } else {
+            active_clips
+        };
         for child in &layout_box.children {
             match z_index_for_stacking(&child.computed_style) {
                 Some(z) => {
+                    // El sitio de ESTA capa se reserva ANTES de recursar.
+                    //
+                    // Si se empujara al terminar (que es lo que se hacia),
+                    // cualquier capa creada por un DESCENDIENTE durante esa
+                    // recursion quedaria ANTES en la lista, y como el orden
+                    // se decide con una ordenacion estable por z-index, a
+                    // igual z el ancestro acabaria pintandose ENCIMA de su
+                    // propio contenido. El fondo de un padre va siempre por
+                    // debajo de lo que contiene, y este motor lo estaba
+                    // invirtiendo: en la Wikipedia real, `.mw-page-container`
+                    // pintaba un rectangulo blanco de 1280x62707 sobre el
+                    // articulo entero y la pagina se veia en blanco de la
+                    // cabecera para abajo.
+                    //
+                    // Una capa z-index se pinta AL FINAL de la lista entera
+                    // (ver `build`), fuera de cualquier `PushClip`/`PopClip`
+                    // que un ANCESTRO haya emitido en el camino normal - asi
+                    // que aqui se envuelve ella misma con los recortes que
+                    // heredaria si no se hubiera desviado. Sin esto, un
+                    // `overflow: hidden/auto/scroll` con un descendiente
+                    // posicionado y con z-index se derramaba sin recortar -
+                    // hueco que se hizo mucho mas frecuente al ampliar
+                    // `establishes_clip` a `auto`/`scroll` (antes solo
+                    // `overflow: hidden` exacto lo disparaba).
+                    let slot = z_layers.len();
+                    z_layers.push((z, Vec::new()));
                     let mut layer_items = Vec::new();
-                    Self::build_items(child, &mut layer_items, images, z_layers);
-                    z_layers.push((z, layer_items));
+                    for rect in clips_para_hijos {
+                        layer_items.push(DisplayItem::PushClip { rect: rect.clone() });
+                    }
+                    Self::build_items(child, &mut layer_items, images, z_layers, clips_para_hijos);
+                    for _ in clips_para_hijos {
+                        layer_items.push(DisplayItem::PopClip);
+                    }
+                    z_layers[slot].1 = layer_items;
                 }
-                None => Self::build_items(child, target, images, z_layers),
+                None => Self::build_items(child, target, images, z_layers, clips_para_hijos),
             }
         }
         if clips {
             target.push(DisplayItem::PopClip);
         }
     }
+}
+
+/// Si esta caja recorta su contenido desbordado.
+///
+/// Antes se comparaba SOLO contra el literal `"hidden"`, asi que
+/// `overflow: auto` (igual de comun), `overflow: scroll`, la forma de dos
+/// valores `overflow: hidden auto` y las variantes por eje `overflow-x`/
+/// `overflow-y` no recortaban nada y su contenido se derramaba por encima
+/// del resto de la pagina.
+///
+/// `auto` y `scroll` recortan igual que `hidden` porque este motor todavia
+/// no puede desplazar el interior de una caja: lo que en un navegador real
+/// quedaria oculto tras una barra de scroll, aqui queda simplemente oculto.
+/// Es una simplificacion declarada, pero mucho mas cercana a la verdad que
+/// dejarlo salir.
+fn establishes_clip(computed_style: &HashMap<String, String>) -> bool {
+    let recorta = |valor: &str| matches!(valor.trim(), "hidden" | "clip" | "scroll" | "auto");
+    for prop in ["overflow", "overflow-x", "overflow-y"] {
+        let Some(valor) = computed_style.get(prop) else { continue };
+        // `overflow: hidden auto` son DOS valores (eje x y eje y): basta con
+        // que uno de los dos recorte.
+        if valor.split_whitespace().any(recorta) {
+            return true;
+        }
+    }
+    false
 }
 
 /// `z-index` SOLO participa en el orden de pintado si el elemento tambien
@@ -405,11 +513,16 @@ fn parse_rgb_component(token: &str) -> Option<u8> {
 /// mas abajo) - sin aproximacion, resultado identico al de un navegador
 /// real para el mismo triplete.
 ///
-/// NO implementado: `hwb()`/`lab()`/`lch()`/`oklab()`/`oklch()` y el resto
-/// de espacios de color modernos - devuelven `None` y la caja se queda
-/// sin pintar, en vez de fingir una conversion. Tampoco los ~90 nombres
-/// extendidos que faltan en la tabla.
-fn parse_css_color(value: &str) -> Option<[u8; 4]> {
+/// `hwb()` (blancura/negrura, misma familia que HSL - `hwb_to_rgb` mas
+/// abajo) y `oklch()` (el espacio de color perceptualmente uniforme de CSS
+/// Color 4 - `oklch_to_rgb` mas abajo, la formula de referencia de Björn
+/// Ottosson, sin aproximacion) tambien se parsean de verdad.
+///
+/// NO implementado: `lab()`/`lch()`/`oklab()` y el resto de espacios de
+/// color modernos - devuelven `None` y la caja se queda sin pintar, en vez
+/// de fingir una conversion. Tampoco los ~90 nombres extendidos que faltan
+/// en la tabla.
+pub(crate) fn parse_css_color(value: &str) -> Option<[u8; 4]> {
     let value = value.trim();
 
     if let Some(hex) = value.strip_prefix('#') {
@@ -438,7 +551,7 @@ fn parse_css_color(value: &str) -> Option<[u8; 4]> {
         // Acepta tanto la sintaxis clasica con comas (`rgb(1, 2, 3)`) como
         // la moderna con espacios (`rgb(1 2 3 / 0.5)`), que ya usan muchas
         // hojas de estilo reales.
-        let normalised = inner.replace(',', " ").replace('/', " ");
+        let normalised = inner.replace([',', '/'], " ");
         let parts: Vec<&str> = normalised.split_whitespace().collect();
         if parts.len() < 3 {
             return None;
@@ -464,7 +577,7 @@ fn parse_css_color(value: &str) -> Option<[u8; 4]> {
 
     if let Some(rest) = lower.strip_prefix("hsla(").or_else(|| lower.strip_prefix("hsl(")) {
         let inner = rest.strip_suffix(')')?;
-        let normalised = inner.replace(',', " ").replace('/', " ");
+        let normalised = inner.replace([',', '/'], " ");
         let parts: Vec<&str> = normalised.split_whitespace().collect();
         if parts.len() < 3 {
             return None;
@@ -488,7 +601,121 @@ fn parse_css_color(value: &str) -> Option<[u8; 4]> {
         return Some([r, g, b, a]);
     }
 
+    if let Some(rest) = lower.strip_prefix("hwb(") {
+        let inner = rest.strip_suffix(')')?;
+        let normalised = inner.replace([',', '/'], " ");
+        let parts: Vec<&str> = normalised.split_whitespace().collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let hue = parse_hue_degrees(parts[0])?;
+        let whiteness = parse_percentage_0_1(parts[1])?;
+        let blackness = parse_percentage_0_1(parts[2])?;
+        let (r, g, b) = hwb_to_rgb(hue, whiteness, blackness);
+        let a = match parts.get(3) {
+            Some(token) => parse_alpha_0_1_or_percent(token)?,
+            None => 255,
+        };
+        return Some([r, g, b, a]);
+    }
+
+    if let Some(rest) = lower.strip_prefix("oklch(") {
+        let inner = rest.strip_suffix(')')?;
+        let normalised = inner.replace('/', " ");
+        let parts: Vec<&str> = normalised.split_whitespace().collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let lightness = parse_oklch_lightness(parts[0])?;
+        let chroma = parts[1].trim().parse::<f32>().ok()?.max(0.0);
+        let hue = parse_hue_degrees(parts[2])?;
+        let (r, g, b) = oklch_to_rgb(lightness, chroma, hue);
+        let a = match parts.get(3) {
+            Some(token) => parse_alpha_0_1_or_percent(token)?,
+            None => 255,
+        };
+        return Some([r, g, b, a]);
+    }
+
     NAMED_COLORS.iter().find(|(name, _)| *name == lower).map(|(_, rgba)| *rgba)
+}
+
+/// Componente de alfa de `hwb()`/`oklch()` - mismo parseo (numero 0.0-1.0 o
+/// porcentaje) que ya usan `rgb()`/`hsl()` mas arriba, extraido aqui porque
+/// dos consumidores mas lo necesitan tal cual.
+fn parse_alpha_0_1_or_percent(token: &str) -> Option<u8> {
+    let t = token.trim();
+    let alpha = match t.strip_suffix('%') {
+        Some(percent) => percent.trim().parse::<f32>().ok()? / 100.0,
+        None => t.parse::<f32>().ok()?,
+    };
+    Some((alpha.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// `hwb(hue whiteness blackness)` -> RGB, la formula estandar de CSS Color
+/// 4 §7.1: si blancura+negrura cubren el 100% o mas, el resultado es un
+/// gris puro (proporcional a cuanta blancura hay respecto al total);
+/// si no, se parte del color puro de ese matiz (`hsl_to_rgb` con
+/// saturacion 100%/luminosidad 50%, el mismo helper que ya usa `hsl()`) y
+/// se mezcla hacia blanco/negro segun las dos proporciones.
+fn hwb_to_rgb(hue_deg: f32, whiteness: f32, blackness: f32) -> (u8, u8, u8) {
+    let w = whiteness.clamp(0.0, 1.0);
+    let b = blackness.clamp(0.0, 1.0);
+    if w + b >= 1.0 {
+        let gray = (w / (w + b) * 255.0).round() as u8;
+        return (gray, gray, gray);
+    }
+    let (r, g, bl) = hsl_to_rgb(hue_deg, 1.0, 0.5);
+    let mix = |c: u8| -> u8 {
+        let c = c as f32 / 255.0;
+        ((c * (1.0 - w - b) + w) * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    (mix(r), mix(g), mix(bl))
+}
+
+/// Luminosidad (`L`) de `oklch()`: `0.0..1.0` de verdad (mas comun como
+/// porcentaje, `70%`) o el numero directo que tambien acepta CSS Color 4 -
+/// acotado igual que el resto del parseador.
+fn parse_oklch_lightness(token: &str) -> Option<f32> {
+    let token = token.trim();
+    if let Some(percent) = token.strip_suffix('%') {
+        return Some((percent.trim().parse::<f32>().ok()? / 100.0).clamp(0.0, 1.0));
+    }
+    token.parse::<f32>().ok().map(|v| v.clamp(0.0, 1.0))
+}
+
+/// `oklch(L C H)` -> RGB: la formula de referencia de Björn Ottosson
+/// (creador de OKLab) sin aproximacion - LCH cilindrico a OKLab
+/// rectangular (`a = C*cos(H)`, `b = C*sin(H)`), OKLab a sRGB LINEAL via
+/// las matrices estandar del espacio, y de ahi a sRGB con la curva gamma
+/// real del spec (tramo lineal bajo `0.0031308`, potencia `1/2.4` el
+/// resto). Un `L`/`C`/`H` fuera de gama (el color pedido no cabe en sRGB)
+/// se ACOTA al canal 0..1 mas cercano tras la curva gamma en vez de
+/// devolver `None` o un color inventado - un navegador real hace lo mismo
+/// (gamut mapping por recorte).
+fn oklch_to_rgb(lightness: f32, chroma: f32, hue_deg: f32) -> (u8, u8, u8) {
+    let hue = hue_deg.to_radians();
+    let a = chroma * hue.cos();
+    let b = chroma * hue.sin();
+
+    let l_ = lightness + 0.396_337_78 * a + 0.215_803_76 * b;
+    let m_ = lightness - 0.105_561_346 * a - 0.063_854_17 * b;
+    let s_ = lightness - 0.089_484_18 * a - 1.291_485_5 * b;
+
+    let l3 = l_ * l_ * l_;
+    let m3 = m_ * m_ * m_;
+    let s3 = s_ * s_ * s_;
+
+    let r_lin = 4.076_741_7 * l3 - 3.307_711_6 * m3 + 0.230_969_94 * s3;
+    let g_lin = -1.268_438 * l3 + 2.609_757_4 * m3 - 0.341_319_38 * s3;
+    let b_lin = -0.0041960863 * l3 - 0.703_418_6 * m3 + 1.707_614_7 * s3;
+
+    let gamma_encode = |c: f32| -> u8 {
+        let c = c.clamp(0.0, 1.0);
+        let encoded = if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+        (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    (gamma_encode(r_lin), gamma_encode(g_lin), gamma_encode(b_lin))
 }
 
 /// El matiz (`hue`) de `hsl()` en cualquiera de las cuatro unidades de
@@ -719,6 +946,32 @@ fn parse_css_border(computed_style: &HashMap<String, String>) -> Option<(f32, [u
     Some((resolved_width, resolved_color))
 }
 
+/// `background-image` (Fase 40) - extrae la URL "desnuda" (sin
+/// `url(...)`/comillas) de la declaracion ya expandida por la cascada
+/// (`engine_css::parser::insert_declaration` ya deja aqui el `url(...)`
+/// tanto si el autor escribio el longhand como el shorthand `background:
+/// ... url(...) ...`). Mismo formato sin resolver que usa `ImageMap`/
+/// `BoxType::Image` para `<img src>` (ver su doc-comment en
+/// `engine-layout::tree`) - asi `images.get(...)` encuentra la misma
+/// entrada sin importar de cual de las dos fuentes vino. No distingue
+/// `url(...)` de otra funcion de imagen (`linear-gradient(...)`, sin
+/// soportar) - un valor sin `url(` simplemente no encuentra nada, la
+/// misma degradacion honesta de siempre.
+pub(crate) fn parse_css_background_image(computed_style: &HashMap<String, String>) -> Option<String> {
+    let raw = computed_style.get("background-image")?;
+    let lower = raw.to_ascii_lowercase();
+    let start = lower.find("url(")?;
+    let after = &raw[start + 4..];
+    let end = after.find(')')?;
+    let inner = after[..end].trim();
+    let inner = inner
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(inner);
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
 /// `border-radius` (Fase 3.5) - un unico valor en `px`, aplicado a las 4
 /// esquinas por igual (misma simplificacion "un solo numero" que
 /// `padding`/`margin`/`border-width`). `None`/cero/negativo resuelve a
@@ -738,18 +991,19 @@ fn parse_css_border_radius(computed_style: &HashMap<String, String>) -> Option<f
     None
 }
 
-/// `box-shadow: <offset-x> <offset-y> [<blur-radius>] <color>` (Fase 3.5) -
-/// el `blur-radius` opcional SI se parsea (para no romper el resto de
-/// tokens, p.ej. tomar el color por el blur) pero se DESCARTA - ver el
-/// doc-comment de `DisplayItem::Shadow` para el porque (sombra "dura", sin
-/// difuminado real). `offset-x`/`offset-y` aceptan negativos (a diferencia
-/// de `parse_css_length`, que rechaza negativos porque un padding/border
-/// negativo no tiene sentido - un offset de sombra si) via `parse_css_offset`
-/// local, deliberadamente NO compartida con la copia de `engine-layout::tree`
-/// (misma razon de siempre: crates que no deben depender entre si). `None`
-/// si faltan offset-x/offset-y o el color, o si la propiedad no esta
-/// puesta - sin sombra por defecto, el valor inicial real de la propiedad.
-fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32, f32, [u8; 4])> {
+/// `box-shadow: <offset-x> <offset-y> [<blur-radius>] <color>` (Fase 3.5,
+/// blur real desde entonces) - `offset-x`/`offset-y` aceptan negativos (a
+/// diferencia de `parse_css_length`, que rechaza negativos porque un
+/// padding/border negativo no tiene sentido - un offset de sombra si) via
+/// `parse_css_offset` local, deliberadamente NO compartida con la copia de
+/// `engine-layout::tree` (misma razon de siempre: crates que no deben
+/// depender entre si). El 3er numero (si esta) es el blur-radius, acotado a
+/// no-negativo igual que el resto del motor acota en vez de rechazar - un
+/// 4o numero (spread-radius) sigue sin soportarse (se ignora, no rompe el
+/// resto del parseo). `None` si faltan offset-x/offset-y o el color, o si la
+/// propiedad no esta puesta - sin sombra por defecto, el valor inicial real
+/// de la propiedad.
+fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32, f32, [u8; 4], f32)> {
     fn parse_offset(value: &str) -> Option<f32> {
         let px = value.trim().strip_suffix("px")?;
         px.trim().parse::<f32>().ok()
@@ -765,12 +1019,12 @@ fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32
         } else if let Some(n) = parse_offset(token) {
             offsets.push(n);
         }
-        // Un tercer numero (blur-radius) cae aqui y se ignora a proposito.
     }
 
     let dx = *offsets.first()?;
     let dy = *offsets.get(1)?;
-    Some((dx, dy, color.unwrap_or(INITIAL_COLOR)))
+    let blur = offsets.get(2).copied().unwrap_or(0.0).max(0.0);
+    Some((dx, dy, color.unwrap_or(INITIAL_COLOR), blur))
 }
 
 #[cfg(test)]
@@ -830,11 +1084,59 @@ mod tests {
 
     #[test]
     fn unsupported_color_syntaxes_are_none_instead_of_a_made_up_color() {
-        assert_eq!(parse_css_color("hwb(0 0% 0%)"), None, "hwb() no esta implementado");
-        assert_eq!(parse_css_color("oklch(0.5 0.2 30)"), None, "oklch() no esta implementado");
+        assert_eq!(parse_css_color("lab(50% 40 60)"), None, "lab() no esta implementado");
+        assert_eq!(parse_css_color("oklab(0.5 0.1 0.1)"), None, "oklab() no esta implementado");
         assert_eq!(parse_css_color("currentColor"), None, "currentColor exige el computed_style completo");
         assert_eq!(parse_css_color("basura"), None);
         assert_eq!(parse_css_color(""), None);
+    }
+
+    /// `hwb(0 0% 0%)` es rojo puro (matiz 0, sin blancura ni negrura que lo
+    /// desature) - mismo punto de referencia facil de verificar que ya usan
+    /// las pruebas de `hsl()`.
+    #[test]
+    fn hwb_with_no_whiteness_or_blackness_is_the_pure_hue() {
+        assert_eq!(parse_css_color("hwb(0 0% 0%)"), Some([255, 0, 0, 255]));
+    }
+
+    /// Blancura+negrura sumando 100% o mas colapsa a un gris puro
+    /// (proporcional a cuanta blancura hay) - el matiz deja de importar.
+    #[test]
+    fn hwb_with_whiteness_plus_blackness_over_100_percent_is_a_pure_gray() {
+        assert_eq!(parse_css_color("hwb(210 60% 60%)"), Some([128, 128, 128, 255]));
+    }
+
+    #[test]
+    fn hwb_reads_the_optional_alpha_after_a_slash() {
+        assert_eq!(parse_css_color("hwb(0 0% 0% / 0.5)"), Some([255, 0, 0, 128]));
+    }
+
+    /// `oklch(1 0 0)` es blanco puro (luminosidad maxima, sin croma) y
+    /// `oklch(0 0 0)` es negro puro (luminosidad minima) - los dos puntos
+    /// de referencia que cualquier implementacion de OKLCH tiene que dar
+    /// exactos, sin importar la formula interna.
+    #[test]
+    fn oklch_at_the_lightness_extremes_is_pure_white_or_black() {
+        assert_eq!(parse_css_color("oklch(1 0 0)"), Some([255, 255, 255, 255]));
+        assert_eq!(parse_css_color("oklch(0 0 0)"), Some([0, 0, 0, 255]));
+    }
+
+    /// `oklch(0.63 0.26 29)` es el rojo de referencia de CSS Color 4
+    /// (equivale casi exacto a `red`/`#ff0000`) - el punto de referencia
+    /// que documenta el propio spec para verificar una implementacion de
+    /// OKLCH contra un color RGB conocido.
+    #[test]
+    fn oklch_of_a_known_red_matches_srgb_red_closely() {
+        let Some([r, g, b, a]) = parse_css_color("oklch(0.627955 0.257683 29.2339)") else { panic!("deberia parsear") };
+        assert_eq!(a, 255);
+        assert!(r >= 250, "canal rojo deberia estar cerca de 255, salio {r}");
+        assert!(g <= 20, "canal verde deberia estar cerca de 0, salio {g}");
+        assert!(b <= 20, "canal azul deberia estar cerca de 0, salio {b}");
+    }
+
+    #[test]
+    fn oklch_lightness_accepts_a_percentage_or_a_bare_number() {
+        assert_eq!(parse_css_color("oklch(100% 0 0)"), parse_css_color("oklch(1 0 0)"));
     }
 
     /// Los tres primarios y los limites de luminosidad (0%/100% siempre dan
@@ -935,6 +1237,44 @@ mod tests {
         );
     }
 
+    /// Fase 40, el punto real de `background-image`: una caja con la
+    /// propiedad declarada Y la imagen ya presente en el `ImageMap` (mismo
+    /// mapa que sirve `<img src>`) deberia emitir `BackgroundImage`, en
+    /// tamaño natural (no escalado como `Image`) y ANTES de `Border` -
+    /// mismo orden real del spec que ya usa `background-color`.
+    #[test]
+    fn a_box_with_a_resolved_background_image_emits_a_background_image_item() {
+        let mut input = LayoutBox::new(BoxType::Block);
+        input.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        input.computed_style.insert("background-image".to_string(), "url(tile.png)".to_string());
+        input.computed_style.insert("border".to_string(), "2px solid black".to_string());
+
+        let mut images = ImageMap::new();
+        images.insert("tile.png".to_string(), Arc::new(DecodedImage { width: 4, height: 4, rgba: vec![255; 4 * 4 * 4] }));
+
+        let list = DisplayList::build(&input, &images);
+
+        let bg_index = list.items.iter().position(|item| matches!(item, DisplayItem::BackgroundImage { rect, .. } if rect.width == 100.0));
+        let border_index = list.items.iter().position(|item| matches!(item, DisplayItem::Border { .. }));
+        assert!(bg_index.is_some(), "deberia emitir BackgroundImage cuando la imagen esta resuelta");
+        assert!(bg_index.unwrap() < border_index.unwrap(), "el fondo se pinta ANTES que el border, igual que background-color");
+    }
+
+    /// Sin la imagen resuelta en el `ImageMap` (fallo de descarga/
+    /// decodificacion, `src` invalido) no deberia inventarse ningun
+    /// rectangulo - mismo criterio que `BoxType::Image` ya aplica para
+    /// `<img>`.
+    #[test]
+    fn a_background_image_url_missing_from_the_map_paints_nothing() {
+        let mut input = LayoutBox::new(BoxType::Block);
+        input.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        input.computed_style.insert("background-image".to_string(), "url(no-existe.png)".to_string());
+
+        let list = DisplayList::build(&input, &ImageMap::new());
+
+        assert!(!list.items.iter().any(|item| matches!(item, DisplayItem::BackgroundImage { .. })));
+    }
+
     /// Un placeholder se pinta en gris (`PLACEHOLDER_COLOR`), NO con el
     /// `color` normal de la cascada - para que se distinga de un valor real
     /// ya escrito, igual que en un navegador real.
@@ -1019,6 +1359,119 @@ mod tests {
         assert!(
             !list.items.iter().any(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [255, 0, 0, 255])),
             "el ancestro oculto en si no deberia pintar su propio fondo"
+        );
+    }
+
+    /// `overflow` recorta con cualquiera de sus valores de recorte, no solo
+    /// con el literal `hidden`: `auto` y `scroll` son igual de comunes, y la
+    /// forma de dos valores y las variantes por eje tambien. Comparando solo
+    /// contra `"hidden"`, todo eso se derramaba por encima del resto de la
+    /// pagina.
+    #[test]
+    fn overflow_recorta_con_auto_scroll_y_las_formas_por_eje() {
+        let con = |prop: &str, valor: &str| {
+            let mut m = HashMap::new();
+            m.insert(prop.to_string(), valor.to_string());
+            m
+        };
+        assert!(establishes_clip(&con("overflow", "hidden")));
+        assert!(establishes_clip(&con("overflow", "auto")), "`auto` recorta: este motor no puede desplazar el interior de una caja");
+        assert!(establishes_clip(&con("overflow", "scroll")));
+        assert!(establishes_clip(&con("overflow", "hidden auto")), "la forma de dos ejes recorta si cualquiera de los dos lo hace");
+        assert!(establishes_clip(&con("overflow-y", "auto")));
+        assert!(!establishes_clip(&con("overflow", "visible")), "`visible` es el valor inicial: no recorta nada");
+        assert!(!establishes_clip(&HashMap::new()), "sin `overflow` declarado tampoco");
+    }
+
+    /// El fondo de un ANCESTRO va siempre por debajo del contenido de sus
+    /// descendientes, aunque los dos creen capa propia con el MISMO
+    /// z-index.
+    ///
+    /// Se aplanan las capas en una sola lista, y el ancestro terminaba de
+    /// recursar DESPUES de sus hijos, asi que acababa el ultimo de la lista
+    /// y se pintaba encima de su propio contenido. En la Wikipedia real eso
+    /// tapaba el articulo entero con un rectangulo blanco de pagina
+    /// completa.
+    #[test]
+    fn el_fondo_de_un_ancestro_se_pinta_antes_que_el_contenido_de_sus_hijos() {
+        let mut hijo = LayoutBox::new(BoxType::Block);
+        hijo.computed_style.insert("position".to_string(), "relative".to_string());
+        hijo.computed_style.insert("z-index".to_string(), "0".to_string());
+        hijo.computed_style.insert("background-color".to_string(), "#00ff00".to_string());
+        hijo.dimensions = Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
+
+        let mut ancestro = LayoutBox::new(BoxType::Block);
+        ancestro.computed_style.insert("position".to_string(), "relative".to_string());
+        ancestro.computed_style.insert("z-index".to_string(), "0".to_string());
+        ancestro.computed_style.insert("background-color".to_string(), "#ffffff".to_string());
+        ancestro.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        ancestro.children.push(hijo);
+
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.children.push(ancestro);
+
+        let list = DisplayList::build(&root, &ImageMap::new());
+        let blanco = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [255, 255, 255, 255]))
+            .expect("deberia existir el fondo blanco del ancestro");
+        let verde = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [0, 255, 0, 255]))
+            .expect("deberia existir el fondo verde del hijo");
+
+        assert!(
+            blanco < verde,
+            "el fondo del ancestro (indice {blanco}) deberia pintarse ANTES que el del hijo (indice {verde}), no taparlo"
+        );
+    }
+
+    /// Un descendiente `position: relative` con `z-index` numerico se pinta
+    /// en una capa aparte, spliceada al FINAL de la lista entera - fuera de
+    /// cualquier `PushClip`/`PopClip` que un ANCESTRO con `overflow`
+    /// hubiera emitido en el camino normal. Sin envolver esa capa con los
+    /// mismos recortes que heredaria de no haberse desviado, un
+    /// `overflow: hidden` con un hijo asi por dentro no lo recorta.
+    #[test]
+    fn una_capa_z_index_hereda_el_recorte_de_su_ancestro_con_overflow() {
+        let mut hijo_posicionado = LayoutBox::new(BoxType::Block);
+        hijo_posicionado.computed_style.insert("position".to_string(), "relative".to_string());
+        hijo_posicionado.computed_style.insert("z-index".to_string(), "1".to_string());
+        hijo_posicionado.computed_style.insert("background-color".to_string(), "#ff0000".to_string());
+        // Deliberadamente mas grande que el contenedor, para que un recorte
+        // ausente sea observable con solo mirar el rectangulo de PushClip.
+        hijo_posicionado.dimensions = Rect { x: 0.0, y: 0.0, width: 500.0, height: 500.0 };
+
+        let mut contenedor = LayoutBox::new(BoxType::Block);
+        contenedor.computed_style.insert("overflow".to_string(), "hidden".to_string());
+        contenedor.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        contenedor.children.push(hijo_posicionado);
+
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.children.push(contenedor);
+
+        let list = DisplayList::build(&root, &ImageMap::new());
+        let rojo = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [255, 0, 0, 255]))
+            .expect("deberia existir el fondo rojo del hijo posicionado");
+
+        let recorte_antes = list.items[..rojo].iter().rev().find_map(|item| match item {
+            DisplayItem::PushClip { rect } => Some(rect.clone()),
+            _ => None,
+        });
+        let recorte = recorte_antes.expect("deberia haber un PushClip inmediatamente antes del contenido de la capa z-index");
+        assert_eq!(
+            (recorte.width, recorte.height),
+            (100.0, 100.0),
+            "el recorte deberia ser el rectangulo del contenedor con overflow:hidden (100x100), no quedarse sin recortar"
+        );
+        assert!(
+            list.items[rojo..].iter().any(|item| matches!(item, DisplayItem::PopClip)),
+            "el PushClip de la capa deberia cerrarse con su PopClip"
         );
     }
 
@@ -1147,6 +1600,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_css_background_image_strips_the_url_wrapper_and_quotes() {
+        assert_eq!(parse_css_background_image(&style_with("background-image", "url(x.png)")), Some("x.png".to_string()));
+        assert_eq!(parse_css_background_image(&style_with("background-image", "url(\"x.png\")")), Some("x.png".to_string()));
+        assert_eq!(parse_css_background_image(&style_with("background-image", "url('x.png')")), Some("x.png".to_string()));
+    }
+
+    #[test]
+    fn parse_css_background_image_is_none_without_a_url_function() {
+        assert_eq!(parse_css_background_image(&style_with("background-image", "none")), None);
+        assert_eq!(parse_css_background_image(&style_with("background-image", "linear-gradient(red, blue)")), None, "solo url() esta soportado, no funciones de degradado");
+        assert_eq!(parse_css_background_image(&HashMap::new()), None);
+    }
+
+    #[test]
     fn parse_css_border_radius_reads_a_positive_px_value() {
         assert_eq!(parse_css_border_radius(&style_with("border-radius", "8px")), Some(8.0));
         assert_eq!(parse_css_border_radius(&style_with("border-radius", "8px 12px")), Some(8.0));
@@ -1161,26 +1628,23 @@ mod tests {
 
     #[test]
     fn parse_css_box_shadow_reads_offsets_and_color_in_any_order() {
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255])));
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "#ff0000 4px 6px")), Some((4.0, 6.0, [255, 0, 0, 255])), "el orden deberia ser libre, igual que border");
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255], 0.0)));
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "#ff0000 4px 6px")), Some((4.0, 6.0, [255, 0, 0, 255], 0.0)), "el orden deberia ser libre, igual que border");
     }
 
     #[test]
-    fn parse_css_box_shadow_ignores_the_optional_blur_radius_token() {
-        // El tercer numero (blur-radius) se parsea para no romper el color
-        // que viene despues, pero se descarta - offsets siguen siendo los
-        // dos primeros numeros encontrados.
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px 10px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255])));
+    fn parse_css_box_shadow_reads_the_optional_blur_radius_token() {
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px 10px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255], 10.0)));
     }
 
     #[test]
     fn parse_css_box_shadow_accepts_negative_offsets() {
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "-4px -6px #000000")), Some((-4.0, -6.0, [0, 0, 0, 255])));
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "-4px -6px #000000")), Some((-4.0, -6.0, [0, 0, 0, 255], 0.0)));
     }
 
     #[test]
     fn parse_css_box_shadow_defaults_color_to_black_when_missing() {
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px")), Some((4.0, 6.0, [0, 0, 0, 255])));
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px")), Some((4.0, 6.0, [0, 0, 0, 255], 0.0)));
     }
 
     #[test]

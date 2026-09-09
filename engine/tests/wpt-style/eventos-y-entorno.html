@@ -1,0 +1,146 @@
+<!doctype html>
+<html>
+<head><title>Eventos y entorno (Fase 45)</title></head>
+<body>
+  <div id="caja" class="tarjeta destacada"></div>
+  <div id="otra" class="tarjeta"></div>
+  <p id="suelto" class="tarjetas-de-otra-cosa"></p>
+
+<script>
+// Subclases de Event (tarea C4) y entorno de window (C7), mas las propiedades
+// de document que faltaban (C6).
+
+test(function () {
+  const e = new CustomEvent('cambio', { detail: { id: 7 } });
+  assert_equals(e.type, 'cambio');
+  assert_equals(e.detail.id, 7, 'detail deberia llegar entero, no solo existir');
+}, 'CustomEvent transporta su detail');
+
+test(function () {
+  // El spec dice `null`, no `undefined`. Hay codigo que lo distingue.
+  const e = new CustomEvent('x');
+  assert_true(e.detail === null, 'sin detail debe ser null');
+}, 'CustomEvent sin detail devuelve null');
+
+test(function () {
+  // El caso real: una libreria de estado avisa de un cambio con un
+  // CustomEvent y alguien lo escucha.
+  const caja = document.getElementById('caja');
+  let recibido = null;
+  caja.addEventListener('datos', function (e) { recibido = e.detail; });
+  caja.dispatchEvent(new CustomEvent('datos', { detail: 'hola' }));
+  assert_equals(recibido, 'hola', 'el listener deberia recibir el detail');
+}, 'un CustomEvent despachado llega con su detail al listener');
+
+test(function () {
+  const e = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', ctrlKey: true });
+  assert_equals(e.key, 'Enter');
+  assert_equals(e.code, 'Enter');
+  assert_true(e.ctrlKey);
+  // Los modificadores que NO se pasan deben ser false, no undefined: un
+  // `e.altKey === false` tiene que poder comprobarse.
+  assert_false(e.altKey, 'un modificador ausente debe ser false, no undefined');
+}, 'KeyboardEvent lleva key, code y modificadores');
+
+test(function () {
+  const e = new MouseEvent('click', { clientX: 10, clientY: 20, button: 2 });
+  assert_equals(e.clientX, 10);
+  assert_equals(e.clientY, 20);
+  assert_equals(e.button, 2);
+  assert_false(e.shiftKey);
+}, 'MouseEvent lleva coordenadas y boton');
+
+test(function () {
+  const e = new MouseEvent('click');
+  assert_equals(e.clientX, 0, 'sin coordenadas deben ser 0, no undefined');
+}, 'MouseEvent sin opciones tiene coordenadas cero');
+
+test(function () {
+  const e = new InputEvent('input', { data: 'a', inputType: 'insertText' });
+  assert_equals(e.data, 'a');
+  assert_equals(e.inputType, 'insertText');
+}, 'InputEvent lleva data e inputType');
+
+test(function () {
+  // `bubbles`/`cancelable` siguen funcionando en las subclases, no solo en
+  // Event: se construyen sobre el mismo objeto.
+  const e = new CustomEvent('x', { bubbles: true, cancelable: true });
+  assert_true(e.bubbles);
+  assert_true(e.cancelable);
+  e.preventDefault();
+  assert_true(e.defaultPrevented, 'preventDefault deberia funcionar en una subclase');
+}, 'las subclases heredan el comportamiento de Event');
+
+test(function () {
+  assert_true(typeof window.innerWidth === 'number', 'innerWidth deberia ser un numero');
+  assert_true(window.innerWidth > 0, 'el viewport tiene ancho real, no cero');
+  assert_true(window.innerHeight > 0, 'y alto real');
+}, 'window conoce el tamano real del viewport');
+
+test(function () {
+  assert_equals(window.devicePixelRatio, 1, 'el motor rasteriza a 1:1');
+  assert_equals(window.scrollX, 0, 'no hay scroll horizontal en este motor');
+  assert_true(typeof window.scrollY === 'number');
+}, 'window expone el resto del entorno');
+
+test(function () {
+  // `matchMedia` usa el MISMO evaluador que `@media`, asi que una consulta
+  // que el viewport cumple debe dar true y una que no, false.
+  const ancho = window.innerWidth;
+  const cumple = window.matchMedia('(min-width: 1px)');
+  assert_true(cumple.matches, 'todo viewport tiene mas de 1px');
+  const noCumple = window.matchMedia('(min-width: ' + (ancho + 500) + 'px)');
+  assert_false(noCumple.matches, 'una consulta por encima del viewport no debe cumplirse');
+}, 'matchMedia evalua contra el viewport real');
+
+test(function () {
+  const m = window.matchMedia('(min-width: 1px)');
+  assert_equals(m.media, '(min-width: 1px)', 'deberia devolver la consulta tal cual');
+  // Existen para que llamarlos no lance; que no disparen esta declarado.
+  assert_true(typeof m.addEventListener === 'function');
+}, 'MediaQueryList expone media y sus metodos');
+
+test(function () {
+  // El patron de arranque de media web depende de este valor.
+  assert_equals(document.readyState, 'interactive',
+                'los scripts corren con el documento ya parseado');
+}, 'document.readyState describe el estado real');
+
+test(function () {
+  const tarjetas = document.getElementsByClassName('tarjeta');
+  assert_equals(tarjetas.length, 2, 'deberian salir las dos tarjetas');
+}, 'getElementsByClassName encuentra por clase');
+
+test(function () {
+  // Por TOKEN completo, no por subcadena: `tarjetas-de-otra-cosa` no es
+  // `tarjeta`. Es el mismo criterio que el selector `.tarjeta` de CSS, y
+  // responder distinto entre los dos seria una fuente de fallos sin
+  // diagnostico.
+  const tarjetas = document.getElementsByClassName('tarjeta');
+  for (let i = 0; i < tarjetas.length; i++) {
+    assert_true(tarjetas[i].id !== 'suelto', 'no debe colarse una clase que solo lo contiene');
+  }
+}, 'getElementsByClassName compara tokens, no subcadenas');
+
+test(function () {
+  const f = document.createDocumentFragment();
+  const d = document.createElement('div');
+  f.appendChild(d);
+  assert_equals(f.children.length, 1, 'un fragmento acepta hijos');
+}, 'createDocumentFragment devuelve un contenedor usable');
+
+test(function () {
+  assert_true(document.activeElement !== null,
+              'sin foco real debe devolver body, no null: hay codigo que no comprueba');
+  assert_true(document.hasFocus());
+}, 'document.activeElement y hasFocus responden algo usable');
+
+test(function () {
+  // `null` es el valor CORRECTO dentro de un modulo, y el honesto aqui: los
+  // scripts corren tras parsear el documento entero, asi que no hay un
+  // "script en curso" al que apuntar.
+  assert_true(document.currentScript === null);
+}, 'document.currentScript es null y no un elemento inventado');
+</script>
+</body>
+</html>

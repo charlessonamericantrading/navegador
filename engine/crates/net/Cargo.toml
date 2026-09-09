@@ -24,3 +24,7 @@ brotli.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
+psl.workspace = true
+
+[lints]
+workspace = true

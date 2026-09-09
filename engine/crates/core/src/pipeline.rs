@@ -17,7 +17,7 @@
 
 use engine_css::{CssParser, StyleSheet};
 use engine_dom::{HtmlParser, Node, NodeType};
-use engine_js::{JsRuntime, TestResult};
+use engine_js::{BoxMetrics, JsRuntime, TestResult};
 use engine_layout::{ImageMap, LayoutBox, LayoutTreeBuilder};
 use engine_net::NetworkEngine;
 use engine_text::FontSet;
@@ -106,7 +106,7 @@ pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f
 /// `test`/`assert_equals` como globales.
 pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap) -> (PageResult, Vec<TestResult>) {
     let dom_root = HtmlParser::parse(html);
-    let (script_results, test_results) = scripting::execute_inline_scripts_with_harness(&dom_root, external_scripts);
+    let (script_results, test_results) = scripting::execute_inline_scripts_with_harness(&dom_root, external_scripts, (viewport_width, viewport_height));
 
     let mut combined_css = String::new();
     for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
@@ -148,9 +148,17 @@ pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewp
 /// (sin `StorageContext`, ver el resto de este archivo) se permite, igual
 /// que "sin politica" en el spec real.
 pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap, network: Option<Arc<NetworkEngine>>, storage: Option<crate::scripting::StorageContext>) -> (PageResult, JsRuntime) {
+    // Mismo cronometro por fases que `server::navigate_with_body`, un nivel
+    // mas abajo: sin el, las cuatro etapas caras del motor (parsear HTML,
+    // ejecutar JS, parsear CSS, maquetar) son un unico numero opaco.
+    let t = std::time::Instant::now();
     let dom_root = HtmlParser::parse(html);
+    tracing::info!("[tiempo]   parseo HTML {:?}", t.elapsed());
+
     let allow_inline_style = storage.as_ref().is_none_or(|ctx| ctx.csp.allows_inline("style-src"));
-    let (script_results, runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network, storage);
+    let t = std::time::Instant::now();
+    let (script_results, mut runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network, storage, (viewport_width, viewport_height));
+    tracing::info!("[tiempo]   JS {:?} ({} script(s))", t.elapsed(), script_results.len());
 
     let mut combined_css = String::new();
     if allow_inline_style {
@@ -161,10 +169,87 @@ pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, vi
     }
     combined_css.push_str(css);
 
+    let t = std::time::Instant::now();
     let stylesheet = CssParser::parse(&combined_css);
-    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
+    tracing::info!("[tiempo]   parseo CSS {:?} ({} reglas de {} bytes)", t.elapsed(), stylesheet.rules.len(), combined_css.len());
+
+    let t = std::time::Instant::now();
+    let mut layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
+    tracing::info!("[tiempo]   cascada + layout {:?}", t.elapsed());
+
+    // Un script de CARGA puede asignar `scrollTop`/`scrollLeft` antes de
+    // que este primer layout exista siquiera - se aplica aqui, contra el
+    // arbol que se acaba de construir, mismo mecanismo que usa `core::
+    // server::LoadedPage::relayout` para cualquier layout posterior.
+    if let Some(offsets) = runtime.scroll_offsets() {
+        let copia = offsets.lock().unwrap().clone();
+        engine_layout::apply_scroll_offsets(&mut layout_root, &copia);
+    }
+
+    // El snapshot que lee `getComputedStyle`/`getBoundingClientRect` se
+    // publica AQUI, antes de disparar `DOMContentLoaded` - no despues, como
+    // hacia antes (`core::server` lo publicaba ya de vuelta en su propio
+    // flujo, un paso entero mas tarde). El listener mas comun de la web
+    // real es precisamente `DOMContentLoaded` leyendo geometria/estilo
+    // justo al arrancar; con el snapshot todavia vacio en ese momento,
+    // `getComputedStyle` devolvia un objeto sin ninguna propiedad util.
+    if let Some(snapshot) = runtime.layout_snapshot() {
+        if let Ok(mut data) = snapshot.write() {
+            data.boxes.clear();
+            collect_box_metrics(&layout_root, &mut data.boxes);
+            // El viewport va al mismo buzon que la geometria (Fase 45): es lo
+            // que `window.innerWidth` y `matchMedia` consultan, y aqui es
+            // donde se conoce.
+            data.viewport_width = viewport_width;
+            data.viewport_height = viewport_height;
+        }
+    }
+
+    // `DOMContentLoaded`: el documento ya esta parseado entero, todos sus
+    // scripts han corrido, Y el layout que acaba de calcularse arriba ya es
+    // visible para JS - las tres cosas que el spec exige que sean ciertas
+    // cuando este evento se dispara. Va aqui, despues del layout, y no
+    // justo al terminar los scripts (que era donde vivia antes, en
+    // `scripting::execute_inline_scripts_keeping_runtime`): un listener
+    // registrado en el patron mas comun de arranque de una pagina real -
+    // leer una medida nada mas cargar - necesita el snapshot YA publicado,
+    // no solo el arbol de layout construido en memoria sin que JS pueda
+    // verlo todavia.
+    if let Err(e) = runtime.dispatch_event(&dom_root, "DOMContentLoaded") {
+        tracing::warn!("[js] fallo al disparar DOMContentLoaded: {e}");
+    }
 
     (PageResult { dom_root, stylesheet, layout_root, script_results }, runtime)
+}
+
+/// Aplana el arbol de layout a la lista de `(nodo, metricas)` que espera el
+/// snapshot de `getComputedStyle`/`getBoundingClientRect`. Solo entran las
+/// cajas CON nodo del DOM detras: las de texto y la raiz sintetica no
+/// corresponden a ningun elemento al que JS pueda llegar (misma regla que
+/// `LayoutBox::hit_test`).
+///
+/// Vive en `core` y no en `layout` porque `BoxMetrics` es un tipo de
+/// `engine-js`, y es `core` - que depende de los dos - el unico sitio
+/// donde las dos capas pueden encontrarse sin crear una dependencia nueva
+/// entre ellas. `pub(crate)` porque `core::server` tambien la necesita
+/// (para volver a publicar el snapshot tras un relayout posterior, cuando
+/// ya no hay ningun `DOMContentLoaded` que disparar).
+pub(crate) fn collect_box_metrics(layout: &LayoutBox, out: &mut Vec<(Arc<RwLock<Node>>, BoxMetrics)>) {
+    if let Some(node) = &layout.dom_node {
+        out.push((
+            node.clone(),
+            BoxMetrics {
+                x: layout.dimensions.x,
+                y: layout.dimensions.y,
+                width: layout.dimensions.width,
+                height: layout.dimensions.height,
+                computed_style: layout.computed_style.clone(),
+            },
+        ));
+    }
+    for child in &layout.children {
+        collect_box_metrics(child, out);
+    }
 }
 
 /// Devuelve el valor CRUDO (sin resolver contra ninguna URL base) del
@@ -192,6 +277,39 @@ pub fn find_external_stylesheet_hrefs(dom_root: &Arc<RwLock<Node>>) -> Vec<Strin
                 .get("rel")
                 .is_some_and(|rel| rel.split_whitespace().any(|token| token.eq_ignore_ascii_case("stylesheet")));
             if !is_stylesheet {
+                return None;
+            }
+            attributes.get("href").cloned()
+        })
+        .collect()
+}
+
+/// Devuelve el `href` CRUDO de cada `<link rel="modulepreload">` del
+/// documento (Fase 43).
+///
+/// Por que existe: un bundle moderno no declara todos sus trozos con
+/// `<script src>`. Declara UNO (`<script type="module" src="/assets/index.js">`)
+/// y los demas con `<link rel="modulepreload" href="...">`, precisamente para
+/// que el navegador los tenga descargados antes de que el primero los importe.
+/// Sin recogerlos aqui, el `import` del modulo raiz no encontraria nada, porque
+/// este motor no va a la red durante la evaluacion (ver `engine_js::modules`).
+///
+/// `rel` se compara por tokens, no como cadena entera: `rel="modulepreload"`
+/// puede venir acompañado, igual que ya pasa con `rel="preload stylesheet"` en
+/// `find_external_stylesheet_hrefs`.
+pub fn find_module_preloads(dom_root: &Arc<RwLock<Node>>) -> Vec<String> {
+    Node::find_all_by_tag(dom_root, "link")
+        .iter()
+        .filter_map(|link_node| {
+            let node = link_node.read().unwrap();
+            let NodeType::Element { attributes, .. } = &node.node_type else {
+                return None;
+            };
+            let es_modulepreload = attributes.get("rel").is_some_and(|rel| {
+                rel.split_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("modulepreload"))
+            });
+            if !es_modulepreload {
                 return None;
             }
             attributes.get("href").cloned()
@@ -244,9 +362,85 @@ pub fn find_image_srcs(dom_root: &Arc<RwLock<Node>>) -> Vec<String> {
         .collect()
 }
 
+/// Concatena el texto de cada `<style>` del documento, en orden - mismo
+/// bucle exacto que `build_page_keeping_runtime` usa internamente para
+/// construir `combined_css` (Fase 40: se necesita ANTES de esa llamada,
+/// para descubrir `url(...)` de `background-image` que hay que descargar
+/// primero). Quien llama decide si CSP permite `<style>` en linea
+/// (`csp.allows_inline("style-src")`) - esta funcion es pura y no sabe
+/// nada de CSP, igual que `find_image_srcs`.
+pub fn find_inline_style_css(dom_root: &Arc<RwLock<Node>>) -> String {
+    let mut combined = String::new();
+    for style_tag in &Node::find_all_by_tag(dom_root, "style") {
+        combined.push_str(&Node::text_content(style_tag));
+        combined.push('\n');
+    }
+    combined
+}
+
+/// Devuelve cada `url(...)` declarado en `background`/`background-image`
+/// del CSS ya ensamblado (Fase 40) - mismo patron que `find_image_srcs`:
+/// pura, sin red, quien llama (`core::server`) la resuelve/descarga/
+/// decodifica antes de construir el `ImageMap`, reusando exactamente el
+/// mismo mapa y el mismo `img-src` de CSP que ya gobierna `<img src>` (una
+/// imagen de fondo es tan "imagen" como un `<img>` para el spec de CSP).
+/// Solo lee `background-image` - ya viene expandida ahi tanto si el autor
+/// escribio el longhand como el shorthand `background: ... url(...) ...`
+/// (ver `engine_css::parser::insert_declaration`), asi que no hace falta
+/// mirar las dos claves por separado.
+pub fn find_background_image_urls(css: &str) -> Vec<String> {
+    let sheet = CssParser::parse(css);
+    sheet
+        .rules
+        .iter()
+        .filter_map(|rule| rule.declarations.get("background-image"))
+        .filter_map(|value| extract_url(value))
+        .collect()
+}
+
+/// Extrae la URL "desnuda" (sin `url(...)`/comillas) de un valor
+/// `background-image` ya expandido, p.ej. `url("x.png")` -> `x.png`.
+/// Mismo formato sin resolver que `find_image_srcs` usa para `src` de
+/// `<img>` - asi el mismo `ImageMap` (clave = string sin resolver) sirve
+/// para las dos fuentes de imagen sin distinguir de donde vino cada una.
+fn extract_url(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let start = lower.find("url(")?;
+    let after = &value[start + 4..];
+    let end = after.find(')')?;
+    let inner = after[..end].trim();
+    let inner = inner
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(inner);
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_inline_style_css_concatenates_every_style_tag_in_order() {
+        let dom = HtmlParser::parse("<html><head><style>a{}</style></head><body><style>b{}</style></body></html>");
+        let css = find_inline_style_css(&dom);
+        assert_eq!(css, "a{}\nb{}\n");
+    }
+
+    #[test]
+    fn find_background_image_urls_reads_the_longhand_and_the_shorthand() {
+        let urls = find_background_image_urls(
+            "div { background-image: url(a.png); }\np { background: #fff url(\"b.png\") no-repeat; }",
+        );
+        assert_eq!(urls, vec!["a.png".to_string(), "b.png".to_string()]);
+    }
+
+    #[test]
+    fn find_background_image_urls_ignores_rules_without_one() {
+        let urls = find_background_image_urls("div { color: red; background-color: blue; }");
+        assert!(urls.is_empty());
+    }
 
     #[test]
     fn build_page_runs_the_full_pipeline_without_opening_a_window_or_blocking() {
@@ -270,6 +464,41 @@ mod tests {
         let page = build_page("<html><body><script>1 + 2</script></body></html>", "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new());
         assert_eq!(page.script_results.len(), 1);
         assert_eq!(page.script_results[0].as_deref(), Ok("3"));
+    }
+
+    /// El snapshot que lee `getComputedStyle`/`getBoundingClientRect` tiene
+    /// que estar ya publicado CUANDO `DOMContentLoaded` se dispara - el
+    /// patron mas comun de arranque de una pagina real es precisamente un
+    /// listener de `DOMContentLoaded` leyendo una medida nada mas cargar.
+    /// Publicarlo un paso mas tarde (lo que hacia antes: `core::server`
+    /// publicaba de vuelta en su propio flujo, DESPUES de que este
+    /// pipeline ya hubiera disparado el evento) dejaba ese listener viendo
+    /// un `getComputedStyle` vacio.
+    #[test]
+    fn el_snapshot_de_layout_ya_esta_publicado_cuando_dispara_dom_content_loaded() {
+        let (_page, mut runtime) = build_page_keeping_runtime(
+            r#"<html><head><style>#p { color: rgb(1, 2, 3); width: 200px; }</style></head><body><p id="p">x</p>
+            <script>
+                var resultado = 'sin correr';
+                document.addEventListener('DOMContentLoaded', function () {
+                    var cs = getComputedStyle(document.getElementById('p'));
+                    resultado = cs.getPropertyValue('color') + '|' + cs.getPropertyValue('width');
+                });
+            </script></body></html>"#,
+            "",
+            800.0,
+            600.0,
+            None,
+            &HashMap::new(),
+            &ImageMap::new(),
+            None,
+            None,
+        );
+        let resultado = runtime.eval("resultado").expect("leer 'resultado' deberia ser JS valido");
+        assert_eq!(
+            resultado, "\"rgb(1, 2, 3)|200px\"",
+            "el listener de DOMContentLoaded deberia haber leido el color/ancho REALES, no un snapshot vacio"
+        );
     }
 
     /// `dom_root` y `script_results` deben venir del MISMO documento: un

@@ -54,7 +54,7 @@ pub fn execute_inline_scripts(dom_root: &Arc<RwLock<Node>>, external_scripts: &H
 /// real de WPT que manipula el DOM. Ninguna pagina real usa esto - solo el
 /// runner de tests (`bin/wpt_runner.rs`) - por eso es una funcion aparte y
 /// no un flag en `execute_inline_scripts`.
-pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, external_scripts: &HashMap<String, String>) -> (Vec<Result<String, String>>, Vec<TestResult>) {
+pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, external_scripts: &HashMap<String, String>, viewport: (f32, f32)) -> (Vec<Result<String, String>>, Vec<TestResult>) {
     let scripts = Node::find_all_by_tag(dom_root, "script");
     if scripts.is_empty() {
         return (Vec::new(), Vec::new());
@@ -63,6 +63,29 @@ pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, externa
     let mut runtime = JsRuntime::new();
     if let Err(e) = runtime.bind_dom(dom_root.clone()) {
         tracing::warn!("[js] no se pudo enlazar el DOM al runtime: {e}");
+    }
+
+    // El arnes registra el MISMO entorno que una pagina real: `window`, las
+    // utilidades de plataforma y el entorno de viewport (Fase 45). Antes no lo
+    // hacia, y eso convertia los tests estilo-WPT en pruebas de un motor
+    // distinto del que corre de verdad - un test que use `window.matchMedia`
+    // fallaba con `ReferenceError` aunque la pagina real lo tuviera. Lo que
+    // NO se registra aqui es la red (`fetch`/`XHR`): el arnes no debe salir a
+    // internet, y su ausencia es una decision, no un olvido.
+    if let Err(e) = runtime.register_window() {
+        tracing::warn!("[js] no se pudo registrar window en el arnes: {e}");
+    }
+    if let Err(e) = runtime.register_platform() {
+        tracing::warn!("[js] no se pudieron registrar las utilidades en el arnes: {e}");
+    }
+    if let Err(e) = runtime.register_window_environment() {
+        tracing::warn!("[js] no se pudo registrar el entorno en el arnes: {e}");
+    }
+    if let Some(snapshot) = runtime.layout_snapshot() {
+        if let Ok(mut data) = snapshot.write() {
+            data.viewport_width = viewport.0;
+            data.viewport_height = viewport.1;
+        }
     }
     let test_results = match TestHarness::register(&mut runtime.context) {
         Ok(results) => results,
@@ -76,31 +99,6 @@ pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, externa
     let test_results = test_results.lock().unwrap().clone();
     (script_results, test_results)
 }
-
-/// Igual que `execute_inline_scripts`, pero DEVUELVE el `JsRuntime` en vez
-/// de dropearlo al terminar - necesario para poder disparar eventos MAS
-/// TARDE (`JsRuntime::dispatch_event`) sobre los listeners que un script
-/// registro con `addEventListener` durante la carga inicial; sin esto, el
-/// `EventRegistry` entero (y con el, cualquier listener) se destruye antes
-/// de que la ventana siquiera se abra. A diferencia de
-/// `execute_inline_scripts`/`execute_inline_scripts_with_harness` (que se
-/// saltan crear el runtime si no hay ningun `<script>`, porque no habria
-/// nada que evaluar), esta SIEMPRE crea y enlaza uno, incluso sin scripts -
-/// quien llama quiere un runtime vivo pase lo que pase, no solo cuando hubo
-/// algo que ejecutar al principio.
-///
-/// `network`: `Some` registra `fetch()` real (Fase 4.3, ver
-/// `engine_js::fetch`) y `XMLHttpRequest` (Fase 9, ver `engine_js::xhr`)
-/// ANTES de correr ningun script - asi el PRIMER
-/// `<script>` de la pagina ya lo ve disponible, no solo listeners
-/// registrados mas tarde. `None` (p.ej. `core::main`, que no descarga
-/// recursos externos por diseño) deja `fetch` sin definir - `fetch(...)`
-/// en JS lanza `ReferenceError`, la respuesta honesta cuando de verdad no
-/// hay red disponible en ese contexto - y lo mismo para `new
-/// XMLHttpRequest()`.
-///
-/// `storage`: `Some` registra `localStorage`/`sessionStorage` acotados al
-/// origen que se pase (Fase 15, ver `StorageContext` justo debajo).
 
 /// El almacen de Web Storage de la sesion mas el ORIGEN de la pagina que
 /// se esta construyendo - los dos datos que `localStorage`/
@@ -131,24 +129,77 @@ pub struct StorageContext {
     pub url: String,
 }
 
+/// Igual que `execute_inline_scripts`, pero DEVUELVE el `JsRuntime` en vez
+/// de dropearlo al terminar - necesario para poder disparar eventos MAS
+/// TARDE (`JsRuntime::dispatch_event`) sobre los listeners que un script
+/// registro con `addEventListener` durante la carga inicial; sin esto, el
+/// `EventRegistry` entero (y con el, cualquier listener) se destruye antes
+/// de que la ventana siquiera se abra. A diferencia de
+/// `execute_inline_scripts`/`execute_inline_scripts_with_harness` (que se
+/// saltan crear el runtime si no hay ningun `<script>`, porque no habria
+/// nada que evaluar), esta SIEMPRE crea y enlaza uno, incluso sin scripts -
+/// quien llama quiere un runtime vivo pase lo que pase, no solo cuando hubo
+/// algo que ejecutar al principio.
+///
+/// `network`: `Some` registra `fetch()` real (Fase 4.3, ver
+/// `engine_js::fetch`) y `XMLHttpRequest` (Fase 9, ver `engine_js::xhr`)
+/// ANTES de correr ningun script - asi el PRIMER
+/// `<script>` de la pagina ya lo ve disponible, no solo listeners
+/// registrados mas tarde. `None` (p.ej. `core::main`, que no descarga
+/// recursos externos por diseño) deja `fetch` sin definir - `fetch(...)`
+/// en JS lanza `ReferenceError`, la respuesta honesta cuando de verdad no
+/// hay red disponible en ese contexto - y lo mismo para `new
+/// XMLHttpRequest()`.
+///
+/// `storage`: `Some` registra `localStorage`/`sessionStorage` acotados al
+/// origen que se pase (Fase 15, ver `StorageContext` justo encima).
 pub fn execute_inline_scripts_keeping_runtime(
     dom_root: &Arc<RwLock<Node>>,
     external_scripts: &HashMap<String, String>,
     network: Option<Arc<NetworkEngine>>,
     storage: Option<StorageContext>,
+    viewport: (f32, f32),
 ) -> (Vec<Result<String, String>>, JsRuntime) {
     let scripts = Node::find_all_by_tag(dom_root, "script");
 
-    let mut runtime = JsRuntime::new();
-    if let Err(e) = runtime.bind_dom(dom_root.clone()) {
-        tracing::warn!("[js] no se pudo enlazar el DOM al runtime: {e}");
-    }
     // El origen de la pagina (Fase 20) sale del mismo `StorageContext`
     // que ya trae `core::server` - es literalmente el mismo dato, y
     // duplicar el parametro solo habria abierto la puerta a que un dia se
     // pasaran distintos y el aislamiento de red dejara de coincidir con el
     // de almacenamiento.
     let page_url = storage.as_ref().map(|ctx| ctx.url.clone());
+
+    // Modulos ES (Fase 43): el cargador se instala al CONSTRUIR el `Context`
+    // de Boa, asi que la decision hay que tomarla aqui y no despues. Sin URL
+    // de pagina no hay base contra la que resolver un `import`, asi que ese
+    // camino (`core::main`, los tests sin red) se queda con el runtime
+    // clasico de siempre: un `<script type="module">` fallara ahi con su
+    // motivo en vez de ejecutarse mal.
+    let mut runtime = match &page_url {
+        Some(url) => JsRuntime::with_modules(url),
+        None => JsRuntime::new(),
+    };
+
+    // Todo lo que `core::server` descargo queda disponible para los `import`,
+    // indexado por su URL ABSOLUTA - que es como el cargador los busca, y no
+    // por el `src` crudo con el que vienen aqui. Incluye tanto los
+    // `<script src>` como los `<link rel="modulepreload">`, que es como un
+    // bundle declara sus fragmentos.
+    if runtime.supports_modules() {
+        if let Some(base) = &page_url {
+            if let Ok(base) = url::Url::parse(base) {
+                for (src, codigo) in external_scripts {
+                    if let Ok(absoluta) = base.join(src) {
+                        runtime.add_module_source(absoluta.as_str(), codigo);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Err(e) = runtime.bind_dom(dom_root.clone()) {
+        tracing::warn!("[js] no se pudo enlazar el DOM al runtime: {e}");
+    }
     let storage_csp = storage.as_ref().map(|ctx| ctx.csp.clone());
     if let Some(network) = network {
         if let Err(e) = runtime.register_fetch(network.clone(), page_url.clone()) {
@@ -181,12 +232,47 @@ pub fn execute_inline_scripts_keeping_runtime(
     if let Err(e) = runtime.register_window() {
         tracing::warn!("[js] no se pudo registrar window: {e}");
     }
+    // DESPUES de `register_window` a proposito (Fase 42): `console` y
+    // `performance` se cuelgan tambien de `window` si ya existe, porque en
+    // este motor `window` no ES el objeto global (ver la cabecera de
+    // `engine_js::window`), asi que un global suelto no aparece en `window.*`
+    // y hay codigo real que usa las dos formas.
+    if let Err(e) = runtime.register_platform() {
+        tracing::warn!("[js] no se pudieron registrar las utilidades de plataforma: {e}");
+    }
+    // DESPUES de `register_window` y `bind_dom` (Fase 45): estas propiedades
+    // leen el buzon de layout, que nace en `bind_dom`, y se cuelgan del
+    // objeto `window`, que crea `register_window`.
+    if let Err(e) = runtime.register_window_environment() {
+        tracing::warn!("[js] no se pudo registrar el entorno de window: {e}");
+    }
+    // El viewport se publica ANTES de correr ningun script (Fase 45). No
+    // depende del layout - es un dato de entrada, no un resultado - y
+    // publicarlo con el resto de la geometria (que es lo que hacia el pipeline
+    // por comodidad) dejaba `window.innerWidth` en cero durante TODA la
+    // ejecucion de los scripts, que es justo cuando una pagina lo consulta
+    // para repartir espacio.
+    if let Some(snapshot) = runtime.layout_snapshot() {
+        if let Ok(mut data) = snapshot.write() {
+            data.viewport_width = viewport.0;
+            data.viewport_height = viewport.1;
+        }
+    }
     // DESPUES de `bind_dom` y `register_window` a proposito (Fase 7):
     // `register_history` engancha ademas `window.addEventListener`
     // delegando en `document.documentElement`, asi que necesita que los
     // dos ya existan - ver el shim en `engine_js::history`.
     if let Err(e) = runtime.register_history() {
         tracing::warn!("[js] no se pudo registrar history: {e}");
+    }
+    // `location` - SIEMPRE, por la misma razon que `window` y los
+    // temporizadores: un `location.href` sobre un global inexistente lanza
+    // `ReferenceError` y aborta el script ENTERO, asi que no tenerlo no
+    // costaba solo la navegacion, costaba toda la pagina. Sin URL (documento
+    // sin origen) reporta `about:blank`, que es lo que hace un navegador
+    // real, en vez de no existir.
+    if let Err(e) = runtime.register_location(page_url.clone()) {
+        tracing::warn!("[js] no se pudo registrar location: {e}");
     }
     // Temporizadores (Fase 14) - se registran SIEMPRE, por la misma razon
     // que `window`: `setTimeout` es de lo que TODA pagina real da por
@@ -218,6 +304,15 @@ pub fn execute_inline_scripts_keeping_runtime(
     // `core::server`, asi que los que sigan en el mapa estan autorizados.
     let allow_inline = storage_csp.as_ref().is_none_or(|csp| csp.allows_inline("script-src"));
     let script_results = run_scripts(&mut runtime, &scripts, external_scripts, allow_inline);
+
+    // `DOMContentLoaded` NO se dispara aqui - se dispara en
+    // `pipeline::build_page_keeping_runtime`, DESPUES de construir el
+    // arbol de layout y publicar su snapshot para `getComputedStyle`. El
+    // documento ya esta parseado entero y los scripts ya corrieron en este
+    // punto (que es lo que el spec exige), pero dispararlo AQUI - como se
+    // hacia antes - dejaba el listener mas comun de arranque de una pagina
+    // real (leer una medida nada mas cargar) viendo un snapshot vacio,
+    // porque el layout ni siquiera se habia calculado todavia.
     (script_results, runtime)
 }
 
@@ -233,37 +328,164 @@ pub fn execute_inline_scripts_keeping_runtime(
 /// `core::server::filter_by_csp` - si su contenido esta en el mapa, es que
 /// estaba autorizado y se descargo.
 fn run_scripts(runtime: &mut JsRuntime, scripts: &[Arc<RwLock<Node>>], external_scripts: &HashMap<String, String>, allow_inline: bool) -> Vec<Result<String, String>> {
-    let mut results = Vec::new();
-    for script_node in scripts {
-        let src = match &script_node.read().unwrap().node_type {
-            NodeType::Element { attributes, .. } => attributes.get("src").cloned(),
-            _ => None,
-        };
+    let clasificados: Vec<ScriptClasificado> = scripts
+        .iter()
+        .filter_map(|nodo| ScriptClasificado::de_nodo(nodo, runtime.supports_modules()))
+        .collect();
 
-        let code = match src {
-            Some(src) => match external_scripts.get(&src) {
-                Some(fetched) => fetched.clone(),
-                None => {
-                    tracing::info!("[js] <script src=\"{src}\"> sin contenido pre-descargado, se omite");
-                    continue;
-                }
-            },
-            None => {
-                if !allow_inline {
-                    tracing::warn!("[csp] bloqueado por 'script-src': un <script> en linea (la politica no incluye 'unsafe-inline')");
-                    continue;
-                }
-                let code = Node::text_content(script_node);
-                if code.trim().is_empty() {
-                    continue;
-                }
-                code
+    // Orden de ejecucion del spec, en tres pasadas (Fase 43). Antes habia una
+    // sola: todos en orden de documento, ignorando `defer`/`async`/`type`.
+    //
+    // 1. Clasicos sin atributo, en orden de documento.
+    // 2. `defer` y los MODULOS, en orden de documento. Un modulo es `defer`
+    //    por defecto segun el spec, sin necesidad de escribirlo.
+    // 3. `async`, que el spec deja correr en cuanto llegan. Aqui van al final
+    //    y en orden de documento, porque todo esta ya descargado antes de
+    //    ejecutar nada: no hay un "cuando llegue" que respetar. Es una
+    //    aproximacion declarada, y la que menos codigo rompe - lo que `async`
+    //    promete es "no bloqueo el parseo", no un orden concreto.
+    let mut resultados = Vec::new();
+    for orden in [Orden::Clasico, Orden::Diferido, Orden::Asincrono] {
+        for script in clasificados.iter().filter(|s| s.orden == orden) {
+            if let Some(r) = ejecutar_script(runtime, script, external_scripts, allow_inline) {
+                resultados.push(r);
             }
+        }
+    }
+    resultados
+}
+
+/// Cuando le toca correr a un `<script>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Orden {
+    /// Sin `defer` ni `async`: bloquea el parseo, corre en orden.
+    Clasico,
+    /// `defer`, y tambien todo modulo (que es `defer` implicito).
+    Diferido,
+    /// `async`.
+    Asincrono,
+}
+
+/// Un `<script>` ya clasificado: que codigo le corresponde y cuando.
+struct ScriptClasificado {
+    nodo: Arc<RwLock<Node>>,
+    src: Option<String>,
+    orden: Orden,
+    /// Si se evalua como modulo ES en vez de como script clasico.
+    es_modulo: bool,
+}
+
+impl ScriptClasificado {
+    /// `None` significa "este `<script>` no debe ejecutarse", que NO es lo
+    /// mismo que fallar: un `<script type="application/json">` es un
+    /// contenedor de datos y ejecutarlo seria el error.
+    fn de_nodo(nodo: &Arc<RwLock<Node>>, soporta_modulos: bool) -> Option<Self> {
+        let (src, tipo, tiene_defer, tiene_async, tiene_nomodule) = {
+            let n = nodo.read().unwrap();
+            let NodeType::Element { attributes, .. } = &n.node_type else {
+                return None;
+            };
+            (
+                attributes.get("src").cloned(),
+                attributes.get("type").cloned().unwrap_or_default(),
+                attributes.contains_key("defer"),
+                attributes.contains_key("async"),
+                attributes.contains_key("nomodule"),
+            )
         };
 
-        results.push(runtime.eval(&code).map_err(|e| e.to_string()));
+        let tipo_normalizado = tipo.trim().to_ascii_lowercase();
+        let es_modulo = tipo_normalizado == "module";
+
+        // `nomodule` marca el script de respaldo para navegadores SIN modulos.
+        // Si este motor los soporta, saltarselo es lo correcto: ejecutarlo
+        // ADEMAS del modulo duplicaria la aplicacion entera.
+        if tiene_nomodule && soporta_modulos {
+            tracing::info!("[js] <script nomodule> omitido: este motor ejecuta modulos");
+            return None;
+        }
+
+        // Un `type` que no sea vacio, "module" o un tipo de JavaScript clasico
+        // NO es codigo: `application/json`, `application/ld+json` (datos
+        // estructurados, comunisimo) y `text/template` son contenedores que el
+        // spec dice explicitamente que no se ejecutan. Antes de esta fase se
+        // ejecutaban todos, y un `<script type="application/json">` con datos
+        // producia un error de sintaxis que ensuciaba el diagnostico.
+        const TIPOS_CLASICOS: [&str; 6] = [
+            "",
+            "text/javascript",
+            "application/javascript",
+            "text/ecmascript",
+            "application/ecmascript",
+            "module",
+        ];
+        if !TIPOS_CLASICOS.contains(&tipo_normalizado.as_str()) {
+            tracing::info!("[js] <script type=\"{tipo}\"> no es codigo ejecutable, se omite");
+            return None;
+        }
+
+        // Un modulo es `defer` por defecto. `async` sigue ganando si esta.
+        let orden = if tiene_async {
+            Orden::Asincrono
+        } else if tiene_defer || es_modulo {
+            Orden::Diferido
+        } else {
+            Orden::Clasico
+        };
+
+        // `defer` y `async` en un script SIN `src` no tienen efecto segun el
+        // spec (no hay descarga que diferir), asi que corre como clasico.
+        let orden = if src.is_none() && !es_modulo {
+            Orden::Clasico
+        } else {
+            orden
+        };
+
+        Some(Self { nodo: nodo.clone(), src, orden, es_modulo })
     }
-    results
+}
+
+/// Ejecuta un script ya clasificado. `None` si no habia nada que ejecutar.
+fn ejecutar_script(
+    runtime: &mut JsRuntime,
+    script: &ScriptClasificado,
+    external_scripts: &HashMap<String, String>,
+    allow_inline: bool,
+) -> Option<Result<String, String>> {
+    let codigo = match &script.src {
+        Some(src) => match external_scripts.get(src) {
+            Some(fetched) => fetched.clone(),
+            None => {
+                tracing::info!("[js] <script src=\"{src}\"> sin contenido pre-descargado, se omite");
+                return None;
+            }
+        },
+        None => {
+            if !allow_inline {
+                tracing::warn!("[csp] bloqueado por 'script-src': un <script> en linea (la politica no incluye 'unsafe-inline')");
+                return None;
+            }
+            let codigo = Node::text_content(&script.nodo);
+            if codigo.trim().is_empty() {
+                return None;
+            }
+            codigo
+        }
+    };
+
+    if script.es_modulo {
+        // La URL del modulo importa para dos cosas: identificarlo en la cache
+        // (dos `<script type="module">` distintos no son el mismo modulo) y
+        // servir de base a sus `import`. Un modulo en linea no tiene URL
+        // propia, asi que se le da una derivada de su posicion.
+        let url = match &script.src {
+            Some(src) => runtime.resolve_module_url(src),
+            None => format!("about:inline-module-{:p}", Arc::as_ptr(&script.nodo)),
+        };
+        return Some(runtime.eval_module(&codigo, &url).map_err(|e| e.to_string()));
+    }
+
+    Some(runtime.eval(&codigo).map_err(|e| e.to_string()))
 }
 
 #[cfg(test)]
@@ -328,7 +550,7 @@ mod tests {
     #[test]
     fn execute_inline_scripts_with_harness_records_a_passing_test() {
         let dom = HtmlParser::parse("<html><body><script>test(function() { assert_equals(1 + 1, 2); }, 'suma');</script></body></html>");
-        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new());
+        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new(), (800.0, 600.0));
         assert_eq!(test_results.len(), 1);
         assert!(test_results[0].passed);
         assert_eq!(test_results[0].name, "suma");
@@ -339,7 +561,7 @@ mod tests {
     #[test]
     fn execute_inline_scripts_with_harness_reports_a_failing_test_instead_of_silencing_it() {
         let dom = HtmlParser::parse("<html><body><script>test(function() { assert_equals(1, 2, 'no deberian ser iguales'); }, 'resta rota');</script></body></html>");
-        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new());
+        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new(), (800.0, 600.0));
         assert_eq!(test_results.len(), 1);
         assert!(!test_results[0].passed);
         let message = test_results[0].failure_message.as_ref().expect("deberia haber mensaje de fallo");
@@ -358,7 +580,7 @@ mod tests {
                 }, 'dom real dentro de un test');
             </script></body></html>"#,
         );
-        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new());
+        let (_, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new(), (800.0, 600.0));
         assert_eq!(test_results.len(), 1);
         assert!(test_results[0].passed, "el test deberia poder leer el DOM real: {:?}", test_results[0].failure_message);
     }
@@ -377,7 +599,7 @@ mod tests {
                 });
             </script></body></html>"#,
         );
-        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None, None);
+        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None, None, (800.0, 600.0));
         assert_eq!(script_results.len(), 1, "el <script> que registra el listener deberia haberse ejecutado");
 
         let target = Node::find_by_id(&dom, "target").expect("target deberia existir");
@@ -390,7 +612,7 @@ mod tests {
     #[test]
     fn execute_inline_scripts_keeping_runtime_returns_a_bound_runtime_even_with_no_scripts() {
         let dom = HtmlParser::parse("<html><body><p>sin scripts</p></body></html>");
-        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None, None);
+        let (script_results, mut runtime) = execute_inline_scripts_keeping_runtime(&dom, &HashMap::new(), None, None, (800.0, 600.0));
         assert!(script_results.is_empty());
         // Sin scripts no hay forma de que se haya registrado ningun
         // listener, pero el runtime en si deberia seguir siendo usable

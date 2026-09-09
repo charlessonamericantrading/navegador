@@ -83,6 +83,44 @@ pub struct ReplacedText {
     pub centered: bool,
 }
 
+/// Espacio disponible que el algoritmo flex ofrece en un eje al MEDIR un
+/// item, en terminos propios de este crate (no los de `taffy`): mantener
+/// `layout_box.rs` libre de tipos de `taffy` es lo que permite que la
+/// cache de medidas viva en la caja sin arrastrar esa dependencia hasta
+/// aqui. `tree.rs` convierte desde/hacia los tipos de taffy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AvailableAxis {
+    Definite(f32),
+    MinContent,
+    MaxContent,
+}
+
+/// Clave de `LayoutBox::measure_cache`: identifica QUE medida es. Dos
+/// medidas con la misma clave sobre la misma caja tienen por fuerza el
+/// mismo resultado, porque el subarbol no cambia durante una maquetacion.
+///
+/// Es un enum y no una sola estructura de campos porque hay tres medidas
+/// distintas que no deben mezclarse jamas: la que pide el algoritmo flex
+/// (con sus propias entradas) y las dos anchuras intrinsecas, que son
+/// preguntas independientes sobre la misma caja.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MeasureKey {
+    /// Una medida pedida por el algoritmo flex, con las entradas de las que
+    /// depende su resultado.
+    Flex {
+        known_width: Option<f32>,
+        known_height: Option<f32>,
+        available_width: AvailableAxis,
+        available_height: AvailableAxis,
+    },
+    /// Anchura MINIMA a la que la caja puede reducirse sin desbordar su
+    /// contenido: para un texto, el ancho de su palabra mas larga.
+    MinContentWidth,
+    /// Anchura que la caja ocuparia sin ningun corte de linea: para un
+    /// texto, la frase entera en una sola linea.
+    MaxContentWidth,
+}
+
 #[derive(Debug, Clone)]
 pub struct LayoutBox {
     pub box_type: BoxType,
@@ -124,6 +162,75 @@ pub struct LayoutBox {
     /// (checkbox/radio/hidden/`<select>` - ver `resolve_replaced_text` en
     /// tree.rs).
     pub replaced_text: Option<ReplacedText>,
+    /// Medidas ya calculadas para esta caja, por clave de entrada.
+    ///
+    /// Existe por una razon medida, no por prudencia: `taffy` llama a la
+    /// funcion de medida de un item flex varias veces (min-content,
+    /// max-content, tamaño definitivo), y medir un item significa MAQUETAR
+    /// SU SUBARBOL ENTERO. Con contenedores flex anidados - lo normal en
+    /// cualquier web moderna - ese coste se multiplica por nivel de
+    /// anidamiento en vez de sumarse: en la Wikipedia real eran 505.765
+    /// remaquetados para 35.000 nodos, 84 s de reloj. Recordar el
+    /// resultado por clave lo vuelve lineal, que es lo que hace cualquier
+    /// motor real.
+    ///
+    /// Un `Vec` con busqueda lineal, no un `HashMap`: en la practica son
+    /// dos o tres entradas por caja, donde recorrerlas gana a construir un
+    /// hash, y ademas `f32` no implementa `Hash`.
+    ///
+    /// Solo es valida mientras el subarbol no cambie. No hace falta
+    /// invalidarla nunca porque `LayoutTreeBuilder::build` reconstruye el
+    /// arbol entero desde el DOM en cada maquetacion (tambien al
+    /// redimensionar), asi que cada caja nace con su cache vacia.
+    pub(crate) measure_cache: Vec<(MeasureKey, (f32, f32))>,
+    /// Donde habria caido esta caja si NO estuviera fuera de flujo - la
+    /// "posicion estatica" del spec, en coordenadas absolutas.
+    ///
+    /// Solo se rellena para cajas `position: absolute`/`fixed`, y solo
+    /// existe porque el spec la exige: un absoluto con `left`/`top` en
+    /// `auto` NO va a la esquina de su bloque contenedor, va exactamente
+    /// donde el flujo normal lo habria dejado. Mandarlos todos a la esquina
+    /// (lo que hacia este motor) amontona en (0,0) cada menu desplegable y
+    /// cada tooltip de la pagina, unos encima de otros - en la Wikipedia
+    /// real eso era la franja de texto ilegible pegada al borde superior.
+    ///
+    /// `None` para todo lo demas: una caja en flujo ya tiene su posicion en
+    /// `dimensions`, y no hay nada que recordar.
+    pub(crate) static_position: Option<(f32, f32)>,
+    /// Cuantas columnas ocupa esta celda (`colspan` de `<td>`/`<th>`), 1 si
+    /// no lo declara.
+    ///
+    /// Vive aqui y no en `computed_style` porque `colspan` es un atributo
+    /// PRESENTACIONAL de HTML, no una propiedad CSS: no llega por la
+    /// cascada, se lee del DOM al construir la caja (igual que el `src` de
+    /// una imagen). Ignorarlo no solo ensancha mal una celda - corre TODAS
+    /// las celdas siguientes de esa fila una columna a la izquierda, que es
+    /// lo que descuadraba las filas de subtitulo de Hacker News.
+    pub(crate) colspan: u32,
+    /// Cuantas FILAS ocupa esta celda (`rowspan`), 1 si no lo declara.
+    /// Mismo motivo que `colspan` para vivir aqui y no en la cascada: es un
+    /// atributo presentacional de HTML, no una propiedad CSS.
+    pub(crate) rowspan: u32,
+    /// Ancho del BLOQUE CONTENEDOR de esta caja, que es la referencia contra
+    /// la que el spec resuelve cualquier porcentaje suyo - tambien el de
+    /// `padding-top`/`margin-bottom`, no solo el de `width`.
+    ///
+    /// Se guarda aqui, y no se pasa como parametro, porque quien lo conoce
+    /// (el padre, al colocar al hijo) y quien lo necesita (el hijo, al
+    /// resolver su propio padding dentro de su propia pasada de flujo) estan
+    /// en llamadas distintas. `0.0` significa "todavia sin colocar", y un
+    /// porcentaje sobre esa referencia resuelve a cero - que es justo lo que
+    /// hace el spec cuando la referencia es indefinida.
+    pub(crate) containing_width: f32,
+    /// Alto del bloque contenedor, o `0.0` si es INDEFINIDO (lo normal: un
+    /// contenedor con `height: auto` crece con su contenido, asi que no hay
+    /// numero contra el que medir todavia).
+    ///
+    /// El spec dice que un `height` en porcentaje sobre una referencia
+    /// indefinida se comporta como `auto`, que es justo lo que produce
+    /// dejarlo en cero: `resolve_explicit_height` no devuelve nada y la caja
+    /// sigue creciendo con su contenido.
+    pub(crate) containing_height: f32,
 }
 
 impl LayoutBox {
@@ -136,6 +243,12 @@ impl LayoutBox {
             computed_style: HashMap::new(),
             dom_node: None,
             replaced_text: None,
+            measure_cache: Vec::new(),
+            static_position: None,
+            colspan: 1,
+            rowspan: 1,
+            containing_width: 0.0,
+            containing_height: 0.0,
         }
     }
 
@@ -221,6 +334,56 @@ impl LayoutBox {
         let own_bottom = self.dimensions.y + self.dimensions.height;
         self.children.iter().map(LayoutBox::content_extent).fold(own_bottom, f32::max)
     }
+}
+
+/// El color de fondo que debe pintar el LIENZO entero, propagado desde el
+/// elemento raiz segun el spec (CSS Backgrounds 3, "The Canvas Background").
+///
+/// Es una de esas reglas que parecen un detalle y se notan muchisimo: el
+/// fondo de `<html>` (o, si `<html>` no declara ninguno, el de `<body>`) no
+/// se pinta solo en la caja de ese elemento, sino en TODO el viewport,
+/// incluso por debajo de donde llega el contenido. Sin esto, una pagina con
+/// `body { background: #111 }` se veia como una franja oscura del alto del
+/// contenido sobre un fondo gris claro - el sintoma clasico de "esto esta
+/// roto" en cualquier web con tema oscuro. Verificado en vivo antes de
+/// arreglarlo.
+///
+/// Devuelve el VALOR CSS sin interpretar (`"#2244aa"`, `"red"`): quien
+/// pinta (`engine-gfx`) ya tiene su propio parseo de color, y duplicarlo
+/// aqui seria una segunda fuente de verdad sobre que es un color valido.
+///
+/// NO implementado: que `<body>` deje de pintar su propio fondo cuando este
+/// se ha propagado (el spec dice que el elemento cede el fondo al lienzo).
+/// Como se pinta el mismo color en ambos sitios, el resultado visible es
+/// identico; solo se notaria con fondos semitransparentes superpuestos.
+pub fn canvas_background(layout_root: &LayoutBox) -> Option<String> {
+    let html = find_by_tag(layout_root, "html");
+    if let Some(color) = html.and_then(background_color_of) {
+        return Some(color);
+    }
+    find_by_tag(layout_root, "body").and_then(background_color_of)
+}
+
+fn background_color_of(layout_box: &LayoutBox) -> Option<String> {
+    layout_box.computed_style.get("background-color").cloned()
+}
+
+/// Primera caja en preorden cuyo nodo del DOM tiene esta etiqueta. Se busca
+/// por el DOM y no por posicion en el arbol porque la caja raiz es
+/// sintetica (envuelve el viewport) y no siempre hay un `<html>` explicito
+/// en el HTML original - `html5ever` lo inserta, pero la forma del arbol de
+/// layout depende ademas de `display`.
+fn find_by_tag<'a>(layout_box: &'a LayoutBox, tag: &str) -> Option<&'a LayoutBox> {
+    if let Some(node) = &layout_box.dom_node {
+        if let Ok(node) = node.read() {
+            if let engine_dom::NodeType::Element { tag_name, .. } = &node.node_type {
+                if tag_name.eq_ignore_ascii_case(tag) {
+                    return Some(layout_box);
+                }
+            }
+        }
+    }
+    layout_box.children.iter().find_map(|child| find_by_tag(child, tag))
 }
 
 #[cfg(test)]
