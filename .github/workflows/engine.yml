@@ -83,6 +83,10 @@ jobs:
   # Auditoria de dependencias (tarea F7 del plan). Va en un job aparte para
   # que un aviso de seguridad recien publicado no oculte un fallo de tests:
   # son dos senales distintas y se leen por separado.
+  #
+  # Funciona como TRINQUETE, igual que el lint de la interfaz y la sonda de
+  # APIs del motor: los avisos ya conocidos se listan abajo con su motivo, y
+  # cualquiera NUEVO tumba el job. Lo que no se hace es apagar la puerta.
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -96,3 +100,23 @@ jobs:
           # accion busca `./Cargo.lock`, no lo encuentra y falla con un error
           # que parece de red pero es de ruta.
           working-directory: engine
+          # Avisos conocidos el 2026-09-09. Cada uno con su razon: ninguno se
+          # silencia sin explicar por que. Estan anotados como deuda en
+          # `engine/huecos_sin_resolver.md` y como tarea en `plan.md`.
+          #
+          # RUSTSEC-2025-0003 y RUSTSEC-2024-0379 (`fast-float` 0.2.0): estos
+          #   dos SI son fallos reales, no de mantenimiento - uno es un fallo
+          #   de segmentacion por falta de comprobacion de limites. Llegan a
+          #   traves de `boa_engine` 0.19, el motor de JavaScript, asi que lo
+          #   que los alcanza es codigo de cualquier pagina. Cerrarlo exige
+          #   subir boa de 0.19 a 0.22: tres versiones menores de un crate
+          #   pre-1.0, o sea una migracion de API real (cambian el cargador de
+          #   modulos y las firmas de `NativeFunction`). Es una tarea propia,
+          #   no un cambio de una linea. Mientras tanto el README ya advierte
+          #   que este navegador no es apto para uso diario y no tiene sandbox.
+          # RUSTSEC-2026-0192 (`ttf-parser`) y RUSTSEC-2026-0206 (`rustybuzz`):
+          #   sin mantenimiento, NO vulnerables. Son las dos piezas de
+          #   tipografia del motor y no hay sustituto equivalente hoy.
+          # RUSTSEC-2024-0436 (`paste`): sin mantenimiento. Es una macro de
+          #   compilacion; no llega al binario.
+          ignore: RUSTSEC-2025-0003,RUSTSEC-2024-0379,RUSTSEC-2026-0192,RUSTSEC-2026-0206,RUSTSEC-2024-0436

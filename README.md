@@ -69,6 +69,7 @@ Esto es la parte importante de este README, y está aquí arriba a propósito.
 | **CORS** | ✅ Real (`Access-Control-Allow-Origin`, preflight OPTIONS, credenciales) |
 | **CSP** | ✅ Real (`default-src`, `script-src`, `style-src`, `img-src`, `connect-src`, `font-src`, `media-src`) |
 | **Sandbox de proceso** | ❌ No existe |
+| **Dependencias sin avisos** | ❌ Dos fallos reales en el parser de números de `boa` |
 
 Las defensas de origen (cookies aisladas, CORS, CSP, esquemas seguros) son
 reales y están probadas. Lo que no existe es la capa de abajo: **el motor
@@ -76,8 +77,17 @@ corre en un único proceso sin sandbox del sistema operativo**, y todas las
 pestañas lo comparten, así que un pánico en una tumba el navegador entero.
 Rust elimina de raíz la corrupción de memoria, pero no un fallo lógico en el
 intérprete de JavaScript ni en un decodificador de imágenes ante un fichero
-malicioso. **Úsalo con sitios de confianza o en desarrollo, no como
-navegador diario.**
+malicioso.
+
+La auditoría de dependencias encuentra además **dos fallos reales**, no de
+mantenimiento, en `fast-float`: un fallo de segmentación por falta de
+comprobación de límites y varios problemas de *soundness*. Llegan a través de
+`boa`, el motor de JavaScript, así que lo que los alcanza es código de
+cualquier página. Cerrarlos exige subir `boa` de 0.19 a 0.22, una migración de
+API que está planificada. El CI los tiene listados como conocidos y bloquea
+cualquier aviso nuevo.
+
+**Úsalo con sitios de confianza o en desarrollo, no como navegador diario.**
 
 ### Plataforma
 

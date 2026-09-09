@@ -279,7 +279,24 @@ re-renderizando en cada pulsación es inutilizable. Falta invalidación por sub�
 - **Todas las pestañas en un proceso** (`server.rs:147`): un pánico las mata todas.
 - `tab_id` adivinable: se asigna por posición (`server.rs:222`) `[plan F5]`.
 - Sin aislamiento de sitios; sin fuzzing de los parsers propios.
-- Sin `cargo audit`/`cargo deny` en CI `[plan F7]`.
+- **`boa_engine` 0.19 arrastra `fast-float` 0.2.0, con dos avisos de seguridad
+  REALES** (no de mantenimiento): `RUSTSEC-2025-0003`, un fallo de segmentación
+  por falta de comprobación de límites, y `RUSTSEC-2024-0379`, varios problemas
+  de *soundness*. Lo que los alcanza es el parser de números del motor de
+  JavaScript, es decir código de cualquier página.
+
+  Cerrarlo exige subir boa de 0.19 a 0.22: tres versiones menores de un crate
+  pre-1.0, con cambios de API en el cargador de módulos y en las firmas de
+  `NativeFunction`. Es una tarea propia `[plan F8]`, no un cambio de una línea.
+
+  El CI los tiene listados como conocidos y **bloquea cualquier aviso nuevo**;
+  no están silenciados sin más.
+- Sin mantenimiento, sin vulnerabilidad conocida: `ttf-parser`
+  (`RUSTSEC-2026-0192`), `rustybuzz` (`RUSTSEC-2026-0206`) y `paste`
+  (`RUSTSEC-2024-0436`). Las dos primeras son las piezas de tipografía del
+  motor y no hay sustituto equivalente hoy; `paste` es una macro que no llega
+  al binario.
+- `cargo deny` y `npm audit` siguen sin estar en CI `[plan F7]`.
 
 ---
 

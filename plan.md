@@ -1220,7 +1220,8 @@ Marcar aquí al cerrar. Cada ✅ debe tener su Fase en `ARCHITECTURE.md`.
 - [ ] F4 Site isolation (largo plazo)
 - [ ] F5 Endurecer protocolo NDJSON (límites, `tab_id` no adivinable)
 - [ ] F6 Fuzzing de decodificadores y parsers propios
-- [x] F7 `cargo audit` en CI (job `audit` de `engine.yml`). `cargo deny` y `npm audit` siguen pendientes
+- [x] F7 `cargo audit` en CI (job `audit` de `engine.yml`), como trinquete: los 5 avisos conocidos están listados con su motivo y cualquiera nuevo tumba el job. `cargo deny` y `npm audit` siguen pendientes
+- [ ] **F8 Subir `boa_engine` de 0.19 a 0.22 — P1 — 2 d.** Cierra `RUSTSEC-2025-0003` (fallo de segmentación en `fast-float`) y `RUSTSEC-2024-0379`, los dos únicos avisos de la auditoría que son fallos reales y no de mantenimiento. Lo que los alcanza es el parser de números del motor de JavaScript, o sea código de cualquier página. Son tres versiones menores de un crate pre-1.0: cambian el cargador de módulos (`ModuleLoader`, ver Fase 43) y las firmas de `NativeFunction`, así que hay que revisar `platform.rs`, `modules.rs`, `dom_classes.rs` y `dom_bindings.rs`. **Criterio de aceptación**: los 874 tests en verde, la sonda de APIs sin bajar de 85, y los dos avisos fuera de la lista de ignorados
 
 ### G — Plataforma
 - [ ] G1 `<iframe>` + `postMessage` + `sandbox`
