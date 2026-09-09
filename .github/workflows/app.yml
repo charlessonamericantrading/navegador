@@ -85,16 +85,27 @@ jobs:
         working-directory: desktop
         run: npm ci
 
-      # `--dir` empaqueta sin generar el instalador NSIS: comprueba que la
-      # configuracion de `electron-builder` es valida y que los recursos que
-      # declara existen, sin gastar los minutos de construir el .exe ni
-      # necesitar certificado de firma.
+      # El motor compilado y el backend viven en `desktop/build-resources/`,
+      # que esta en .gitignore porque son binarios de 50 MB. En CI no existen,
+      # y `electron-builder` aborta si un `extraResources` apunta a un
+      # directorio que no esta.
       #
-      # `-c.extraResources=null` desactiva los recursos extra a proposito: el
-      # motor compilado y el backend viven en `desktop/build-resources/`, que
-      # esta en .gitignore porque son binarios de 50 MB. En CI no existen, y
-      # empaquetar sin ellos sigue validando lo que aqui interesa, que es la
-      # configuracion.
+      # Se crean vacios en vez de desactivar `extraResources` por linea de
+      # comandos. La primera version usaba `-c.extraResources=null` y fallaba
+      # solo en CI: el paso corre bajo PowerShell, que parte ese argumento en
+      # `-c` mas una ruta, y `electron-builder` intentaba abrir un fichero de
+      # configuracion llamado `.extraResources=null`. Ademas, con los
+      # directorios presentes se valida la configuracion REAL, que es lo que
+      # este job existe para comprobar.
+      - name: Preparar recursos vacios
+        working-directory: desktop
+        run: |
+          New-Item -ItemType Directory -Force -Path build-resources/engine | Out-Null
+          New-Item -ItemType Directory -Force -Path build-resources/backend-server | Out-Null
+
+      # `--dir` empaqueta sin generar el instalador NSIS: comprueba que la
+      # configuracion es valida y que los recursos que declara existen, sin
+      # gastar los minutos de construir el .exe ni necesitar certificado.
       - name: Empaquetar (sin instalador)
         working-directory: desktop
-        run: npx electron-builder --dir -c.extraResources=null
+        run: npx electron-builder --dir
