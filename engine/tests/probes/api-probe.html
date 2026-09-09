@@ -260,8 +260,15 @@
   comprobar('el.style', conElemento(function (el) {
     el.style.color = 'red'; return el.style.color === 'red';
   }));
+  // Se comprueba el EFECTO sobre el DOM, no que la asignacion no lance.
+  // Asignar una propiedad cualquiera a un objeto JS siempre "funciona" y
+  // devuelve lo asignado, asi que `el.innerHTML = x; el.innerHTML === x` daba
+  // verde incluso sin que `innerHTML` existiera. Fue un falso positivo real de
+  // esta sonda (y de la de la Fase 39), detectado el 2026-09-09.
   comprobar('el.innerHTML', conElemento(function (el) {
-    el.innerHTML = '<b>x</b>'; return el.innerHTML.indexOf('b') !== -1;
+    el.innerHTML = '<b>x</b>';
+    return !!el.firstElementChild &&
+           el.firstElementChild.tagName.toLowerCase() === 'b';
   }));
   comprobar('el.textContent', conElemento(function (el) {
     el.textContent = 'hola'; return el.textContent === 'hola';

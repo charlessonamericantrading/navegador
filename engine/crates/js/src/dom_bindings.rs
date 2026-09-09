@@ -275,6 +275,14 @@ pub struct DocumentBindings {
     /// objeto JS ya construido para el. Ver su doc-comment para el porque.
     #[unsafe_ignore_trace]
     element_objects: Arc<Mutex<HashMap<usize, JsObject>>>,
+    /// Los prototipos de la jerarquia del DOM (Fase 44, ver
+    /// `crate::dom_classes`). Vive aqui por lo mismo que los listeners: son
+    /// UNOS por documento y `build_element_object` los necesita para colgar
+    /// cada elemento del suyo. `None` si el registro fallo - en ese caso los
+    /// elementos se construyen sin cadena, exactamente como antes de la Fase
+    /// 44, en vez de dejar la pagina sin DOM.
+    #[unsafe_ignore_trace]
+    prototypes: Option<crate::dom_classes::DomPrototypes>,
     /// `scrollTop`/`scrollLeft` de cada elemento con `overflow: auto/
     /// scroll` que los haya recibido - puntero de nodo -> (scrollLeft,
     /// scrollTop) en pixeles. `core::pipeline` lo lee tras cada layout
@@ -387,7 +395,18 @@ impl DomBindings {
 
         context.register_global_builtin_callable(js_string!("printEngineLog"), 1, print_fn)?;
 
-        let bindings = DocumentBindings { listeners: Arc::new(Mutex::new(HashMap::new())), layout: cssom::new_layout_snapshot(), mutations: Arc::new(Mutex::new(Vec::new())), element_objects: Arc::new(Mutex::new(HashMap::new())), scroll_offsets: Arc::new(Mutex::new(HashMap::new())) };
+        // La jerarquia de clases se registra ANTES de construir ningun objeto de
+        // elemento: `build_element_object` la consulta para colgar cada uno de su
+        // prototipo. Si fallara, se sigue sin ella (elementos sin cadena, como
+        // antes de la Fase 44) en vez de dejar la pagina entera sin DOM.
+        let prototypes = match crate::dom_classes::register_dom_classes(context) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!("[js] no se pudo registrar la jerarquia del DOM: {e}");
+                None
+            }
+        };
+        let bindings = DocumentBindings { listeners: Arc::new(Mutex::new(HashMap::new())), layout: cssom::new_layout_snapshot(), mutations: Arc::new(Mutex::new(Vec::new())), element_objects: Arc::new(Mutex::new(HashMap::new())), scroll_offsets: Arc::new(Mutex::new(HashMap::new())), prototypes };
         // `getComputedStyle` es un GLOBAL (no un metodo de elemento), asi
         // que se registra aqui, donde nace el snapshot que consulta. Se le
         // pasa `node_from_js_value` porque el tipo que lleva los datos
@@ -1609,6 +1628,398 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         Ok(JsValue::from(js_string!("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")))
     });
 
+    // ---------------------------------------------------------------------
+    // Metodos de Element que faltaban (Fase 44, tarea C6 del plan).
+    //
+    // Se eligieron por lo que rompen al faltar, medido con la sonda de APIs:
+    // `matches`/`closest` son la base de la delegacion de eventos, que es como
+    // funciona todo framework; `contains` decide "el clic fue dentro o fuera"
+    // en cualquier menu desplegable; `innerHTML` es como se monta contenido en
+    // casi todo el codigo real.
+    // ---------------------------------------------------------------------
+
+    // `matches(selector)` con el matcher REAL del crate `css` (el de Firefox),
+    // el mismo que usa la cascada. Reusarlo en vez de escribir otro comparador
+    // es lo que garantiza que `el.matches('.a > .b')` responda igual que si esa
+    // regla estuviera en una hoja de estilos.
+    let matches_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let Some(arg) = args.first() else { return Ok(JsValue::from(false)) };
+            let selector = arg.to_string(context)?.to_std_string_escaped();
+            Ok(JsValue::from(SelectorMatcher::matches(&selector, &capture.0)))
+        },
+        capture.clone(),
+    );
+
+    // `closest(selector)` sube por los ancestros EMPEZANDO POR EL PROPIO
+    // elemento, que es lo que dice el spec y lo que hace util al metodo:
+    // `e.target.closest('button')` acierta tanto si se pulso el boton como si
+    // se pulso el icono de dentro.
+    let closest_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let Some(arg) = args.first() else { return Ok(JsValue::null()) };
+            let selector = arg.to_string(context)?.to_std_string_escaped();
+
+            let mut actual = Some(capture.0.clone());
+            while let Some(nodo) = actual {
+                let es_elemento =
+                    matches!(nodo.read().unwrap().node_type, NodeType::Element { .. });
+                if es_elemento && SelectorMatcher::matches(&selector, &nodo) {
+                    return Ok(element_to_js_object(&nodo, &capture.1, context).into());
+                }
+                let padre = nodo.read().unwrap().parent.as_ref().and_then(Weak::upgrade);
+                actual = padre;
+            }
+            Ok(JsValue::null())
+        },
+        capture.clone(),
+    );
+
+    // `contains(otro)`. Devuelve `true` tambien para el propio elemento, igual
+    // que el spec: es el detalle que hace correcto el patron "cerrar si el clic
+    // fue fuera" - sin el, pulsar el propio menu lo cerraria.
+    let contains_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, _context| {
+            let Some(valor) = args.first() else { return Ok(JsValue::from(false)) };
+            let Some(otro) = node_from_js_value(valor) else {
+                return Ok(JsValue::from(false));
+            };
+            Ok(JsValue::from(nodo_contiene(&capture.0, &otro)))
+        },
+        capture.clone(),
+    );
+
+    // `remove()` se quita a si mismo de su padre. Sustituye al
+    // `el.parentNode.removeChild(el)` de antes y es lo que escribe el codigo
+    // moderno.
+    let remove_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, _context| {
+            let padre = capture.0.read().unwrap().parent.as_ref().and_then(Weak::upgrade);
+            detach_from_parent(&capture.0);
+            capture.0.write().unwrap().parent = None;
+            if let Some(padre) = padre {
+                capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                    kind: "childList",
+                    target: padre,
+                    attribute_name: None,
+                    old_value: None,
+                    added: Vec::new(),
+                    removed: vec![capture.0.clone()],
+                });
+            }
+            Ok(JsValue::undefined())
+        },
+        capture.clone(),
+    );
+
+    // `append(...)` acepta VARIOS argumentos y ademas cadenas, que se
+    // convierten en nodos de TEXTO. Esa es toda la diferencia con
+    // `appendChild`, y la razon de que el codigo moderno lo prefiera: ademas de
+    // caber en una linea, `el.append(nombreDelUsuario)` no puede inyectar
+    // etiquetas, al contrario que `innerHTML`.
+    let append_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let mut anadidos = Vec::new();
+            for arg in args {
+                let nodo = argumento_a_nodo(arg, context)?;
+                detach_from_parent(&nodo);
+                nodo.write().unwrap().parent = Some(Arc::downgrade(&capture.0));
+                capture.0.write().unwrap().children.push(nodo.clone());
+                anadidos.push(nodo);
+            }
+            if !anadidos.is_empty() {
+                capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                    kind: "childList",
+                    target: capture.0.clone(),
+                    attribute_name: None,
+                    old_value: None,
+                    added: anadidos,
+                    removed: Vec::new(),
+                });
+            }
+            Ok(JsValue::undefined())
+        },
+        capture.clone(),
+    );
+
+    // `prepend(...)` inserta al principio conservando el orden de los
+    // argumentos: `prepend(a, b)` deja `a` antes que `b`, igual que el spec.
+    let prepend_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let mut anadidos = Vec::new();
+            for (i, arg) in args.iter().enumerate() {
+                let nodo = argumento_a_nodo(arg, context)?;
+                detach_from_parent(&nodo);
+                nodo.write().unwrap().parent = Some(Arc::downgrade(&capture.0));
+                let mut padre = capture.0.write().unwrap();
+                let pos = i.min(padre.children.len());
+                padre.children.insert(pos, nodo.clone());
+                drop(padre);
+                anadidos.push(nodo);
+            }
+            if !anadidos.is_empty() {
+                capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                    kind: "childList",
+                    target: capture.0.clone(),
+                    attribute_name: None,
+                    old_value: None,
+                    added: anadidos,
+                    removed: Vec::new(),
+                });
+            }
+            Ok(JsValue::undefined())
+        },
+        capture.clone(),
+    );
+
+    // `cloneNode(profundo)`. La copia es un arbol NUEVO sin padre: no comparte
+    // estado con el original, que es lo que hace util al metodo (clonar una
+    // plantilla y montarla en otro sitio).
+    let clone_node_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let profundo = args.first().map(|v| v.to_boolean()).unwrap_or(false);
+            let copia = clonar_nodo(&capture.0, profundo);
+            Ok(element_to_js_object(&copia, &capture.1, context).into())
+        },
+        capture.clone(),
+    );
+
+    // `innerHTML` de verdad. Antes NO existia, pero la sonda lo daba por
+    // presente: asignar una propiedad cualquiera a un objeto JS siempre
+    // "funciona" y devuelve lo asignado, asi que la comprobacion pasaba sin que
+    // el DOM cambiara. Es el motivo de que ahora la sonda mida el EFECTO.
+    let inner_html_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, _context| {
+            let hijos = capture.0.read().unwrap().children.clone();
+            Ok(JsValue::from(js_string!(serializar_hijos(&hijos))))
+        },
+        capture.clone(),
+    );
+    let inner_html_getter_fn = FunctionObjectBuilder::new(context.realm(), inner_html_getter)
+        .name(js_string!("get innerHTML"))
+        .length(0)
+        .constructor(false)
+        .build();
+
+    let inner_html_setter = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let html = match args.first() {
+                Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                None => String::new(),
+            };
+            let removidos = capture.0.read().unwrap().children.clone();
+            reemplazar_hijos_con_html(&capture.0, &html);
+            let anadidos = capture.0.read().unwrap().children.clone();
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "childList",
+                target: capture.0.clone(),
+                attribute_name: None,
+                old_value: None,
+                added: anadidos,
+                removed: removidos,
+            });
+            Ok(JsValue::undefined())
+        },
+        capture.clone(),
+    );
+    let inner_html_setter_fn = FunctionObjectBuilder::new(context.realm(), inner_html_setter)
+        .name(js_string!("set innerHTML"))
+        .length(1)
+        .constructor(false)
+        .build();
+
+    // `outerHTML`, solo getter. El setter reemplazaria el nodo dentro de su
+    // padre y necesita parseo de HTML EN CONTEXTO (un `<td>` suelto se parsea
+    // distinto fuera de una tabla), que este motor todavia no hace desde JS.
+    // Sin setter, un intento de escribirlo no hace nada visible; con un setter
+    // a medias, produciria un arbol equivocado en silencio.
+    let outer_html_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, _context| {
+            Ok(JsValue::from(js_string!(serializar_nodo(&capture.0))))
+        },
+        capture.clone(),
+    );
+    let outer_html_getter_fn = FunctionObjectBuilder::new(context.realm(), outer_html_getter)
+        .name(js_string!("get outerHTML"))
+        .length(0)
+        .constructor(false)
+        .build();
+
+    // `isConnected`: si el nodo sigue colgando de un documento. Codigo real lo
+    // consulta antes de tocar un elemento que pudo desmontarse mientras
+    // esperaba a una promesa.
+    let is_connected_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, _context| {
+            let mut actual = Some(capture.0.clone());
+            while let Some(nodo) = actual {
+                if matches!(nodo.read().unwrap().node_type, NodeType::Document) {
+                    return Ok(JsValue::from(true));
+                }
+                let padre = nodo.read().unwrap().parent.as_ref().and_then(Weak::upgrade);
+                match padre {
+                    Some(p) => actual = Some(p),
+                    None => return Ok(JsValue::from(false)),
+                }
+            }
+            Ok(JsValue::from(false))
+        },
+        capture.clone(),
+    );
+    let is_connected_getter_fn = FunctionObjectBuilder::new(context.realm(), is_connected_getter)
+        .name(js_string!("get isConnected"))
+        .length(0)
+        .constructor(false)
+        .build();
+
+    // `dataset`: los `data-*` con el nombre en camelCase (`data-user-id` pasa a
+    // `dataset.userId`). Se construye una FOTO en cada lectura, no un proxy
+    // vivo: escribir en `dataset` no cambia el atributo. Declarado en
+    // `huecos_sin_resolver.md`; leerlo, que es el uso mayoritario, funciona.
+    let dataset_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, context| {
+            let pares: Vec<(String, String)> = {
+                let n = capture.0.read().unwrap();
+                match &n.node_type {
+                    NodeType::Element { attributes, .. } => attributes
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            k.strip_prefix("data-").map(|r| (a_camel_case(r), v.clone()))
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            };
+            let mut init = ObjectInitializer::new(context);
+            for (k, v) in pares {
+                init.property(js_string!(k), js_string!(v), Attribute::all());
+            }
+            Ok(init.build().into())
+        },
+        capture.clone(),
+    );
+    let dataset_getter_fn = FunctionObjectBuilder::new(context.realm(), dataset_getter)
+        .name(js_string!("get dataset"))
+        .length(0)
+        .constructor(false)
+        .build();
+
+    // `id` y `className` como accessors VIVOS sobre sus atributos (Fase 44).
+    //
+    // No estaban, y son de lo mas usado que hay: `el.id` aparece en cualquier
+    // codigo que recorra elementos, y `el.className` es la forma clasica de
+    // leer o reemplazar las clases de golpe (`classList` ya existia, pero no
+    // sustituye a poder asignar la cadena entera).
+    //
+    // Vivos y no una foto, al contrario que `tagName`: la etiqueta de un
+    // elemento no cambia nunca, pero su `id` y sus clases si, y devolver el
+    // valor que tenian al construir el objeto JS daria respuestas obsoletas en
+    // cuanto alguien las tocara.
+    let id_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, _context| {
+            let n = capture.0.read().unwrap();
+            let valor = match &n.node_type {
+                NodeType::Element { attributes, .. } => {
+                    attributes.get("id").cloned().unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            // Cadena vacia, no `null`: el spec dice que `el.id` es siempre una
+            // cadena. Devolver `null` romperia cualquier `el.id.startsWith(...)`.
+            Ok(JsValue::from(js_string!(valor)))
+        },
+        capture.clone(),
+    );
+    let id_getter_fn = FunctionObjectBuilder::new(context.realm(), id_getter)
+        .name(js_string!("get id"))
+        .length(0)
+        .constructor(false)
+        .build();
+
+    let id_setter = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let valor = match args.first() {
+                Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                None => String::new(),
+            };
+            let anterior = {
+                let mut n = capture.0.write().unwrap();
+                match &mut n.node_type {
+                    NodeType::Element { attributes, .. } => {
+                        attributes.insert("id".to_string(), valor)
+                    }
+                    _ => None,
+                }
+            };
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "attributes",
+                target: capture.0.clone(),
+                attribute_name: Some("id".to_string()),
+                old_value: anterior,
+                added: Vec::new(),
+                removed: Vec::new(),
+            });
+            Ok(JsValue::undefined())
+        },
+        capture.clone(),
+    );
+    let id_setter_fn = FunctionObjectBuilder::new(context.realm(), id_setter)
+        .name(js_string!("set id"))
+        .length(1)
+        .constructor(false)
+        .build();
+
+    let class_name_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args: &[JsValue], capture: &ElementCapture, _context| {
+            let n = capture.0.read().unwrap();
+            let valor = match &n.node_type {
+                NodeType::Element { attributes, .. } => {
+                    attributes.get("class").cloned().unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            Ok(JsValue::from(js_string!(valor)))
+        },
+        capture.clone(),
+    );
+    let class_name_getter_fn = FunctionObjectBuilder::new(context.realm(), class_name_getter)
+        .name(js_string!("get className"))
+        .length(0)
+        .constructor(false)
+        .build();
+
+    let class_name_setter = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let valor = match args.first() {
+                Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                None => String::new(),
+            };
+            let anterior = {
+                let mut n = capture.0.write().unwrap();
+                match &mut n.node_type {
+                    NodeType::Element { attributes, .. } => {
+                        attributes.insert("class".to_string(), valor)
+                    }
+                    _ => None,
+                }
+            };
+            capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                kind: "attributes",
+                target: capture.0.clone(),
+                attribute_name: Some("class".to_string()),
+                old_value: anterior,
+                added: Vec::new(),
+                removed: Vec::new(),
+            });
+            Ok(JsValue::undefined())
+        },
+        capture.clone(),
+    );
+    let class_name_setter_fn = FunctionObjectBuilder::new(context.realm(), class_name_setter)
+        .name(js_string!("set className"))
+        .length(1)
+        .constructor(false)
+        .build();
+
     let mut obj_init = ObjectInitializer::with_native_data(capture.clone(), context);
     obj_init
         .property(js_string!("tagName"), js_string!(tag_name.to_uppercase()), Attribute::all())
@@ -1635,7 +2046,21 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         .function(get_bounding_client_rect, js_string!("getBoundingClientRect"), 0)
         .function(get_client_rects, js_string!("getClientRects"), 0)
         .function(get_context, js_string!("getContext"), 1)
-        .function(to_data_url, js_string!("toDataURL"), 0);
+        .function(to_data_url, js_string!("toDataURL"), 0)
+        // Fase 44 (tarea C6)
+        .function(matches_fn, js_string!("matches"), 1)
+        .function(closest_fn, js_string!("closest"), 1)
+        .function(contains_fn, js_string!("contains"), 1)
+        .function(remove_fn, js_string!("remove"), 0)
+        .function(append_fn, js_string!("append"), 0)
+        .function(prepend_fn, js_string!("prepend"), 0)
+        .function(clone_node_fn, js_string!("cloneNode"), 1)
+        .accessor(js_string!("innerHTML"), Some(inner_html_getter_fn), Some(inner_html_setter_fn), Attribute::all())
+        .accessor(js_string!("outerHTML"), Some(outer_html_getter_fn), None, Attribute::all())
+        .accessor(js_string!("isConnected"), Some(is_connected_getter_fn), None, Attribute::all())
+        .accessor(js_string!("dataset"), Some(dataset_getter_fn), None, Attribute::all())
+        .accessor(js_string!("id"), Some(id_getter_fn), Some(id_setter_fn), Attribute::all())
+        .accessor(js_string!("className"), Some(class_name_getter_fn), Some(class_name_setter_fn), Attribute::all());
 
     if tag_name.eq_ignore_ascii_case("canvas") {
         obj_init
@@ -1643,7 +2068,22 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
             .property(js_string!("height"), JsValue::from(150.0), Attribute::all());
     }
 
-    obj_init.build()
+    let objeto = obj_init.build();
+
+    // Colgar el elemento de su prototipo (Fase 44). Es lo que hace que
+    // `el instanceof HTMLElement` responda `true` y que un polyfill instalado
+    // en `Element.prototype` lo vean los elementos ya creados - los dos
+    // patrones que un bundle real ejecuta al arrancar y que antes fallaban en
+    // silencio.
+    //
+    // Los metodos que este objeto ya trae puestos siguen tapando a los del
+    // prototipo; la simplificacion esta declarada en la cabecera de
+    // `crate::dom_classes`.
+    if let Some(prototipos) = &registry.prototypes {
+        objeto.set_prototype(Some(prototipos.para_etiqueta(&tag_name)));
+    }
+
+    objeto
 }
 
 /// Construye un objeto CanvasRenderingContext2D compatible con las APIs estándar del W3C.
@@ -3469,5 +3909,264 @@ mod tests {
              canvas.tagName + ',' + (ctx !== null) + ',' + (m.width > 0)",
         );
         assert_eq!(result, "\"CANVAS,true,true\"");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ayudantes de la Fase 44 (tarea C6 del plan): serializacion, clonado y
+// conversion de argumentos.
+// ---------------------------------------------------------------------------
+
+/// Serializa un nodo a HTML, incluyendo su propia etiqueta (`outerHTML`).
+///
+/// No usa `html5ever` para serializar aunque lo use para parsear: el adaptador
+/// `TreeSink` de este motor no guarda lo necesario para una reserializacion
+/// fiel (orden original de atributos, comillas usadas, mayusculas del fuente).
+/// Escribir el serializador a mano aqui es honesto sobre eso; lo que produce
+/// es HTML equivalente, no un calco del original.
+pub(crate) fn serializar_nodo(node: &Arc<RwLock<Node>>) -> String {
+    let n = node.read().unwrap();
+    match &n.node_type {
+        NodeType::Text(texto) => escapar_texto(texto),
+        NodeType::Comment(texto) => format!("<!--{texto}-->"),
+        NodeType::Document => serializar_hijos(&n.children),
+        NodeType::Element { tag_name, attributes } => {
+            let mut atributos: Vec<_> = attributes.iter().collect();
+            // Orden estable: un `HashMap` no lo tiene, y sin ordenar el mismo
+            // elemento produciria cadenas distintas entre ejecuciones, lo que
+            // haria imposible cualquier test sobre `outerHTML`.
+            atributos.sort_by(|a, b| a.0.cmp(b.0));
+            let attrs: String = atributos
+                .iter()
+                .map(|(k, v)| format!(" {}=\"{}\"", k, escapar_atributo(v)))
+                .collect();
+
+            // Los elementos vacios del spec no llevan cierre. Escribir
+            // `<img></img>` produciria HTML que, reparseado, da un arbol
+            // distinto.
+            const SIN_CIERRE: [&str; 14] = [
+                "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+                "param", "source", "track", "wbr",
+            ];
+            if SIN_CIERRE.contains(&tag_name.to_ascii_lowercase().as_str()) {
+                return format!("<{tag_name}{attrs}>");
+            }
+            format!("<{tag_name}{attrs}>{}</{tag_name}>", serializar_hijos(&n.children))
+        }
+    }
+}
+
+/// Serializa solo los hijos de un nodo (`innerHTML`).
+pub(crate) fn serializar_hijos(hijos: &[Arc<RwLock<Node>>]) -> String {
+    hijos.iter().map(serializar_nodo).collect()
+}
+
+/// Escapa lo que no puede aparecer crudo en texto HTML.
+fn escapar_texto(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Escapa lo que no puede aparecer crudo dentro de un atributo entre comillas.
+fn escapar_atributo(s: &str) -> String {
+    s.replace('&', "&amp;").replace('"', "&quot;")
+}
+
+/// Copia un nodo. Con `profundo`, tambien todo su subarbol.
+///
+/// La copia es un arbol NUEVO sin padre: no comparte estado con el original,
+/// que es lo que el spec promete y lo que hace util al metodo (clonar una
+/// plantilla y montarla en otro sitio).
+pub(crate) fn clonar_nodo(node: &Arc<RwLock<Node>>, profundo: bool) -> Arc<RwLock<Node>> {
+    let n = node.read().unwrap();
+    let copia = Node::new(n.node_type.clone());
+    if profundo {
+        for hijo in &n.children {
+            let hijo_copia = clonar_nodo(hijo, true);
+            Node::append_child(&copia, hijo_copia);
+        }
+    }
+    copia
+}
+
+/// Comprueba si `posible` esta dentro de `raiz`, incluyendo la propia `raiz`.
+///
+/// Que se incluya a si mismo no es un descuido: el spec lo dice, y es lo que
+/// hace correcto el patron mas comun del metodo ("cerrar el menu si el clic
+/// fue fuera"). Sin ello, pulsar el propio menu lo cerraria.
+pub(crate) fn nodo_contiene(raiz: &Arc<RwLock<Node>>, posible: &Arc<RwLock<Node>>) -> bool {
+    if Arc::ptr_eq(raiz, posible) {
+        return true;
+    }
+    let hijos = raiz.read().unwrap().children.clone();
+    hijos.iter().any(|hijo| nodo_contiene(hijo, posible))
+}
+
+/// Convierte un argumento de `append`/`prepend` en un nodo.
+///
+/// Una cadena se convierte en nodo de TEXTO, no se parsea como HTML: es lo que
+/// dice el spec y es ademas la propiedad que hace seguros a estos metodos
+/// frente a `innerHTML` (`el.append(nombreDelUsuario)` no puede inyectar
+/// etiquetas).
+pub(crate) fn argumento_a_nodo(
+    valor: &JsValue,
+    context: &mut Context,
+) -> JsResult<Arc<RwLock<Node>>> {
+    if let Some(nodo) = node_from_js_value(valor) {
+        return Ok(nodo);
+    }
+    let texto = valor.to_string(context)?.to_std_string_escaped();
+    Ok(Node::new(NodeType::Text(texto)))
+}
+
+/// `data-user-id` a `userId`, la conversion que el spec define para `dataset`.
+pub(crate) fn a_camel_case(s: &str) -> String {
+    let mut salida = String::with_capacity(s.len());
+    let mut siguiente_mayuscula = false;
+    for c in s.chars() {
+        if c == '-' {
+            siguiente_mayuscula = true;
+        } else if siguiente_mayuscula {
+            salida.extend(c.to_uppercase());
+            siguiente_mayuscula = false;
+        } else {
+            salida.push(c);
+        }
+    }
+    salida
+}
+
+/// Reemplaza todos los hijos de `node` por lo que produzca parsear `html`.
+///
+/// El fragmento se parsea con `html5ever` (el parser real, el mismo que la
+/// pagina) y se extraen los hijos de su `<body>`: parsear a mano seria una
+/// segunda fuente de verdad sobre que es HTML valido, y ademas la
+/// recuperacion de errores del spec es justo lo que hace que `innerHTML`
+/// funcione con fragmentos mal formados, que es como llegan casi siempre.
+pub(crate) fn reemplazar_hijos_con_html(node: &Arc<RwLock<Node>>, html: &str) {
+    let documento = engine_dom::HtmlParser::parse(html);
+    let cuerpo = Node::find_all_by_tag(&documento, "body").into_iter().next();
+
+    let nuevos: Vec<Arc<RwLock<Node>>> = match cuerpo {
+        Some(cuerpo) => cuerpo.read().unwrap().children.clone(),
+        // Sin `<body>` (no deberia pasar con html5ever, que siempre lo crea)
+        // se cuelga lo que haya en la raiz: mejor que perder el contenido.
+        None => documento.read().unwrap().children.clone(),
+    };
+
+    {
+        let mut n = node.write().unwrap();
+        for hijo in &n.children {
+            hijo.write().unwrap().parent = None;
+        }
+        n.children.clear();
+    }
+    for nuevo in nuevos {
+        nuevo.write().unwrap().parent = Some(Arc::downgrade(node));
+        node.write().unwrap().children.push(nuevo);
+    }
+}
+
+#[cfg(test)]
+mod tests_fase44 {
+    use super::*;
+    use engine_dom::HtmlParser;
+
+    fn primer(tag: &str, html: &str) -> Arc<RwLock<Node>> {
+        let dom = HtmlParser::parse(html);
+        Node::find_all_by_tag(&dom, tag).into_iter().next().expect("no se encontro el tag")
+    }
+
+    #[test]
+    fn serializar_incluye_la_etiqueta_propia_y_sus_atributos() {
+        let div = primer("div", r#"<html><body><div id="a" class="b">hola</div></body></html>"#);
+        let html = serializar_nodo(&div);
+        assert!(html.starts_with("<div "), "debe incluir su propia etiqueta: {html}");
+        assert!(html.contains(r#"id="a""#) && html.contains(r#"class="b""#));
+        assert!(html.ends_with("</div>"));
+    }
+
+    #[test]
+    fn serializar_no_cierra_los_elementos_vacios() {
+        // `<img></img>` reparseado da un arbol distinto del original.
+        let img = primer("img", r#"<html><body><img src="x.png"></body></html>"#);
+        let html = serializar_nodo(&img);
+        assert!(!html.contains("</img>"), "un <img> no lleva cierre: {html}");
+    }
+
+    #[test]
+    fn serializar_escapa_lo_que_romperia_el_html() {
+        let div = primer("div", "<html><body><div>a &lt; b &amp; c</div></body></html>");
+        let html = serializar_nodo(&div);
+        assert!(html.contains("&lt;") && html.contains("&amp;"), "sin escapar: {html}");
+    }
+
+    #[test]
+    fn el_orden_de_atributos_es_estable() {
+        // Un HashMap no lo garantiza; sin ordenar, el mismo elemento daria
+        // cadenas distintas entre ejecuciones.
+        let div = primer("div", r#"<html><body><div c="3" a="1" b="2"></div></body></html>"#);
+        assert_eq!(serializar_nodo(&div), serializar_nodo(&div));
+        let html = serializar_nodo(&div);
+        assert!(html.find(r#"a="1""#) < html.find(r#"b="2""#));
+    }
+
+    #[test]
+    fn clonar_superficial_no_lleva_los_hijos() {
+        let div = primer("div", "<html><body><div><span>x</span></div></body></html>");
+        let copia = clonar_nodo(&div, false);
+        assert!(copia.read().unwrap().children.is_empty());
+    }
+
+    #[test]
+    fn clonar_profundo_copia_el_subarbol_sin_compartirlo() {
+        let div = primer("div", "<html><body><div><span>x</span></div></body></html>");
+        let copia = clonar_nodo(&div, true);
+        assert_eq!(copia.read().unwrap().children.len(), 1);
+        // Si la copia compartiera nodos con el original, tocar la copia
+        // cambiaria el documento.
+        let original_hijo = div.read().unwrap().children[0].clone();
+        let copia_hijo = copia.read().unwrap().children[0].clone();
+        assert!(!Arc::ptr_eq(&original_hijo, &copia_hijo));
+    }
+
+    #[test]
+    fn contiene_se_incluye_a_si_mismo() {
+        let div = primer("div", "<html><body><div><span>x</span></div></body></html>");
+        assert!(nodo_contiene(&div, &div), "el spec dice que un nodo se contiene a si mismo");
+    }
+
+    #[test]
+    fn contiene_encuentra_nietos_y_rechaza_hermanos() {
+        let dom = HtmlParser::parse("<html><body><div><p><span>x</span></p></div><i>y</i></body></html>");
+        let div = Node::find_all_by_tag(&dom, "div").into_iter().next().unwrap();
+        let span = Node::find_all_by_tag(&dom, "span").into_iter().next().unwrap();
+        let i = Node::find_all_by_tag(&dom, "i").into_iter().next().unwrap();
+        assert!(nodo_contiene(&div, &span), "un nieto sigue estando dentro");
+        assert!(!nodo_contiene(&div, &i), "un hermano no esta dentro");
+    }
+
+    #[test]
+    fn reemplazar_hijos_parsea_html_de_verdad() {
+        let div = primer("div", "<html><body><div>viejo</div></body></html>");
+        reemplazar_hijos_con_html(&div, "<b>nuevo</b><i>tambien</i>");
+        let hijos = div.read().unwrap().children.clone();
+        assert_eq!(hijos.len(), 2, "deberian ser dos elementos, no texto plano");
+        assert!(serializar_hijos(&hijos).contains("<b>nuevo</b>"));
+    }
+
+    #[test]
+    fn reemplazar_hijos_tolera_html_mal_formado() {
+        // Es como llega casi siempre. La recuperacion de errores es de
+        // html5ever, no nuestra: por eso se parsea con el y no a mano.
+        let div = primer("div", "<html><body><div>x</div></body></html>");
+        reemplazar_hijos_con_html(&div, "<b>sin cerrar");
+        assert_eq!(div.read().unwrap().children.len(), 1);
+    }
+
+    #[test]
+    fn camel_case_convierte_como_el_spec() {
+        assert_eq!(a_camel_case("user-id"), "userId");
+        assert_eq!(a_camel_case("simple"), "simple");
+        assert_eq!(a_camel_case("a-b-c"), "aBC");
     }
 }

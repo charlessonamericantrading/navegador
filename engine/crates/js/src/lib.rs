@@ -2,6 +2,7 @@ pub mod runtime;
 pub mod cookie;
 pub mod cssom;
 pub mod dom_bindings;
+pub mod dom_classes;
 pub mod event_loop;
 pub mod fetch;
 pub mod history;

@@ -4322,3 +4322,106 @@ de texto visible (`MIN_VISIBLE_TEXT_CHARS`) y el bundle del test producia 31. La
 heuristica hacia exactamente lo que documenta; lo poco realista era el test.
 
 **Tests del Workspace**: 856 pasando, 0 fallando.
+
+### Fase 44: Jerarquia de clases del DOM y los metodos de Element que faltaban (2026-09-09)
+
+Tareas C3 y C6 del `plan.md`. Con los modulos ES resueltos (Fase 43), el techo
+pasa a ser la superficie de plataforma, y esto es el primer trozo grande de ella.
+
+Sonda de APIs: **56 -> 73 de 114**. Tests estilo-WPT: **24 -> 42**.
+
+#### `instanceof` y los polyfills, los dos patrones que fallaban en silencio
+
+Cada objeto de elemento era un objeto suelto sin ninguna cadena de prototipos.
+Eso rompia dos cosas que un bundle real hace al arrancar:
+
+1. `el instanceof HTMLElement` era `false`. Es la comprobacion con la que media
+   web decide si algo es un nodo o un objeto de configuracion, y una respuesta
+   equivocada manda al codigo por la rama que no es.
+2. `Element.prototype.matches = ...` no hacia nada. Ese es literalmente como se
+   instala un polyfill: se anade al prototipo y se espera que lo vean los
+   elementos ya creados. Sin cadena, el polyfill se instalaba "bien" y el metodo
+   seguia sin existir.
+
+`dom_classes.rs` construye la jerarquia real (`EventTarget` -> `Node` ->
+`Element` -> `HTMLElement` -> subclases) y registra cada clase como global con su
+`prototype` y su `constructor` enlazados en los dos sentidos - sin ese enlace,
+toda la jerarquia existiria y `instanceof` seguiria dando `false`, porque es
+`Clase.prototype` lo que busca.
+
+Los constructores LANZAN con `new`. No es una limitacion: el spec dice
+`TypeError: Illegal constructor` y los elementos se crean con
+`document.createElement`. Devolver un objeto seria peor - pareceria un elemento
+y no estaria en ningun documento.
+
+**Lo que esta fase NO cierra, y por que**: los metodos siguen en la instancia, no
+en el prototipo, porque `build_element_object` los construye con closures que
+capturan su nodo. Un metodo que el motor YA tiene tapa al del prototipo, asi que
+un envoltorio de `Element.prototype.appendChild` se instala y nunca se ejecuta.
+Un metodo que el motor NO tiene si se hereda, que es el caso de todo polyfill.
+Cerrarlo del todo exige que cada metodo recupere su nodo desde `this`, es decir
+reescribir las ~675 lineas de `build_element_object`.
+
+#### El falso positivo que llevaba dos fases dando verde
+
+`innerHTML` **no existia**. La sonda lo daba por presente porque comprobaba
+`el.innerHTML = x; el.innerHTML.indexOf(...)`, y asignar una propiedad
+cualquiera a un objeto JS siempre funciona y devuelve lo asignado. La
+comprobacion pasaba sin que el DOM cambiara, y el mismo fallo estaba en la sonda
+de la Fase 39.
+
+Corregido en los dos sitios: la sonda ahora comprueba el EFECTO
+(`el.firstElementChild.tagName`), e `innerHTML` esta implementado de verdad, con
+getter que reserializa e setter que parsea con `html5ever` - el parser real, no
+uno a mano: su recuperacion de errores es justo lo que hace que `innerHTML`
+funcione con fragmentos mal formados, que es como llegan casi siempre.
+
+Es el mejor argumento a favor de la regla de la sonda que dice que una
+comprobacion debe medir capacidad real y no ausencia de excepcion.
+
+#### Metodos anadidos, elegidos por lo que rompen al faltar
+
+`matches` y `closest` usan el matcher REAL del crate `css` (el de Firefox), el
+mismo que la cascada: reusarlo y no escribir otro comparador es lo que garantiza
+que `el.matches('.a > .b')` responda igual que si esa regla estuviera en una
+hoja de estilos. Son la base de la delegacion de eventos, que es como funciona
+todo framework.
+
+Detalles del spec que tienen test propio porque su ausencia se nota tarde:
+
+- **`closest` empieza por el propio elemento.** Es lo que hace util al metodo:
+  `e.target.closest('button')` acierta tanto si se pulso el boton como si se
+  pulso el icono de dentro.
+- **`contains` se incluye a si mismo.** Es lo que hace correcto el patron
+  "cerrar el menu si el clic fue fuera": sin ello, pulsar el propio menu lo
+  cerraria.
+- **`append` convierte cadenas en nodos de TEXTO**, no las parsea como HTML.
+  Esa es la propiedad que lo hace seguro frente a `innerHTML`:
+  `el.append(nombreDelUsuario)` no puede inyectar etiquetas.
+- **`prepend(a, b)` deja `a` antes que `b`**, no al reves.
+- **`cloneNode` produce un arbol nuevo sin compartir nodos** con el original; si
+  los compartiera, tocar la copia cambiaria el documento.
+
+#### Un hueco que encontro el propio test
+
+Al escribir `tests/wpt-style/element-methods.html`, dos casos fallaron porque
+`boton.id` era `undefined`: los elementos exponian `tagName` pero **no `id` ni
+`className`**, que son de lo mas usado que hay. Se anadieron como accessors
+VIVOS sobre sus atributos - vivos y no una foto como `tagName`, porque la
+etiqueta de un elemento no cambia nunca pero su `id` y sus clases si.
+
+#### Simplificaciones declaradas
+
+- `dataset` es una foto en cada lectura, no un proxy vivo: escribir en el no
+  cambia el atributo. Leerlo, que es el uso mayoritario, funciona.
+- `outerHTML` no tiene setter: reemplazar el nodo dentro de su padre exige
+  parseo de HTML EN CONTEXTO (un `<td>` suelto se parsea distinto fuera de una
+  tabla). Un setter a medias produciria un arbol equivocado en silencio.
+- El serializador esta escrito a mano y no lo hace `html5ever`: el adaptador
+  `TreeSink` no guarda lo necesario para una reserializacion fiel (orden
+  original de atributos, comillas, mayusculas del fuente). Produce HTML
+  equivalente, no un calco. El orden de atributos se ordena alfabeticamente a
+  proposito: un `HashMap` no tiene orden y sin ordenarlo el mismo elemento
+  daria cadenas distintas entre ejecuciones.
+
+**Tests del Workspace**: 874 pasando, 0 fallando.

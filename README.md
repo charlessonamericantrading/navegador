@@ -23,7 +23,7 @@ solo compilándolo. Las cifras salen de correr la suite de tests el
 | | |
 |---|---|
 | **Motor** | ~25.800 líneas de Rust, 10 crates |
-| **Tests** | 856 pasando, 0 fallando (medido el 2026-09-09) |
+| **Tests** | 874 pasando, 0 fallando (medido el 2026-09-09) |
 | **Red** | HTTP/1.1 + HTTPS real (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies RFC 6265, CORS y CSP |
 | **HTML** | Parseo con `html5ever` (el de Servo), DOM mutable, `<canvas>` 2D context |
 | **CSS** | Cascada con especificidad real, selectores con combinadores (`selectors`, el de Firefox), pseudo-clases, `@media`, `rem`, porcentajes, shorthands (`padding`/`margin` de 1-4 valores, `flex`) |
@@ -96,15 +96,12 @@ que sea.
 
 Lo que bloquea hoy, comprobado contra el código el 2026-09-09:
 
-* **Sin cadena de prototipos DOM.** Cada nodo es un objeto suelto, así que
-  `instanceof HTMLElement` es falso y parchear `Element.prototype` no hace
-  nada. Los bundles hacen ambas cosas al arrancar.
 * **`window` no es el objeto global.** En un navegador `window === globalThis`,
   así que `addEventListener(...)` a secas funciona. Aquí no: lanza
   `ReferenceError` y mata el script.
 * **APIs ausentes:** `AbortController`, `structuredClone`, `crypto`,
   `matchMedia`, `IntersectionObserver`, `ResizeObserver`, `customElements`,
-  `CustomEvent`, `DOMParser`, `closest`, `matches`, `dataset`, `innerText`,
+  `CustomEvent`, `KeyboardEvent`, `MouseEvent`, `DOMParser`, `innerText`,
   `insertAdjacentHTML`, `document.readyState`, `FormData`, `Blob`.
 
 **Los módulos ES ya funcionan desde la Fase 43**, que era el bloqueo anterior a
@@ -115,7 +112,14 @@ empaquetador se ejecuta y pinta su contenido, verificado de punta a punta en
 `engine/crates/core/tests/bundle_modulos.rs`. Lo que sigue faltando de ahí es
 `import()` dinámico y los *import maps*.
 
-Hay una sonda que mide lo demás, no es una impresión: **56 de 114** el
+**La jerarquía de clases del DOM funciona desde la Fase 44**: `instanceof
+HTMLElement` responde bien y un polyfill instalado en `Element.prototype` lo
+ven los elementos ya creados, que son los dos patrones que un framework ejecuta
+al arrancar. Con ella llegaron `matches`, `closest`, `contains`, `remove`,
+`append`, `prepend`, `cloneNode`, `dataset`, `id`, `className`, `outerHTML` y
+un `innerHTML` de verdad.
+
+Hay una sonda que mide lo demás, no es una impresión: **73 de 114** el
 2026-09-09.
 Se ejecuta con la suite y un test impide que el número baje.
 
@@ -152,8 +156,8 @@ descargar todos los subrecursos.
 
 La métrica honesta de un motor de navegador es cuántos tests de
 [Web Platform Tests](https://github.com/web-platform-tests/wpt) pasa. Este
-motor **no ejecuta la suite oficial todavía**: los 24 tests estilo-WPT que
-corre están escritos a mano y pasan los 24. Hasta que ese número exista,
+motor **no ejecuta la suite oficial todavía**: los 42 tests estilo-WPT que
+corre están escritos a mano y pasan los 42. Hasta que ese número exista,
 cualquier afirmación sobre "compatibilidad" —incluida la de este README— es
 una impresión, no un dato.
 
@@ -214,7 +218,7 @@ npm run start          # frontend (Vite) + aplicación Electron
 
 ```bash
 cd engine
-cargo test --workspace          # los 856 tests
+cargo test --workspace          # los 874 tests
 cargo run -p engine-core --bin engine_server   # servidor NDJSON por stdin/stdout
 ```
 

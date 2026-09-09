@@ -32,7 +32,17 @@ use serde_json::json;
 /// | 2026-09-09 | 56/114    | `console`, `URL`, `URLSearchParams`,        |
 /// |            |           | `performance`, `atob`/`btoa`,               |
 /// |            |           | `TextEncoder`/`TextDecoder` (tarea C5)      |
-const MINIMO: usize = 56;
+/// | 2026-09-09 | 65/114    | Jerarquia de clases del DOM: `instanceof` y |
+/// |            |           | polyfills sobre prototipos (tarea C3)       |
+/// | 2026-09-09 | 73/114    | `matches`, `closest`, `contains`, `remove`, |
+/// |            |           | `append`/`prepend`, `cloneNode`, `dataset`, |
+/// |            |           | `innerHTML` real, `outerHTML`, `id`,        |
+/// |            |           | `className`, `isConnected` (tarea C6).      |
+/// |            |           | Incluye corregir un FALSO POSITIVO: la      |
+/// |            |           | sonda daba `innerHTML` por presente sin     |
+/// |            |           | estarlo, porque asignar una propiedad       |
+/// |            |           | cualquiera a un objeto JS siempre funciona  |
+const MINIMO: usize = 73;
 
 /// El total de comprobaciones de la sonda. Se vigila aparte del minimo para
 /// cazar un caso concreto: que alguien "suba" el porcentaje borrando

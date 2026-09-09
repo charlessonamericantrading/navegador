@@ -14,7 +14,7 @@ aquí. Los identificadores entre corchetes remiten a las tareas de `../plan.md`.
 
 **Última verificación contra el código: 2026-09-09** (actualizado tras la Fase 42). Cada entrada de este fichero
 se comprobó con `grep` sobre `engine/crates/*/src` en esa fecha, no se copió de
-`ARCHITECTURE.md`. Estado de la suite: **856 tests pasando, 0 fallando**.
+`ARCHITECTURE.md`. Estado de la suite: **874 tests pasando, 0 fallando**.
 
 ---
 
@@ -45,35 +45,61 @@ normal, no un `Uint8Array`**. Se indexa y se recorre igual, que es lo que hace
 casi todo el código; lo que no funcionará es pasárselo a algo que exija un
 TypedArray de verdad.
 
-### 1.2 DOM: métodos y propiedades `[plan C6]`
+### 1.2 DOM: métodos y propiedades `[plan C6]` — parcialmente cerrado (Fase 44)
 
-`document`: `readyState`, `currentScript`, `write`/`writeln`, `activeElement`,
-`hasFocus`, `createDocumentFragment`, `createComment`, `createRange`, `importNode`,
-`adoptNode`, `getElementsByClassName`, `elementFromPoint` (el hit-testing ya existe
-en `server.rs`, solo falta exponerlo a JS).
+**Ya funcionan**: `matches`, `closest`, `contains`, `remove`, `append`,
+`prepend`, `cloneNode`, `dataset` (solo lectura), `innerHTML` (getter y setter,
+con parseo real), `outerHTML` (solo getter), `isConnected`, `id`, `className`.
 
-`Element`: `closest`, `matches` (el matcher real ya existe en el crate `css`, falta
-el puente), `insertAdjacentHTML`/`Element`/`Text`, `innerText`, `outerHTML`,
-`dataset`, `getAttributeNames`, `toggleAttribute`, `hasAttributes`, `replaceWith`,
-`before`, `after`, `append`, `prepend`, `replaceChildren`, `children`,
-`firstElementChild`/`lastElementChild`/`nextElementSibling`/`previousElementSibling`,
-`childElementCount`, `scrollIntoView`, `focus`/`blur`, `scrollTop`/`Left`/`Width`/
-`Height`, `offsetTop`/`Left`/`Width`/`Height`/`Parent`, `clientWidth`/`Height`.
+`document`: faltan `readyState`, `currentScript`, `write`/`writeln`,
+`activeElement`, `hasFocus`, `createDocumentFragment`, `createComment`,
+`createRange`, `importNode`, `adoptNode`, `getElementsByClassName`,
+`elementFromPoint` (el hit-testing ya existe en `server.rs`, solo falta
+exponerlo a JS).
 
-`Node`: `contains`, `isConnected`, constantes `nodeType`, `nodeName`, `nodeValue`,
-`cloneNode`, `isEqualNode`, `compareDocumentPosition`, `getRootNode`, `normalize`.
+`Element`: faltan `insertAdjacentHTML`/`Element`/`Text`, `innerText`,
+`getAttributeNames`, `toggleAttribute`, `hasAttributes`, `replaceWith`,
+`before`, `after`, `replaceChildren`, `childElementCount`, `scrollIntoView`,
+`focus`/`blur`, `offsetTop`/`Left`/`Width`/`Height`/`Parent`,
+`clientWidth`/`Height`.
+
+`Node`: faltan `nodeName`, `nodeValue`, `isEqualNode`,
+`compareDocumentPosition`, `getRootNode`, `normalize`.
 
 `NodeList`/`HTMLCollection` iterables (`forEach`, `Symbol.iterator`).
 
-### 1.3 Cadena de prototipos `[plan C3]`
+Simplificaciones declaradas de la Fase 44:
 
-No existe. Cada nodo se expone como un objeto suelto con propiedades añadidas a
-mano. Los bundles hacen `instanceof HTMLElement`, `Object.getPrototypeOf(el)` y
-parchean `Element.prototype.foo`; nada de eso puede funcionar hoy.
+- **`dataset` es una foto, no un proxy vivo.** Escribir en él no cambia el
+  atributo. Leerlo, que es el uso mayoritario, funciona.
+- **`outerHTML` no tiene setter.** Reemplazar el nodo dentro de su padre exige
+  parseo de HTML *en contexto* (un `<td>` suelto se parsea distinto fuera de una
+  tabla), que este motor todavía no hace desde JS. Un setter a medias produciría
+  un árbol equivocado en silencio.
+- **El serializador de `innerHTML`/`outerHTML` está escrito a mano**, no lo hace
+  `html5ever`: el adaptador `TreeSink` no guarda lo necesario para una
+  reserialización fiel (orden original de atributos, comillas, mayúsculas del
+  fuente). Produce HTML equivalente, no un calco.
 
-Falta: `EventTarget` → `Node` → `Element` → `HTMLElement` → subclases concretas, más
-`Document`, `Text`, `Comment`, `DocumentFragment`, registrados como globales para
-que `instanceof` funcione.
+### 1.3 Cadena de prototipos `[plan C3]` — cerrada con una salvedad (Fase 44)
+
+**Ya funciona**: `EventTarget` → `Node` → `Element` → `HTMLElement` → subclases
+concretas, más `Document`, `Text`, `Comment`, `DocumentFragment`, registrados
+como globales. `el instanceof HTMLElement` responde bien, `Node.ELEMENT_NODE`
+existe, y `new HTMLDivElement()` lanza `Illegal constructor` como el spec.
+
+**Lo que NO cierra**: los métodos de un elemento siguen viviendo en la propia
+instancia, no en el prototipo, porque `build_element_object` los construye con
+un *closure* que captura su nodo. Consecuencia exacta:
+
+- Un método que el motor **ya tiene** (`appendChild`, `setAttribute`…) tapa al
+  del prototipo. Un envoltorio del estilo `const orig = Element.prototype.appendChild;
+  Element.prototype.appendChild = ...` se instala pero nunca se ejecuta.
+- Un método que el motor **no tiene** sí se hereda, que es el caso de todo
+  polyfill y el que más importa.
+
+Cerrarlo exige que cada método recupere su nodo desde `this` en vez de desde una
+captura, es decir reescribir las ~675 líneas de `build_element_object`.
 
 ### 1.4 Eventos `[plan C4]`
 
