@@ -4536,3 +4536,62 @@ ausencia ahi es una decision, no un olvido.
   y una aproximacion cuando si.
 
 **Tests del Workspace**: 874 pasando, 0 fallando. **Estilo-WPT**: 60.
+
+### Fase 46: El lint de la interfaz vuelve a funcionar, y pasa a bloquear (2026-09-09)
+
+No toca el motor. Cierra el hallazgo colateral de la Fase 41: `npm run lint`
+llevaba roto y nadie lo sabia porque el CI lo tenia marcado como informativo.
+
+#### La causa: una incompatibilidad que no se arregla escribiendo mejor codigo
+
+La interfaz declaraba TypeScript 7 (el port nativo en Go) y `typescript-eslint`
+solo soporta `>=4.8.4 <6.1.0`, incluida su ultima version. Con TS 7 el parser
+revienta antes de analizar un solo fichero:
+
+```
+TypeError: Cannot read properties of undefined (reading 'Cjs')
+```
+
+No habia forma de arreglarlo desde este repositorio: la pieza compatible no
+existe todavia.
+
+#### La decision: bajar TypeScript a 5.9
+
+Se eligio bajar el compilador y recuperar el lint, y no al reves, midiendo lo
+que cuesta cada lado:
+
+- **Lo que se pierde**: la velocidad del compilador nativo. La interfaz son 21
+  modulos y compila en menos de medio segundo con las dos versiones. A esta
+  escala la ventaja de TS 7 no es observable.
+- **Lo que se gana**: las reglas de `react-hooks`, que cazan clases de error
+  reales - dependencias que faltan en un efecto (cierres obsoletos), `setState`
+  dentro de un efecto (bucles de render), lectura de una `ref` durante el
+  render.
+
+Es reversible con una linea en cuanto `typescript-eslint` soporte TS 7.
+
+#### 20 hallazgos de golpe, y por que no se arreglaron todos
+
+Al volver a funcionar, el lint encontro 20 problemas: 9 `no-explicit-any`, 5
+`react-hooks/refs`, 2 `react-hooks/exhaustive-deps`, y cuatro sueltos.
+
+Arreglar los de `react-hooks` a ciegas puede CAMBIAR el comportamiento de la
+interfaz: el "arreglo" de un `exhaustive-deps` es anadir una dependencia, y eso
+altera cuando se re-ejecuta el efecto. No es una limpieza cosmetica.
+
+Asi que el lint pasa a bloquear como TRINQUETE
+(`frontend/scripts/lint-ratchet.mjs`): falla si el numero SUBE, no si es mayor
+que cero. Exigir cero habria dejado la puerta en rojo durante semanas, y un CI
+rojo permanente deja de leerse - que es peor que no tenerlo.
+
+Es el mismo patron que `crates/core/tests/api_probe.rs` usa para la sonda de
+APIs del motor, y por la misma razon: convierte una deuda grande en una que solo
+puede menguar.
+
+El trinquete se probo en las dos direcciones antes de darlo por bueno (falla con
+la base a 19, pasa con la base a 20). Uno que no se ha visto fallar no se sabe
+si funciona.
+
+Detalle de implementacion: usa la API de `eslint` en vez de lanzar `npx`.
+Lanzar un `.cmd` desde Node en Windows falla con `EINVAL`, y el proceso extra no
+aportaba nada.

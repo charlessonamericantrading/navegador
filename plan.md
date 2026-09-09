@@ -1170,7 +1170,7 @@ Marcar aquí al cerrar. Cada ✅ debe tener su Fase en `ARCHITECTURE.md`.
 
 ### B — CI
 - [x] B1 `engine.yml` (build + tests + clippy `-D warnings` + WPT + `cargo audit`). **`fmt` NO se exige**, ver la cabecera del workflow. *Branch protection* queda por activar en GitHub (ajuste del repo, no del código)
-- [x] B2 `app.yml` (tipos + build de la interfaz + `electron-builder --dir`). Lint informativo: `typescript-eslint` no soporta TypeScript 7
+- [x] B2 `app.yml` (tipos + build de la interfaz + `electron-builder --dir` + lint). **Lint arreglado y bloqueante** (Fase 46): TypeScript bajado a 5.9 para recuperar `typescript-eslint`, y trinquete que falla si los hallazgos suben (hoy 20)
 - [x] B3 `wpt_runner` en CI — los 24 tests estilo-WPT pasan
 - [x] B4 Test de humo NDJSON: 14 tests contra el binario real, cubren las 16 variantes más entrada inválida, con guardia anti-regresión de cobertura
 

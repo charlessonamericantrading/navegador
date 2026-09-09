@@ -4,17 +4,17 @@
 # de Rust: que la interfaz compila con tipos correctos, que el bundle de
 # produccion se genera, y que `electron-builder` sigue sabiendo empaquetar.
 #
-# Sobre ESLint: hoy NO bloquea, y no por dejadez. La interfaz declara
-# TypeScript 7 (el port nativo, mucho mas rapido), pero `typescript-eslint`
-# —incluida su ultima version, 8.70— solo soporta TypeScript `<6.1.0`. Con TS 7
-# el parser revienta antes de analizar un solo fichero
-# (`TypeError: Cannot read properties of undefined (reading 'Cjs')`). No es un
-# fallo del codigo de este repo ni algo que se arregle escribiendo mejor
-# TypeScript: es que la pieza compatible todavia no existe. Las alternativas
-# son bajar TypeScript a 5.x (perdiendo el compilador rapido) o esperar a que
-# `typescript-eslint` soporte TS 7; mientras tanto, `tsc` SI comprueba los
-# tipos de verdad y eso si bloquea, que es la mitad que de verdad atrapa
-# errores.
+# Sobre ESLint: bloquea, pero como TRINQUETE. Falla si el numero de hallazgos
+# SUBE, no si es mayor que cero (ver `frontend/scripts/lint-ratchet.mjs`).
+#
+# El motivo esta en la Fase 46: el lint llevaba roto porque la interfaz
+# declaraba TypeScript 7 y `typescript-eslint` --incluida su ultima version--
+# solo soporta `<6.1.0`. Al bajar TypeScript a 5.9 volvio a funcionar y
+# aparecieron 20 hallazgos de golpe. Exigir cero habria dejado esta puerta en
+# rojo hasta arreglarlos todos, y varios son de `react-hooks/exhaustive-deps`,
+# cuyo arreglo puede cambiar el comportamiento de la interfaz. Un CI rojo
+# permanente deja de leerse, que es peor que no tenerlo.
+
 name: app
 
 on:
@@ -53,12 +53,10 @@ jobs:
         working-directory: frontend
         run: npm run build
 
-      # Informativo mientras dure la incompatibilidad TS 7 / typescript-eslint
-      # descrita en la cabecera de este fichero.
-      - name: Lint (informativo)
+      # Trinquete, no exigencia de cero. Ver la cabecera de este fichero.
+      - name: Lint (sin regresiones)
         working-directory: frontend
-        continue-on-error: true
-        run: npm run lint
+        run: npm run lint:ci
 
   desktop:
     runs-on: windows-latest
