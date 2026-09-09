@@ -215,8 +215,8 @@ fn eval_calc(expr: &str, font_px: f32, viewport: (f32, f32)) -> Option<f32> {
     let mut tokens: Vec<String> = Vec::new();
     let mut actual = String::new();
     let mut anterior_es_valor = false;
-    let mut chars = expr.chars().peekable();
-    while let Some(c) = chars.next() {
+    let chars = expr.chars().peekable();
+    for c in chars {
         match c {
             '(' | ')' => {
                 if !actual.trim().is_empty() {
@@ -3240,9 +3240,8 @@ impl LayoutTreeBuilder {
                 }
                 let filas_abarcadas = cell.rowspan.max(1);
                 if filas_abarcadas > 1 {
-                    for c in col..(col + span).min(column_count) {
-                        ocupadas_medida[c] = filas_abarcadas;
-                    }
+                    let fin = (col + span).min(column_count);
+                    ocupadas_medida[col..fin].fill(filas_abarcadas);
                 }
                 col += span.max(1);
             }
@@ -3347,13 +3346,12 @@ impl LayoutTreeBuilder {
                 let span = (cell.colspan as usize).clamp(1, column_count - col);
                 let filas_abarcadas = cell.rowspan.max(1);
                 if filas_abarcadas > 1 {
-                    for c in col..(col + span).min(column_count) {
-                        // El contador se decrementa al CERRAR cada fila,
-                        // incluida esta, asi que se apunta el numero total de
-                        // filas y no una menos: si no, la ocupacion se agota
-                        // justo antes de la primera fila que deberia saltar.
-                        ocupadas[c] = filas_abarcadas;
-                    }
+                    // El contador se decrementa al CERRAR cada fila,
+                    // incluida esta, asi que se apunta el numero total de
+                    // filas y no una menos: si no, la ocupacion se agota
+                    // justo antes de la primera fila que deberia saltar.
+                    let fin = (col + span).min(column_count);
+                    ocupadas[col..fin].fill(filas_abarcadas);
                     celdas_que_abarcan.push((indice_fila, indice_celda, filas_abarcadas));
                 }
                 // Una celda con `colspan` ocupa el ancho SUMADO de todas las

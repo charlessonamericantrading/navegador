@@ -197,7 +197,7 @@ fn build_clip_mask(width: u32, height: u32, stack: &[Rect], scroll_offset_y: f32
 /// lado mas corto por quien llama (evita un rectangulo "imposible" con
 /// esquinas que se solaparian). `None` si `radius <= 0` (sin nada que
 /// redondear - quien llama cae al `fill_rect` normal en ese caso).
-const KAPPA: f32 = 0.5522847498;
+const KAPPA: f32 = 0.552_284_8;
 
 fn rounded_rect_path(rect: SkiaRect, radius: f32) -> Option<Path> {
     if radius <= 0.0 {
@@ -317,7 +317,7 @@ fn box_blur_horizontal(data: &mut [u8], width: usize, height: usize, radius: u32
         return;
     }
     let radius = radius as i64;
-    let window = (radius * 2 + 1) as i64;
+    let window = radius * 2 + 1;
     let mut row = vec![0u8; width * 4];
     for y in 0..height {
         let base = y * width * 4;
@@ -350,7 +350,7 @@ fn box_blur_vertical(data: &mut [u8], width: usize, height: usize, radius: u32) 
         return;
     }
     let radius = radius as i64;
-    let window = (radius * 2 + 1) as i64;
+    let window = radius * 2 + 1;
     let mut col = vec![0u8; height * 4];
     for x in 0..width {
         for y in 0..height {
@@ -678,7 +678,7 @@ mod tests {
         let items = vec![DisplayItem::SolidRect { rect: Rect { x: 0.0, y: 0.0, width: side, height: side }, color: [0, 0, 0, 255], radius }];
         paint_display_list(&mut pixmap, &items, None, 0.0);
 
-        let painted_pixels = pixmap.data().chunks_exact(4).filter(|p| p[3] > 128).count() as f32;
+        let painted_pixels = pixmap.data().as_chunks::<4>().0.iter().filter(|p| p[3] > 128).count() as f32;
         let circle_area = std::f32::consts::PI * radius * radius;
         let relative_error = (painted_pixels - circle_area).abs() / circle_area;
         assert!(relative_error < 0.01, "el area pintada ({painted_pixels}px) deberia acercarse al area real del circulo ({circle_area}px, error {relative_error})");
@@ -757,7 +757,7 @@ mod tests {
             paint_display_list(&mut pixmap, &items, None, 0.0);
             pixmap
         };
-        let count_partial_alpha = |pixmap: &Pixmap| pixmap.data().chunks_exact(4).filter(|p| p[3] > 0 && p[3] < 255).count();
+        let count_partial_alpha = |pixmap: &Pixmap| pixmap.data().as_chunks::<4>().0.iter().filter(|p| p[3] > 0 && p[3] < 255).count();
 
         let hard = paint_with(0.0);
         let soft = paint_with(20.0);

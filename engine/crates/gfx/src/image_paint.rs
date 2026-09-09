@@ -17,7 +17,7 @@ use tiny_skia::{IntSize, Mask, Pixmap, PixmapPaint, Transform};
 /// falta distinguir el formato aqui.
 fn to_premultiplied_pixmap(image: &DecodedImage) -> Option<Pixmap> {
     let mut data = image.rgba.clone();
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         let alpha = pixel[3] as u32;
         pixel[0] = ((pixel[0] as u32 * alpha) / 255) as u8;
         pixel[1] = ((pixel[1] as u32 * alpha) / 255) as u8;

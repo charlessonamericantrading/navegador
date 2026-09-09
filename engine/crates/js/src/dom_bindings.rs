@@ -805,7 +805,7 @@ fn dispatch_event_to_listeners(
         .map(|listeners| {
             listeners
                 .iter()
-                .filter(|(t, _, c)| t == event_type && phase_capture.map_or(true, |want| *c == want))
+                .filter(|(t, _, c)| t == event_type && phase_capture.is_none_or(|want| *c == want))
                 .map(|(_, l, _)| l.clone())
                 .collect()
         })
@@ -813,7 +813,7 @@ fn dispatch_event_to_listeners(
 
     for listener in matching {
         if let Some(func) = JsFunction::from_object(listener) {
-            func.call(this_value, &[event_value.clone()], context)?;
+            func.call(this_value, std::slice::from_ref(event_value), context)?;
         }
     }
     Ok(())

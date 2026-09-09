@@ -244,7 +244,7 @@ pub fn register_mutation_observer(context: &mut Context, bindings: DocumentBindi
 
             capture.0.lock().unwrap().push(Observer {
                 id,
-                callback: callback.into(),
+                callback,
                 observer_object: observer_object.clone(),
                 targets: Vec::new(),
                 queued: Vec::new(),

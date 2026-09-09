@@ -86,12 +86,10 @@ impl<'i> AtRuleParser<'i> for RuleParser {
     ) -> Result<Self::AtRule, ParseError<'i, Self::Error>> {
         let mut nested_parser = RuleParser;
         let mut rules = Vec::new();
-        for result in StyleSheetParser::new(input, &mut nested_parser) {
-            if let Ok(inner) = result {
-                for mut rule in inner {
-                    rule.media.get_or_insert_with(|| prelude.clone());
-                    rules.push(rule);
-                }
+        for inner in StyleSheetParser::new(input, &mut nested_parser).flatten() {
+            for mut rule in inner {
+                rule.media.get_or_insert_with(|| prelude.clone());
+                rules.push(rule);
             }
         }
         Ok(rules)
@@ -1218,6 +1216,6 @@ mod shorthand_expansion_tests {
     #[test]
     fn values_with_parentheses_are_left_alone_instead_of_being_split() {
         let d = decls("div { padding: calc(10px + 2px) 4px; }");
-        assert!(d.get("padding-top").is_none(), "no deberia inventar longhands a partir de un calc()");
+        assert!(!d.contains_key("padding-top"), "no deberia inventar longhands a partir de un calc()");
     }
 }

@@ -38,6 +38,12 @@ pub struct JsRuntime {
     timers: Option<crate::timers::TimerQueue>,
 }
 
+impl Default for JsRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JsRuntime {
     pub fn new() -> Self {
         let mut context = Context::default();

@@ -29,3 +29,6 @@ engine-js = { path = "../js" }
 engine-text = { path = "../text" }
 engine-image = { path = "../image" }
 engine-ai = { path = "../ai" }
+
+[lints]
+workspace = true

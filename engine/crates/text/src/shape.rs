@@ -97,6 +97,10 @@ struct FaceMetrics {
     line_gap: f32,
 }
 
+/// La cache de `TEXT_WIDTHS`, con nombre propio porque su clave es una
+/// tripleta y el tipo escrito entero no se lee.
+type TextWidthCache = std::collections::HashMap<(u64, u32, Box<str>), f32>;
+
 thread_local! {
     /// `id de fuente -> metricas de su cara`. Ver `FaceMetrics`.
     static FACE_METRICS: std::cell::RefCell<std::collections::HashMap<u64, Option<FaceMetrics>>> =
@@ -114,7 +118,7 @@ thread_local! {
     /// `rustybuzz` no es `Sync` y porque asi no hay contencion; la clave
     /// lleva el id de fuente (ver `SystemFont::cache_id`) para que dos
     /// fuentes distintas no compartan entradas jamas.
-    static TEXT_WIDTHS: std::cell::RefCell<std::collections::HashMap<(u64, u32, Box<str>), f32>> =
+    static TEXT_WIDTHS: std::cell::RefCell<TextWidthCache> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 

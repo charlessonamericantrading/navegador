@@ -77,31 +77,6 @@ pub fn execute_inline_scripts_with_harness(dom_root: &Arc<RwLock<Node>>, externa
     (script_results, test_results)
 }
 
-/// Igual que `execute_inline_scripts`, pero DEVUELVE el `JsRuntime` en vez
-/// de dropearlo al terminar - necesario para poder disparar eventos MAS
-/// TARDE (`JsRuntime::dispatch_event`) sobre los listeners que un script
-/// registro con `addEventListener` durante la carga inicial; sin esto, el
-/// `EventRegistry` entero (y con el, cualquier listener) se destruye antes
-/// de que la ventana siquiera se abra. A diferencia de
-/// `execute_inline_scripts`/`execute_inline_scripts_with_harness` (que se
-/// saltan crear el runtime si no hay ningun `<script>`, porque no habria
-/// nada que evaluar), esta SIEMPRE crea y enlaza uno, incluso sin scripts -
-/// quien llama quiere un runtime vivo pase lo que pase, no solo cuando hubo
-/// algo que ejecutar al principio.
-///
-/// `network`: `Some` registra `fetch()` real (Fase 4.3, ver
-/// `engine_js::fetch`) y `XMLHttpRequest` (Fase 9, ver `engine_js::xhr`)
-/// ANTES de correr ningun script - asi el PRIMER
-/// `<script>` de la pagina ya lo ve disponible, no solo listeners
-/// registrados mas tarde. `None` (p.ej. `core::main`, que no descarga
-/// recursos externos por diseño) deja `fetch` sin definir - `fetch(...)`
-/// en JS lanza `ReferenceError`, la respuesta honesta cuando de verdad no
-/// hay red disponible en ese contexto - y lo mismo para `new
-/// XMLHttpRequest()`.
-///
-/// `storage`: `Some` registra `localStorage`/`sessionStorage` acotados al
-/// origen que se pase (Fase 15, ver `StorageContext` justo debajo).
-
 /// El almacen de Web Storage de la sesion mas el ORIGEN de la pagina que
 /// se esta construyendo - los dos datos que `localStorage`/
 /// `sessionStorage` necesitan y que solo `core::server` conoce a la vez
@@ -131,6 +106,30 @@ pub struct StorageContext {
     pub url: String,
 }
 
+/// Igual que `execute_inline_scripts`, pero DEVUELVE el `JsRuntime` en vez
+/// de dropearlo al terminar - necesario para poder disparar eventos MAS
+/// TARDE (`JsRuntime::dispatch_event`) sobre los listeners que un script
+/// registro con `addEventListener` durante la carga inicial; sin esto, el
+/// `EventRegistry` entero (y con el, cualquier listener) se destruye antes
+/// de que la ventana siquiera se abra. A diferencia de
+/// `execute_inline_scripts`/`execute_inline_scripts_with_harness` (que se
+/// saltan crear el runtime si no hay ningun `<script>`, porque no habria
+/// nada que evaluar), esta SIEMPRE crea y enlaza uno, incluso sin scripts -
+/// quien llama quiere un runtime vivo pase lo que pase, no solo cuando hubo
+/// algo que ejecutar al principio.
+///
+/// `network`: `Some` registra `fetch()` real (Fase 4.3, ver
+/// `engine_js::fetch`) y `XMLHttpRequest` (Fase 9, ver `engine_js::xhr`)
+/// ANTES de correr ningun script - asi el PRIMER
+/// `<script>` de la pagina ya lo ve disponible, no solo listeners
+/// registrados mas tarde. `None` (p.ej. `core::main`, que no descarga
+/// recursos externos por diseño) deja `fetch` sin definir - `fetch(...)`
+/// en JS lanza `ReferenceError`, la respuesta honesta cuando de verdad no
+/// hay red disponible en ese contexto - y lo mismo para `new
+/// XMLHttpRequest()`.
+///
+/// `storage`: `Some` registra `localStorage`/`sessionStorage` acotados al
+/// origen que se pase (Fase 15, ver `StorageContext` justo encima).
 pub fn execute_inline_scripts_keeping_runtime(
     dom_root: &Arc<RwLock<Node>>,
     external_scripts: &HashMap<String, String>,

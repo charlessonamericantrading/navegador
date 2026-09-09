@@ -119,7 +119,7 @@ fn proxy_get(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
     // lee como `undefined`, igual que en un navegador real
     // (`localStorage.getItem('x')` es `null`, pero `localStorage.x` es
     // `undefined` si `x` no esta guardado).
-    let Some(capture) = capture_from_target(&target) else { return Ok(JsValue::undefined()) };
+    let Some(capture) = capture_from_target(target) else { return Ok(JsValue::undefined()) };
     let Ok(store) = capture.storage.lock() else { return Ok(JsValue::undefined()) };
     Ok(match store.get_item(capture.kind, &capture.origin, &key) {
         Some(value) => js_string!(value).into(),
@@ -142,7 +142,7 @@ fn proxy_set(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
         return Ok(JsValue::from(target.set(pk, value, false, context)?));
     };
 
-    let Some(capture) = capture_from_target(&target) else { return Ok(JsValue::from(false)) };
+    let Some(capture) = capture_from_target(target) else { return Ok(JsValue::from(false)) };
     let value_str = to_storage_string(Some(&value), context)?;
     let Ok(mut store) = capture.storage.lock() else { return Ok(JsValue::from(false)) };
     match store.set_item(capture.kind, &capture.origin, &key, &value_str) {
@@ -168,7 +168,7 @@ fn proxy_has(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
     if target.has_own_property(js_string!(key.clone()), context)? {
         return Ok(JsValue::from(true));
     }
-    let Some(capture) = capture_from_target(&target) else { return Ok(JsValue::from(false)) };
+    let Some(capture) = capture_from_target(target) else { return Ok(JsValue::from(false)) };
     let Ok(store) = capture.storage.lock() else { return Ok(JsValue::from(false)) };
     Ok(JsValue::from(store.get_item(capture.kind, &capture.origin, &key).is_some()))
 }
@@ -186,7 +186,7 @@ fn proxy_delete_property(_this: &JsValue, args: &[JsValue], context: &mut Contex
     if target.has_own_property(js_string!(key.clone()), context)? {
         return Ok(JsValue::from(false));
     }
-    let Some(capture) = capture_from_target(&target) else { return Ok(JsValue::from(true)) };
+    let Some(capture) = capture_from_target(target) else { return Ok(JsValue::from(true)) };
     if let Ok(mut store) = capture.storage.lock() {
         store.remove_item(capture.kind, &capture.origin, &key);
     }

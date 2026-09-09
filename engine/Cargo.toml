@@ -57,3 +57,28 @@ dirs = "5"
 # la clase de dato que la doctrina de dependencias dice que no vale la pena
 # mantener a mano.
 psl = "2.1.226"
+
+# Lints compartidos por los 10 crates (cada uno los hereda con
+# `[lints] workspace = true`). Lo que se permite aqui se permite por una
+# razon escrita, no por comodidad: `cargo clippy -D warnings` es una puerta
+# de CI, y una puerta que se salta con `#[allow]` sueltos por el codigo deja
+# de ser una puerta.
+[workspace.lints.clippy]
+# La documentacion de este motor son parrafos de prosa dentro de `///`, no
+# listas de markdown. Este lint pide reindentar la continuacion de cualquier
+# linea que EMPIECE por un guion, y en un texto en castellano un guion al
+# principio de linea suele ser un inciso, no una vinieta. Reformatear ~35
+# bloques de prosa para satisfacerlo empeoraria justo lo que este proyecto
+# cuida mas.
+doc_lazy_continuation = "allow"
+# Cinco funciones del pipeline (layout de tablas, pintado, `build_page`)
+# reciben 8-12 argumentos porque llevan el estado de una pasada completa.
+# Agruparlos en structs es refactor real con riesgo de regresion, no un
+# arreglo de estilo; esta anotado como deuda tecnica en
+# `huecos_sin_resolver.md` en vez de silenciado y olvidado.
+too_many_arguments = "allow"
+# El DOM es `Arc<RwLock<Node>>` y `Node` no es `Send`/`Sync` a proposito:
+# vive en un solo hilo junto al runtime de JS, que tampoco lo es (`boa`).
+# El `Arc` esta por el grafo compartido con ciclos padre/hijo, no por
+# concurrencia. Ver la doctrina de crates en `ARCHITECTURE.md`.
+arc_with_non_send_sync = "allow"

@@ -580,7 +580,7 @@ impl CookieStore {
         // Orden del spec (§5.4.2): ruta mas especifica primero. Algunos
         // servidores reales leen solo el primer valor de un nombre repetido,
         // asi que el orden importa de verdad, no es cosmetico.
-        matching.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        matching.sort_by_key(|c| std::cmp::Reverse(c.path.len()));
         Some(matching)
     }
 

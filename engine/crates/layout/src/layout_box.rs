@@ -336,6 +336,56 @@ impl LayoutBox {
     }
 }
 
+/// El color de fondo que debe pintar el LIENZO entero, propagado desde el
+/// elemento raiz segun el spec (CSS Backgrounds 3, "The Canvas Background").
+///
+/// Es una de esas reglas que parecen un detalle y se notan muchisimo: el
+/// fondo de `<html>` (o, si `<html>` no declara ninguno, el de `<body>`) no
+/// se pinta solo en la caja de ese elemento, sino en TODO el viewport,
+/// incluso por debajo de donde llega el contenido. Sin esto, una pagina con
+/// `body { background: #111 }` se veia como una franja oscura del alto del
+/// contenido sobre un fondo gris claro - el sintoma clasico de "esto esta
+/// roto" en cualquier web con tema oscuro. Verificado en vivo antes de
+/// arreglarlo.
+///
+/// Devuelve el VALOR CSS sin interpretar (`"#2244aa"`, `"red"`): quien
+/// pinta (`engine-gfx`) ya tiene su propio parseo de color, y duplicarlo
+/// aqui seria una segunda fuente de verdad sobre que es un color valido.
+///
+/// NO implementado: que `<body>` deje de pintar su propio fondo cuando este
+/// se ha propagado (el spec dice que el elemento cede el fondo al lienzo).
+/// Como se pinta el mismo color en ambos sitios, el resultado visible es
+/// identico; solo se notaria con fondos semitransparentes superpuestos.
+pub fn canvas_background(layout_root: &LayoutBox) -> Option<String> {
+    let html = find_by_tag(layout_root, "html");
+    if let Some(color) = html.and_then(background_color_of) {
+        return Some(color);
+    }
+    find_by_tag(layout_root, "body").and_then(background_color_of)
+}
+
+fn background_color_of(layout_box: &LayoutBox) -> Option<String> {
+    layout_box.computed_style.get("background-color").cloned()
+}
+
+/// Primera caja en preorden cuyo nodo del DOM tiene esta etiqueta. Se busca
+/// por el DOM y no por posicion en el arbol porque la caja raiz es
+/// sintetica (envuelve el viewport) y no siempre hay un `<html>` explicito
+/// en el HTML original - `html5ever` lo inserta, pero la forma del arbol de
+/// layout depende ademas de `display`.
+fn find_by_tag<'a>(layout_box: &'a LayoutBox, tag: &str) -> Option<&'a LayoutBox> {
+    if let Some(node) = &layout_box.dom_node {
+        if let Ok(node) = node.read() {
+            if let engine_dom::NodeType::Element { tag_name, .. } = &node.node_type {
+                if tag_name.eq_ignore_ascii_case(tag) {
+                    return Some(layout_box);
+                }
+            }
+        }
+    }
+    layout_box.children.iter().find_map(|child| find_by_tag(child, tag))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,54 +547,4 @@ mod tests {
         root.children.push(child);
         assert_eq!(root.content_extent(), 1000.0, "900 + 100 del nieto, no el borde del hijo (100) ni el de la raiz (100)");
     }
-}
-
-/// El color de fondo que debe pintar el LIENZO entero, propagado desde el
-/// elemento raiz segun el spec (CSS Backgrounds 3, "The Canvas Background").
-///
-/// Es una de esas reglas que parecen un detalle y se notan muchisimo: el
-/// fondo de `<html>` (o, si `<html>` no declara ninguno, el de `<body>`) no
-/// se pinta solo en la caja de ese elemento, sino en TODO el viewport,
-/// incluso por debajo de donde llega el contenido. Sin esto, una pagina con
-/// `body { background: #111 }` se veia como una franja oscura del alto del
-/// contenido sobre un fondo gris claro - el sintoma clasico de "esto esta
-/// roto" en cualquier web con tema oscuro. Verificado en vivo antes de
-/// arreglarlo.
-///
-/// Devuelve el VALOR CSS sin interpretar (`"#2244aa"`, `"red"`): quien
-/// pinta (`engine-gfx`) ya tiene su propio parseo de color, y duplicarlo
-/// aqui seria una segunda fuente de verdad sobre que es un color valido.
-///
-/// NO implementado: que `<body>` deje de pintar su propio fondo cuando este
-/// se ha propagado (el spec dice que el elemento cede el fondo al lienzo).
-/// Como se pinta el mismo color en ambos sitios, el resultado visible es
-/// identico; solo se notaria con fondos semitransparentes superpuestos.
-pub fn canvas_background(layout_root: &LayoutBox) -> Option<String> {
-    let html = find_by_tag(layout_root, "html");
-    if let Some(color) = html.and_then(background_color_of) {
-        return Some(color);
-    }
-    find_by_tag(layout_root, "body").and_then(background_color_of)
-}
-
-fn background_color_of(layout_box: &LayoutBox) -> Option<String> {
-    layout_box.computed_style.get("background-color").cloned()
-}
-
-/// Primera caja en preorden cuyo nodo del DOM tiene esta etiqueta. Se busca
-/// por el DOM y no por posicion en el arbol porque la caja raiz es
-/// sintetica (envuelve el viewport) y no siempre hay un `<html>` explicito
-/// en el HTML original - `html5ever` lo inserta, pero la forma del arbol de
-/// layout depende ademas de `display`.
-fn find_by_tag<'a>(layout_box: &'a LayoutBox, tag: &str) -> Option<&'a LayoutBox> {
-    if let Some(node) = &layout_box.dom_node {
-        if let Ok(node) = node.read() {
-            if let engine_dom::NodeType::Element { tag_name, .. } = &node.node_type {
-                if tag_name.eq_ignore_ascii_case(tag) {
-                    return Some(layout_box);
-                }
-            }
-        }
-    }
-    layout_box.children.iter().find_map(|child| find_by_tag(child, tag))
 }

@@ -152,6 +152,16 @@ pub struct NetworkEngine {
 /// descubrio ejecutando el binario de verdad, no solo compilandolo.
 static CRYPTO_PROVIDER_INIT: std::sync::Once = std::sync::Once::new();
 
+/// Equivale a `NetworkEngine::new()`: sin persistencia de cookies a disco.
+/// Existe para que el tipo cumpla el contrato que Rust espera de cualquier
+/// tipo con un `new()` sin argumentos, no porque construirlo por defecto sea
+/// el camino del producto (ese es `with_persistent_cookies`).
+impl Default for NetworkEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NetworkEngine {
     /// Sin persistencia de cookies a disco - la que usan TODOS los tests de
     /// este archivo y de `engine-js` (ver el aviso de `CookieStore::new`) y
