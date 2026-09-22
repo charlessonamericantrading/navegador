@@ -4595,3 +4595,33 @@ si funciona.
 Detalle de implementacion: usa la API de `eslint` en vez de lanzar `npx`.
 Lanzar un `.cmd` desde Node en Windows falla con `EINVAL`, y el proceso extra no
 aportaba nada.
+
+### Fase 47: `wpt_runner` deja de aprobar documentos que no ejecuto (2026-09-23)
+
+Primera tarea del backlog del plan maestro (`plan.md`, F03 y seccion 9). El
+runner tiraba los resultados de script y trataba un documento sin tests como
+neutro, asi que un fixture cuyo script lanzaba antes de llegar a `test(...)`
+imprimia `0 pasaron, 0 fallaron, 0 en total` y salia con codigo 0.
+
+#### Estado del arnes frente a subtests
+
+Se separa lo mismo que separa `testharness.js`: el estado del documento y el
+resultado de cada subtest. Un documento termina en `HARNESS-ERROR` si no se
+pudo leer, si alguno de sus `<script>` acabo con una excepcion no capturada o
+si no registro ningun `test(...)` (lo que tambien cubre que el propio arnes no
+llegara a registrarse). Una excepcion DESPUES de tests que pasaron conserva
+esos subtests, pero el documento sigue contando como incompleto.
+
+Codigos de salida: `0` aprobado, `1` subtests fallidos, `2` uso, `3` algun
+`HARNESS-ERROR`. El `3` tiene prioridad sobre el `1`: con resultados
+incompletos, el recuento de fallos no es fiable. El CI (`engine.yml`) ya
+invocaba el runner, asi que la puerta endurecida no requirio cambios alli.
+
+La regla vive en una funcion pura (`classify_document`) con sus tests en el
+propio binario; `scripting.rs` fija el contrato del que depende (la excepcion
+llega como `Err` en los resultados de script).
+
+#### Lo que NO cambia todavia
+
+Sin timeout por documento ni aislamiento de procesos: un fixture con un bucle
+infinito sigue colgando el runner entero. Es la siguiente tarea del backlog.

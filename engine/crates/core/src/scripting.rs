@@ -568,6 +568,18 @@ mod tests {
         assert!(message.contains("no deberian ser iguales"));
     }
 
+    /// Contrato del que depende `wpt_runner` para no dar un falso verde: una
+    /// excepcion FUERA de `test(...)` no desaparece, llega como `Err` en los
+    /// resultados de script aunque no se haya registrado ningun test.
+    #[test]
+    fn execute_inline_scripts_with_harness_reports_an_uncaught_exception_outside_tests() {
+        let dom = HtmlParser::parse("<html><body><script>noExiste(); test(function() {}, 'nunca llega');</script></body></html>");
+        let (script_results, test_results) = execute_inline_scripts_with_harness(&dom, &HashMap::new(), (800.0, 600.0));
+        assert!(test_results.is_empty());
+        let error = script_results[0].as_ref().expect_err("la excepcion deberia llegar como Err");
+        assert!(error.contains("noExiste"), "{error}");
+    }
+
     /// El punto real de esta funcion: `document.*` Y `test`/`assert_*`
     /// disponibles A LA VEZ en el mismo script, para poder escribir tests
     /// estilo WPT que manipulan el DOM real y lo comprueban con el arnes.
