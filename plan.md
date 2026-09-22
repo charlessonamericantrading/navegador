@@ -1,1271 +1,1290 @@
-# plan.md — Plan de ataque completo de Navegador IA
+# Plan maestro de Navegador IA y de su motor web
 
-> Fecha de elaboración: 2026-09-09. Rama de partida: `fix/paginas-vacias-y-rendimiento`
-> (11 commits por delante de `main`). Estado medido, no leído: `cargo test --workspace`
-> ejecutado hoy → **819 tests pasando, 0 fallando** en los 10 crates.
->
-> **Progreso: bloques A y B cerrados** (Fase 41), salvo A1 (abrir el PR, requiere
-> decisión) y A5 (reevaluada como innecesaria). **Del bloque C: C1, C3 y C4
-> cerrados; C5, C6, C7 y C9 parcialmente** (Fases 42 a 45). El bloqueo estructural
-> que impedía que cualquier bundle arrancara está resuelto. Superficie de
-> plataforma medida: **85/114**, y 60 tests estilo-WPT.
-> Ver el [checklist maestro](#15-checklist-maestro).
->
-> Este documento sigue la misma doctrina que `engine/ARCHITECTURE.md`: cada tarea
-> dice QUÉ falta, DÓNDE está el hueco en el código, CÓMO se verifica que quedó
-> cerrado y QUÉ NO se hace a propósito. Cuando una tarea se cierre, se marca aquí
-> y se documenta como una Fase nueva en `ARCHITECTURE.md` (que sigue siendo la
-> fuente de verdad; si este plan lo contradice, gana `ARCHITECTURE.md`).
+**Revisión:** 21 de septiembre de 2026.
 
----
+**Código analizado:** `888a62593ad46c36cb2b518edb00251d8c0e5f9e`.
+
+**Rama local:** `fix/paginas-vacias-y-rendimiento`.
+
+**Objetivo:** convertir el prototipo actual en un navegador seguro, compatible y mantenible, desarrollar su motor propio y demostrar ventajas concretas frente a Google Chrome.
+
+**Alcance de esta entrega:** análisis y planificación; no se han implementado las correcciones descritas.
+
+**Plan anterior conservado íntegramente:** [plan del 09-09-2026](docs/plans/plan-2026-09-09.md).
 
 ## Índice
 
-- [0. Cómo usar este plan](#0-cómo-usar-este-plan)
-- [1. Diagnóstico: qué hay y qué no](#1-diagnóstico-qué-hay-y-qué-no)
-- [2. Bloque A — Higiene inmediata (1-2 días)](#2-bloque-a--higiene-inmediata)
-- [3. Bloque B — Integración continua y calidad (2-3 días)](#3-bloque-b--integración-continua-y-calidad)
-- [4. Bloque C — Web moderna: que los bundles no mueran (el techo del producto)](#4-bloque-c--web-moderna)
-- [5. Bloque D — CSS y layout pendientes](#5-bloque-d--css-y-layout-pendientes)
-- [6. Bloque E — Red: caché HTTP, HTTP/2, `@import`](#6-bloque-e--red)
-- [7. Bloque F — Seguridad: sandbox de proceso](#7-bloque-f--seguridad-sandbox-de-proceso)
-- [8. Bloque G — Plataforma web ausente (iframe, media, workers, sockets, IndexedDB, WebGL)](#8-bloque-g--plataforma-web-ausente)
-- [9. Bloque H — Compatibilidad medible: Web Platform Tests reales](#9-bloque-h--compatibilidad-medible-wpt)
-- [10. Bloque I — Producto: IA, Electron, backend, distribución](#10-bloque-i--producto)
-- [11. Bloque J — Multiplataforma](#11-bloque-j--multiplataforma)
-- [12. Bloque K — Rendimiento](#12-bloque-k--rendimiento)
-- [13. Orden recomendado y dependencias entre bloques](#13-orden-recomendado-y-dependencias)
-- [14. Lo que NO se va a hacer (y por qué)](#14-lo-que-no-se-va-a-hacer)
-- [15. Checklist maestro](#15-checklist-maestro)
+1. [Diagnóstico y evidencias](#1-diagnóstico-y-evidencias)
+2. [Qué significa superar a Chrome](#2-qué-significa-superar-a-chrome)
+3. [Arquitectura objetivo y reglas de desarrollo](#3-arquitectura-objetivo-y-reglas-de-desarrollo)
+4. [Fases de ejecución](#4-fases-de-ejecución)
+5. [Dependencias e hitos de entrega](#5-dependencias-e-hitos-de-entrega)
+6. [Validación, presupuestos y comparación](#6-validación-presupuestos-y-comparación)
+7. [Organización y capacidad de trabajo](#7-organización-y-capacidad-de-trabajo)
+8. [Riesgos y decisiones de arquitectura](#8-riesgos-y-decisiones-de-arquitectura)
+9. [Primer backlog ejecutable](#9-primer-backlog-ejecutable)
+10. [Correspondencia con el plan anterior](#10-correspondencia-con-el-plan-anterior)
+11. [Comandos y evidencias de cierre](#11-comandos-y-evidencias-de-cierre)
+12. [Referencias técnicas](#12-referencias-técnicas)
 
----
+## 1. Diagnóstico y evidencias
 
-## 0. Cómo usar este plan
+### 1.1 Dictamen
 
-1. Cada tarea tiene un identificador (`A1`, `C4`...), una **prioridad** (P0 = bloquea
-   el producto, P1 = importante, P2 = deseable, P3 = a largo plazo), una **estimación**
-   orientativa en días de trabajo de una persona, los **ficheros** implicados, los
-   **criterios de aceptación** y el **comando de verificación**.
-2. Se ataca en el orden del apartado 13, no en el orden de aparición.
-3. Regla heredada de `ARCHITECTURE.md` y que este plan mantiene: **si una función no
-   está implementada, no existe.** Nada de stubs que devuelvan éxito. Un stub de
-   `IntersectionObserver` que nunca dispara es peor que un `TypeError` claro.
-4. Cada tarea cerrada:
-   - añade tests en el crate afectado,
-   - se verifica en vivo contra `engine_server.exe` (release) o contra una web real,
-   - se documenta como Fase N+1 en `engine/ARCHITECTURE.md` con sus simplificaciones,
-   - actualiza las cifras del README si cambian.
-5. Los commits siguen el formato ya usado en el repo:
-   `feat(crate): descripción (Fase N)` / `fix(crate): ...` / `docs: ...`.
+El proyecto es un **prototipo funcional de navegador con motor propio**, con trabajo sustancial ya realizado. Tiene parsers reales, ejecución de JavaScript mediante Boa, layout, rasterizado, red HTTPS, pestañas, formularios e integración con una interfaz de escritorio. No hay que empezar desde cero.
 
----
+Todavía no es un navegador de uso general ni hay evidencias para afirmar que supera a Chrome. La distancia principal está en aislamiento de contenido hostil, semántica de plataforma web, representación visual, integración completa del producto y mantenimiento. Pasar los tests internos demuestra que los comportamientos cubiertos siguen funcionando; no demuestra compatibilidad general ni seguridad suficiente.
 
-## 1. Diagnóstico: qué hay y qué no
+Hay que separar tres productos técnicos:
 
-### 1.1 Lo que funciona y está probado (no tocar salvo regresión)
+- **Motor web:** carga documentos, aplica políticas, ejecuta scripts y produce píxeles y accesibilidad.
+- **Navegador:** ventanas, pestañas, perfiles, permisos, historial, descargas, actualizaciones y experiencia de usuario.
+- **Agente IA:** observa páginas y propone o ejecuta acciones dentro de capacidades autorizadas.
 
-| Área | Estado real |
-|---|---|
-| Red | HTTP/1.1 + HTTPS (`hyper` + `rustls`), redirecciones 301-308, gzip/deflate/brotli, cookies RFC 6265 con `HttpOnly`/`SameSite`, CORS con preflight, CSP (7 directivas), esquemas seguros |
-| HTML | `html5ever`, DOM mutable, `<template>` (simplificado), `<noscript>` correcto |
-| CSS | Cascada con especificidad, `!important`, origen agente-de-usuario, `:hover` y pseudo-clases básicas, `@media` (con `em`/`rem`/rangos), `@supports`, `var()`, shorthands, `rem`/`em`/`%`, `hsl()`, `box-sizing` |
-| Layout | Bloque, inline, inline-block, flexbox (`taffy`) con intrinsic sizing, grid (columnas, gap, áreas), tablas, `float`, `position` (relative/absolute/fixed/sticky), `overflow: hidden`, scroll real |
-| JS | `boa` (ES moderno completo), DOM bindings, eventos con captura/burbujeo, `fetch`/`XHR`, timers, rAF, `localStorage`/`sessionStorage` persistentes, `location`, `history` (SPA), `MutationObserver`, `getComputedStyle`, `getBoundingClientRect`, CSSOM básico, Canvas 2D, `document.cookie` |
-| Pintado | `tiny-skia`, SVG (`resvg`), fuentes reales, `border-radius`, sombras, `text-decoration`, `text-align`, `background-image` (mosaico natural), value/placeholder de inputs |
-| IA | Crate `engine-ai` con AOM y `to_llm_representation` |
-| Producto | Electron ↔ `engine_server` por NDJSON/IPC directo; pestañas, historial, formularios GET/POST, login por cookies; aviso `requires_javascript` |
+Cada uno necesita pruebas y criterios de aceptación propios. Una interfaz atractiva no resuelve un fallo de origen; añadir APIs no resuelve una actualización insegura; un resultado correcto del modelo no demuestra que se haya ejecutado la acción.
 
-### 1.2 Lo que falta (resumen; el detalle está en cada bloque)
+### 1.2 Qué se ha revisado
 
-| # | Hueco | Prioridad | Bloque |
+Se han inspeccionado el árbol versionado, los manifiestos y lockfiles, los workflows, el plan anterior, el backlog del motor, secciones de arquitectura y los caminos principales de Electron, React, agente, servidor Rust, protocolo, scripting, red, tipografía y pruebas. Se han ejecutado las comprobaciones indicadas abajo y dos reproducciones adicionales contra binarios reales.
+
+No se ha hecho una auditoría exhaustiva de cada línea, una revisión criptográfica ni una evaluación visual completa de sitios. Tampoco se han probado instaladores, Linux, macOS, sesiones con credenciales reales, proveedores de IA ni Chrome en esta revisión. El estado remoto de GitHub, sus protecciones de rama y sus releases no se ha consultado: no se presume que esté igual que en el plan anterior.
+
+El árbol Git estaba limpio al comenzar. Las compilaciones generan artefactos locales ignorados. La entrega documental modifica este plan y conserva una copia histórica del anterior.
+
+### 1.3 Resultados medidos en esta revisión
+
+Entorno: Windows, PowerShell, Node `24.14.0`, npm `11.9.0`, Cargo y rustc `1.98.0`.
+
+| Comprobación | Resultado observado | Interpretación |
+|---|---|---|
+| `cargo test --workspace --locked` | **874 aprobados, 0 fallidos, 0 ignorados** | Incluye tests unitarios e integración; no son 874 WPT oficiales |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Aprobado | Se mantienen las excepciones declaradas en `Cargo.toml` |
+| Binario `wpt_runner` sobre `tests/wpt-style` | **60 aprobados, 0 fallidos** | Seis documentos locales; suite escrita en el proyecto |
+| `cargo test -p engine-core --test api_probe --locked -- --nocapture` | **85/114** | 29 comprobaciones de la sonda no satisfechas; no mide todo el estándar |
+| `npm run build` en `frontend` | Aprobado | TypeScript y bundle Vite compilados |
+| `npm run lint:ci` | Aprobado con **20 hallazgos** | La puerta tolera la deuda registrada |
+| `npm run lint` | **18 errores y 2 advertencias** | El lint estricto sigue fallando |
+| `npm audit --json` en `desktop` | **13 entradas afectadas: 12 altas y 1 crítica** | Conteo por paquetes del informe, no 13 fallos independientes explotables |
+| `npm audit --json` en `frontend` | **5 entradas: 4 altas y 1 moderada** | Requiere separar herramientas de compilación y código distribuido |
+| `cargo audit --version` | Herramienta no instalada | No se ha ejecutado una auditoría Rust actualizada localmente |
+| Fixture con excepción antes de `test(...)` | `wpt_runner` devuelve **0** y `0/0` | Falso éxito reproducido del ejecutor |
+| Página local con `setTimeout` que cambia el título | `ANTES` → `DESPUES`; **0 mensajes espontáneos de estado** durante la observación | La mutación existe al pedir `get_state`, pero no llega sola al consumidor |
+
+Los informes npm corresponden a los lockfiles y a la base de avisos consultada el día de la revisión. No equivalen a una prueba de explotación. El paquete `tar` concentra la severidad crítica en el árbol de herramientas de escritorio; `electron` también aparece afectado. Aunque Electron se declare como dependencia de desarrollo, su runtime se distribuye con la aplicación: `--omit=dev` por sí solo no audita el producto final.
+
+Versiones fijadas observadas: Electron `30.5.1`, electron-builder `24.13.3`, Vite `8.0.16`, TypeScript `5.9.3`, React `19.2.7`; el manifiesto del motor declara Boa `0.19`. Se elegirán versiones de destino mantenidas al ejecutar la migración, sin congelar aquí una supuesta versión «última».
+
+Inventario orientativo de archivos versionados: **10 crates**, **68 archivos Rust**, unas **36.546 líneas físicas Rust** contando comentarios, tests y separadores. Esta cifra no es tamaño de implementación productiva ni una medida de madurez.
+
+### 1.4 Arquitectura actual
+
+```text
+Interfaz local React/Vite, dibujada por Electron
+       │ API expuesta por preload
+       ▼
+Proceso principal Electron
+       │ JSON por stdin/stdout; correlación de solicitudes
+       ▼
+engine_server: un proceso para todas las pestañas
+       ├─ net: HTTP/1.1, TLS, cookies, CORS, CSP, almacenamiento
+       ├─ dom: html5ever y árbol mutable
+       ├─ css + layout: cascada y construcción de cajas
+       ├─ js: Boa, bindings y temporizadores
+       ├─ text + image + gfx: fuentes, imágenes y rasterizado
+       └─ ai: árbol semántico y representación para el agente
+       │ PNG completo codificado en Base64 + metadatos
+       ▼
+Viewport de la interfaz
+
+Ruta alternativa de desarrollo:
+React en navegador → WebSocket local → FastAPI → motor Rust
+```
+
+**Precisión importante:** las páginas visitadas se procesan con el motor Rust, pero la interfaz se ejecuta en Electron, que incorpora Chromium. «Motor de páginas propio» describe el diseño; «el producto no contiene Chromium» no lo describe. Sustituir la carcasa Electron es una decisión independiente de sustituir el motor de páginas.
+
+### 1.5 Estado por subsistema
+
+| Subsistema | Base existente | Trabajo que sigue siendo necesario |
+|---|---|---|
+| Red | HTTPS con rustls, redirecciones, compresión y políticas implementadas | Límites, cancelación, revisión de políticas, caché, streaming, HTTP/2 y después HTTP/3 |
+| HTML/DOM | html5ever, mutaciones, bindings y jerarquía de clases | Identidad y colecciones vivas, namespaces, fragmentos en contexto, parser coordinado con scripts |
+| JavaScript | Boa, promesas, módulos precargados, APIs parciales | Global de ventana, event loop completo, cargas de módulos, APIs web y conformance |
+| CSS | Parsers y selectores reutilizados, cascada, varias propiedades | Valores tipados, pseudo-elementos, estados de interacción, cascada moderna |
+| Layout | Bloques, inline y soporte parcial de flex/grid/tablas/posición | Cobertura semántica, texto complejo, geometría sincronizada e invalidación |
+| Gráficos | tiny-skia, SVG y código GPU en el repositorio | El camino de escritorio sigue enviando PNG; composición y presentación eficientes pendientes |
+| Pestañas | Estado e historial por pestaña | Un proceso compartido, recuperación, sesiones durables y aislamiento de sitios |
+| Accesibilidad | AOM interno | No acredita UI Automation, VoiceOver o AT-SPI; selección y edición siguen incompletas |
+| IA | Simulación y Gemini, límite de pasos, AOM opcional en interfaz de tipos | Credenciales, cancelación real, permisos, conexión efectiva del AOM y comprobación de resultados |
+| Distribución | Configuración y scripts de empaquetado | Artefacto integral probado, dependencias mantenidas, firma y actualización verificadas |
+| Calidad | Tests, CI, sonda y lint con límite | Fallos del harness, WPT oficiales, Test262, E2E de escritorio y pruebas de seguridad |
+
+### 1.6 Hallazgos que deben convertirse en trabajo
+
+Los estados distinguen **reproducido**, **confirmado en código** y **pendiente de validar**. P0 bloquea exposición general o la fiabilidad de la validación; P1 bloquea un uso cotidiano razonable; P2 completa el producto; P3 es ampliación o investigación. La prioridad no sustituye las dependencias.
+
+| ID | Hallazgo y evidencia | Estado | Prioridad | Fases |
+|---|---|---|---|---|
+| H01 | Todas las pestañas viven en `EngineServer`; `sandbox.rs` aplica mitigaciones de Windows y declara que no es sandbox | Confirmado | P0 | F06–F09 |
+| H02 | Avisos npm y cinco excepciones Rust en `.github/workflows/engine.yml`; dos de fast-float corresponden a fallos de seguridad documentados | npm medido; Rust pendiente de reauditar | P0 | F02 |
+| H03 | `wpt_runner.rs` ignora resultados de scripts y termina bien si no hubo tests | Reproducido con fixture temporal | P0 | F03 |
+| H04 | `gemini_api_key` se persiste en `localStorage`; petición al proveedor desde el renderer | Confirmado en `AgentSidebar.tsx` y `AgentOrchestrator.ts` | P0 | F05, F34 |
+| H05 | `ipcMain.handle('engine:request')` reenvía payload sin validación de esquema ni del emisor; faltan políticas explícitas de navegación de la carcasa | Confirmado; no explotación demostrada | P0 | F04 |
+| H06 | `next_line()` y buffer stdout sin límite de trama; timeout Electron no cancela el trabajo del motor | Confirmado | P0 | F04, F06, F10 |
+| H07 | Tick de 250 ms modifica la pestaña activa y hace relayout, pero la rama de tick no escribe un estado a stdout | Reproducido por protocolo | P1 | F10, F22 |
+| H08 | `window !== globalThis`, globals cortos ausentes | Reproducido por sonda | P1 | F11 |
+| H09 | `el.append/prepend` falla en la sonda aunque existe implementación y se anuncia como conseguido | Discrepancia reproducida; causa exacta pendiente | P1 | F03, F11 |
+| H10 | `modules.rs` ignora `_referrer`, usa base del documento y fuentes previamente descargadas | Confirmado | P1 | F13 |
+| H11 | Métodos en instancias DOM; `dataset` snapshot; algunas colecciones y wrappers tienen simplificaciones | Confirmado parcial; inventario completo pendiente | P1 | F11 |
+| H12 | XHR se implementa de forma síncrona incluso para la forma asíncrona | Confirmado en código y backlog | P1 | F10, F14 |
+| H13 | `get_state` rasteriza PNG completo/Base64; relayout reconstruye el árbol | Confirmado | P1 | F19, F21, F22 |
+| H14 | `getAccessibilityPrompt` es opcional en el orquestador, pero `App.tsx` no lo proporciona | Confirmado | P1 | F34 |
+| H15 | `sendCommand` muestra errores y no los propaga; el agente puede continuar tras un comando fallido | Confirmado en código; falta E2E de fallo | P1 | F05, F30, F34 |
+| H16 | «Detener» cambia una bandera, pero no aborta la petición del modelo ni impide una acción decidida por el paso en curso | Confirmado en el flujo; falta test de carrera | P0 | F05 |
+| H17 | Escritura del agente usa `press_enter: true` desde `App.tsx` y puede enviar el formulario al rellenarlo | Confirmado en configuración; efecto depende del formulario | P0 | F05, F15 |
+| H18 | Python es opcional al arrancar Electron, pero `build-app.js` exige compilarlo con PyInstaller | Confirmado | P1 | F01 |
+| H19 | CI de escritorio empaqueta con directorios de motor/backend vacíos | Confirmado | P1 | F01, F38 |
+| H20 | 20 hallazgos de lint, entre ellos refs durante render, dependencias de hooks y uso de `any` | Reproducido | P1 | F01, F30 |
+| H21 | `app://` usa comparación textual `absolutePath.startsWith(baseDir)` | Revisión defensiva necesaria; no se afirma traversal explotable | P0 | F04 |
+| H22 | Backend opcional acepta WebSocket antes de una validación visible de origen/autenticación; CORS HTTP abierto | Confirmado en endpoint; exposición efectiva por validar | P0 si se habilita | F04 |
+| H23 | Runtime nativo carece de reinicio supervisado equivalente al del backend Python | Confirmado en `desktop/main.js` | P1 | F06 |
+| H24 | Selección de fuentes limitada al sans-serif de sistema y variantes | Confirmado en `text/src/font.rs` | P1 | F20 |
+| H25 | No se han obtenido resultados de WPT oficial, Test262, benchmark comparativo o accesibilidad del SO | No evaluado | P1 | F03, F32, F39, F40 |
+
+Las mitigaciones de Windows tienen valor, pero no eliminan acceso a archivos, red y datos del usuario. Rust reduce determinadas clases de fallos; no justifica afirmar que elimina toda corrupción de memoria, que no hay errores en dependencias o que desaparece un porcentaje fijo de vulnerabilidades del producto.
+
+### 1.7 Documentación que hay que reconciliar
+
+El plan anterior acumula cifras históricas como si fueran estado actual y mantiene listas de APIs ausentes que ya tienen implementación. El backlog también conserva ausencias que fases posteriores cerraron. No se debe copiar ese texto al nuevo código ni usarlo para decidir qué implementar sin verificarlo.
+
+Casos concretos:
+
+- El resultado actual de la sonda es 85/114; sus fallos no significan necesariamente que cada API carezca por completo de implementación.
+- `document.readyState`, `activeElement`, `createDocumentFragment` y otras APIs aparecen como pendientes en pasajes antiguos pese a avances posteriores.
+- El protocolo revisado contiene **16 variantes**; `SubmitForm` no está en el enum. La ausencia de ese comando no implica ausencia total de formularios: hay envío interno por interacción.
+- Hay **seis** fixtures estilo WPT y 60 comprobaciones, frente a referencias históricas a cuatro fixtures y 24 pruebas.
+- Existen targets de empaquetado Linux y macOS en `desktop/package.json`; lo pendiente es probarlos, no añadirlos como si no existieran.
+- Hay un tick de temporizadores en segundo plano; comentarios anteriores que dicen que solo avanzan al recibir comandos están obsoletos.
+- No se han verificado las afirmaciones previas sobre releases inexistentes o commits por delante de `main`.
+
+La nueva regla de evidencia es: **comportamiento reproducido y código actual > informes fechados > narración histórica**. `ARCHITECTURE.md` conserva decisiones y evolución, pero necesita separar historia y estado vigente.
+
+## 2. Qué significa superar a Chrome
+
+### 2.1 Un objetivo comprobable
+
+«Mejor que Chrome» se convierte en una matriz de resultados. No se promete ganar simultáneamente en todos los equipos, páginas, versiones o capacidades. El objetivo inicial es alcanzar una base segura y útil, y después demostrar ventajas en privacidad, consumo y productividad con IA sin ocultar incompatibilidades.
+
+| Dimensión | Línea base actual | Objetivo propuesto | Cómo se demostrará |
 |---|---|---|---|
-| 1 | Las webs construidas con JS en cliente se ven vacías. ~~Causa raíz: no hay `<script type="module">`~~ **resuelto** (Fase 43). Lo que queda es superficie de plataforma: APIs del DOM que un framework toca al arrancar | **P0** | C3, C6 |
-| 2 | Sin sandbox de proceso | P1 | F |
-| 3 | ~~Sin CI~~ **hecho** (Fase 41): `engine.yml` y `app.yml` | ~~P0~~ | B |
-| 4 | ~~README con datos falsos y `huecos_sin_resolver.md` inexistente~~ **hecho** (Fase 41). Queda solo la rama sin fusionar en `main` | P1 | A |
-| 5 | Sin `<iframe>`, `<video>`, `<audio>`, WebGL, IndexedDB, WebSockets, Web Workers, Service Workers | P2/P3 | G |
-| 6 | Sin caché HTTP ni HTTP/2 ni `@import` | P1 | E |
-| 7 | Sin `::before`/`::after`, `linear-gradient()`, `background-size`/`position`/`repeat` variantes, `calc()` real, `transition`/`animation`, `transform` | P1 | D |
-| 8 | Solo Windows; nunca compilado en macOS/Linux | P2 | J |
-| 9 | Sin métrica de compatibilidad (4 ficheros WPT a mano, no la suite oficial) | P1 | H |
-| 10 | IA solo con Gemini y clave del usuario en `localStorage`; agente duplicado en TS y Python; sin opción de modelo local (Ollama en PCCOM) | P1 | I |
-| 11 | Backend Python huérfano que se sigue empaquetando | P1 | I |
-| 12 | Instalador sin firmar; auto-update apuntando a un repo sin releases | P2 | I |
-| 13 | JS interpretado sin JIT; sin reflow incremental; cada navegación reconstruye todo | P2 | K |
+| Compatibilidad | Sonda 85/114, sin WPT oficial | Corpus crítico completo y brecha decreciente frente a navegadores de referencia | WPT versionado, tareas reales y resultados por familia |
+| Seguridad | Sin sandbox del renderer Rust | Aislamiento obligatorio, actualización segura y cero P0 abiertos | Tests negativos, revisión independiente y respuesta a incidentes |
+| Memoria | Sin medición comparable | Aspiración: al menos 20% menos en corpus y hardware acordados | Suma de todos los procesos, misma funcionalidad, p50/p95 |
+| Respuesta de interfaz | Sin línea base | Interacción fluida y menos bloqueos perceptibles | Latencia entrada→presentación, trazas y sesiones largas |
+| Carga de páginas | Cifras históricas no revalidadas | Paridad primero; aspiración posterior de mejora ≥15% en corpus fijado | Frío/caliente, misma red y contenido, intervalos de confianza |
+| Energía | Sin medición | Aspiración de mejora ≥15% en uso equivalente | Consumo total medido en equipos físicos |
+| IA | Agente experimental | ≥90% de éxito en tareas autorizadas del corpus y cero acciones prohibidas en las pruebas | Éxito observable, presupuesto y pruebas adversarias |
+| Privacidad | Sin aislamiento de perfiles completo | IA remota opt-in, mínimo dato enviado y borrado comprobable | Capturas de tráfico y pruebas de retención |
+| Accesibilidad | AOM interno | Navegación y edición utilizables con teclado y lector de pantalla | Ensayos con tecnologías asistivas y usuarios |
+| Fiabilidad | Tests internos en verde | Metas explícitas de sesiones sin caída y recuperación sin pérdida | Beta con consentimiento y reportes reproducibles |
 
-### 1.3 APIs de JavaScript ausentes (comprobado con `grep` en `engine/crates/js/src`, 2026-09-09)
+Los porcentajes son **metas de producto propuestas**, no resultados ni estimaciones. Tras F39 se ratifican o ajustan mediante una decisión documentada; no se cambian después de medir para presentar un resultado favorable.
 
-Ninguna de estas existe hoy. Cada una es una línea potencial que mata un bundle entero:
+Un motor que consume menos por no ejecutar scripts, omitir imágenes o fallar al abrir una aplicación no ha ganado una comparación. Esos casos cuentan como fallos de compatibilidad.
 
-```
-matchMedia            IntersectionObserver   ResizeObserver        URLSearchParams
-AbortController       TextEncoder/Decoder    customElements        performance.now
-console (como global) CustomEvent            DOMParser             structuredClone
-atob / btoa           document.currentScript document.write        innerText
-dataset               closest()              insertAdjacentHTML    URL (constructor)
-```
+### 2.2 Alcance del producto acabado
 
-`document.readyState` y `Event` existen parcialmente (una referencia cada uno; hay
-que verificar si son constructores reales o solo cadenas).
+La primera versión estable se orienta a escritorio: navegación cotidiana, aplicaciones web del corpus, multimedia común, trabajo accesible, perfiles, datos persistentes, descargas, permisos, actualizaciones y agente opcional. No necesita implementar inmediatamente cada API experimental para ser útil, pero toda omisión debe estar registrada y no debe anunciarse como soporte.
 
-Globales que SÍ están registrados hoy (`register_global_property` en el crate `js`):
-`window`, `document`, `location`, `history`, `navigator`, `localStorage`,
-`sessionStorage`, `fetch`, `XMLHttpRequest`, `MutationObserver`, `setTimeout`,
-`setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`,
-`requestAnimationFrame`, `cancelAnimationFrame`, `getComputedStyle`, más los del
-arnés de tests (`test`, `assert_*`).
+Móvil, DRM comercial, compatibilidad universal con extensiones de Chrome y todas las políticas empresariales se tratan como programas separados. Se incluye su camino de decisión para no perderlos; no se oculta que pueden requerir acuerdos, especialistas o restricciones de plataforma.
 
----
+«Terminar» significa aprobar los hitos de producto y disponer de mantenimiento sostenible. Los estándares, dependencias y ataques siguen evolucionando después de la versión 1.0.
 
-## 2. Bloque A — Higiene inmediata
+## 3. Arquitectura objetivo y reglas de desarrollo
 
-Objetivo: que el repo diga la verdad y que el trabajo hecho llegue a `main`.
-Sin esto, cualquier bloque posterior se construye sobre documentación que miente.
+### 3.1 Separación de responsabilidades
 
-### A1 — Fusionar `fix/paginas-vacias-y-rendimiento` en `main` — P0 — 0,5 d
-
-- **Qué**: abrir PR de la rama actual contra `main`. 11 commits, 42 ficheros,
-  +8.083/-628 líneas.
-- **Antes de abrir**: `cargo test --workspace` en verde (hecho hoy: 691/0),
-  `cargo clippy --workspace` sin errores nuevos, `npm run build` en `frontend`.
-- **Aceptación**: PR fusionado; `main` contiene la Fase 40.
-- **Verificación**: `git log --oneline main | head -1` muestra `41ef295` o el merge.
-
-### A2 — Corregir el README — P0 — 0,5 d
-
-Ficheros: `README.md`.
-
-Errores concretos detectados:
-
-1. Sección "Web moderna": dice *"Hoy faltan `location.href` y `MutationObserver`"*.
-   Falso desde el commit `8a0ea7f`. Sustituir por la lista real del apartado 1.3.
-2. Tabla "Motor": *"703 pasando"*. Hoy son 691 (medido). `ARCHITECTURE.md` dice 805
-   en la Fase 40. **Investigar la discrepancia** (ver A4) antes de escribir la cifra.
-3. Comando `cargo test --workspace # los 703 tests` → quitar el número o poner el real.
-4. Tabla "Seguridad": la fila *Política de mismo origen* está en ✅ pero el texto
-   de abajo dice *"Sin política de mismo origen ni sandbox"*. Unificar: SOP existe
-   para cookies/almacenamiento/CORS; lo que no existe es sandbox.
-5. Sección "Sobre la IA": añadir que la clave de Gemini se guarda en `localStorage`
-   del renderer y que no hay modo local todavía (hasta que I2 lo cierre).
-6. Añadir enlace a este `plan.md`.
-
-- **Aceptación**: ningún dato del README contradice `ARCHITECTURE.md` ni el código.
-
-### A3 — Crear `engine/huecos_sin_resolver.md` o quitar la referencia — P0 — 0,25 d
-
-`ARCHITECTURE.md` (Fase 40) cita `huecos_sin_resolver.md` dos veces como si existiera.
-No está en el repo (`find` sin resultados). Dos opciones; se elige la primera:
-
-- **Opción elegida**: crear `engine/huecos_sin_resolver.md` con la lista viva de
-  simplificaciones declaradas que aún no se han cerrado (extraerlas con
-  `grep -n "NO implementado\|No implementado\|Deliberadamente NO" engine/ARCHITECTURE.md`).
-  Este fichero pasa a ser el backlog técnico del motor y este `plan.md` lo enlaza.
-- Alternativa: borrar las dos referencias.
-- **Aceptación**: `grep -rn huecos_sin_resolver engine/` solo apunta a ficheros existentes.
-
-### A4 — Reconciliar la cifra de tests — P1 — 0,25 d
-
-- Ejecutar `cargo test --workspace 2>&1 | grep "test result"` y sumar.
-- Ejecutar `cargo test --workspace -- --list | wc -l` para contar sin ejecutar.
-- Posibles causas de 805 vs 691: tests con `#[ignore]`, tests de integración en
-  `engine/tests/` que no se compilan por defecto, doc-tests (hoy 0), o simplemente
-  una cifra escrita a mano. Documentar la causa en `ARCHITECTURE.md`.
-- **Aceptación**: README, ARCHITECTURE.md y la salida real coinciden.
-
-### A5 — Limpiar el árbol de trabajo — P2 — 0,25 d
-
-- `Navegador IA Setup.exe` (108 MB) vive en la raíz. Está ignorado por `*.exe`,
-  correcto, pero conviene moverlo a `desktop/dist/` o borrarlo tras subirlo a un release.
-- `backend/app/**/__pycache__/` está ignorado pero presente; borrar.
-- `backend/build/`, `backend/dist/` idem.
-- `.claude/launch.json`: decidir si se versiona (hoy sí, sin `.lock`).
-
----
-
-## 3. Bloque B — Integración continua y calidad
-
-Objetivo: que ningún commit rompa los 691 tests sin que alguien se entere.
-
-### B1 — GitHub Actions: tests del motor — P0 — 0,5 d
-
-Fichero nuevo: `.github/workflows/engine.yml`.
-
-```yaml
-name: engine
-on:
-  push: { branches: [main] }
-  pull_request:
-jobs:
-  test:
-    runs-on: windows-latest          # única plataforma verificada hoy
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with: { workspaces: engine }
-      - run: cargo test --workspace --locked
-        working-directory: engine
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-        working-directory: engine
-      - run: cargo fmt --all --check
-        working-directory: engine
+```text
+Interfaz del navegador ─── servicio de accesibilidad del SO
+        │ contrato tipado; solo capacidades necesarias
+        ▼
+Broker confiable
+  ├─ perfiles, permisos, sesiones y navegación
+  ├─ supervisor de procesos y límites
+  ├─ servicio de credenciales y proveedores IA
+  ├─ servicio de red y almacenamiento particionado
+  ├─ descargas y archivos elegidos por el usuario
+  └─ actualizador y verificación de artefactos
+        │ canales acotados; identidad y autorización por contexto
+        ├─ renderer Rust A: DOM/CSS/JS/layout, sandbox
+        ├─ renderer Rust B: DOM/CSS/JS/layout, sandbox
+        ├─ workers: presupuesto y contexto de origen
+        └─ servicios aislados de imagen/media/GPU cuando corresponda
+                   │ superficies y regiones modificadas
+                   ▼
+             composición y presentación
 ```
 
-- Nota: `clippy -D warnings` y `fmt --check` probablemente fallen la primera vez.
-  Hacer primero una pasada `cargo fmt --all` y `cargo clippy --fix` en un commit
-  aparte (`chore(engine): fmt + clippy`) y solo después activar `-D warnings`.
-- **Aceptación**: badge verde en el README; un PR con un test roto no se puede fusionar
-  (activar *branch protection* en `main` con el check requerido).
-
-### B2 — GitHub Actions: frontend y desktop — P1 — 0,5 d
-
-Fichero: `.github/workflows/app.yml`.
-
-- `npm ci` + `npm run lint` + `npm run build` en `frontend/`.
-- `npm ci` en `desktop/` + `electron-builder --dir` (sin publicar) para comprobar que
-  el empaquetado no está roto.
-- **Aceptación**: ambos jobs en verde.
-
-### B3 — Runner de WPT en CI — P1 — 0,25 d (depende de B1)
-
-- Añadir paso `cargo run -p engine-core --bin wpt_runner -- tests/wpt-style` en
-  `engine.yml`. El binario ya devuelve exit code 1 si algo falla.
-- **Aceptación**: los 4 ficheros de `engine/tests/wpt-style/` se ejecutan en cada PR.
-
-### B4 — Tests de humo del protocolo NDJSON — P1 — 1 d
-
-- Hoy `engine_server` se prueba con tests unitarios dentro de `server.rs`
-  (`Resize`, `Scroll`...). Falta un test de integración que arranque el binario
-  real, le mande `ping`, `navigate` a un servidor local, `get_state`, `click`,
-  `type_text`, `press_key`, `back`, `new_tab`, `get_accessibility_tree`, `shutdown`
-  y compruebe las respuestas JSON.
-- Fichero nuevo: `engine/crates/core/tests/ndjson_smoke.rs`.
-- **Aceptación**: el test cubre los 17 `EngineRequest` del `match` en `server.rs:313-419`.
-
-### B5 — Matriz multiplataforma en CI — P2 (ver bloque J)
-
----
-
-## 4. Bloque C — Web moderna
-
-**Este bloque es el producto.** Todo lo demás es soporte. El diagnóstico de la Fase 39
-sigue vigente: no falta un motor de JS, faltan piezas sueltas de DOM/BOM y cada una
-que falte mata el script completo con un `TypeError`.
-
-Principio de trabajo del bloque: **medir antes de implementar**. No se implementa una
-API porque "seguro que hace falta"; se implementa porque una sonda o un bundle real
-se murió en ella.
-
-### C1 — Sonda de APIs v2 (60+ comprobaciones) — P0 — 1 d
-
-- La sonda de la Fase 39 medía 28 APIs (26/28). Ampliarla a un fichero versionado:
-  `engine/tests/probes/api-probe.html`.
-- Cada comprobación es `typeof X === 'function'` / `'object'` o una llamada mínima
-  con `try/catch`, y el resultado se vuelca en `document.title` como `"N/M: faltan a,b,c"`.
-- Lista inicial (de 1.3 más las de constructores/prototipos que los bundlers
-  usan para *feature detection*):
-  `Element.prototype`, `HTMLElement.prototype`, `Node.prototype`, `Event`,
-  `CustomEvent`, `EventTarget` (constructor), `URL`, `URLSearchParams`, `AbortController`,
-  `AbortSignal`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`,
-  `performance.now`, `performance.mark`, `console.log/warn/error/debug/table/group`,
-  `matchMedia`, `IntersectionObserver`, `ResizeObserver`, `customElements.define`,
-  `DOMParser`, `document.currentScript`, `document.readyState`, `document.write`,
-  `document.documentElement.dataset`, `el.closest`, `el.matches`,
-  `el.insertAdjacentHTML/Element/Text`, `el.innerText`, `el.textContent` (setter),
-  `el.replaceWith`, `el.before/after/append/prepend`, `el.getAttributeNames`,
-  `el.hasAttributes`, `el.toggleAttribute`, `el.scrollIntoView`, `el.focus/blur`,
-  `document.activeElement`, `document.hasFocus`, `window.innerWidth/Height`,
-  `window.devicePixelRatio`, `window.scrollX/Y`, `window.scrollTo`, `window.open`,
-  `window.crypto.getRandomValues`, `crypto.randomUUID`, `Intl.DateTimeFormat`,
-  `Intl.NumberFormat`, `queueMicrotask`, `Promise.allSettled`, `WeakRef`,
-  `FinalizationRegistry`, `globalThis`, `Symbol.asyncIterator`, `Array.prototype.at`,
-  `Object.hasOwn`, `String.prototype.replaceAll`, `import()` dinámico,
-  `<script type="module">`, `<script defer>`, `<script async>`.
-- **Aceptación**: la sonda corre con `wpt_runner` o con `engine_server` y el número
-  queda registrado en `ARCHITECTURE.md`. El número inicial se anota aquí:
-  `Sonda v2: __/__ (fecha)`.
-
-### C2 — Corpus de bundles reales — P0 — 1 d
-
-- Crear `engine/tests/bundles/` con 5 páginas mínimas **congeladas en disco**
-  (sin red en tests) que usen los frameworks reales compilados en producción:
-  1. `react-vite/` (Vite + React 19, `npm run build`, un contador).
-  2. `vue-vite/` (Vue 3, un formulario).
-  3. `svelte/` (Svelte 5).
-  4. `nextjs-static/` (`next export` de una página con hidratación).
-  5. `vanilla-esm/` (módulos ES nativos con `import`).
-- Un test de integración por bundle: cargar con `build_page_keeping_runtime`,
-  comprobar que `requires_javascript` es `false` y que el texto esperado aparece
-  en el layout.
-- Estos 5 tests **fallarán al crearse**. Es el objetivo: son la definición de
-  "hecho" de todo el bloque C. Se marcan `#[ignore]` hasta que cada uno pase, y
-  el plan es ir quitando `#[ignore]` uno a uno.
-- **Aceptación**: los 5 bundles existen, cada uno tiene su test, y el primer
-  fallo de cada uno está anotado (qué API, qué línea).
-
-### C3 — Prototipos reales para los elementos DOM — P0 — 3 d
-
-Ficheros: `engine/crates/js/src/dom_bindings.rs` (2.000+ líneas; valorar partirlo en
-`dom_bindings/{element,node,document,event}.rs`).
-
-- Hoy cada nodo se expone como un objeto con propiedades y métodos añadidos
-  individualmente. Los bundlers hacen `Element.prototype.matches ||
-  Element.prototype.msMatchesSelector`, `Object.getPrototypeOf(el) === HTMLDivElement.prototype`,
-  `instanceof HTMLElement`, o parchean `Node.prototype.appendChild`. Nada de eso puede
-  funcionar sin una cadena de prototipos real.
-- Implementar la jerarquía mínima: `EventTarget` → `Node` → `Element` → `HTMLElement`
-  → (`HTMLDivElement`, `HTMLInputElement`, `HTMLAnchorElement`, `HTMLFormElement`,
-  `HTMLImageElement`, `HTMLCanvasElement`, `HTMLScriptElement`, `HTMLStyleElement`,
-  `HTMLSelectElement`, `HTMLTextAreaElement`, `HTMLButtonElement`); `Document`,
-  `Text`, `Comment`, `DocumentFragment`.
-- Registrar los constructores como globales (`window.HTMLElement`...) para que
-  `instanceof` funcione. Constructores que lanzan `TypeError: Illegal constructor`
-  salvo `Event`, `CustomEvent`, `DocumentFragment`, `Text`, `Comment` (que sí son
-  construibles en el spec).
-- **No se hace**: `HTMLUnknownElement` para cada tag raro (todos caen a `HTMLElement`).
-- **Aceptación**: `document.createElement('div') instanceof HTMLDivElement === true`;
-  parchear `Element.prototype.foo = ...` afecta a todos los elementos.
-
-### C4 — Constructores de eventos y `EventTarget` construible — P0 — 1 d
-
-Ficheros: `engine/crates/js/src/dom_bindings.rs`, `event_loop.rs`.
-
-- `new Event(type, {bubbles, cancelable, composed})`, `new CustomEvent(type, {detail})`,
-  `new EventTarget()`. Sin esto React no puede sintetizar eventos ni ninguna lib de
-  estado emitir cambios.
-- `event.target`, `currentTarget`, `eventPhase`, `timeStamp`, `isTrusted` (false para
-  los sintéticos), `defaultPrevented`, `composedPath()`.
-- `KeyboardEvent`, `MouseEvent`, `InputEvent`, `FocusEvent` con sus campos
-  (`key`, `code`, `clientX/Y`, `button`, `relatedTarget`, `inputType`, `data`).
-  Esto además cierra el hueco declarado en `ARCHITECTURE.md` ("metadatos de tecla
-  todavía no están implementados").
-- **Aceptación**: `el.dispatchEvent(new CustomEvent('x', {detail: 1}))` llega a un
-  listener con `e.detail === 1`.
-
-### C5 — Utilidades de plataforma sin DOM — P0 — 2 d
-
-Fichero nuevo: `engine/crates/js/src/platform.rs`.
-
-- `URL` y `URLSearchParams` → envolver el crate `url` (ya es dependencia de `net`).
-- `TextEncoder`/`TextDecoder` (UTF-8 solo; otras codificaciones lanzan `RangeError`
-  real, no devuelven basura).
-- `atob`/`btoa` → crate `base64`.
-- `AbortController`/`AbortSignal` → integrado con `fetch` (cancelar la petición de
-  verdad; hoy `fetch` es `hyper`, se puede abortar el future).
-- `structuredClone` → serialización recursiva de objetos planos, arrays, `Map`, `Set`,
-  `Date`; lanza `DataCloneError` con funciones/símbolos como el spec.
-- `crypto.getRandomValues`, `crypto.randomUUID` → crate `rand`/`uuid`.
-- `performance.now()` (ms desde la navegación, `f64`), `performance.mark/measure`
-  (mínimo: no lanzar, registrar en un `Vec`).
-- `console` como objeto global real: `log/info/warn/error/debug/trace/table/group/
-  groupEnd/time/timeEnd/assert/count`. Salida a `tracing` (NO a stdout: rompería el
-  protocolo NDJSON, ver `engine_server.rs:15`). Hoy existe `printEngineLog` como
-  apaño; `console` debe reemplazarlo.
-- `queueMicrotask` ya existe; verificar orden respecto a `Promise.then`.
-- **Aceptación**: cada API tiene ≥3 tests; la sonda C1 las marca en verde.
-
-### C6 — `document` y `Element`: métodos que faltan — P0 — 2 d
-
-Fichero: `dom_bindings.rs`.
-
-- `document.readyState` (`loading` → `interactive` → `complete`, con eventos
-  `readystatechange`), `document.currentScript` (apuntar al `<script>` en ejecución;
-  `null` en módulos), `document.write`/`writeln` (solo durante el parseo: como el
-  motor parsea todo antes de ejecutar, se implementa como *insertar tras el script
-  actual* y se documenta la simplificación), `document.activeElement`, `document.hasFocus`,
-  `document.createDocumentFragment`, `document.createComment`, `document.createRange`
-  (mínimo), `document.importNode`, `document.adoptNode`, `document.getElementsByClassName`,
-  `document.elementFromPoint` (ya hay hit-testing en `server.rs`; exponerlo).
-- `Element`: `closest`, `matches` (ya hay matcher real; exponerlo), `insertAdjacentHTML/
-  Element/Text`, `innerText` (getter con layout: solo lo visible; setter = `textContent`),
-  `outerHTML`, `dataset` (Proxy sobre `data-*`), `getAttributeNames`, `toggleAttribute`,
-  `hasAttributes`, `replaceWith`, `before`, `after`, `append`, `prepend`, `replaceChildren`,
-  `children` (solo elementos), `firstElementChild`/`lastElementChild`/
-  `nextElementSibling`/`previousElementSibling`, `childElementCount`, `scrollIntoView`
-  (mover el scroll real del servidor), `focus`/`blur` (con `focusin/focusout/focus/blur`),
-  `getClientRects` (ya existe), `scrollTop/Left/Width/Height` (lectura real, escritura
-  mueve scroll), `offsetTop/Left/Width/Height/Parent`, `clientWidth/Height`.
-- `Node`: `contains`, `isConnected`, `nodeType` (constantes en `Node.ELEMENT_NODE`...),
-  `nodeName`, `nodeValue`, `cloneNode(deep)`, `isEqualNode`, `compareDocumentPosition`,
-  `getRootNode`, `normalize`.
-- `NodeList`/`HTMLCollection` iterables con `forEach`, `length`, índice, `Symbol.iterator`.
-- **Aceptación**: los tests de `engine/tests/wpt-style/dom-mutation-and-navigation.html`
-  se amplían con cada método; sonda C1 en verde.
-
-### C7 — `window`: propiedades de entorno — P0 — 1 d
-
-Fichero: `engine/crates/js/src/window.rs`.
-
-- `innerWidth/innerHeight/outerWidth/outerHeight` (del viewport real que ya llega
-  en `Resize`), `devicePixelRatio` (1.0), `scrollX/scrollY/pageXOffset/pageYOffset`,
-  `scrollTo/scrollBy/scroll` (mueven el scroll real: hoy `Scroll` viene del servidor;
-  hace falta el camino inverso JS → servidor), `screen.width/height`,
-  `matchMedia(query)` → reusar el evaluador de `@media` del crate `css`; devuelve
-  `MediaQueryList` con `matches`, `media`, `addEventListener('change')` que dispara
-  en `Resize`.
-- `window.open` → **no se implementa**; lanza y se documenta (sin ventanas emergentes
-  a propósito).
-- `window.name`, `window.self/top/parent/frames` (= `window` mientras no haya iframes),
-  `window.frameElement = null`.
-- `alert/confirm/prompt` → registran en `tracing` y devuelven `undefined/false/null`;
-  el servidor NDJSON emite un evento `dialog` para que la UI de Electron lo muestre
-  (nuevo mensaje en `protocol.rs`).
-- **Aceptación**: un bundle React que hace `window.matchMedia('(prefers-color-scheme: dark)')`
-  no muere.
-
-### C8 — Observadores — P1 — 2 d
-
-Fichero nuevo: `engine/crates/js/src/observers.rs` (junto a `mutation_observer.rs`).
-
-- `IntersectionObserver`: calcular intersección real contra el viewport a partir de
-  los rectángulos del layout tras cada `Scroll`/`Resize`/re-layout. `observe/unobserve/
-  disconnect/takeRecords`, `thresholds`, `rootMargin` (solo px). Callbacks en la cola de
-  macrotareas.
-- `ResizeObserver`: comparar `contentRect` tras cada re-layout.
-- Regla: **si no se puede disparar de verdad, no se registra.** Un observador que
-  nunca dispara deja al bundle esperando para siempre (misma razón por la que la
-  Fase 39 no puso un stub de `MutationObserver`).
-- **Aceptación**: test donde un elemento fuera del viewport entra al hacer scroll y
-  el callback recibe `isIntersecting: true`.
-
-### C9 — Módulos ES, `defer`, `async`, `import()` dinámico — P0 — 3 d — **EMPEZAR POR AQUÍ**
-
-> **Reordenado el 2026-09-09.** Al verificar los huecos contra el código (Fase 41)
-> quedó claro que esta tarea no es una más del bloque: es la que va **primera**.
-> Se creía que el techo eran las APIs del DOM ausentes; es anterior a eso. Todo
-> bundle de Vite, Next o Svelte se sirve como `<script type="module">`, que aquí
-> no existe, así que **ninguno arranca por muchas APIs que se añadan**. C1 y C2
-> (medir) siguen antes, pero de las tareas de implementación esta es la primera.
-
-Ficheros: `engine/crates/core/src/scripting.rs`, `pipeline.rs`, `engine/crates/js/src/runtime.rs`.
-
-- Hoy: los `<script>` se ejecutan **todos seguidos después de parsear** (`scripting.rs:13`).
-  Los externos se descargan (`find_external_script_srcs`) pero hay que verificar el orden.
-- Implementar el orden real del spec:
-  1. scripts clásicos sin atributo → en orden de documento (ya),
-  2. `defer` → tras el parseo, en orden, antes de `DOMContentLoaded`,
-  3. `async` → en cuanto llegan (aquí: tras los clásicos, orden de descarga),
-  4. `type="module"` → `defer` implícito, semántica de módulo (`import`/`export`,
-     `this === undefined`, modo estricto). `boa` soporta módulos (`Module::parse`);
-     hace falta un *module loader* que resuelva especificadores relativos contra la
-     URL del documento y los descargue con `NetworkEngine`.
-  5. `import()` dinámico → mismo loader, devuelve `Promise`.
-  6. `<script type="importmap">` → P2, solo `imports` sin `scopes`.
-  7. `nomodule` → ignorar cuando hay soporte de módulos.
-- Todo bundle Vite/Next moderno es `type="module"`. **Sin esta tarea el corpus C2 no
-  puede pasar aunque todas las APIs existan.**
-- **Aceptación**: `vanilla-esm` del corpus C2 pasa; `defer` se ejecuta antes de
-  `DOMContentLoaded` y `async` no bloquea.
-
-### C10 — Ejecución de scripts durante el parseo (streaming) — P1 — 4 d
-
-- Simplificación declarada en `ARCHITECTURE.md` (Fase 8, líneas ~2019-2087): el
-  pipeline ejecuta todo el JS **después** de parsear el documento completo. Eso rompe
-  `document.write`, `document.currentScript`, scripts que leen `document.body` cuando
-  aún no existe (esperan `null`), y cualquier script que dependa de que el DOM "de
-  abajo" no exista todavía.
-- Solución: `html5ever` soporta pausar el `TreeSink` en `</script>`. Enganchar la
-  ejecución del script en ese punto (`html5ever_sink.rs`), con el runtime de `boa`
-  vivo durante el parseo.
-- Riesgo: cambia la firma de `build_page*` y el orden de `fetch_external_stylesheets`.
-  Hacerlo detrás de un flag interno hasta que el corpus C2 pase con ambos modos.
-- **Aceptación**: `document.write('<p>x</p>')` inserta en el sitio correcto; un
-  script antes de `<body>` ve `document.body === null`.
-
-### C11 — Formularios desde JS — P1 — 1 d
-
-- `form.submit()`, `form.reset()`, `form.elements`, `form.requestSubmit()`,
-  evento `submit` cancelable desde JS (hoy el submit lo hace el servidor al hacer
-  clic; el evento tiene que pasar por JS primero y respetar `preventDefault`).
-- `FormData` (constructor desde `<form>`, `append/get/getAll/has/entries`), aceptado
-  por `fetch` como cuerpo (`multipart/form-data` real con boundary).
-- `input.value` setter que dispara `input`/`change` **solo** cuando lo hace el
-  usuario (no cuando lo asigna JS; React depende de esta distinción).
-- `input.checked`, `select.value`/`selectedIndex`/`options`, `textarea.value`.
-- `EngineRequest::SubmitForm` en el protocolo (declarado como no implementado en
-  `ARCHITECTURE.md`).
-- **Aceptación**: `vue-vite` del corpus (formulario) pasa.
-
-### C12 — Selección de texto y portapapeles — P2 — 1,5 d
-
-- `window.getSelection()`, `Selection`/`Range` mínimos, `document.execCommand('copy')`
-  (deprecado pero usado), `navigator.clipboard.writeText/readText` (vía Electron).
-- Selección visual por arrastre en el servidor (`ARCHITECTURE.md`: "selección de
-  texto no implementada").
-- **Aceptación**: seleccionar con el ratón resalta y Ctrl+C copia.
-
-### C13 — Cierre del bloque: corpus en verde — P0
-
-- Quitar `#[ignore]` de los 5 tests de C2 uno a uno.
-- Verificar en vivo contra 10 webs reales de la lista de la Fase 39
-  (`ignislove.com`, una tienda Shopify, un blog Next, una app Vue, docs con Docusaurus,
-  Google, Wikipedia, un periódico, GitHub, MDN) y anotar en `ARCHITECTURE.md` cuáles
-  se ven y cuáles no, con captura.
-- Actualizar el aviso `requires_javascript`: si el JS se ejecutó y sigue sin haber
-  texto, el mensaje debe decir "el script se ejecutó pero falló en X" con el
-  primer error capturado, no "esta página necesita JavaScript".
-
----
-
-## 5. Bloque D — CSS y layout pendientes
-
-Todas estas son simplificaciones declaradas en `ARCHITECTURE.md`. Prioridad según
-frecuencia en CSS real.
-
-### D1 — `::before` / `::after` con `content` — P1 — 2 d
-
-- Ficheros: `engine/crates/css/src/selector.rs` (`NoPseudoElement` es un enum vacío:
-  el parser rechaza `::before` y **descarta la regla entera**, ver línea ~2630 de
-  `ARCHITECTURE.md`), `engine/crates/layout/src/tree.rs`.
-- Implementar `PseudoElement::{Before, After}`, generar cajas anónimas en el árbol
-  de layout con `content: "texto" | attr(x) | counter()` (counters P2), `display`
-  por defecto `inline`.
-- Impacto: iconos de fuente (Font Awesome), clearfix, viñetas personalizadas,
-  comillas. Muchísimo CSS real.
-- **Aceptación**: `a::after { content: " →" }` pinta la flecha.
-
-### D2 — `linear-gradient()` / `radial-gradient()` como `background-image` — P1 — 1,5 d
-
-- Ficheros: `engine/crates/css/src/parser.rs` (hoy solo extrae `url()`),
-  `engine/crates/gfx/src/display_list.rs` + `image_paint.rs`.
-- `tiny-skia` tiene `LinearGradient`/`RadialGradient` nativos: es solo parseo +
-  mapeo de ángulo/paradas.
-- Declarado como "candidato real siguiente" en la Fase 40.
-- **Aceptación**: `background: linear-gradient(90deg, red, blue)` pinta el degradado.
-
-### D3 — `background-size`, `background-position`, `background-repeat` variantes, capas múltiples — P1 — 1,5 d
-
-- Continuación directa de la Fase 40. `cover`/`contain`/`<length>`/`%`,
-  `no-repeat`/`repeat-x`/`repeat-y`, `center`/`top left`/`<length>`, y lista separada
-  por comas (capas, la primera arriba).
-- **Aceptación**: `background: url(x) center / cover no-repeat` se ve como en Chrome.
-
-### D4 — `calc()` real — P1 — 1,5 d
-
-- Hoy `calc()` y `var()` dentro de shorthands se dejan sin expandir y el layout
-  resuelve a cero (Fase 39). `var()` ya funciona en longhands (commit `bc20af9`).
-- Implementar un evaluador de expresiones con unidades mixtas (`calc(100% - 2rem)`)
-  que se resuelva en el momento en que se conoce el *containing block*, es decir,
-  en `layout`, no en `css`. Guardar el AST en `computed_style` y evaluar tarde.
-- `min()`, `max()`, `clamp()` con el mismo evaluador.
-- **Aceptación**: `width: calc(100% - 40px)` en un padre de 400px → 360px.
-
-### D5 — `transform` 2D — P1 — 2 d
-
-- `translate/scale/rotate/skew/matrix`, `transform-origin`. `tiny-skia` pinta con
-  `Transform`; el hit-testing del servidor (`click`) tiene que invertir la matriz.
-- No afecta al layout (correcto por spec), solo al pintado y al hit-testing.
-- **Aceptación**: un botón con `transform: translateX(100px)` se pinta y recibe clics
-  en su posición transformada.
-
-### D6 — `transition` y `animation` (`@keyframes`) — P2 — 4 d
-
-- Requiere un bucle de fotogramas real (hoy `requestAnimationFrame` va por la cola
-  de `setTimeout(0)`). Diseñar primero el *tick* del servidor: `EngineRequest::Tick`
-  o un temporizador interno que re-pinte a 60 Hz solo cuando hay animaciones activas.
-- `transition-property/duration/timing-function/delay`, `@keyframes`,
-  `animation-*`. Interpolación de longitudes, colores, `transform`, `opacity`.
-- **No se hace**: `animation-timeline`, `view-transition`, `will-change`.
-- **Aceptación**: `transition: opacity .3s` produce ≥10 capturas intermedias distintas.
-
-### D7 — `opacity`, `visibility`, `z-index` con contextos de apilamiento — P1 — 1,5 d
-
-- Verificar cuáles existen (grep en `gfx`). `z-index` necesita ordenar la display
-  list por contexto de apilamiento (spec CSS2 apéndice E), no solo por orden de árbol.
-- **Aceptación**: un `position: absolute; z-index: -1` queda detrás de su hermano.
-
-### D8 — Listas: viñetas, numeración, `list-style-*` — P1 — 1 d
-
-- `ARCHITECTURE.md` (hoja de agente de usuario): "sin viñetas ni sangría de listas".
-  Commit `8360c3e` habla de "pulido de listas"; verificar qué quedó.
-- `list-style-type: disc|circle|square|decimal|none`, `list-style-position`,
-  marcadores como cajas `::marker` (reusar D1).
-- **Aceptación**: `<ul><li>` pinta el punto y `<ol>` numera.
-
-### D9 — Tipografía — P1 — 2 d
-
-- `@font-face` con descarga de `woff2`/`ttf` (crate `ttf-parser` ya está; `woff2`
-  necesita el crate `woff2` o descomprimir con `brotli`, que ya es dependencia).
-- `font-family` con *fallback* real por glifo ausente (hoy: verificar en `text/`).
-- `line-height` numérico/`normal` correcto, `letter-spacing`, `word-spacing`,
-  `text-transform`, `white-space: pre|nowrap|pre-wrap`, `text-overflow: ellipsis`,
-  `word-break`, `overflow-wrap`.
-- Shaping con `rustybuzz` para ligaduras/árabe/devanagari (hoy `text/src/shape.rs`
-  tiene 190 líneas cambiadas en esta rama: revisar qué cubre).
-- **Aceptación**: una página con Google Fonts por `@font-face` usa la fuente descargada.
-
-### D10 — Grid completo — P2 — 2 d
-
-- Hoy: `grid-template-columns`, `gap`, `grid-template-areas`. Faltan
-  `grid-template-rows`, `grid-auto-flow`, `grid-auto-rows/columns`, `repeat(auto-fill,
-  minmax())`, `grid-column/row` con `span`, alineación (`justify-items`, `align-content`).
-  `taffy` lo soporta todo con la feature `grid`; es solo el puente en `layout/src/tree.rs`.
-
-### D11 — Flexbox completo — P2 — 1 d
-
-- Verificar `order`, `align-self`, `flex-wrap` multi-línea con `align-content`, `gap`
-  en flex, `min-width: auto` correcto. `taffy` lo hace; comprobar el mapeo.
-
-### D12 — Otros CSS frecuentes — P2 — 2 d
-
-- `outline`, `cursor` (enviar al servidor para cambiar el cursor de Electron),
-  `pointer-events: none` (afecta al hit-testing), `user-select`, `object-fit`/
-  `object-position` en `<img>`, `aspect-ratio`, `inset`, `gap` en flex,
-  `filter: blur|grayscale|drop-shadow` (P3), `backdrop-filter` (P3), `clip-path` (P3),
-  `mix-blend-mode` (P3), `columns` (P3), `writing-mode` (P3).
-- `:focus`, `:focus-visible`, `:active`, `:checked`, `:disabled`, `:first-child`,
-  `:last-child`, `:nth-child(an+b)`, `:not()`, `:is()`, `:where()`, `:has()` (P2),
-  `:root`, `:empty`, `:target` — verificar cuáles del `EnginePseudoClass` existen
-  y añadir el resto. El crate `selectors` los parsea; falta la evaluación en `element.rs`.
-- `@container` (P3), `@layer` (P2: afecta a la cascada), `@property` (P3),
-  `@font-face` (D9), `@import` (E3), `@page` (nunca).
-
-### D13 — Reflow incremental — P2 — 5 d
-
-- Hoy cualquier mutación del DOM desde JS re-hace layout completo. Para páginas de
-  13.000 nodos son ~1,8 s por mutación (cifra de la Fase 39 para la carga inicial).
-  Con React re-renderizando en cada tecleo, es inutilizable.
-- Diseñar *dirty flags* por subárbol: una mutación marca su ancestro de bloque
-  más cercano; el layout solo recalcula desde ahí si el tamaño del contenedor no
-  cambia (contención). Empezar por el caso fácil: cambios de texto/atributo dentro
-  de un bloque con `width` fijo.
-- Cache de estilos calculados por (elemento, hash de reglas aplicables).
-- **Aceptación**: cambiar un `textContent` en una página de 10.000 nodos tarda
-  <50 ms (medido con `performance.now()` desde el propio JS).
-
----
-
-## 6. Bloque E — Red
-
-### E1 — Caché HTTP en memoria y disco — P1 — 2 d
-
-- Fichero nuevo: `engine/crates/net/src/cache.rs`.
-- RFC 9111 mínimo: `Cache-Control: max-age/no-store/no-cache`, `Expires`, `ETag` +
-  `If-None-Match`, `Last-Modified` + `If-Modified-Since`, 304. Clave: método + URL.
-  Solo GET/HEAD. `Vary: Accept-Encoding` respetado.
-- Disco: mismo directorio que `localStorage` (Fase 25), formato simple
-  (cabeceras JSON + cuerpo). Límite 200 MB con LRU.
-- Impacto medido esperado: la segunda carga de Wikipedia debería bajar de 4,0 s a
-  <1 s (sin descargas).
-- **Aceptación**: test con servidor local que cuenta peticiones: segunda navegación
-  no vuelve a pedir el CSS/imágenes con `max-age`.
-
-### E2 — HTTP/2 — P2 — 1 d
-
-- `hyper` 1.x soporta h2 con la feature `http2` y ALPN en `hyper-rustls`. Es
-  configuración, no código: activar y verificar que `Accept-Encoding`, redirecciones y
-  cookies siguen pasando los tests.
-- Multiplexación reduce la latencia de subrecursos (hoy paralelizados con
-  `futures-util`, pero cada uno abre conexión).
-- **Aceptación**: `NetworkResponse` expone `version` y contra `https://www.google.com`
-  devuelve `HTTP/2`.
-
-### E3 — `@import` en hojas de estilo — P1 — 0,5 d
-
-- Declarado no implementado en `fetch_external_stylesheets`. Parsear `@import url(...)
-  [media]` al principio de cada hoja descargada, descargar recursivamente (límite de
-  profundidad 5, detección de ciclos), insertar en orden. Reusar el pool paralelo de
-  la Fase 39.
-- **Aceptación**: una hoja que importa otra aplica ambas.
-
-### E4 — `<link rel="preload|prefetch|modulepreload|icon">` — P2 — 0,5 d
-
-- `preload`/`modulepreload`: adelantar descarga al pool. `icon`: exponer el favicon
-  en `get_state` para que la pestaña de Electron lo muestre.
-
-### E5 — Streaming de respuesta y parseo progresivo — P2 — 3 d
-
-- Hoy se descarga el cuerpo completo antes de parsear. Con C10 (parseo con scripts en
-  streaming) tiene sentido alimentar `html5ever` por *chunks*. Mejora el tiempo hasta
-  el primer pintado en páginas grandes.
-
-### E6 — DNS, proxy, `Referer`, `Referrer-Policy`, HSTS — P2 — 1,5 d
-
-- `Referer` correcto según `Referrer-Policy` (hoy verificar si se manda).
-- HSTS: recordar `Strict-Transport-Security` y forzar https (persistente en disco).
-- Proxy del sistema: `hyper-util` puede leer `HTTPS_PROXY`; exponer en ajustes.
-- DNS propio: **no** (doctrina de dependencias).
-
-### E7 — Cookies: `Set-Cookie` con `Partitioned`, `__Host-`/`__Secure-` prefijos, límites — P2 — 0,5 d
-
----
-
-## 7. Bloque F — Seguridad: sandbox de proceso
-
-Es el hueco de seguridad más grave que queda y el único ❌ de la tabla del README.
-Rust elimina la corrupción de memoria pero no un fallo lógico en `boa` que permita a
-un script leer el disco vía una API mal expuesta, ni un bug en `resvg`/`image` con un
-fichero malicioso.
-
-### F1 — Modelo de amenazas escrito — P1 — 0,5 d
-
-- Fichero nuevo: `engine/SECURITY.md`. Qué se protege (disco del usuario, otras
-  pestañas, cookies de otros orígenes, la red local), de qué (página maliciosa,
-  subrecurso malicioso, servidor comprometido), y qué NO (un atacante con acceso
-  local a la máquina).
-- Inventario de superficie: cada API de `engine_server` que toca disco
-  (`localStorage` en disco, caché E1, sesión persistente del commit `8360c3e`).
-
-### F2 — Aislar el motor en un proceso por pestaña — P1 — 4 d
-
-- Hoy: un solo `engine_server` con N pestañas en el mismo proceso (`server.rs:147`,
-  struct de pestaña). Un pánico en una pestaña mata todas.
-- Diseño: `engine_server` pasa a ser un **broker** que lanza un `engine_tab` (nuevo
-  binario en `core/src/bin/`) por pestaña, reenvía las peticiones NDJSON por su
-  `tab_id` y agrega respuestas. El broker es el único que toca disco (cookies,
-  `localStorage`, caché): los procesos de pestaña le piden esos datos por IPC y solo
-  reciben los de su origen.
-- Ventaja inmediata: un pánico/OOM en una pestaña no tumba el navegador;
-  `close_tab` mata el proceso y libera memoria de verdad.
-- **Aceptación**: `panic!()` inyectado en una pestaña → la pestaña muestra "página
-  bloqueada", las demás siguen.
-
-### F3 — Sandbox del SO para los procesos de pestaña — P1 — 3 d (Windows) + 2 d por plataforma
-
-- Ya existe `engine/crates/core/src/sandbox.rs` (Fase 37, "sandboxing avanzado";
-  `sandbox.rs:58` habla de plataforma sin soporte). **Leerlo primero** y documentar
-  qué hace hoy exactamente antes de ampliarlo.
-- Windows: *Job Objects* (límite de memoria/CPU, sin procesos hijos), *restricted
-  token* (sin privilegios), *AppContainer* (P2, más complejo pero es lo que usa
-  Chromium). Crate `windows` o `windows-sys`.
-- Linux: `seccomp-bpf` + *namespaces* (crate `nix`/`seccompiler`). macOS:
-  `sandbox_init` con perfil `.sb`.
-- El proceso de pestaña **no debe** poder abrir ficheros ni sockets: toda la red pasa
-  por el broker. Esto obliga a mover `NetworkEngine` al broker (o a un tercer proceso
-  de red, como Chromium). Hacerlo por fases: primero red en pestaña con sandbox
-  parcial, después red en broker.
-- **Aceptación**: desde JS, un `fetch('file:///C:/Windows/win.ini')` falla en el
-  esquema (ya), y un intento de `std::fs::read` inyectado en el proceso de pestaña
-  falla por el SO, no por el código.
-
-### F4 — Aislamiento de sitios (site isolation) — P3
-
-- Un proceso por **sitio**, no por pestaña, para que un `<iframe>` de otro origen no
-  comparta memoria. Depende de G1 (iframes). Solo tiene sentido después de F2/F3.
-
-### F5 — Endurecimiento del propio protocolo NDJSON — P2 — 1 d
-
-- Límite de tamaño por línea (hoy `main.js`/backend hablan de buffer de 64 MB),
-  validación estricta de JSON con `deny_unknown_fields`, `tab_id` no adivinable
-  (UUID en vez de posición: `server.rs:222` documenta que hoy es por posición).
-- Fuzzing del parser de peticiones con `cargo-fuzz` (P2).
-
-### F6 — Fuzzing de decodificadores — P2 — 1 d
-
-- `cargo-fuzz` sobre `engine-image::decode_image` (PNG/JPEG/SVG/WebP), el parser de
-  CSS y el parser de cookies. Los crates externos ya están fuzzeados, pero el
-  *pegamento* propio no.
-
-### F7 — Auditoría de dependencias en CI — P1 — 0,25 d
-
-- `cargo audit` y `cargo deny` (licencias + advisories) en `engine.yml`;
-  `npm audit --audit-level=high` en `app.yml`.
-
----
-
-## 8. Bloque G — Plataforma web ausente
-
-Ordenado por lo que más páginas rompe.
-
-### G1 — `<iframe>` — P1 — 4 d
-
-- Necesario para: vídeos de YouTube embebidos, widgets de pago (Stripe), Google
-  Maps, botones sociales, y toda la publicidad. Sin iframe muchas páginas "se ven"
-  pero tienen agujeros.
-- Diseño: un iframe es un **documento anidado** con su propio DOM, hoja de estilos,
-  runtime JS y `location`, cuyo `<html>` se coloca como caja reemplazada en el
-  layout del padre. `window.parent`/`frames`/`postMessage` para comunicación
-  entre ambos, con comprobación de origen. `sandbox` attribute con sus tokens.
-  `srcdoc`. `about:blank`.
-- Dependencia fuerte de F2 si se quiere aislar por origen; sin F2, mismo proceso
-  (aceptable como primera fase, igual que Firefox durante años).
-- **Aceptación**: una página con un iframe de otro origen pinta el contenido del
-  iframe en su caja y `postMessage` cruza en ambas direcciones.
-
-### G2 — `<video>` y `<audio>` — P2 — 5 d
-
-- Decodificación: **no se escribe a mano** (doctrina). Opciones: crate `ffmpeg-next`
-  (enlaza libav, licencia LGPL, pesado), `symphonia` (audio puro Rust: MP3/AAC/FLAC/
-  Vorbis/Opus) + `rav1d`/`dav1d` para AV1, o delegar el vídeo a Electron
-  (`<video>` de Chromium en una capa superpuesta posicionada con el rectángulo del
-  layout). La delegación a Electron es la más barata y honesta: el motor calcula la
-  caja, Electron reproduce. Elegir esta como primera fase; documentar que el
-  vídeo NO lo pinta el motor.
-- API JS: `HTMLMediaElement` (`play/pause/currentTime/duration/volume/muted/
-  readyState`, eventos `play/pause/timeupdate/ended/loadedmetadata`), controles nativos.
-- Audio puro con `symphonia` + `cpal` sí puede vivir en el motor (P3).
-- **Aceptación**: un `<video src="x.mp4" controls>` se reproduce en su sitio y
-  `video.play()` desde JS funciona.
-
-### G3 — WebSockets — P2 — 1,5 d
-
-- Crate `tokio-tungstenite` (ya está `tokio`). API `WebSocket` completa: `send`,
-  `close`, `onopen/onmessage/onerror/onclose`, `binaryType`, `readyState`. CSP
-  `connect-src` ya existe; aplicarla a `ws://`/`wss://`. Origen en el handshake.
-- Necesario para: chats, dashboards en vivo, HMR de Vite en desarrollo (útil para
-  el propio corpus C2).
-- **Aceptación**: eco contra un servidor local `tungstenite`.
-
-### G4 — IndexedDB — P2 — 4 d
-
-- Crate `sled` o `redb` (Rust puro) como almacén clave-valor por origen. API:
-  `indexedDB.open` con `onupgradeneeded`, `IDBDatabase`, `IDBObjectStore`
-  (`add/put/get/delete/getAll/count/openCursor`), `IDBTransaction` con `readonly/
-  readwrite`, índices con `createIndex`, `IDBKeyRange`. Todo asíncrono por la cola
-  de macrotareas; claves y valores con `structuredClone` (C5).
-- Necesario para: Firebase, muchas PWAs, Excalidraw, editores offline.
-- **Aceptación**: los tests estilo WPT `idbfactory_open` básicos portados a mano.
-
-### G5 — Web Workers — P2 — 3 d
-
-- Un `Worker` = un `boa::Context` en un hilo de `tokio` con su propia cola de
-  macrotareas, sin DOM, con `postMessage`/`onmessage` (mensajes por `structuredClone`),
-  `importScripts`, `fetch`, timers, `self`. `SharedWorker` no. `SharedArrayBuffer`
-  no (requiere COOP/COEP).
-- **Aceptación**: `new Worker('w.js')` calcula algo y devuelve el resultado.
-
-### G6 — Service Workers — P3 — 6 d
-
-- Depende de E1 (caché), G5 (workers) y de un registro persistente por origen.
-  `register`, ciclo `install/activate/fetch`, `Cache` API, `clients`. Es lo que hace
-  que las PWAs funcionen offline. Muy invasivo: intercepta toda la red de su alcance.
-  Dejarlo para el final del bloque.
-
-### G7 — WebGL / WebGPU — P3 — 10+ d
-
-- `wgpu` ya es dependencia de `gfx` (para la ventana). Exponer WebGL 1 sobre
-  `wgpu` es un traductor GLSL→WGSL (`naga` lo hace) más ~300 funciones de API.
-  WebGPU sería más directo (`wgpu` ES WebGPU) pero casi ninguna web lo usa aún.
-- Pragmático: `canvas.getContext('webgl')` devuelve `null` de forma honesta (la
-  web cae a su fallback 2D si lo tiene). Ya es así hoy por ausencia; documentarlo.
-
-### G8 — APIs de dispositivo — P3
-
-- `Notification`, `Geolocation`, `getUserMedia`, `Bluetooth`, `USB`, `Battery`,
-  `Vibration`, `Gamepad`: todas devuelven denegado/no soportado de forma explícita
-  y documentada. Sin stubs que finjan éxito.
-
-### G9 — `<dialog>`, `<details>/<summary>`, `<progress>`, `<meter>`, `<input type=date|color|range|file>` — P2 — 2 d
-
-- Controles nativos que faltan en `layout` (verificar cada uno). `<input type=file>`
-  necesita diálogo de Electron y `File`/`FileList`/`FileReader`/`Blob` en JS (C5-bis).
-
-### G10 — `Blob`, `File`, `FileReader`, `URL.createObjectURL`, `ReadableStream` — P2 — 2 d
-
-- `fetch(...).body` como `ReadableStream`, `response.blob()`, `arrayBuffer()`,
-  `formData()`. Descargas: `<a download>` → diálogo de guardado de Electron.
-
-### G11 — Impresión, `window.print()`, PDF — P3
-
-### G12 — MathML, namespaces SVG correctos en el DOM — P3
-
-- Simplificación declarada en `html5ever_sink.rs`. Afecta a `document.createElementNS`
-  y a `el.namespaceURI`, que D3.js y algunas libs de gráficos consultan.
-
----
-
-## 9. Bloque H — Compatibilidad medible (WPT)
-
-Sin este bloque, "compatibilidad" sigue siendo una impresión. `ARCHITECTURE.md` lo
-dice en su sección "Métrica de progreso" y explica qué falta del arnés.
-
-### H1 — Completar `testharness.js` — P1 — 2 d
-
-- Fichero: `engine/crates/js/src/test_harness.rs`.
-- Hoy: `test`, `assert_equals`, `assert_true`, `assert_false`. Faltan (declarados):
-  `async_test` (con `step`, `step_func`, `done`), `promise_test`, `assert_throws_js`,
-  `assert_throws_dom`, `assert_array_equals`, `assert_not_equals`, `assert_in_array`,
-  `assert_class_string`, `assert_own_property`, `assert_unreached`, `assert_approx_equals`,
-  `setup({explicit_done, timeout})`, `done()`, `add_completion_callback`,
-  `step_timeout`, `format_value`.
-- Alternativa más honesta: **cargar el `testharness.js` real de WPT** en vez de
-  reimplementarlo en Rust. Si el motor ya ejecuta ES moderno, el fichero oficial
-  (~4.000 líneas de JS) debería correr. Probarlo primero; si corre, H1 se reduce a
-  0,5 d y la métrica es mucho más creíble. Solo si falla, reimplementar.
-- **Aceptación**: `testharness.js` oficial carga y `add_completion_callback` entrega
-  los resultados a Rust.
-
-### H2 — Vendorizar un subconjunto de WPT — P1 — 1 d
-
-- Script `scripts/sync-wpt.sh` que clona `web-platform-tests/wpt` a `engine/tests/wpt/`
-  (ignorado en git, o *sparse checkout* de los directorios elegidos) fijado a un commit.
-- Directorios iniciales con sentido para lo que el motor soporta:
-  `dom/nodes`, `dom/events`, `html/dom`, `html/semantics/forms` (parcial),
-  `css/CSS2/box-display`, `css/css-flexbox`, `css/css-grid`, `css/selectors`,
-  `cssom`, `fetch/api/basic`, `xhr`, `url`, `encoding`, `html/webappapis/timers`,
-  `html/browsers/history`, `storage`, `cookies`.
-- `wpt_runner` gana: `--expectations expectations.json` (lista de tests que se sabe
-  que fallan, para que CI solo falle en **regresiones**, no en lo que nunca pasó),
-  `--json` para exportar resultados, timeout por test (hoy no hay: un test con bucle
-  infinito cuelga el runner), y soporte de `<script src="/resources/testharness.js">`
-  con rutas absolutas del corpus.
-- Los reftests (comparación de capturas contra referencia) son P2: el runner
-  necesita pintar ambos y comparar píxeles con tolerancia.
-- **Aceptación**: `wpt_runner tests/wpt/dom/nodes --json > results.json` produce
-  un número. Ese número va al README con fecha y **sustituye** cualquier afirmación
-  cualitativa de compatibilidad.
-
-### H3 — Panel de compatibilidad — P2 — 0,5 d
-
-- `scripts/wpt-report.js` genera una tabla Markdown por directorio (pasan/total/%)
-  a partir de `results.json`; se pega en `ARCHITECTURE.md` en cada fase.
-
-### H4 — Tests de captura (visual regression) propios — P2 — 1 d
-
-- Para cada web del corpus C13, guardar la captura PNG de referencia y comparar en
-  CI con tolerancia (crate `image-compare` o `dssim`). Detecta regresiones de pintado
-  que ningún test unitario ve.
-
----
-
-## 10. Bloque I — Producto
-
-### I1 — Decidir el destino del backend Python — P1 — 0,5 d de decisión + 1 d de ejecución
-
-Hechos:
-- `backend/app/core/main.py` expone un WebSocket `/ws` que envuelve al motor y
-  ejecuta un agente Gemini (`backend/app/domains/agent/agent.py`).
-- `frontend/src/domains/agent/AgentOrchestrator.ts` hace **lo mismo** en TypeScript
-  contra Gemini directamente desde el renderer.
-- Electron ya habla con `engine_server` por IPC (`desktop/main.js:417`) sin pasar por Python.
-- `desktop/package.json` sigue empaquetando `build-resources/backend-server` (PyInstaller)
-  en el instalador: son decenas de MB y un proceso más que arrancar.
-
-Opción recomendada: **eliminar el backend Python** y quedarse con el orquestador
-en TypeScript, moviendo las llamadas al LLM del renderer al **proceso principal de
-Electron** (por seguridad: la clave no debe vivir en el renderer ni en `localStorage`).
-Si más adelante hace falta Python (por ejemplo, para hablar con Faster-Whisper en
-PCCOM), se llama por HTTP a un servicio externo, no se empaqueta.
-
-Tareas si se elimina:
-- Borrar `backend/`, `scripts/install-backend.js`, `backend-server.spec`, la entrada
-  `extraResources` de `desktop/package.json`, `instalar.bat/.sh` (o dejarlos solo
-  para `npm install`), y las referencias en README/ARCHITECTURE.md ("Integración con
-  el producto" menciona a Python como cliente del puente).
-- **Aceptación**: `npm run build:app` produce un instalador sin carpeta
-  `backend-server` y el Copiloto sigue funcionando.
-
-### I2 — Proveedor de IA configurable: Gemini, Anthropic, OpenAI-compatible, Ollama local — P1 — 2 d
-
-Ficheros: `frontend/src/domains/agent/AgentOrchestrator.ts`, `AgentSidebar.tsx`,
-`desktop/main.js`, `desktop/preload.js`.
-
-- Abstraer `runGeminiStep` en una interfaz `LlmProvider { complete(prompt, tools) }`
-  con implementaciones:
-  - `GeminiProvider` (la actual, `gemini-2.0-flash`; actualizar a la versión vigente),
-  - `AnthropicProvider` (Messages API con *tool use*; el AOM como herramienta),
-  - `OpenAiCompatibleProvider` (sirve para OpenAI, Groq, Mistral, LM Studio),
-  - `OllamaProvider` apuntando por defecto a `http://192.168.1.47:11434/api/generate`
-    (el 7B `Qwen2.5-Coder` de PCCOM según el CLAUDE.md global) con la URL editable.
-- Las llamadas HTTP salen del **proceso principal** de Electron vía `ipcRenderer.invoke('llm:complete')`;
-  la clave se guarda con `safeStorage` de Electron (cifrado del SO), no en `localStorage`.
-- Selector de proveedor y modelo en el panel de ajustes; modo "simulación" se conserva.
-- **Aceptación**: el agente completa una tarea ("busca X en Wikipedia y dime el primer
-  párrafo") con Ollama local sin clave de ningún tipo.
-
-### I3 — El agente usa el AOM, no el texto plano — P1 — 1,5 d
-
-- Hoy `AgentOrchestrator.ts` manda `domText` (texto) al modelo. El crate `engine-ai`
-  ya genera `to_llm_representation` con roles y coordenadas, y `EngineRequest::
-  GetAccessibilityTree` existe. Conectarlos: el prompt del agente lleva el AOM y las
-  acciones devuelven `{action: 'click', target_id}` en vez de coordenadas adivinadas.
-- Añadir al AOM: estado (`checked`, `disabled`, `expanded`), `value` de inputs,
-  `href` de enlaces, y un `id` estable por nodo para que el modelo lo referencie.
-- Herramientas del agente: `navigate`, `click(id)`, `type(id, text)`, `press(key)`,
-  `scroll(dy)`, `back`, `read(id)`, `done(answer)`. Bucle con límite de pasos y
-  confirmación del usuario antes de `submit` de formularios o navegación a un
-  dominio nuevo (seguridad del agente).
-- **Aceptación**: tarea "inicia sesión en X con estas credenciales" se completa
-  usando ids del AOM y pide confirmación antes de enviar el formulario.
-
-### I4 — Transcripción de voz (feature `feat/voice-transcription` de GlowApp reutilizable) — P2 — 1 d
-
-- Botón de micrófono en el panel del Copiloto → `MediaRecorder` en el renderer de
-  Electron (Chromium, sí lo tiene) → POST al endpoint de Faster-Whisper en PCCOM →
-  texto en el cuadro. URL configurable; desactivado si no responde.
-
-### I5 — UI de Electron: lo que falta para un navegador usable — P1 — 3 d
-
-Ficheros: `frontend/src/core/App.tsx`, `domains/browser/components/BrowserViewport.tsx`.
-
-- Favicon en pestañas (E4), indicador de carga real (progreso por subrecursos:
-  nuevo evento `progress` en el protocolo), botón de recargar y detener,
-  menú contextual (abrir en pestaña nueva, copiar enlace, inspeccionar AOM),
-  atajos (Ctrl+T/W/L/R/Tab, Alt+←/→, F5, Ctrl+F para buscar en página),
-  zoom (Ctrl +/-: `Resize` con factor de escala en el servidor), marcadores
-  (JSON en `userData`), historial navegable con búsqueda, descargas (G10),
-  gestor de cookies/almacenamiento por sitio ("borrar datos de este sitio"),
-  candado TLS con detalles del certificado (`rustls` los expone), página de error
-  con detalle real (`NetworkError` ya tiene variantes), `about:blank`/`about:settings`
-  internas, modo oscuro de la UI, ventana con estado recordado.
-- Panel de desarrollador mínimo: árbol DOM, estilos calculados, AOM, consola
-  (los `console.*` de C5 viajan por un nuevo mensaje `console` del protocolo), red
-  (lista de peticiones con estado/tiempo).
-- **Aceptación**: cada elemento tiene un test de humo en Playwright **contra la UI de
-  Electron** (no contra el motor; no viola la regla de "sin Playwright en el
-  instalador", es dev-only).
-
-### I6 — Distribución: firma, releases, auto-update — P2 — 1 d + decisión de compra
-
-Fichero: `desktop/DISTRIBUCION.md` ya lo explica; falta ejecutarlo.
-
-- Publicar el primer *release* en GitHub (`charlessonamericantrading/navegador`,
-  ya configurado en `publish`) con `electron-builder --publish always` desde CI
-  (`GH_TOKEN` como secreto). Hasta entonces el auto-update falla en silencio.
-- Comprar certificado de firma (OV ~70-300 USD/año) o, gratis, instrucciones de
-  SmartScreen en la página de descarga. Decisión del propietario.
-- `desktop/package.json`: `version` sigue en `1.0.0` mientras el motor es `0.1.0` y
-  el README dice "no apto para uso general". Alinear a `0.x` con *semver* y un
-  `CHANGELOG.md`.
-- **Aceptación**: `latest.yml` publicado; la app instalada detecta la siguiente versión.
-
-### I7 — Telemetría de fallos opt-in — P3 — 1 d
-
-- Cuando una pestaña muere (F2) o `requires_javascript` salta con un error de JS,
-  ofrecer enviar la URL + primer error a un endpoint propio. Estrictamente opt-in.
-  Es la forma más rápida de saber qué API falta en el mundo real (bloque C).
-
-### I8 — Documentación de usuario y contribución — P2 — 1 d
-
-- `CONTRIBUTING.md` (cómo añadir una fase, la doctrina de "no existe si no está
-  implementado", cómo correr `wpt_runner`), `docs/protocolo-ndjson.md` (los 17
-  mensajes con ejemplo JSON de petición y respuesta), plantilla de PR con checklist
-  (tests, ARCHITECTURE.md, README).
-
----
-
-## 11. Bloque J — Multiplataforma
-
-### J1 — Compilar en Linux y macOS en CI — P2 — 1 d
-
-- Añadir `ubuntu-latest` y `macos-latest` a la matriz de `engine.yml`, solo
-  `cargo build` + `cargo test` (sin empaquetar). Los fallos esperables: rutas de
-  `localStorage`/sesión con `\`, `sandbox.rs` (solo Windows), enlaces a fuentes del
-  sistema en `text/`.
-- **Aceptación**: los tres SO en verde.
-
-### J2 — Fuentes del sistema por plataforma — P2 — 1 d
-
-- Verificar cómo `text/` localiza fuentes. Si está a mano, usar `font-kit` o
-  `fontdb` (ya llega con `usvg`) para descubrir fuentes en Windows/macOS/Linux/
-  fontconfig.
-
-### J3 — Empaquetado macOS (`dmg`) y Linux (`AppImage`/`deb`) — P2 — 1 d
-
-- `electron-builder` ya tiene targets `mac` en `package.json`; añadir `linux`.
-  El motor se compila por plataforma en CI y se copia a `build-resources/engine/`.
-- Notarización de macOS: requiere cuenta de desarrollador de Apple (99 USD/año).
-  Decisión del propietario; sin ella Gatekeeper bloquea.
-
-### J4 — Móvil — no planificado
-
-- Electron no existe en móvil. Sería una app nativa con el motor como biblioteca
-  (`cdylib` + JNI/Swift). Fuera de alcance; se documenta como decisión.
-
----
-
-## 12. Bloque K — Rendimiento
-
-Cifras de partida (Fase 39, 2026-08-27): página sintética 13.000 nodos / 2.000
-reglas → 1,8 s; Wikipedia "España" → 4,0 s CPU; Google → 457 ms.
-
-### K1 — Banco de pruebas de rendimiento reproducible — P1 — 1 d
-
-- `engine/benches/` con `criterion`: parseo, cascada, layout, pintado por separado
-  sobre 3 páginas congeladas (pequeña/media/grande). CI guarda los resultados y avisa
-  si una regresión supera el 20 %.
-- **Aceptación**: `cargo bench` produce cifras y hay un fichero `BENCHMARKS.md` con
-  la evolución por fase.
-
-### K2 — Perfilado de la ruta caliente actual — P1 — 1 d
-
-- `cargo flamegraph` sobre Wikipedia. Sospechosos según `ARCHITECTURE.md`: clonado
-  de `Arc<RwLock<Node>>` en cada consulta, medición de texto sin caché por
-  (fuente, tamaño, cadena), `resolve_style` por nodo sin caché de reglas compartidas
-  (Bloom filter de ancestros como Stylo).
-
-### K3 — Caché de medición de texto y de estilos — P1 — 2 d
-
-### K4 — Pintado incremental y por capas — P2 — 3 d
-
-- Hoy cada `get_state` genera una captura PNG completa en Base64 (coste de codificar
-  + transferir por IPC en cada scroll). Alternativas: memoria compartida entre
-  `engine_server` y Electron, o solo enviar la región sucia. Con D6 (animaciones)
-  esto es obligatorio.
-
-### K5 — JIT — P3 / no planificado
-
-- `boa` no tiene JIT. Cambiar a V8 (`rusty_v8`) rompería la doctrina (traer un motor
-  de 2 M de líneas con su propio sandbox) y la identidad del proyecto. Se acepta que
-  el JS sea más lento. Se revisará si `boa` añade JIT.
-
-### K6 — Memoria — P2 — 1 d
-
-- Medir RSS por pestaña con 10 pestañas abiertas. Liberar el árbol de layout y la
-  captura de las pestañas en segundo plano (hoy se conservan: `server.rs:789`
-  "repintar conservando todo su estado").
-
----
-
-## 13. Orden recomendado y dependencias
-
-```
-Semana 1   A1 A2 A3 A4 A5 ──► B1 B2 B3 F7          (repo veraz y protegido)
-Semana 2   C1 C2 ──► C3 C4 C5                       (medir; base de prototipos)
-Semana 3   C6 C7 C9 ──► primer bundle en verde       (vanilla-esm, react-vite)
-Semana 4   C8 C11 K1 K2 ──► vue-vite en verde
-Semana 5   D1 D2 D3 D4 E3 ──► svelte/next en verde; C13
-Semana 6   I1 I2 I3 ──► Copiloto con Ollama y AOM
-Semana 7   E1 E2 D5 D7 D8 D9
-Semana 8   H1 H2 H3 ──► primera cifra WPT en el README
-Semana 9   F1 F2 F5 ──► proceso por pestaña
-Semana 10  F3 (Windows) G1 (iframe)
-Semana 11  I5 I6 J1 J2
-Semana 12  C10 D13 K3 K4
-Después    G3 G4 G5 G9 G10 D6 D10 D11 D12 E4-E7 F3(otros SO) F6 H4 I4 I7 I8 J3 K6
-Largo      G2 G6 G7 F4 D12(P3) G8 G11 G12
+La primera separación puede ser un proceso por pestaña. El destino necesita representar sitios, orígenes, frames y grupos de contextos: pestaña y frontera de seguridad no son conceptos equivalentes. Chromium documenta esta distinción en su [diseño de aislamiento de sitios](https://www.chromium.org/Home/chromium-security/site-isolation/).
+
+El broker decide capacidades y valida cada operación. Un identificador difícil de adivinar no sustituye autorización. Los renderers no reciben las claves de IA, acceso arbitrario al perfil ni permiso de lanzar procesos.
+
+### 3.2 Principios que se mantienen
+
+1. El motor propio procesa las páginas. No se introduce un fallback silencioso a Chromium para aparentar compatibilidad.
+2. Se reutilizan TLS, parsers, códecs y algoritmos complejos mantenidos cuando corresponda. «Propio» no significa reescribir toda dependencia.
+3. Una API anunciada debe tener semántica observable, errores correctos y pruebas; no se registran stubs de éxito.
+4. La IA no sustituye validaciones deterministas de seguridad ni corrige páginas ejecutando cambios arbitrarios sin autorización.
+5. Las optimizaciones preservan resultado, aislamiento y accesibilidad.
+6. Toda modificación funcional pequeña lleva una regresión relevante; no se generan tests que únicamente repitan el código.
+7. Las funcionalidades sensibles o experimentales van tras flags desactivables; un fallo en la sandbox impide iniciar contenido no confiable.
+8. Las decisiones costosas se documentan con alternativas, experimentos y salida reversible antes de una migración completa.
+
+### 3.3 Decisiones que no conviene heredar como prohibiciones eternas
+
+El plan anterior descartaba de forma permanente reconsiderar el runtime JS, una ruta de JIT o `window.open`. Para el objetivo ampliado conviene revisarlo con datos:
+
+- Boa sigue siendo el punto de partida. La elección de runtime y eventual JIT se evaluará en F29; no se cambia ahora ni se presume que una sustitución vaya a resolver las APIs web.
+- `window.open` debe tener activación de usuario, permisos y aislamiento adecuados. Bloquear todos los usos impediría ciertos flujos legítimos de autenticación.
+- El AOM puede ahorrar contexto al modelo, pero el ahorro debe medirse; no se fija un «80%» sin corpus.
+- No se delega multimedia en una webview con una sesión paralela sin definir cómo conserva origen, permisos, cookies y composición.
+- Sustituir Electron se decide por coste total, memoria, accesibilidad y portabilidad, no por una etiqueta de marketing.
+
+### 3.4 Formato de cada fase
+
+Las fases nuevas se llaman **F00–F43**. Son identificadores de planificación, no sustituyen la numeración histórica de `ARCHITECTURE.md`, que ya llega a Fase 46.
+
+Cada fase contiene objetivo, dependencias, archivos o componentes, tareas y una puerta de salida. Su estado inicial es pendiente salvo la inspección ejecutada en esta entrega. Las casillas no se marcan al escribir código: se marcan al aportar evidencia de aceptación.
+
+## 4. Fases de ejecución
+
+### F00 — Línea base fiable y decisiones de alcance
+
+**Prioridad:** P0. **Depende de:** nada. **Resultado:** estado reproducible del proyecto y backlog sin contradicciones.
+
+**Ámbito:** este plan, `README.md`, `engine/ARCHITECTURE.md`, `engine/huecos_sin_resolver.md`, inventario de dependencias y documentación nueva en `docs/`.
+
+- [x] Inspeccionar la arquitectura y ejecutar las comprobaciones recogidas en 1.3.
+- [x] Conservar el plan previo y establecer identificadores nuevos sin borrar la historia.
+- [ ] Guardar informes estructurados asociados a commit, fecha, SO, compilador y comandos.
+- [ ] Reconciliar capacidades declaradas contra código y pruebas; distinguir implementado, parcial, ausente y no verificado.
+- [ ] Separar en arquitectura el estado vigente del relato de fases históricas.
+- [ ] Definir usuarios iniciales, equipos de referencia y corpus crítico de tareas antes de comparar rendimiento.
+- [ ] Verificar la relación real con `main`, estado del CI remoto y política de contribución antes de planear integración.
+- [ ] Abrir un registro de decisiones para broker, runtime JS, almacenamiento, UI y modelo de extensiones.
+
+**Aceptación:** un tercero identifica qué funciona, reproduce los resultados y localiza evidencia de cada capacidad sin reconciliar tres cifras incompatibles. No quedan afirmaciones de seguridad total o superioridad sin respaldo.
+
+### F01 — Compilación reproducible y limpieza del producto
+
+**Prioridad:** P0/P1. **Depende de:** F00. **Ámbito:** scripts raíz, `scripts/`, manifiestos, CI, frontend y backend opcional.
+
+- [ ] Definir una ruta de instalación desde checkout limpio: dependencias, build del motor, frontend y arranque; el README actual omite pasos necesarios.
+- [ ] Fijar toolchains compatibles y probar la versión mínima realmente soportada. Añadir `rust-version` y archivo de toolchain cuando estén verificados.
+- [ ] Usar lockfiles y `npm ci` en validación; `--locked` también en la construcción de distribución.
+- [ ] Hacer que el build del navegador normal no requiera Python. Documentar la ruta opcional web/FastAPI y evitar eliminarla antes de migrar sus usuarios o pruebas.
+- [ ] Sustituir nombres de instaladores que contienen `1.0.0` fijo por valores derivados del manifiesto; alinear versiones y canal preestable.
+- [ ] Resolver los 20 hallazgos de lint por grupos: tipado del protocolo, hooks/refs, efectos y organización de componentes.
+- [ ] Mantener el límite de deuda decreciente durante la limpieza; después exigir cero errores y advertencias acordadas.
+- [ ] Probar artefactos completos: el empaquetado con recursos vacíos no será la puerta de lanzamiento.
+- [ ] Revisar scripts `.bat`/`.sh`, rutas con espacios y caracteres no ASCII; sustituir esperas fijas por comprobaciones de disponibilidad.
+- [ ] Normalizar formato por lotes aislados y registrar cambios puramente mecánicos para conservar la utilidad del historial.
+
+**Aceptación:** una máquina limpia compila e inicia la aplicación siguiendo instrucciones únicas, sin copiar binarios antiguos, sin backend obligatorio y con lint estricto aprobado. El build informa del commit y toolchain utilizados.
+
+### F02 — Dependencias y cadena de suministro
+
+**Prioridad:** P0. **Depende de:** línea base F00; puede avanzar junto a F01. **Ámbito:** Cargo/npm/Python, lockfiles y CI.
+
+- [ ] Instalar en el entorno de auditoría herramientas versionadas para Rust y revisar el lockfile completo con una base de avisos actualizada.
+- [ ] Clasificar cada aviso por dependencia, ruta, ejecución en build/runtime, entradas controlables y mitigación real.
+- [ ] Migrar Electron y electron-builder a versiones mantenidas, revisando cambios de sandbox, preload, protocolos y actualización.
+- [ ] Corregir avisos npm mediante actualización controlada; no ejecutar `audit fix --force` sin revisar el diff y los cambios incompatibles.
+- [ ] Migrar Boa y su familia de crates a una versión compatible mantenida, o aplicar una solución upstream verificada que retire la ruta vulnerable; probar módulos, GC y bindings.
+- [ ] Retirar excepciones resueltas. Las restantes tienen propietario, justificación técnica, fecha de revisión y condición de bloqueo de release.
+- [ ] Generar SBOM del instalador, incluyendo runtime Electron y bibliotecas transitivas; incorporar revisión de licencias y avisos de terceros.
+- [ ] Fijar acciones de CI por revisión verificable y reducir permisos de tokens; separar construcción sin secretos y publicación.
+- [ ] Programar auditorías periódicas: una vulnerabilidad puede aparecer sin cambios en el código.
+
+**Aceptación:** ningún aviso crítico/alto sin tratar en una ruta distribuida o en la cadena que produce el artefacto de release. Las excepciones no se convierten en una lista permanente. Tests, sonda y aplicación empaquetada siguen funcionando.
+
+Los fallos de fast-float se documentan en [RUSTSEC-2025-0003](https://rustsec.org/advisories/RUSTSEC-2025-0003.html) y [RUSTSEC-2024-0379](https://rustsec.org/advisories/RUSTSEC-2024-0379.html). Esto confirma la naturaleza de esos avisos; no sustituye una nueva auditoría de todo el árbol.
+
+### F03 — Pruebas que detecten fallos reales
+
+**Prioridad:** P0. **Depende de:** F00. **Ámbito:** `wpt_runner.rs`, `test_harness.rs`, `api_probe.rs`, fixtures y CI.
+
+- [x] Corregir el falso verde reproducido: excepción de script, error de carga del harness, fichero ilegible o ausencia inesperada de tests deben producir fallo diferenciado. *(23-09-2026, Fase 47 de `ARCHITECTURE.md`: `HARNESS-ERROR` por documento y código de salida 3; el fixture de 11.2 devuelve 3 y los seis fixtures siguen 60/60.)*
+- [x] Separar estado del harness y resultados de subtests; `0/0` nunca cuenta como compatibilidad aprobada. *(Misma fase.)*
+- [ ] Añadir un proceso supervisor con timeout por documento, cierre del árbol de procesos y salida estructurada para crashes/hangs.
+- [ ] Comparar identidades de tests, no solo la suma: un nuevo aprobado no puede esconder la regresión de otro caso.
+- [ ] Investigar el fallo `el.append/prepend` con fixture mínimo y comparación de mutación, identidad y colección; corregir implementación o sonda según la semántica observada.
+- [ ] Montar un primer adaptador para harness WPT oficial y servidores locales con HTTP, HTTPS y varios orígenes; fijar commit del corpus.
+- [ ] Mantener expectations por test con motivo, responsable y estado; no editar un test upstream para adaptarlo al motor.
+- [ ] Añadir formato JSON de resultados y conservación de stderr, timeout, semilla y revisión del ejecutable.
+- [ ] Diseñar pruebas E2E separadas para motor y carcasa Electron; automatizar la carcasa no debe sustituir el motor Rust por el motor de la herramienta.
+
+**Aceptación:** el fixture que hoy devuelve éxito con `0/0` pasa a fallo; un proceso colgado no bloquea el resto; la suite distingue regresión, no soportado, fallo de harness y timeout. Primer informe oficial limitado con denominador y exclusiones explícitos.
+
+### F04 — Frontera segura de Electron e IPC
+
+**Prioridad:** P0. **Depende de:** F01–F03 para validación. **Ámbito:** `desktop/main.js`, `preload.js`, `electron.d.ts`, protocolo Rust y frontend.
+
+- [ ] Definir un esquema versionado de peticiones, respuestas y eventos; generar tipos compartidos o comprobar equivalencia automáticamente.
+- [ ] Validar emisor, frame y origen de cada IPC privilegiado, además de payload, tamaño, tipo y valores finitos.
+- [ ] Reducir la API de preload a capacidades explícitas; impedir que contenido de página obtenga el canal general del motor.
+- [ ] Declarar y verificar sandbox de la carcasa, aislamiento de contexto, permisos y restricciones de nuevas ventanas/navegación.
+- [ ] Incorporar CSP de la aplicación, fuentes locales y política de conexiones; quitar dependencias de Google Fonts en el arranque.
+- [ ] Reescribir la resolución de recursos `app://` con parser de URL y comprobación de pertenencia de ruta, contemplando consultas, codificación, mayúsculas y separadores.
+- [ ] Limitar líneas NDJSON, solicitudes pendientes, buffers y tamaño de imágenes; gestionar backpressure y Unicode fragmentado entre chunks.
+- [ ] Tipar errores y propagar cancelación; una expiración de la promesa no equivale a detener una operación.
+- [ ] Si se conserva FastAPI: validar origen WebSocket, autenticar la sesión local, limitar mensajes y probar conexiones desde páginas no autorizadas. CORS HTTP no protege un WebSocket.
+
+**Aceptación:** mensajes malformados o de un emisor ajeno se rechazan; los límites evitan crecimiento ilimitado; no es posible leer recursos fuera de la raíz autorizada en el corpus de rutas; la carcasa no navega a contenido arbitrario.
+
+La selección de controles se apoya en la [guía de seguridad de Electron](https://www.electronjs.org/docs/latest/tutorial/security). Su aplicación a la carcasa no protege automáticamente el proceso Rust independiente.
+
+### F05 — Corregir inmediatamente las acciones del agente
+
+**Prioridad:** P0. **Depende de:** contratos de F04; correcciones iniciales pueden empezar con F03. **Ámbito:** `AgentSidebar`, `AgentOrchestrator`, `App.tsx` y servicio privilegiado nuevo.
+
+- [ ] Retirar claves de `localStorage` y del renderer; migrarlas una vez a almacenamiento protegido o pedir reintroducción, y borrar el valor anterior tras migración verificada.
+- [ ] Mover peticiones de proveedor al servicio autorizado, con redacción de logs y sin devolver secretos al frontend.
+- [ ] Implementar identificador de ejecución y cancelación desde UI hasta proveedor y herramientas; comprobar cancelación también después de cada `await` y antes de actuar.
+- [ ] Cambiar rellenado para que no implique Enter/envío; enviar formularios será una acción distinta con política propia.
+- [ ] Hacer que errores del motor rechacen o devuelvan un resultado tipado de fallo; el agente no debe convertir una notificación visual en éxito.
+- [ ] Rechazar acciones desconocidas o respuestas malformadas del modelo. `else => acción completada` debe desaparecer.
+- [ ] Vincular acciones a pestaña, documento y revisión observada; al cambiar el usuario de pestaña se revalida o cancela el paso.
+- [ ] Exigir autorización concreta para compras, envíos, borrados, publicación y revelación de datos; respetar autorizaciones previas sin preguntar en cada paso inocuo.
+- [ ] Añadir pruebas de detener durante la petición, respuesta tardía, fallo del motor, campo desaparecido y doble ejecución.
+
+**Aceptación:** detener impide nuevas acciones pendientes; rellenar no envía; no hay claves en almacenamiento del renderer ni en logs; un fallo real se presenta como fallo y no como objetivo conseguido.
+
+En Linux, el almacenamiento protegido debe comprobar la disponibilidad real de un almacén seguro; no basta con llamar a una API. La documentación de [safeStorage](https://www.electronjs.org/docs/latest/api/safe-storage) describe diferencias entre plataformas y backends.
+
+### F06 — Broker y aislamiento inicial por procesos
+
+**Prioridad:** P0. **Depende de:** F02–F04. **Ámbito:** `core/server.rs`, binarios del motor, servicios de red/datos y supervisor de escritorio.
+
+- [ ] Extraer gestión de sesiones y pestañas de la ejecución de documentos; definir ownership de cada recurso antes de moverlo de proceso.
+- [ ] Introducir broker y renderer por pestaña como primer paso, conservando contrato externo mientras evoluciona el interno.
+- [ ] Añadir identificadores de contexto, documento y navegación; descartar respuestas de documentos destruidos.
+- [ ] Mover acceso a red, perfil, cookies y archivos a servicios mediados. El renderer solicita capacidades, no rutas arbitrarias.
+- [ ] Añadir watchdog fuera del proceso que ejecuta JS; una cola de promesas o bucle infinito no puede impedir que el supervisor intervenga.
+- [ ] Hacer que cerrar pestaña cancele cargas, termine tareas y libere handles; probar caída, arranque fallido y proceso huérfano.
+- [ ] Recuperar pestañas con página de fallo y recarga explícita, sin repetir automáticamente POST ni acciones del agente.
+- [ ] Medir coste de arranque/RSS para dimensionar límites, sin reusar procesos entre fronteras incompatibles por ahorrar memoria.
+
+**Aceptación:** un crash o bucle infinito deliberado en una pestaña no cierra ni bloquea las demás ni la interfaz; no sobreviven procesos al cierre; una petición tardía no modifica otra pestaña. Documentar qué aislamiento todavía no proporciona el proceso por pestaña.
+
+### F07 — Sandbox efectiva del sistema operativo
+
+**Prioridad:** P0. **Depende de:** F06. **Ámbito:** `sandbox.rs`, lanzador del broker y adaptadores de plataforma.
+
+- [ ] Crear `engine/SECURITY.md` con activos, entradas hostiles, fronteras, privilegios y amenazas cubiertas/no cubiertas.
+- [ ] Diseñar en Windows un proceso con token restringido/AppContainer según el prototipo elegido, límites de Job Object y lista mínima de handles heredados.
+- [ ] Aplicar restricciones antes de recibir contenido: lectura del perfil, escritura en disco, red directa, creación de hijos y acceso a interfaces privilegiadas.
+- [ ] Mantener las mitigaciones existentes y evaluar sus efectos sobre fuentes, GPU y un posible JIT; no relajarlas globalmente para resolver una incompatibilidad.
+- [ ] Crear en Linux política equivalente basada en mecanismos disponibles y probar el modelo de distribución; resolver macOS con su modelo de sandbox y firma.
+- [ ] Diseñar permisos de archivos como handles/capacidades obtenidos tras elección del usuario, nunca directorios completos por comodidad.
+- [ ] Añadir pruebas negativas ejecutadas desde dentro del renderer: archivo privado, socket, proceso hijo, conexión al broker ajeno y recurso del otro perfil.
+- [ ] Si la política no puede aplicarse, fallar de forma cerrada y mostrar el motivo; ningún fallback transparente al proceso sin restricciones.
+
+**Aceptación:** las pruebas verifican denegación efectiva, no solo flags retornados. Revisión independiente antes de abrir una beta a navegación arbitraria. Cada SO distribuido necesita evidencia propia.
+
+### F08 — Políticas de red y seguridad de recursos
+
+**Prioridad:** P0. **Depende de:** F03–F04; mover la implementación al servicio diseñado en F06. **Ámbito:** `net/`, `fetch.rs`, `xhr.rs`, carga de subrecursos.
+
+- [ ] Auditar cookies, CORS y CSP contra casos negativos y redirecciones; implementación existente no equivale a cobertura completa.
+- [ ] Centralizar contexto de petición: origen iniciador, destino, modo, credenciales, redirect mode, referrer y partición de datos.
+- [ ] Limitar bytes comprimidos/descomprimidos, cabeceras, tiempos, profundidad de redirección y dimensiones decodificadas.
+- [ ] Revisar retirada de credenciales al cambiar origen, cookies HttpOnly/Secure/SameSite, sufijos públicos y prefijos de seguridad.
+- [ ] Completar MIME, `nosniff`, mixed content, HSTS y Referrer-Policy; representar claramente errores de certificado y evitar bypasses silenciosos.
+- [ ] Completar CSP según el subconjunto objetivo: fuentes, inline/nonces/hashes, navegación de formularios y frames cuando existan; añadir reportes útiles.
+- [ ] Modelar contextos seguros, orígenes opacos y recursos `data:`/`blob:`/`file:` antes de habilitarlos ampliamente.
+- [ ] Separar navegación humana a localhost de acceso de una página o agente a servicios privados; diseñar política explícita contra accesos no autorizados y DNS rebinding.
+- [ ] Verificar que toda nueva vía de carga —módulo, fuente, worker, media— atraviesa la misma política.
+
+**Aceptación:** matriz por API/esquema/origen con casos positivos y negativos; servidor local multi-origen demuestra que redirecciones y subrecursos no evaden controles. La base semántica de red se contrastará con el [Fetch Standard](https://fetch.spec.whatwg.org/).
+
+### F09 — Modelo de origen, sitios y contextos de navegación
+
+**Prioridad:** P0 para beta pública. **Depende de:** F06–F08, diseño de F11. **Ámbito:** broker, navegación, DOM global y políticas de datos.
+
+- [ ] Crear tipos diferentes para URL, origen, sitio, clave de almacenamiento y grupo de contextos; evitar comparaciones ad hoc de strings.
+- [ ] Diseñar cambio de proceso al navegar entre fronteras de aislamiento y transferencia segura de navegación pendiente.
+- [ ] Implementar modelo de frame y relaciones parent/opener con control de acceso incluso si dos documentos comparten proceso.
+- [ ] Incorporar aislamiento de subframes de otros sitios, restricciones de opener y políticas COOP/COEP/CORP donde corresponda.
+- [ ] Particionar cookies, almacenamiento y cachés donde la política de privacidad lo requiera; no confundir partición con mero directorio por dominio.
+- [ ] Impedir que mensajes y referencias sobrevivan como capacidades válidas después de navegar o destruir un contexto.
+- [ ] Probar orígenes opacos, puertos, subdominios, redirecciones y esquemas internos con una matriz compartida entre red, DOM y agente.
+
+**Aceptación:** las relaciones de navegación no permiten leer DOM/datos ajenos; sitios aislados no comparten renderer indebidamente; el historial y la apertura legítima de ventanas siguen funcionando. UUIDs no se contabilizan como cumplimiento de esta fase.
+
+### F10 — Event loop, cancelación y actualización de pantalla
+
+**Prioridad:** P1, con límites anti-bloqueo P0. **Depende de:** F03–F04; integración con F06. **Ámbito:** `runtime.rs`, `event_loop.rs`, `timers.rs`, `server.rs` y transporte de estados.
+
+- [ ] Corregir primero H07: cuando el temporizador cambia contenido visible, publicar invalidación/estado que llegue a la UI sin clic ni sondeo manual.
+- [ ] Sustituir el tick fijo como mecanismo central por planificación de tareas, microtareas, red y oportunidad de renderizado.
+- [ ] Evitar que `handle(...).await` monopolice la atención de mensajes durante una navegación; permitir cancelar, cerrar o cambiar pestaña.
+- [ ] Integrar I/O con el hilo dueño de Boa sin compartir objetos no `Send` de forma insegura ni bloquear con esperas síncronas.
+- [ ] Separar colas de tarea y drenado de microtareas; cubrir orden, rechazo de promesas y errores sin ocultarlos.
+- [ ] Sincronizar rAF con presentación y visibilidad; limitar trabajo en background sin impedir funcionalidades necesarias.
+- [ ] Propagar abortos reales hasta DNS/conexión/cuerpo/decodificación cuando sea posible; liberar recursos y reportar resultado consistente.
+- [ ] Añadir presupuesto de ejecución y watchdog externo; un timeout de Tokio no interrumpe por sí solo un bucle síncrono de JS.
+- [ ] Probar dos pestañas, temporizadores, input y red lenta simultáneos, incluyendo cierre durante callback.
+
+**Aceptación:** un reloj de página se actualiza visualmente sin interacción; no hay 250 ms de latencia mínima impuesta a animaciones; cancelar no deja descargas activas sin dueño; los tests de orden y respuesta del broker pasan. El modelo se contrastará con [event loops de HTML](https://html.spec.whatwg.org/multipage/webappapis.html#event-loops).
+
+### F11 — Identidad DOM, bindings y ventana global
+
+**Prioridad:** P1. **Depende de:** F02–F03 y contratos de F10. **Ámbito:** `dom_bindings.rs`, `dom_classes.rs`, `window.rs`, `node.rs`, `cssom.rs`.
+
+- [ ] Resolver `window`, `self`, `globalThis` y exposición de globals con semántica de Window/WindowProxy; no parchear únicamente tres aliases.
+- [ ] Establecer identidad estable de wrappers por nodo y realm, incluyendo referencias obtenidas por APIs diferentes.
+- [ ] Mover métodos a prototipos y obtener nodo desde `this`; implementar comprobaciones de receptor y descriptores adecuados.
+- [ ] Diseñar la relación GC de Boa ↔ árbol Rust, raíces, nodos desconectados y listeners; probar liberación y evitar punteros vivos tras destrucción.
+- [ ] Corregir `append/prepend` y colecciones según el resultado de la reproducción: distinguir colecciones vivas de resultados estáticos.
+- [ ] Completar atributos y propiedades reflejadas, `dataset` vivo, `NodeList`, `HTMLCollection`, iteradores y mutaciones sin snapshots engañosos.
+- [ ] Añadir operaciones de Node/Element/Document pendientes: reemplazo, inserción, adopción, importación, normalización y orden documental.
+- [ ] Completar geometría, foco y estilos usados con reglas de sincronización; una lectura de medida debe ver mutaciones previas cuando corresponda.
+- [ ] Evaluar una capa WebIDL/generación de bindings para reducir implementaciones manuales inconsistentes, empezando por un conjunto pequeño.
+
+**Aceptación:** casos de identidad, prototipos, polyfills, `call` con receptor incorrecto, colecciones tras mutación y destrucción de documentos pasan; la sonda mejora sin perder casos ya aprobados.
+
+### F12 — HTML completo y coordinación del parser
+
+**Prioridad:** P1. **Depende de:** F10–F11, streaming inicial de F17. **Ámbito:** `parser.rs`, `html5ever_sink.rs`, `scripting.rs`, pipeline.
+
+- [ ] Conservar namespaces y nombres de SVG/MathML, doctype, modo quirks y propiedades de documento relevantes.
+- [ ] Implementar contenido inerte de `<template>` y fragmentos en contexto real, incluyendo tablas y elementos de texto especial.
+- [ ] Integrar pausas del parser por scripts clásicos y continuación del documento; cubrir `document.write` de forma compatible y acotada.
+- [ ] Actualizar `readyState`, `currentScript`, DOMContentLoaded y load a partir del ciclo real, no valores aproximados permanentes.
+- [ ] Preservar orden de `<style>` y `<link>` en cascada; verificar el efecto de estilos y scripts insertados dinámicamente.
+- [ ] Añadir DOMParser y serialización semánticamente correcta; fidelidad de bytes al fuente no es requisito del serializador DOM.
+- [ ] Cubrir `<base>`, codificaciones, BOM, metadatos y cambios de base permitidos con fixtures difíciles.
+- [ ] Limitar profundidad/tamaño y fuzzear el adaptador propio de html5ever, no asumir que reutilizar el parser valida el TreeSink.
+
+**Aceptación:** corpus de parseo y serialización sin diferencias no justificadas; scripts observan el DOM disponible en su momento; namespaces y templates funcionan en librerías del corpus. No se reescribe html5ever sin necesidad demostrada.
+
+### F13 — Módulos y carga de scripts moderna
+
+**Prioridad:** P1. **Depende de:** F08, F10–F12. **Ámbito:** `modules.rs`, `scripting.rs`, descubrimiento/carga de recursos.
+
+- [ ] Resolver especificadores contra el módulo importador; conservar URL canónica y metadatos por módulo.
+- [ ] Descargar el grafo transitivo bajo política de red, incluso si no aparece en `modulepreload`.
+- [ ] Implementar `import()` dinámico con promesa, caché, cancelación y errores adecuados.
+- [ ] Implementar import maps, bare specifiers y resolución de scopes; invalidar supuestos actuales basados únicamente en rutas de bundler.
+- [ ] Cubrir ciclos, live bindings, evaluación única, errores de enlace y top-level await si la versión del runtime lo soporta conforme al objetivo.
+- [ ] Implementar `import.meta` y revisar MIME/CORS de módulos, incluidas redirecciones.
+- [ ] Ejecutar `async` según disponibilidad real y `defer` en su secuencia; manejar inserción dinámica de scripts.
+- [ ] Añadir fixtures con dependencias en subdirectorios, chunks no precargados, errores 404, cambios de origen y navegación cancelada.
+
+**Aceptación:** aplicaciones compiladas sin hacks específicos de sus nombres de archivo cargan y navegan entre rutas; un módulo se evalúa una sola vez por mapa; se informa de la URL y causa exacta al fallar.
+
+### F14 — APIs básicas de plataforma web
+
+**Prioridad:** P1. **Depende de:** F08, F10–F11. **Ámbito:** `platform.rs`, `fetch.rs`, `xhr.rs`, objetos nuevos y harness.
+
+- [ ] Implementar Headers, Request y Response con cuerpos, consumo único, clonación y errores; convertir fetch en una API coherente sobre el servicio de red.
+- [ ] Añadir AbortController/AbortSignal conectados a cancelación real, no solo una bandera visible.
+- [ ] Implementar Blob, File, FormData y streams con backpressure, límites y ownership; los permisos de archivos siguen en el broker.
+- [ ] Corregir TextEncoder/Decoder para tipos binarios y opciones pertinentes; probar Unicode inválido y límites de buffers.
+- [ ] Añadir `structuredClone` con ciclos, tipos soportados y transferencias; rechazar explícitamente valores no clonables.
+- [ ] Incorporar aleatoriedad criptográfica y UUID mediante primitivas mantenidas; planificar WebCrypto sin inventar algoritmos.
+- [ ] Habilitar y validar Intl según runtime/datos elegidos; documentar tamaño, actualizaciones y locale fallback.
+- [ ] Implementar performance entries reales, eventos de error y rejection; instrumentación parcial no debe simular mediciones.
+- [ ] Convertir XHR asíncrono en ejecución realmente asíncrona con readyState, abort, timeout y responseType.
+
+**Aceptación:** las APIs funcionan como conjunto en casos de streaming, cancelación, clones y datos binarios; el estado y orden de eventos coinciden con casos de referencia. La sonda de existencia se acompaña de pruebas semánticas.
+
+### F15 — Entrada, edición, formularios y selección
+
+**Prioridad:** P1. **Depende de:** F10–F14. **Ámbito:** servidor, protocolo de input, bindings y viewport.
+
+- [ ] Modelar eventos reales de ratón, pointer, teclado, rueda y foco con coordenadas, botones, modificadores, composición e identificadores.
+- [ ] Implementar EventTarget construible, fases, composedPath y acción por defecto; distinguir eventos sintéticos de entrada confiable.
+- [ ] Añadir foco por teclado, orden Tab, focus-visible, captura de puntero y estados CSS sincronizados.
+- [ ] Completar controles `<details>`, `<summary>`, `<dialog>`, `<progress>` y `<meter>` con estados, eventos, foco y representación accesible. Enrutar alert/confirm/prompt a diálogos de UI sin congelar otras pestañas ni permitir suplantación del origen.
+- [ ] Implementar caret, selección, rangos, copiar/cortar/pegar, deshacer y edición de texto; añadir IME para español, CJK y teclas muertas.
+- [ ] Completar formularios: requestSubmit frente a submit, validación, submitter, reset, controles asociados y multipart.
+- [ ] Incorporar selectores de archivo/color/fecha y controles accesibles; no convertir una ruta de archivo recibida por JS en permiso.
+- [ ] Añadir comando de envío si lo necesita el broker/agente, con identidad de formulario y resultado; evitar duplicar la lógica de envío del motor.
+- [ ] Implementar contenteditable y editores del corpus por etapas con semántica documentada.
+- [ ] Cubrir zoom, DPI, scroll y transformaciones en hit-testing y selección.
+
+**Aceptación:** una persona rellena, corrige, selecciona y envía formularios con teclado o ratón; el agente distingue escribir/enviar; un editor de prueba funciona con IME y conserva selección tras cambios del DOM.
+
+### F16 — Almacenamiento web y persistencia transaccional
+
+**Prioridad:** P1. **Depende de:** F06, F08–F11, F14. **Ámbito:** `net/storage.rs`, `js/storage.rs`, perfiles y base de datos nueva.
+
+- [ ] Separar almacenamiento de navegador y almacenamiento accesible a páginas, con claves de partición y cuotas explícitas.
+- [ ] Completar semántica de Storage: acceso por propiedad, eventos, sessionStorage y aislamiento de ventanas/perfiles.
+- [ ] Añadir IndexedDB incrementalmente: claves, object stores, índices, transacciones, upgrade, cursores y recuperación.
+- [ ] Diseñar operaciones atómicas, migraciones de esquema, journaling y tolerancia a cierre durante escritura.
+- [ ] Implementar Cache Storage con reglas de origen y cuotas como dependencia de Service Workers.
+- [ ] Incorporar estimación de uso, evicción predecible y borrado por sitio; no eliminar datos activos de forma arbitraria.
+- [ ] Probar modo privado sin persistencia accidental en cookies, cachés, logs o archivos temporales.
+- [ ] Revisar permisos de directorios, corrupción de archivos y tamaño máximo; no confiar en archivos del perfil como datos bien formados.
+
+**Aceptación:** aplicaciones locales guardan datos y los recuperan tras reiniciar; transacciones interrumpidas no dejan estados parciales; borrar un sitio y cerrar un perfil privado elimina lo especificado y no afecta a otros perfiles.
+
+### F17 — Red eficiente, caché y carga progresiva
+
+**Prioridad:** P1. **Depende de:** F08; coordinación con F10, F12 y F16. **Ámbito:** `http_client.rs`, servicio de red y pipeline.
+
+- [ ] Añadir métricas de DNS, conexión, TLS, primer byte, bytes, caché y decodificación antes de optimizar.
+- [ ] Implementar caché de memoria/disco con revalidación, ETag, Last-Modified, Cache-Control, Vary y partición; cubrir `no-store` y respuestas autenticadas.
+- [ ] Incorporar HTTP/2 y negociación ALPN con pruebas de fallback, multiplexado y cancelación de streams.
+- [ ] Implementar streaming del cuerpo y parseo progresivo con límites; presentar contenido antes de descargar todo cuando sea válido.
+- [ ] Implementar carga recursiva de `@import`, resolución de URLs relativa a cada CSS y detección de ciclos.
+- [ ] Añadir prioridades, preload/modulepreload, caché de preflight y reuso de conexiones medido; evitar precargas que filtren actividad sin política.
+- [ ] Integrar proxy del SO, PAC si entra en alcance, errores offline y cambios de conectividad; no asumir red directa permanente.
+- [ ] Evaluar HTTP/3 con biblioteca mantenida después de estabilizar caché y HTTP/2; incluir métricas y fallback.
+- [ ] Incorporar formatos de compresión adicionales solo tras revisar límites y beneficio, sin asumir que una decisión histórica sigue vigente.
+
+**Aceptación:** recargas condicionadas transfieren menos bytes de forma verificable; contenido `no-store` no reaparece desde disco; una carga lenta permite interacción/cancelación; mejorar tiempos no empeora políticas de red.
+
+### F18 — CSS: valores, cascada y estados
+
+**Prioridad:** P1. **Depende de:** F03, F11–F12. **Ámbito:** `css/`, estilos calculados y adaptación de selectores.
+
+- [ ] Inventariar propiedades por parseo, valor calculado, layout y pintura; «se parsea» no significa «se soporta».
+- [ ] Introducir valores tipados para longitudes, porcentajes, colores y expresiones; evaluar calc/min/max/clamp en la etapa con información suficiente.
+- [ ] Completar cascada: herencia, important, capas, origen de usuario, variables, fallbacks y ciclos; verificar orden de hojas externas/inline.
+- [ ] Implementar pseudo-elementos before/after/marker/placeholder y contenido generado, integrados en layout y accesibilidad.
+- [ ] Conectar hover/focus/active/focus-within a invalidación real; definir privacidad de visited sin exponer historial mediante lecturas.
+- [ ] Cubrir selectores pendientes, incluidos casos de `:has`, con invalidación asociada y límites de coste.
+- [ ] Añadir container queries, nesting y registro de custom properties por etapas tras asegurar valores y dependencias.
+- [ ] Implementar colores modernos, gradientes y fondos multicapa junto a pintura; mantener CSS.supports coherente con capacidades reales.
+
+**Aceptación:** reftests y casos de cascada muestran el resultado esperado; no hay aceptación silenciosa que termine en cero arbitrario; cambiar un estado de interacción modifica el estilo y la zona correcta.
+
+### F19 — Layout correcto e incremental
+
+**Prioridad:** P1. **Depende de:** F11, F18; coordinar texto con F20. **Ámbito:** `layout/`, snapshots CSSOM y geometría.
+
+- [ ] Caracterizar el soporte existente de bloques/inline/float/posición con casos de conformidad antes de extenderlo.
+- [ ] Completar flex: tamaños intrínsecos, min/max, wrap, orden, baseline, gaps y alineación; auditar el adaptador de taffy.
+- [ ] Completar grid: tracks implícitos, filas, auto-placement, repeat/minmax, spans, alineación y subgrid en una etapa posterior.
+- [ ] Cubrir tablas, contenido reemplazado, aspect-ratio, object-fit, overflow y scroll anidado.
+- [ ] Corregir containing blocks de fixed/absolute/sticky, margin collapsing y medidas dependientes del porcentaje.
+- [ ] Añadir flags de suciedad de estilo/layout/pintura, dependencias y recomputación por subárbol con invalidación conservadora correcta.
+- [ ] Implementar IntersectionObserver con umbrales, root/rootMargin, scroll y notificación inicial; ResizeObserver con cajas observadas, orden de entrega y protección frente a bucles. Desconexión y eliminación de nodos deben liberar observaciones.
+- [ ] Sincronizar lecturas CSSOM que exigen layout; medir y hacer visible el coste de reflows forzados.
+- [ ] Extender writing modes y fragmentación para impresión en coordinación con F20/F30.
+- [ ] Añadir presupuestos para árboles profundos, cajas enormes y overflow numérico.
+
+**Aceptación:** el corpus de layout es correcto y una mutación localizada no recorre innecesariamente todo el documento; objetivo inicial de p95 <50 ms para escenarios definidos de 10.000 nodos, a ratificar tras la línea base de rendimiento.
+
+### F20 — Tipografía, idiomas y fuentes web
+
+**Prioridad:** P1. **Depende de:** F08, F17–F19. **Ámbito:** `text/`, carga de fuentes y rasterizado.
+
+- [ ] Respetar font-family, pesos/estilos reales y fallback por cobertura; sustituir la selección exclusiva sans-serif sin duplicar el descubrimiento de fuentes.
+- [ ] Añadir `@font-face`, WOFF/WOFF2 y font-display con validación, caché y decodificación aislada cuando proceda.
+- [ ] Cubrir shaping complejo, ligaduras, kerning, bidi, separación por grafemas y segmentación de líneas Unicode.
+- [ ] Implementar white-space, word-break, overflow-wrap, letter/word spacing, text-transform y ellipsis.
+- [ ] Añadir fuentes variables, emoji y fallback multilingüe según corpus, preservando correspondencia texto↔glifos para selección.
+- [ ] Cachear shaping y medidas por claves completas: fuente, variaciones, tamaño, idioma, dirección y contenido.
+- [ ] Revisar dependencias de tipografía señaladas como sin mantenimiento; elegir sustitución o mantenimiento sostenible con métricas.
+- [ ] Usar fuentes de prueba redistribuibles fijadas para reftests; separar diferencias de rasterizado del SO de errores de geometría.
+
+**Aceptación:** español, árabe/hebreo, CJK y emoji tienen lectura, cursor y selección coherentes; cambiar la fuente modifica medidas reales; las fuentes web respetan políticas de origen y límites.
+
+### F21 — Pintura correcta y modelo de apilamiento
+
+**Prioridad:** P1. **Depende de:** F18–F20. **Ámbito:** `gfx/display_list.rs`, `paint.rs`, `raster.rs`, imágenes y Canvas.
+
+- [ ] Implementar stacking contexts, z-index, opacity, visibility y clipping con orden verificable.
+- [ ] Añadir fondos multicapa, gradientes, repeat/size/position y propagación del fondo al canvas sin doble composición incorrecta.
+- [ ] Implementar transforms 2D y después 3D, perspectiva y matriz inversa para hit-testing; cubrir elementos fuera del viewport.
+- [ ] Completar borders, sombras, outline, masks y filtros por etapas con límites de superficie intermedia.
+- [ ] Verificar SVG y Canvas 2D como APIs con estado, paths, transforms, composición y lectura de píxeles sujeta a origen.
+- [ ] Añadir gestión de color, escalado, alpha premultiplicado y formatos de imagen con fixtures de referencia.
+- [ ] Diferenciar árbol DOM, layout, display list y regiones interactivas; no aproximar clicks con cajas visuales obsoletas.
+- [ ] Incorporar snapshots visuales y reftests con tolerancias localizadas, nunca una tolerancia global que oculte páginas incompletas.
+
+**Aceptación:** transparencia, stacking y transforms coinciden con referencias; coordenadas visuales e interacción corresponden; leer canvas contaminado por recursos ajenos no filtra píxeles.
+
+### F22 — Composición, animaciones y presentación eficiente
+
+**Prioridad:** P1/P2. **Depende de:** F06, F10, F19–F21. **Ámbito:** GPU/compositor, protocolo de frames y viewport.
+
+- [ ] Medir por separado rasterizado, PNG, Base64, IPC, decodificación y presentación en la ruta actual.
+- [ ] Añadir IDs de frame y invalidación explícita; descartar fotogramas atrasados y mantener sincronía con hit-testing.
+- [ ] Prototipar memoria compartida/superficies nativas y regiones sucias; validar ownership y límites antes de retirar la ruta PNG de diagnóstico.
+- [ ] Incorporar composición por capas y scroll que no requiera repintar la página completa si su contenido no cambia.
+- [ ] Implementar transitions, animations, keyframes y Web Animations con reloj común, estado de visibilidad y preferencias de movimiento reducido.
+- [ ] Añadir tratamiento de pérdida de dispositivo, resize, suspensión del equipo y múltiples monitores/DPI.
+- [ ] Limitar cuadros en vuelo para que un renderer no agote memoria ni bloquee la interfaz.
+- [ ] Conservar una ruta software probada para equipos sin aceleración; no afirmar aceleración de escritorio solo por existir `wgpu` en dependencias.
+
+**Aceptación:** scroll/animación sostenidos con métricas p95/p99, sin cola creciente de cuadros ni coste de PNG por cada evento; a 60 Hz se persigue presupuesto de 16,7 ms por cuadro, con rendimiento real informado por dispositivo.
+
+### F23 — Workers, mensajería y ejecución en background
+
+**Prioridad:** P2, necesario para aplicaciones modernas. **Depende de:** F07–F10, F13–F14, F16–F17.
+
+- [ ] Implementar MessageChannel, MessagePort y structured clone con transferencias y cierre definido.
+- [ ] Añadir Dedicated Workers con runtime propio, carga de scripts/módulos, terminación y presupuestos de recursos.
+- [ ] Incorporar Shared Workers si el corpus lo requiere, respetando claves de origen y vida útil de clientes.
+- [ ] Implementar Service Workers: registro, instalación, activación, actualización, alcance y control de clientes.
+- [ ] Integrar fetch interception y Cache Storage sin saltarse políticas, cuotas ni separación de perfiles.
+- [ ] Diseñar estados offline, terminación/reinicio y eventos pendientes sin mantener procesos ilimitados.
+- [ ] Permitir SharedArrayBuffer/Atomics solo cuando estén resueltos requisitos de aislamiento y modelo de memoria; no habilitarlos globalmente.
+- [ ] Crear herramientas para inspeccionar y desregistrar workers y borrar sus datos.
+
+**Aceptación:** aplicación offline del corpus funciona tras reiniciar, un worker bloqueado se termina, y una actualización de SW no mezcla código/datos incompatibles ni afecta a otro origen.
+
+### F24 — Frames, componentes web y ventanas relacionadas
+
+**Prioridad:** P1/P2. **Depende de:** F09–F15, F18–F21. **Ámbito:** árbol de contextos, DOM y compositor.
+
+- [ ] Implementar iframe con documento, origen, viewport y ciclo de vida propios; incluir lazy loading y eliminación durante navegación.
+- [ ] Añadir postMessage con targetOrigin, source y validación al entregar; probar navegación entre envío y recepción.
+- [ ] Implementar atributos sandbox y Permissions Policy según APIs disponibles; combinar correctamente restricciones heredadas.
+- [ ] Añadir `window.open` controlado por activación/permiso y relaciones opener seguras para flujos legítimos.
+- [ ] Implementar Shadow DOM, slots, árbol compuesto y retargeting de eventos; integrar estilos y accesibilidad.
+- [ ] Añadir customElements, upgrades, callbacks y adopción con pruebas de orden y destrucción.
+- [ ] Completar namespaces y rendering interactivo SVG/MathML donde el corpus lo demande.
+- [ ] Validar impresión, foco, teclado y hit-testing a través de límites de frame y shadow root.
+
+**Aceptación:** un componente con shadow root y un login simulado entre dos orígenes funcionan sin leer DOM ajeno; un iframe restringido no gana capacidades al navegar o abrir otra ventana.
+
+### F25 — Compatibilidad de frameworks y aplicaciones
+
+**Prioridad:** P1, trabajo continuo desde F03. **Depende de:** F11–F24 según escenario. **Ámbito:** nuevo corpus versionado y fixtures de aplicaciones.
+
+- [ ] Crear aplicaciones mínimas reales compiladas con versiones fijadas de vanilla ESM, React/Vite, Vue, Svelte y Next con SSR/hidratación.
+- [ ] Añadir routing, chunks dinámicos, formularios controlados, fetch, listas, observers y persistencia; no limitarse a pintar un texto inicial.
+- [ ] Incorporar Web Components y un editor complejo cuando sus dependencias estén disponibles.
+- [ ] Separar pruebas locales deterministas de seguimiento de sitios vivos; cambios de terceros no bloquean indistintamente todo CI.
+- [ ] Para cada fallo, guardar primer error, recurso, DOM, captura, traza y fixture reducido; resolver causas genéricas sin parches por hostname.
+- [ ] Ampliar a un corpus inicial de 20 tareas y después 100 tareas representativas con requisitos escritos antes de medir.
+- [ ] Mostrar al usuario errores parciales accionables; `requires_javascript` es una heurística de página vacía, no un diagnóstico universal.
+- [ ] Verificar que las tareas completas pasan —entrar, buscar, editar, guardar— y no solo que desaparece un TypeError.
+
+**Aceptación:** todos los recorridos críticos del corpus aprobado pasan, sin modificar bundles para el motor; cada exclusión tiene motivo y una política de producto explícita. Los sitios reales se registran con fecha y versión, no como soporte perpetuo.
+
+### F26 — Audio, vídeo y multimedia
+
+**Prioridad:** P2, requerida para navegador cotidiano. **Depende de:** F07–F10, F14, F17, F21–F22.
+
+- [ ] Seleccionar biblioteca de demux/decodificación mantenida, formatos iniciales y límites de licencia/distribución.
+- [ ] Implementar HTMLMediaElement, estados, eventos, selección de pistas, rangos, buffering, pausa y seek.
+- [ ] Aislar decodificadores y conectar superficies al compositor manteniendo origen y permisos; no crear navegación paralela oculta para reproducir.
+- [ ] Añadir controles accesibles, subtítulos WebVTT, audio focus, mute y política de autoplay.
+- [ ] Integrar Media Source Extensions y streaming adaptativo tras estabilizar reproducción básica.
+- [ ] Añadir Web Audio por etapas con presupuesto de tiempo real, suspensión y selección de dispositivos.
+- [ ] Estudiar EME/DRM como decisión contractual y técnica separada: no prometer reproducción de servicios protegidos sin soporte autorizado.
+- [ ] Probar archivos truncados, metadatos hostiles, red lenta, suspensión y reproducción larga.
+
+**Aceptación:** corpus de audio/vídeo no protegido reproduce con sincronización y uso medido de recursos; errores de códec son claros; una entrada corrupta no compromete ni bloquea el navegador.
+
+### F27 — Tiempo real, dispositivos y permisos
+
+**Prioridad:** P2. **Depende de:** F07–F10, F14, F23 y multimedia pertinente.
+
+- [ ] Implementar WebSocket y EventSource con origen, TLS, cierre, reconexión definida y límites de buffer.
+- [ ] Añadir un modelo único de permisos por origen, perfil, frame y duración; revocación durante el uso incluida.
+- [ ] Implementar getUserMedia con indicador de captura persistente, selección de dispositivo y parada verificable.
+- [ ] Integrar WebRTC con biblioteca mantenida, ICE/STUN/TURN, política de exposición de IP y llamadas del corpus.
+- [ ] Incorporar notificaciones, geolocalización y portapapeles avanzado solo con activación/permiso adecuados.
+- [ ] Evaluar USB, Bluetooth, HID, serial y otras APIs por demanda real; las no soportadas permanecen ausentes o fallan según contrato, sin simular dispositivos.
+- [ ] Impedir que IA o frames de terceros eludan la decisión de permiso del usuario.
+
+**Aceptación:** una llamada de prueba funciona y puede detenerse por completo; revocar micrófono/cámara tiene efecto inmediato; las peticiones inesperadas no quedan concedidas por defecto.
+
+### F28 — WebGL, WebGPU y gráficos avanzados
+
+**Prioridad:** P2/P3. **Depende de:** F07, F14, F21–F22; evidencia de necesidad en F25.
+
+- [ ] Elegir arquitectura de contexto y traducción gráfica mantenida; diferenciar APIs web del backend gráfico interno.
+- [ ] Implementar WebGL por conjuntos de capacidades con validación de parámetros, shaders y recursos.
+- [ ] Aislar GPU/compilación de shaders cuando lo permita la plataforma; acotar memoria, tiempo y número de contextos.
+- [ ] Cubrir pérdida/restauración de contexto, lectura de píxeles, restricciones de origen y convivencia con compositor.
+- [ ] Ejecutar suites de conformidad y escenas reales; no usar una escena de demostración como evidencia de API completa.
+- [ ] Añadir WebGPU como programa posterior con revisión de shaders, límites y adaptadores permitidos.
+- [ ] Publicar matriz por SO/GPU/controlador y fallback; bloquear combinaciones conocidas problemáticas de forma actualizable.
+
+**Aceptación:** capacidades anunciadas respaldadas por suites y pruebas de estabilidad; contenido gráfico hostil no derriba el broker ni consume recursos sin límite.
+
+### F29 — ECMAScript, WebAssembly y estrategia de rendimiento JS
+
+**Prioridad:** P1 para conformidad; P3 para cambios profundos. **Depende de:** F02–F03, F10–F14, medición inicial F39.
+
+- [ ] Ejecutar Test262 sobre la versión y configuración exactas del runtime integrado; distinguir resultado upstream de resultado del producto.
+- [ ] Medir tiempo de parseo, bytecode, ejecución, GC, bindings y trabajo DOM en aplicaciones; separar costes antes de culpar al intérprete.
+- [ ] Optimizar interfaces de host, asignaciones y GC verificando semántica y memoria; colaborar con upstream cuando el fallo sea de Boa.
+- [ ] Incorporar WebAssembly con runtime mantenido y bindings web, streaming, memoria y aislamiento; planificar SIMD/threads según seguridad y demanda.
+- [ ] Registrar una decisión sobre continuar con Boa, contribuir a su optimización/JIT o evaluar otro runtime: compatibilidad, seguridad, licencia, tamaño, integración y coste de mantenimiento.
+- [ ] Si se investiga JIT, hacerlo en prototipo aislado con W^X, restricciones de código dinámico y revisión de sandbox; no debilitar la política global.
+- [ ] Mantener adaptador del runtime y pruebas de host para poder comparar alternativas sin reescribir todo el navegador de una vez.
+
+**Aceptación:** reporte Test262 reproducible y plan de brechas; decisiones de runtime basadas en perfiles y experimentos. WebAssembly solo se anuncia tras pasar el subconjunto de conformidad definido. [Test262](https://github.com/tc39/test262) es la referencia de pruebas de lenguaje.
+
+### F30 — Experiencia de navegador completa
+
+**Prioridad:** P1. **Depende de:** F01, F04, F10, F15; persistencia y downloads según F16–F17. **Ámbito:** frontend, broker y páginas internas.
+
+- [ ] Descomponer `App.tsx` en estado de sesión, transporte, comandos y vistas con tipos; evitar estado duplicado que compita con el motor.
+- [ ] Añadir omnibox con URL/búsqueda bien diferenciadas, validación, historial de navegación y proveedores configurables.
+- [ ] Completar recargar/detener, favicon, progreso real, errores de red, nueva pestaña y página de pestaña caída.
+- [ ] Añadir reordenación, pin, grupos, mover pestañas entre ventanas, restaurar cerrada y recuperación de sesión.
+- [ ] Separar historial persistente del historial de sesión del documento; cubrir navegación SPA, fragmentos, scroll restaurado, recarga con POST y BFCache con elegibilidad explícita. No reenviar formularios al volver atrás sin la política correspondiente.
+- [ ] Implementar atajos, menú contextual, zoom, buscar en página y selección/copiar con consistencia entre UI y motor.
+- [ ] Añadir marcadores, historial buscable, exportación/importación y gestor de descargas con pausar/cancelar/reintentar cuando el servidor lo soporte.
+- [ ] Implementar detalles de conexión, permisos y datos por sitio; HTTPS no se presenta como garantía de confianza del contenido.
+- [ ] Añadir impresión y PDF con layout paginado, fuentes y vista previa; documentos PDF descargados requieren visor aislado o integración segura.
+- [ ] Crear ajustes, modo oscuro, idioma, tamaño de texto y estado de ventana recordado; errores en lenguaje comprensible con detalle técnico opcional.
+- [ ] Diseñar qué ocurre sin motor, sin conexión, con actualización pendiente o disco lleno; evitar pantallas vacías y cargas eternas.
+
+**Aceptación:** recorridos E2E de instalación, navegación, varias ventanas, descarga, impresión, restauración y cierre pasan en el artefacto empaquetado. Ningún control aparenta una función que el motor no implementa.
+
+### F31 — Perfiles, privacidad y protección de datos
+
+**Prioridad:** P1. **Depende de:** F07–F09, F16–F17, F30.
+
+- [ ] Implementar perfiles separados con cookies, datos, historial, permisos, extensiones y secretos independientes.
+- [ ] Añadir modo privado con almacenamiento efímero y política explícita de archivos descargados; verificar rastros en logs/cachés/crash reports.
+- [ ] Implementar borrar por sitio, rango temporal y perfil; mostrar qué se conserva y permitir exportar datos propios.
+- [ ] Diseñar bloqueo de rastreadores y filtros con listas mantenidas, excepciones visibles y pruebas de compatibilidad.
+- [ ] Reducir exposición por fingerprinting mediante política coherente; no devolver valores falsos inconsistentes que rompan webs sin beneficio medido.
+- [ ] Mantener telemetría y envío a IA remota desactivados hasta elección informada; retirar URLs completas y formularios de logs por defecto.
+- [ ] Añadir importación de marcadores/historial; contraseñas solo mediante flujos autorizados y almacenamiento del SO.
+- [ ] Integrar autocompletado y WebAuthn/passkeys por etapas, con revisión de origen y protección de credenciales.
+- [ ] Evaluar protección de phishing/descargas con fuente mantenida y minimización de consultas; no crear listas de reputación improvisadas.
+
+**Aceptación:** dos perfiles y una sesión privada no comparten datos indebidamente; el borrado está probado a nivel de almacenamiento; capturas de tráfico justifican las afirmaciones de privacidad.
+
+### F32 — Accesibilidad del navegador y de las páginas
+
+**Prioridad:** P1. **Depende de:** F11, F15, F19–F22, F30. **Ámbito:** `ai/aom.rs`, árbol accesible y adaptadores de SO.
+
+- [ ] Separar árbol de accesibilidad estándar y proyección compacta para IA; compartir datos correctos sin asumir que tienen el mismo propósito.
+- [ ] Implementar nombre accesible, roles, estados, relaciones y actualizaciones incrementales siguiendo semántica HTML/ARIA.
+- [ ] Exponer UI Automation en Windows, API accesible de macOS y AT-SPI en Linux con foco, acciones y límites de permisos.
+- [ ] Hacer accesibles barra de direcciones, pestañas, diálogos, descargas, errores y panel IA.
+- [ ] Probar teclado completo, lector de pantalla, contraste, zoom, preferencias de movimiento y colores forzados.
+- [ ] Asegurar consistencia entre foco DOM, foco visual, caret y foco accesible en frames y componentes.
+- [ ] Introducir pruebas con usuarios y tareas, además de checks automáticos; registrar bloqueos como defectos de producto.
+
+**Aceptación:** tareas críticas completas con teclado y lector de pantalla en cada SO soportado. El AOM no publica campos secretos al proveedor IA por el hecho de que deban ser editables con tecnología asistiva.
+
+### F33 — Herramientas de desarrollo y diagnóstico
+
+**Prioridad:** P1/P2. **Depende de:** F04, F10–F14, F18–F22. **Ámbito:** protocolo de inspección, frontend y trazas.
+
+- [ ] Publicar errores JS, stacks, consola, rechazos y URLs de script con IDs de contexto.
+- [ ] Añadir inspector DOM, estilos calculados/usados, geometría, reglas aplicadas y AOM.
+- [ ] Incorporar árbol de capas, invalidaciones y traza de frame para relacionar un defecto visual con CSS, layout, pintura o transporte.
+- [ ] Añadir panel de red: peticiones, estados, redirecciones, timings, caché, bloqueos de política y cuerpos con límites/redacción.
+- [ ] Implementar source maps y depuración JS según capacidades reales del runtime; declarar limitaciones cuando no exista debugger integrado.
+- [ ] Mostrar almacenamiento, workers, permisos y memoria por pestaña para diagnóstico.
+- [ ] Definir un protocolo de automatización/inspección documentado; evaluar WebDriver/BiDi para interoperabilidad en lugar de inventar indefinidamente.
+- [ ] No exponer puerto de depuración remoto por defecto; proteger activación, autenticación y aislamiento de perfil.
+- [ ] Añadir captura de diagnóstico reproducible sin secretos y con consentimiento antes de enviar a terceros.
+
+**Aceptación:** un fallo de framework se reduce a una causa mediante herramientas del proyecto, sin editar código para añadir logs; inspeccionar no abre una puerta privilegiada a las páginas.
+
+### F34 — Agente IA útil, verificable y con control del usuario
+
+**Prioridad:** P1/P2. **Depende de:** F05, F09, F14–F15, F30–F33.
+
+- [ ] Conectar `getAccessibilityPrompt` real desde el broker a `BrowserInterface`; versionar observaciones y IDs de nodo/documento.
+- [ ] Revalidar existencia, visibilidad, posición y permisos inmediatamente antes de cada acción; preferir operaciones semánticas sobre coordenadas antiguas.
+- [ ] Definir esquema de herramientas y estados: propuesto, autorizado, ejecutado, comprobado, fallido, cancelado. Una respuesta del modelo no prueba cumplimiento.
+- [ ] Incorporar proveedores configurables y modelos locales mediante adaptadores, con catálogo de modelos, health checks, cuotas y límites de coste.
+- [ ] Unificar el agente TS/Python en una implementación autoritativa o justificar servicios distintos; no mantener dos políticas de seguridad divergentes.
+- [ ] Tratar contenido de página/documentos como datos no confiables: nunca autoriza revelar secretos, cambiar permisos o ampliar una tarea.
+- [ ] Minimizar observaciones enviadas, ocultar contraseñas/tokens y permitir previsualizar qué contexto sale del equipo.
+- [ ] Diseñar autorizaciones reutilizables dentro de tarea/origen/capacidad y confirmaciones concretas para efectos sensibles; evitar preguntar por cada lectura inocua.
+- [ ] Verificar resultados por estado del sistema: navegación final, dato guardado, descarga o cambio del DOM; detectar repetición y bucles.
+- [ ] Añadir presupuesto de pasos/tiempo/tokens, reintentos idempotentes, pausa/reanudación segura y botón de detener siempre disponible.
+- [ ] Voz opcional: captura con permiso y transcripción configurable local/remota; no acoplarla a un servidor personal concreto ni enviarla por defecto.
+- [ ] Crear corpus de tareas y ataques de prompt injection en páginas, atributos, texto oculto, frames y documentos; medir acciones no autorizadas y exposición de datos.
+
+**Aceptación:** éxito verificable en el corpus, cancelación efectiva y cero acciones prohibidas en su suite adversaria. Informar alcance y límites: cero fallos observados no significa garantía universal contra prompt injection.
+
+### F35 — Extensiones y personalización
+
+**Prioridad:** P2/P3. **Depende de:** F07–F09, F14, F23–F24, F30–F31.
+
+- [ ] Definir qué modelo se soportará: extensiones propias, subconjunto WebExtensions o compatibilidad ampliada; documentar APIs prometidas.
+- [ ] Diseñar instalación, firma, actualización, revocación y origen de paquetes; no ejecutar código descargado con privilegios del broker.
+- [ ] Añadir permisos por host/capacidad, concesión temporal y revisión de ampliaciones tras actualizar.
+- [ ] Implementar worlds aislados, mensajería y lifecycle para scripts de contenido y background.
+- [ ] Priorizar casos útiles: gestor de contraseñas, accesibilidad, filtros y herramientas de productividad, con pruebas de aislamiento.
+- [ ] Mantener estadísticas de coste por extensión y capacidad de desactivación/recuperación ante fallo.
+- [ ] No prometer instalar cualquier extensión de Chrome ni acceso a su tienda sin validar compatibilidad y condiciones aplicables.
+
+**Aceptación:** extensión de prueba útil con permisos mínimos; intento de leer un host no concedido falla; desinstalar elimina código y datos según política, sin dejar tareas activas.
+
+### F36 — Sincronización y continuidad entre equipos
+
+**Prioridad:** P2/P3. **Depende de:** F16, F30–F31; criptografía y revisión externa.
+
+- [ ] Definir datos sincronizables: marcadores, ajustes y pestañas primero; credenciales e historial requieren decisión de privacidad separada.
+- [ ] Diseñar cifrado de extremo a extremo con bibliotecas mantenidas, rotación y recuperación; no llamar E2EE a cifrado solo de transporte.
+- [ ] Modelar conflictos, tombstones, relojes, duplicados y dispositivos offline para evitar resurrección de datos borrados.
+- [ ] Añadir vinculación/revocación de dispositivos, exportación y borrado de cuenta verificable.
+- [ ] Mantener servicio opcional: navegar no exige una cuenta ni conexión al servidor de sincronización.
+- [ ] Probar corrupción, rollback, dispositivo perdido y migración de esquemas; preparar operación, copias y alertas sin leer datos privados.
+
+**Aceptación:** dos equipos convergen tras ediciones offline, revocación bloquea acceso futuro y las claves no quedan disponibles al servicio en el diseño E2EE. Sin revisión suficiente, esta función permanece experimental.
+
+### F37 — Soporte de sistemas operativos
+
+**Prioridad:** P2. **Depende de:** F01–F02; sandbox F07 y accesibilidad F32 obligatorias antes de distribuir cada SO.
+
+- [ ] Añadir Linux/macOS a compilación y tests con plataforma/hardware definidos, incluyendo ARM64 cuando entre en alcance.
+- [ ] Revisar rutas, permisos, directorios de datos, proxies, fuentes, atajos y ciclo de vida de ventanas.
+- [ ] Probar IME, selección, portapapeles, impresión, DPI y aceleración en cada plataforma.
+- [ ] Completar targets de empaquetado ya declarados y verificar dependencias del sistema, no solo generar archivos.
+- [ ] Aplicar sandbox y almacén de credenciales de cada SO; funciones sin backend seguro se deshabilitan con motivo explícito.
+- [ ] Automatizar actualización desde una versión anterior instalada y desinstalación respetando decisiones sobre datos.
+- [ ] Publicar matriz de soporte y versiones mínimas basada en pruebas; «la biblioteca lo soporta» no basta.
+
+**Aceptación:** mismas tareas críticas en los SO anunciados, con excepciones registradas; no se vende como multiplataforma una compilación que nunca se inició en un equipo real.
+
+### F38 — Distribución, firma y actualizaciones confiables
+
+**Prioridad:** P1 para cualquier release pública. **Depende de:** F01–F07, F30; F37 por plataforma.
+
+- [ ] Construir instalador completo en CI con frontend y motor del mismo commit; comprobar hash/manifest y ausencia de recursos vacíos.
+- [ ] Ejecutar smoke test del instalado en máquina/VM limpia y verificar la versión del motor que realmente arranca.
+- [ ] Separar canales desarrollo, alpha, beta y estable; gestionar versiones coherentes entre carcasa, protocolo, perfil y motor.
+- [ ] Integrar firma y notarización pertinentes, custodia de claves y permisos mínimos del job de publicación.
+- [ ] Validar autenticidad e integridad de actualizaciones, migraciones de perfil y compatibilidad antes de instalar.
+- [ ] Probar descarga truncada, firma incorrecta, falta de espacio, pérdida de energía y salto de varias versiones.
+- [ ] Diseñar despliegue gradual y recuperación sin volver automáticamente a una versión vulnerable ni destruir datos migrados.
+- [ ] Publicar notas de versión, checksums, licencias y limitaciones. La compra de certificados o publicación efectiva es una decisión operativa posterior a preparar el artefacto.
+
+**Aceptación:** instalar, actualizar y desinstalar funciona en entornos limpios; paquetes manipulados se rechazan; existe procedimiento probado para retirar una release defectuosa.
+
+### F39 — Rendimiento, energía y comparación frente a Chrome
+
+**Prioridad:** P1 desde el inicio para instrumentación; comparación completa después de F25. **Depende de:** F03 y capacidad funcional equivalente por escenario.
+
+- [ ] Crear fixtures congelados pequeños/medianos/grandes y registrar licencias, servidor, versiones, fuentes y hashes.
+- [ ] Medir etapas de motor con benchmarks y perfiles: parseo, estilo, layout, shaping, JS, GC, pintura, transporte y composición.
+- [ ] Medir experiencia completa incluyendo procesos Electron/broker/renderers/GPU/red, no solo el RSS de Rust.
+- [ ] Registrar arranque, primera presentación, interacción, scroll, restauración, 1/10/50 pestañas y sesiones prolongadas.
+- [ ] Comparar con una versión estable de Chrome registrada el día del ensayo; añadir Firefox/WebKit donde ayuden a detectar sesgos.
+- [ ] Ejecutar Speedometer cuando la plataforma permita completar la suite sin modificarla; un benchmark que no arranca es incompatibilidad, no rendimiento cero comparable.
+- [ ] Alternar orden, controlar temperatura/energía/caché y repetir suficientes veces; conservar resultados brutos e intervalos, no elegir la mejor corrida.
+- [ ] Priorizar optimizaciones con perfil: cachés, invalidación, suspensión de pestañas, BFCache y transporte; validar equivalencia visual/funcional.
+- [ ] Medir consumo en reposo y actividad con hardware físico; no inferir energía únicamente a partir de CPU o FPS.
+- [ ] Publicar resultados positivos y negativos con corpus completo; revisar metas de 2.1 solo mediante decisión previa a la nueva medición.
+
+**Aceptación:** informe reproducible con versión, hardware, configuración, distribución de tiempos y fallos; la afirmación «supera a Chrome en X» enlaza a ese informe. [Speedometer 3.1](https://browserbench.org/Speedometer3.1/) puede aportar una medida de respuesta de aplicaciones web, pero no cubre por sí solo todas las dimensiones.
+
+### F40 — Conformidad amplia, fuzzing y resistencia a fallos
+
+**Prioridad:** P0/P1 transversal, profundización antes de estable. **Depende de:** infraestructura F03 y componentes bajo prueba.
+
+- [ ] Ampliar WPT oficial por familias: DOM, HTML, CSS, eventos, red, almacenamiento, workers, accesibilidad y APIs añadidas.
+- [ ] Añadir reftests, tests de servidor, certificados y variantes según el corpus; implementar automatización de acciones donde lo necesite testdriver.
+- [ ] Reportar pass/fail/timeout/crash/skip por test y subtest, cambios de denominador y errores del harness por separado.
+- [ ] Incorporar fuzzing de adaptadores propios, IPC, CSS, DOM, imágenes, fuentes, URL/políticas y deserialización con presupuestos.
+- [ ] Añadir property tests para invariantes y pruebas diferenciales contra motores de referencia; las diferencias se investigan, no se asume que la mayoría siempre tiene razón.
+- [ ] Utilizar sanitizers/Miri donde sean aplicables, revisar `unsafe`, FFI, handles y límites aritméticos.
+- [ ] Probar memoria agotada, disco lleno, procesos caídos, GPU perdida y recuperación de perfiles dañados.
+- [ ] Hacer campañas adversarias del agente y auditoría externa de broker, sandbox, actualización y almacenamiento de secretos.
+- [ ] Reducir cada fallo a fixture permanente; asociar crashes equivalentes sin descartar síntomas distintos solo por stack similar.
+
+**Aceptación:** suite ampliada sin regresiones no justificadas, campañas documentadas y sin bloqueos de seguridad abiertos. Las cifras de WPT incluyen commit y alcance; no se transforma un subconjunto elegido en porcentaje de «toda la web».
+
+### F41 — Alpha, beta y versión estable
+
+**Prioridad:** P1. **Depende de:** hitos detallados en sección 5; no basta con terminar la UI.
+
+- [ ] Definir lista de funciones soportadas y recorridos críticos de cada canal antes de invitar usuarios.
+- [ ] Alpha: probar instalación, navegación y recuperación con corpus controlado; recoger fallos sin prometer uso general.
+- [ ] Beta: habilitar navegación general solo después de sandbox, actualizaciones y revisión de seguridad; mantener canal de reporte accesible.
+- [ ] Medir sesiones sin caída, tareas fallidas, incompatibilidades graves y pérdida de datos; combinar instrumentación opt-in con ensayos internos.
+- [ ] Clasificar incidentes por impacto y reproducibilidad; detener promoción ante pérdida de datos o escape de privilegios.
+- [ ] Ejecutar regresión de producto, accesibilidad, multimedia, actualizaciones, privacidad e IA sobre candidato firmado.
+- [ ] Documentar limitaciones, migraciones y asistencia; proporcionar una vía para desactivar IA/extensiones sin perder navegación.
+- [ ] Publicar estable solo con las puertas aprobadas y mantenimiento asignado; la numeración 1.0 no sustituye esta revisión.
+
+**Aceptación:** candidato de release con evidencias por gate y periodo de beta suficiente para observar los escenarios definidos; problemas residuales conocidos sin bloquear tareas críticas. No se promete ausencia absoluta de errores.
+
+### F42 — Móvil y programas de expansión
+
+**Prioridad:** P3, investigación explícita. **Depende de:** motor estable y decisión de producto independiente.
+
+- [ ] Evaluar Android/iOS por separado: UI nativa, embedding como biblioteca, ciclo de vida, entrada táctil, permisos y energía.
+- [ ] Verificar restricciones vigentes de distribución y uso de motores en cada plataforma/región antes de comprometer implementación.
+- [ ] Prototipar arranque, renderizado, input y sandbox con un corpus mínimo; Electron de escritorio no es una estrategia móvil.
+- [ ] Investigar uso del motor en sistemas embebidos o automatización solo si existe demanda y mantenimiento asignado.
+- [ ] Estudiar administración empresarial, políticas y despliegue gestionado como programa propio, sin introducir acceso remoto por defecto.
+- [ ] Emitir decisión continuar/aplazar/cancelar con coste, riesgos y criterios; la investigación puede cerrarse sin lanzar un producto.
+
+**Aceptación:** decisión documentada y prototipo medido cuando proceda. Esta fase no bloquea la primera estable de escritorio ni se presenta como compatibilidad móvil adquirida.
+
+### F43 — Mantenimiento y mejora continua
+
+**Prioridad:** permanente. **Depende de:** se inicia con F02 y continúa después de F41.
+
+- [ ] Mantener responsables por área, guardia de incidentes y procedimiento de disclosure en `SECURITY.md`.
+- [ ] Definir objetivos internos de triage y corrección por severidad, con mecanismo de release de emergencia.
+- [ ] Actualizar dependencias, corpus WPT/Test262 y listas de políticas regularmente; medir el efecto de cambiar el denominador.
+- [ ] Conservar compatibilidad de perfiles, exportación y recuperación entre versiones; probar migraciones antiguas.
+- [ ] Repetir benchmarks frente a versiones nuevas de referencia y retirar afirmaciones que dejen de ser ciertas.
+- [ ] Contribuir correcciones upstream y presupuestar mantenimiento de dependencias críticas abandonadas.
+- [ ] Revisar coste de operación de sincronización/IA, incidencias de privacidad y utilidad real de funcionalidades.
+- [ ] Eliminar flags y compatibilidad temporal obsoletos mediante migración documentada, sin acumular caminos de ejecución imposibles de probar.
+
+**Aceptación operativa:** cada release tiene responsables y pruebas, los avisos no quedan ignorados indefinidamente y el proyecto puede corregir un incidente aunque no avance ninguna función nueva.
+
+## 5. Dependencias e hitos de entrega
+
+### 5.1 Orden de trabajo
+
+La numeración organiza áreas; no obliga a terminar 44 fases en una fila. Hay tres líneas que pueden avanzar con contratos estables: seguridad/infraestructura, compatibilidad del motor y experiencia de producto. El trabajo paralelo aquí es una propuesta de organización futura, no una afirmación de que se hayan utilizado varios agentes en esta revisión.
+
+```mermaid
+flowchart TD
+  A[F00: línea base] --> B[F01–F03: build, dependencias, pruebas]
+  B --> C[F04–F05: IPC y agente inmediato]
+  C --> D[F06–F09: procesos, sandbox y orígenes]
+  B --> E[F10–F14: event loop, DOM, HTML, módulos, APIs]
+  D --> E
+  E --> F[F15–F17: entrada, datos y red]
+  E --> G[F18–F22: CSS, layout, texto y composición]
+  F --> H[F23–F29: plataforma avanzada y aplicaciones]
+  G --> H
+  C --> I[F30–F34: producto, privacidad, accesibilidad e IA]
+  F --> I
+  G --> I
+  H --> J[F35–F38: ecosistema y distribución]
+  I --> J
+  J --> K[F40–F41: revisión integral y estable]
+  L[F39: medición desde la línea base] --> K
+  B --> L
+  K --> M[F43: mantenimiento continuo]
+  K -. decisión separada .-> N[F42: móvil y expansión]
 ```
 
-Dependencias duras:
-- **B1 antes que todo lo demás**: sin CI, cada bloque puede romper el anterior.
-- **C3 antes que C6/C8**: los métodos nuevos deben colgar de prototipos reales o
-  habrá que reescribirlos.
-- **C5 (`structuredClone`) antes que G4/G5** (IndexedDB y Workers lo usan para pasar datos).
-- **C9 (módulos) antes que C13**: ningún bundle moderno pasa sin módulos.
-- **F2 antes que F3 y G1 (si se quiere aislado)**.
-- **E1 antes que G6**.
-- **H1 antes que H2**.
-- **I1 antes que I2** (no tiene sentido abstraer proveedores en dos sitios).
+El diagrama resume macrodependencias; las dependencias de cada fase prevalecen. F25 empieza con fixtures temprano y crece a medida que existen APIs; F39 empieza con instrumentación sin esperar a poder completar Speedometer; F40 inicia fuzzing antes de la beta. F35/F36/F42 pueden seguir experimentales sin bloquear estable si se declaran fuera de esa versión.
 
----
+### 5.2 Hitos y puertas
 
-## 14. Lo que NO se va a hacer
+| Hito | Estado/objetivo | Requisitos de salida |
+|---|---|---|
+| M0 — Diagnóstico | Revisión actual | Evidencias de 1.3, hallazgos y plan conservado; no equivale a F00 completo |
+| M1 — Base reproducible | Desarrollo fiable | F00–F03 cerradas en su alcance inicial; build limpio, lint estricto, sin falsos verdes y dependencias tratadas |
+| M2 — Fronteras protegidas | Infraestructura segura | F04–F09 cerradas en Windows, cancelación del agente y pruebas negativas; revisión de amenazas |
+| M3 — Web interactiva básica | Motor coherente | F10–F17 y CSS/layout/texto esenciales; globals, módulos transitivos, formularios, datos y actualizaciones visibles |
+| M4 — Aplicaciones útiles | Compatibilidad medible | Corpus inicial de 20 tareas completo, WPT inicial reproducible y visuales críticos aprobados |
+| M5 — Alpha de producto | Navegador operable | UI esencial, perfiles, accesibilidad inicial, recuperación y artefacto completo; limitaciones publicadas |
+| M6 — Beta de uso general | Validación externa controlada | Sandbox/orígenes revisados, actualizaciones verificadas, multimedia común, datos y tareas críticas; cero P0 abiertos |
+| M7 — Ventaja demostrada | Diferenciación | Informe comparativo equivalente y al menos una ventaja significativa; no anunciar superioridad universal |
+| M8 — Estable 1.0 | Producto mantenible | Puertas de release, corpus ampliado, accesibilidad, fiabilidad, actualización y mantenimiento satisfechos |
 
-Decisiones explícitas, para que nadie las reabra sin motivo:
+Si una capacidad imprescindible para el corpus no está lista, se retrasa el hito o se cambia el alcance **antes** de evaluar el candidato, con justificación y anuncio. No se borran retrospectivamente casos difíciles para declarar un aprobado.
 
-| No se hace | Por qué |
+### 5.3 Condiciones que bloquean una release
+
+- Escape de sandbox, lectura de datos de otro contexto o acceso privilegiado no autorizado.
+- Pérdida/corrupción de datos, repetición automática de operaciones sensibles o restauración insegura de sesión.
+- Paquetes de actualización no autenticados, credenciales expuestas o dependencia crítica sin tratamiento.
+- Harness que omite pruebas o devuelve éxito sin haberlas ejecutado.
+- Cancelación del agente ineficaz o ejecución fuera de la autorización del usuario.
+- Incapacidad de instalar/iniciar/actualizar el artefacto final en una plataforma anunciada.
+- Una tarea crítica del corpus falla y no existe una reducción de alcance aprobada previamente.
+
+Una regresión cosmética menor puede tener seguimiento posterior; no se trata igual que un fallo de origen aunque ambos produzcan un test rojo.
+
+## 6. Validación, presupuestos y comparación
+
+### 6.1 Pirámide de pruebas
+
+| Nivel | Qué debe comprobar | Ejemplos | Cuándo |
+|---|---|---|---|
+| Unidad | Invariantes y semántica local | Resolución de URL, cascada, cookies, mutación DOM | Cada cambio relevante |
+| Integración de motor | Recorrido entre subsistemas | HTML→JS→DOM→layout→píxeles; formularios→red | Cada PR de motor |
+| Contrato/proceso | IPC, aislamiento y ciclo de vida | Request inválida, EOF, cancelación, crash | Cada PR de protocolo/procesos |
+| WPT/Test262 | Conformidad externa | Subsets fijados y expectations | Subset en PR; ampliada periódicamente |
+| Visual | Geometría y pintura | Reftests, texto, transforms, stacking | Por cambios visuales y noche |
+| Producto E2E | Tarea completa del usuario | Navegar, descargar, restaurar, imprimir | PR seleccionadas y release |
+| Seguridad | Rechazos y contención efectivos | Origen ajeno, escape de ruta, recurso hostil | Cada cambio de frontera y release |
+| Rendimiento | Trabajo equivalente medido | Carga, interacción, memoria total y energía | Corpus corto en CI; laboratorio periódico |
+| Larga duración | Fugas y recuperación | Cientos de navegaciones, suspensión, cierre forzado | Nocturna y candidato |
+| IA | Autorización, acción y resultado | Inyección, cancelar, tarea fallida y datos privados | Cambio de política/modelo/herramientas |
+
+El CI necesita servidores locales y perfiles temporales independientes. Los tests no deben tocar cookies o almacenamiento del perfil habitual. Los fixtures que requieren Internet se etiquetan y separan de la puerta determinista.
+
+### 6.2 Matriz mínima de escenarios
+
+| Grupo | Escenarios obligatorios |
 |---|---|
-| Sustituir `boa` por V8 / JIT propio | Rompe la doctrina de dependencias y la identidad del proyecto; el coste de compatibilidad no está en el JIT |
-| Fallback a Chromium/WebView cuando el motor falla | El producto es el motor. Si falla, se ve que falla |
-| Stubs de APIs que "no rompen" (observadores que nunca disparan, `play()` que devuelve `Promise` resuelta sin reproducir) | Peor que un `TypeError`: el bundle espera para siempre |
-| Imitar el `User-Agent` de Chrome | Las páginas usarían APIs que no existen y fallarían más lejos y peor |
-| DNS propio, TLS propio, decodificadores propios de imagen/vídeo | Doctrina: lo resuelto no se reescribe |
-| WebGL antes de que el resto del bloque C esté cerrado | 10+ días para algo que casi ninguna web necesita para verse |
-| Versión móvil | Sin Electron; sería otro producto |
-| `window.open` / ventanas emergentes | Fuente de abusos; se lanza error y se documenta |
-| Guardar claves de API en `localStorage` del renderer | Se migra a `safeStorage` (I2) |
+| Carga | HTML simple, CSS externo, compresión, redirecciones, error TLS, offline, servidor lento y cancelación |
+| Scripts | Clásico, defer, async, módulos anidados, import dinámico, error de sintaxis, loop infinito y promesas |
+| DOM | Identidad, colecciones, adopción, template, namespaces, shadow root y lectura tras mutación |
+| Entrada | Click, doble click, rueda, Tab, Unicode, IME, selección, clipboard, envío explícito y validación |
+| Presentación | 100/125/150/200% DPI, zoom, diferentes tamaños, scroll anidado, fuentes faltantes y transparencias |
+| Datos | Dos orígenes, subdominios, dos perfiles, privado, cuota, borrado y disco lleno |
+| Vida útil | Abrir/cerrar 100 pestañas, cambiar mientras carga, crash renderer, reinicio app y actualización |
+| IA | Nodo desaparecido, navegación durante decisión, salida malformada, proveedor caído, detener y petición sensible |
+| Dispositivos | Cámara/micrófono revocados, dispositivo ausente, GPU perdida y suspensión/reanudación |
 
----
+### 6.3 Presupuestos iniciales y su revisión
 
-## 15. Checklist maestro
+Estos valores son objetivos de ingeniería, pendientes de confirmar con F39. No son rendimiento observado hoy.
 
-Marcar aquí al cerrar. Cada ✅ debe tener su Fase en `ARCHITECTURE.md`.
+| Métrica | Objetivo inicial | Restricción para interpretar el dato |
+|---|---|---|
+| Interacción en interfaz propia | p95 <100 ms | Medir hasta respuesta visible, no hasta envío del comando |
+| Frame a 60 Hz | Trabajo dentro de 16,7 ms en corpus de animación | Informar cuadros perdidos y p99; hardware registrado |
+| Mutación localizada en fixture de 10k nodos | p95 <50 ms | Resultado correcto; medir también lectura forzada de layout |
+| Detener agente | Ninguna acción nueva después de reconocer la cancelación | No puede deshacer una acción externa ya completada; mostrar estado incierto si corresponde |
+| Cierre de renderer bloqueado | Control recuperable por supervisor en pocos segundos, umbral configurado | Medir desde detección; broker/UI siguen respondiendo |
+| Sesiones de beta sin crash de app | Meta ≥99,5% | Reportar tamaño y duración de muestra, caídas de pestaña aparte |
+| Datos | Cero pérdida silenciosa en pruebas de interrupción | No confundir este resultado con garantía absoluta |
+| Rendimiento frente a Chrome | Metas de 2.1 | Funciones/corpus equivalentes y reporte de incompatibilidades |
 
-### A — Higiene
-- [ ] A1 PR de `fix/paginas-vacias-y-rendimiento` fusionado en `main` — **pendiente de tu visto bueno** (requiere `git push`, acción externa)
-- [x] A2 README sin datos falsos (location/MutationObserver, cifra de tests, SOP)
-- [x] A3 `engine/huecos_sin_resolver.md` creado y enlazado, con cada entrada verificada por `grep` contra el código
-- [x] A4 Cifra de tests reconciliada: eran **805**, no 703; hoy **819** con los nuevos
-- [~] A5 Árbol limpio — **reevaluada como innecesaria**: todo lo señalado (`.exe`, `__pycache__`, `backend/build`, `backend/dist`, `.venv`) ya está en `.gitignore`, así que no ensucia el repo. Borrar el `.venv` de 281 MB obligaría a reinstalar sin ganancia, y el destino del backend lo decide I1
+Los límites duros de bytes, memoria por proceso, profundidad y cola se fijarán por tipo de recurso a partir de medición y modelo de amenazas. No se usa un único máximo arbitrario para HTML, vídeo, imágenes y frames IPC. Cada límite incluye comportamiento al excederlo y prueba.
 
-### B — CI
-- [x] B1 `engine.yml` (build + tests + clippy `-D warnings` + WPT + `cargo audit`). **`fmt` NO se exige**, ver la cabecera del workflow. *Branch protection* queda por activar en GitHub (ajuste del repo, no del código)
-- [x] B2 `app.yml` (tipos + build de la interfaz + `electron-builder --dir` + lint). **Lint arreglado y bloqueante** (Fase 46): TypeScript bajado a 5.9 para recuperar `typescript-eslint`, y trinquete que falla si los hallazgos suben (hoy 20)
-- [x] B3 `wpt_runner` en CI — los 24 tests estilo-WPT pasan
-- [x] B4 Test de humo NDJSON: 14 tests contra el binario real, cubren las 16 variantes más entrada inválida, con guardia anti-regresión de cobertura
+### 6.4 Protocolo del benchmark comparativo
 
-### C — Web moderna
-- [x] C1 Sonda v2 versionada con **114 comprobaciones**; cifra inicial **48/114**, hoy **56/114**. Test `api_probe` impide que baje y que se borren comprobaciones
-- [ ] C2 Corpus de 5 bundles con tests `#[ignore]`
-- [x] C3 Cadena de prototipos DOM real + constructores globales (Fase 44). `instanceof` y polyfills funcionan. **Salvedad declarada**: los métodos siguen en la instancia, así que un envoltorio sobre un método que el motor ya tiene no llega a ejecutarse
-- [x] C4 `Event`, `CustomEvent`, `KeyboardEvent`, `MouseEvent`, `InputEvent`, `FocusEvent` con sus campos (Fase 45). Falta `EventTarget` construible y que el teclado/ratón reales rellenen los metadatos
-- [~] C5 **hecho**: `console`, `URL`, `URLSearchParams`, `performance.now`, `atob`/`btoa`, `TextEncoder`/`TextDecoder` (Fase 42). **Pendientes a propósito**: `AbortController` (hasta que cancele el `fetch` de verdad), `crypto` (necesita aleatoriedad real), `structuredClone`
-- [~] C6 **parcialmente** (Fases 44-45): `matches`, `closest`, `contains`, `remove`, `append`, `prepend`, `cloneNode`, `dataset`, `innerHTML` real, `outerHTML`, `isConnected`, `id`, `className`, `readyState`, `activeElement`, `currentScript`, `getElementsByClassName`, `createDocumentFragment`, `createComment`, `hasFocus`. **Pendientes**: `write`, `insertAdjacentHTML`, `innerText`, `focus`, `scrollIntoView`, `offset*`, `client*`
-- [~] C7 **mayoritariamente** (Fase 45): `innerWidth`/`innerHeight`, `devicePixelRatio`, `scrollX`/`scrollY`, `matchMedia` con el evaluador real de `@media`. **Pendientes**: `scrollTo` que mueva de verdad, diálogos vía protocolo
-- [ ] C8 `IntersectionObserver` / `ResizeObserver` reales
-- [~] C9 **mayoritariamente hecho** (Fase 43): `type="module"` en línea y externo, `import`/`export` reales, `defer`/`async` con el orden del spec, `nomodule` omitido, `<link rel="modulepreload">` descargado. **Pendientes**: `import()` dinámico, import maps, y resolución relativa al módulo importador (hoy se resuelve contra la página)
-- [ ] C10 Scripts ejecutados durante el parseo (streaming)
-- [ ] C11 Formularios desde JS + `FormData` + `SubmitForm` en protocolo
-- [ ] C12 Selección de texto y portapapeles
-- [ ] C13 Los 5 bundles en verde; 10 webs reales verificadas con captura
+1. Registrar hash de ambos ejecutables, versión exacta de Chrome, sistema, CPU/GPU/RAM, controladores, energía y resolución.
+2. Crear perfiles nuevos equivalentes. Separar comparación por defecto y comparación con funciones configuradas iguales.
+3. Servir contenido fijado; controlar ancho de banda/latencia cuando se mida red. Mantener visitas a sitios vivos en informe separado.
+4. Separar arranque frío/caliente, caché HTTP fría/caliente, JS warm-up y sesión restaurada.
+5. Verificar éxito funcional, contenido y estado de página antes de aceptar un dato de velocidad o memoria.
+6. Alternar orden de ejecución. Empezar con al menos 20 repeticiones cortas por escenario y ajustar tamaño según variabilidad; no aplicar ese número mecánicamente a ensayos de batería de horas.
+7. Reportar mediana, p95, dispersión e intervalos de confianza; conservar todos los valores y regla de tratamiento de outliers.
+8. Sumar procesos y memoria compartida con una metodología explícita; no mezclar RSS bruto con memoria privada como si fueran iguales.
+9. Documentar energía con instrumento o mecanismo validado y calibración; no publicar porcentajes cuando la incertidumbre es mayor que la diferencia.
+10. Publicar el informe con scripts, corpus distribuible y limitaciones, incluyendo escenarios donde Chrome gana.
 
-### D — CSS/layout
-- [ ] D1 `::before`/`::after` + `content`
-- [ ] D2 `linear-gradient`/`radial-gradient`
-- [ ] D3 `background-size/position/repeat` + capas
-- [ ] D4 `calc()`/`min()`/`max()`/`clamp()` evaluados en layout
-- [ ] D5 `transform` 2D + hit-testing
-- [ ] D6 `transition`/`animation` + bucle de fotogramas
-- [ ] D7 `opacity`/`visibility`/`z-index` con contextos de apilamiento
-- [ ] D8 Listas con marcadores
-- [ ] D9 `@font-face` (woff2), `white-space`, `text-overflow`, `line-height`, shaping
-- [ ] D10 Grid completo (rows, auto-flow, repeat/minmax, span, alineación)
-- [ ] D11 Flexbox completo (order, align-self, wrap multilínea, gap)
-- [ ] D12 Pseudo-clases restantes, `outline`, `cursor`, `pointer-events`, `object-fit`, `aspect-ratio`, `@layer`
-- [ ] D13 Reflow incremental (<50 ms por mutación en 10k nodos)
+### 6.5 Definición de terminado de una tarea
 
-### E — Red
-- [ ] E1 Caché HTTP (memoria + disco, validación condicional)
-- [ ] E2 HTTP/2 por ALPN
-- [ ] E3 `@import`
-- [ ] E4 `preload`/`modulepreload`/favicon
-- [ ] E5 Parseo progresivo por chunks
-- [ ] E6 `Referrer-Policy`, HSTS, proxy del sistema
-- [ ] E7 Prefijos y `Partitioned` en cookies
+- Comportamiento y límites escritos, con issue o identificador de esta hoja de ruta.
+- Reproducción previa cuando corrige un fallo y regresión relevante después.
+- Pruebas de capa afectada e integración correspondiente aprobadas.
+- Políticas de origen, permisos y cancelación revisadas si atraviesa fronteras.
+- Sin incremento oculto de deuda, avisos o tests omitidos.
+- Medición si el cambio afirma una mejora de rendimiento, memoria o consumo de tokens.
+- Documentación actualizada y compatibilidad/migración de datos considerada.
+- Evidencia asociada al commit y al artefacto, con responsable de mantenimiento.
 
-### F — Seguridad
-- [ ] F1 `engine/SECURITY.md` con modelo de amenazas
-- [ ] F2 Broker + proceso por pestaña
-- [ ] F3 Sandbox del SO (Windows; después Linux/macOS)
-- [ ] F4 Site isolation (largo plazo)
-- [ ] F5 Endurecer protocolo NDJSON (límites, `tab_id` no adivinable)
-- [ ] F6 Fuzzing de decodificadores y parsers propios
-- [x] F7 `cargo audit` en CI (job `audit` de `engine.yml`), como trinquete: los 5 avisos conocidos están listados con su motivo y cualquiera nuevo tumba el job. `cargo deny` y `npm audit` siguen pendientes
-- [ ] **F8 Subir `boa_engine` de 0.19 a 0.22 — P1 — 2 d.** Cierra `RUSTSEC-2025-0003` (fallo de segmentación en `fast-float`) y `RUSTSEC-2024-0379`, los dos únicos avisos de la auditoría que son fallos reales y no de mantenimiento. Lo que los alcanza es el parser de números del motor de JavaScript, o sea código de cualquier página. Son tres versiones menores de un crate pre-1.0: cambian el cargador de módulos (`ModuleLoader`, ver Fase 43) y las firmas de `NativeFunction`, así que hay que revisar `platform.rs`, `modules.rs`, `dom_classes.rs` y `dom_bindings.rs`. **Criterio de aceptación**: los 874 tests en verde, la sonda de APIs sin bajar de 85, y los dos avisos fuera de la lista de ignorados
+## 7. Organización y capacidad de trabajo
 
-### G — Plataforma
-- [ ] G1 `<iframe>` + `postMessage` + `sandbox`
-- [ ] G2 `<video>`/`<audio>` (delegado a Electron en fase 1)
-- [ ] G3 WebSockets
-- [ ] G4 IndexedDB
-- [ ] G5 Web Workers
-- [ ] G6 Service Workers
-- [ ] G7 WebGL (`null` honesto hasta entonces)
-- [ ] G8 APIs de dispositivo denegadas explícitamente
-- [ ] G9 `<dialog>`, `<details>`, `<progress>`, inputs date/color/range/file
-- [ ] G10 `Blob`/`File`/`FileReader`/`ReadableStream`/descargas
-- [ ] G11 Impresión/PDF
-- [ ] G12 Namespaces SVG/MathML en el DOM
+### 7.1 Un programa por hitos, sin fechas artificiales
 
-### H — WPT
-- [ ] H1 `testharness.js` oficial cargando (o arnés completo en Rust)
-- [ ] H2 Corpus WPT vendorizado + `--expectations` + timeout + JSON; primera cifra: ___/___
-- [ ] H3 Informe por directorio en `ARCHITECTURE.md`
-- [ ] H4 Tests de captura visual
+No se mantiene el calendario previo de doce semanas ni estimaciones de uno o dos días para subsistemas completos. Como juicio de planificación, desarrollar un motor competitivo de uso general es trabajo potencialmente de varios años y mantenimiento permanente; no se puede calcular una fecha honesta solo contando archivos o APIs.
 
-### I — Producto
-- [ ] I1 Backend Python eliminado (o justificado y reducido)
-- [ ] I2 Proveedores LLM: Gemini, Anthropic, OpenAI-compatible, Ollama (PCCOM); clave en `safeStorage`
-- [ ] I3 Agente sobre AOM con ids estables y confirmación antes de submit/dominio nuevo
-- [ ] I4 Voz → Faster-Whisper (PCCOM)
-- [ ] I5 UI de navegador completa (favicon, progreso, atajos, zoom, marcadores, descargas, candado TLS, devtools mínimo)
-- [ ] I6 Release en GitHub + auto-update funcionando + versión `0.x` + CHANGELOG (+ firma, decisión de compra)
-- [ ] I7 Telemetría opt-in de fallos
-- [ ] I8 CONTRIBUTING, protocolo documentado, plantilla de PR
+La falta de límite de tiempo permite cerrar causas estructurales y ampliar pruebas. No conviene usarla para abrir todos los subsistemas simultáneamente. Se entrega valor con hitos verificables y se recalcula alcance tras obtener datos de ejecución.
 
-### J — Multiplataforma
-- [ ] J1 Linux y macOS en la matriz de CI
-- [ ] J2 Descubrimiento de fuentes por plataforma
-- [ ] J3 Empaquetado dmg/AppImage/deb (+ notarización, decisión de compra)
+Para estimar una fase:
 
-### K — Rendimiento
-- [ ] K1 `cargo bench` con `criterion` + `BENCHMARKS.md`
-- [ ] K2 Flamegraph y lista de puntos calientes
-- [ ] K3 Cachés de medición de texto y estilos
-- [ ] K4 Pintado incremental / memoria compartida con Electron
-- [ ] K6 Liberar memoria de pestañas en segundo plano
+1. Separar investigación, prototipo, implementación, pruebas, migración y documentación.
+2. Resolver primero incertidumbres que puedan invalidar la arquitectura.
+3. Dividir hasta tener tareas revisables con resultado observable.
+4. Medir capacidad real durante varios ciclos y usar rangos, no fechas inventadas.
+5. Reservar capacidad para regresiones, dependencias e incidentes en cada ciclo.
 
----
+### 7.2 Responsabilidades necesarias
 
-*Última revisión: 2026-09-09. Al cerrar cualquier tarea, actualizar la fecha y la
-sección 1.2 de este fichero.*
+| Área | Responsabilidad |
+|---|---|
+| Arquitectura de motor | Ownership, contratos, DOM/JS, scheduling y compatibilidad |
+| Seguridad | Broker, sandbox, origen, credenciales, actualización y auditorías |
+| Renderizado | CSS, layout, tipografía, gráficos y composición |
+| Producto | UI, accesibilidad, perfiles, entrada, integración de escritorio |
+| Infraestructura | Builds, CI, paquetes, firma, benchmarks y entornos de pruebas |
+| IA | Proveedores, herramientas, política de autorización, evaluaciones y privacidad |
+| Calidad | Corpus, reducción de fallos, WPT, reftests y tareas reales |
+
+Una persona puede asumir varios papeles, pero las revisiones de seguridad y decisiones de gran impacto se benefician de una segunda revisión independiente. Más personas no eliminan dependencias de arquitectura ni multiplican linealmente la velocidad.
+
+### 7.3 Política de cambios y documentación
+
+- Mantener PRs acotadas por problema; separar refactor, actualización de dependencia y cambio semántico cuando facilite revisar.
+- Crear ADRs para decisiones difíciles de revertir; incluir alternativas descartadas y un experimento de aceptación.
+- Registrar avances en el plan con fecha y enlaces a evidencia; no marcar una fase completa por terminar su demostración.
+- Mantener un tablero de tareas activas pequeño; cerrar y estabilizar antes de abrir otro subsistema.
+- Preparar correcciones y artefactos localmente antes de decisiones de publicación, compras o cambios en servicios externos.
+- Revisar la correspondencia entre README, backlog y capacidades en cada release.
+
+## 8. Riesgos y decisiones de arquitectura
+
+| Riesgo | Señal temprana | Mitigación/decisión |
+|---|---|---|
+| Añadir APIs sobre un modelo DOM incorrecto | Misma clase de fallos de identidad/prototipos repetida | Priorizar F11 y bindings consistentes antes de ampliar métodos |
+| Sandbox incompatible con recursos actuales | Renderer necesita archivos/red globales | Mover capacidades al broker; no quitar restricciones |
+| Runtime JS insuficiente | Test262/perfiles y apps muestran brecha dominante | ADR y experimento F29; mantener adaptador y pruebas |
+| Electron impide meta de memoria/tamaño | Coste fijo domina aun con motor optimizado | Medir carcasa alternativa nativa en prototipo; decidir con accesibilidad/portabilidad |
+| Concurrencia desordena estados | Respuestas viejas sobrescriben pestaña nueva | Versiones de contexto/documento/frame y cancelación |
+| Aparente compatibilidad por mocks | API existe pero app espera indefinidamente | Pruebas semánticas y ausencia explícita hasta implementar |
+| Métricas maquilladas involuntariamente | Menos nodos/recursos procesados mejora benchmark | Verificar equivalencia y contar incompatibilidades |
+| Crecimiento de superficie de ataque | Nueva API con otra vía de archivos/red | Unificar políticas y exigir revisión de fronteras |
+| Datos irrecuperables tras crash/update | Migraciones sin rollback ni exportación | Transacciones, copias, fixtures de versión anterior |
+| IA ejecuta contenido como instrucciones | Página solicita secretos/cambio de permisos | Separación de datos/autoridad y política determinista |
+| IA indica éxito sin efecto | Error del motor absorbido o salida inválida | Resultados tipados y poscondiciones verificadas |
+| Dependencias quedan congeladas | Excepciones de auditoría sin fecha | Propietario y revisión periódica; impedir releases inseguras |
+| Multiplicar servicios duplica lógica | TS/Python divergen en comandos o permisos | Implementación autoritativa y adaptadores finos |
+| Complejidad de media/DRM | Requisitos de licencia o integración no resueltos | Separar capacidades y verificar condiciones antes de prometer |
+| Tests largos frenan todas las PRs | Feedback tarda demasiado o siempre falla | Suites escalonadas deterministas y campañas periódicas |
+| Falta mantenimiento tras 1.0 | Nadie atiende avisos o cambios de web | F43 como coste permanente y capacidad reservada |
+
+Decisiones que deben producir ADR antes de implementación masiva: frontera broker/renderer; almacenamiento y particiones; generador de bindings; estrategia de runtime; transporte de superficies; biblioteca multimedia; UI nativa frente a Electron; extensiones; sincronización cifrada.
+
+## 9. Primer backlog ejecutable
+
+Este es el siguiente tramo de trabajo recomendado. El documento no implica que estas tareas ya estén hechas.
+
+| Orden | Tarea | Archivo/área inicial | Resultado verificable |
+|---|---|---|---|
+| 1 | ~~Corregir falso verde del runner~~ **hecho** (Fase 47) | `core/src/bin/wpt_runner.rs`, harness | Fixture con excepción antes de tests devuelve fallo y diagnóstico |
+| 2 | Añadir timeout por proceso de test | Harness/runner | Fixture infinito termina con TIMEOUT y continúa la suite |
+| 3 | Investigar append/prepend | `api-probe.html`, `dom_bindings.rs` | Causa reducida, caso semántico y corrección sin bajar cobertura |
+| 4 | Corregir publicación de cambios de timers | `core/src/server.rs`, Electron/viewport | El título/captura cambian sin petición manual posterior |
+| 5 | Corregir cancelación y autoenvío del agente | `AgentSidebar`, orquestador, `App.tsx` | Detener durante llamada no actúa después; escribir no envía |
+| 6 | Propagar resultados y fallos de comandos | `App.tsx`, tipos IPC, orquestador | Error de motor no termina como objetivo completado |
+| 7 | Retirar clave de renderer | Servicio IA/credenciales, preload | No existe secreto en localStorage, UI o logs |
+| 8 | Auditar y migrar dependencias | Tres árboles npm, Rust y Python opcional | Informe de alcance y PRs de actualización con regresiones |
+| 9 | Endurecer IPC/protocolo | `main.js`, `preload.js`, `protocol.rs` | Payload/emisor inválidos rechazados y límites probados |
+| 10 | Resolver lint por grupos | Frontend | 18 errores/2 advertencias → cero con pruebas de interacción |
+| 11 | Desacoplar Python del build principal | `build-app.js`, manifiestos, scripts | Build nativo completo sin `.venv` |
+| 12 | Probar paquete con motor real | `.github/workflows/app.yml` | Artefacto instalado responde ping y renderiza fixture |
+| 13 | Diseñar broker y modelo de amenazas | ADR, `SECURITY.md`, prototipo | Dos renderers independientes y caída contenida |
+| 14 | Preparar corpus/frameworks y benchmark base | Fixtures nuevos, scripts de medición | Resultados con denominadores y fallos preservados |
+
+Las tareas 5–9 y el diseño de sandbox tienen prioridad de seguridad aunque aparezcan después de las reproducciones en la tabla. Se pueden trabajar de forma independiente cuando haya responsables, sin esperar a cerrar cuestiones cosméticas.
+
+## 10. Correspondencia con el plan anterior
+
+La copia histórica conserva texto, checklists y razones. Esta tabla permite interpretar referencias `[plan C5]` y similares que ya existen en código y backlog hasta actualizar esos enlaces. No se reabren automáticamente trabajos terminados; se verifica su parte pendiente.
+
+| IDs anteriores | Destino vigente | Tratamiento |
+|---|---|---|
+| A1 | F00, F01 | Verificar rama/PR real; no presumir que sigue 11 commits por delante |
+| A2–A4 | F00, F03 | Reconciliar documentación y cifras; preservar evidencia histórica |
+| A5 | F01 | Mantener artefactos ignorados; no borrar entornos útiles sin motivo |
+| B1–B3 | F01–F03 | CI existe; ampliar y corregir puertas en lugar de crearlo otra vez |
+| B4 | F03, F04, F06 | Mantener 14 tests NDJSON y ampliar contrato/fallos |
+| C1–C2 | F03, F25 | Mantener sonda; añadir corpus real y semántica |
+| C3 | F11 | Jerarquía existente; faltan métodos/identidad/prototipos completos |
+| C4 | F11, F15 | Eventos existentes; completar constructor, metadata y entrada real |
+| C5 | F14, F33 | Utilidades parciales; completar binarios, abort, crypto y consola |
+| C6–C7 | F10–F12, F15 | DOM, global window, geometría, foco y diálogos |
+| C8 | F18–F19, F25 | Observadores reales vinculados a layout y ciclo de render |
+| C9–C10 | F12–F13 | Carga real, parser, módulos transitivos y async |
+| C11–C12 | F14–F15 | Formularios, selección y clipboard |
+| C13 | F25 | Tareas completas de aplicaciones y sitios |
+| D1–D4 | F18, F21 | Pseudo-elementos, fondos y expresiones |
+| D5–D8 | F18–F19, F21–F22 | Transformaciones, animación, stacking y listas |
+| D9 | F20 | Texto y fuentes, incluidos casos multilingües |
+| D10–D13 | F18–F19, F22 | Grid/flex, CSS adicional e incrementalidad |
+| E1–E5 | F12–F13, F17 | Caché, HTTP/2, imports, preloads y streaming |
+| E6–E7 | F08–F09, F17 | HSTS/referrer/proxy/cookies y particiones |
+| F1–F4 | F06–F09 | Amenazas, procesos, sandbox y sitios |
+| F5–F6 | F04, F40 | Límites y autorización del protocolo; fuzzing |
+| F7–F8 | F02 | Auditoría y migración Boa verificadas de nuevo |
+| G1 | F09, F24 | Iframes y postMessage bajo aislamiento |
+| G2 | F26 | Media propia integrada con políticas |
+| G3 | F27 | WebSockets/EventSource |
+| G4–G6 | F14, F16, F23 | Clonación, IndexedDB, Workers y Service Workers |
+| G7 | F28 | WebGL y eventual WebGPU |
+| G8 | F27, F31 | Permisos y dispositivos |
+| G9 | F15, F18–F19 | Controles HTML y elementos interactivos |
+| G10 | F14, F17, F30 | Binarios, streams y descargas |
+| G11 | F19, F30 | Impresión/PDF |
+| G12 | F12, F24 | SVG/MathML y namespaces |
+| H1–H4 | F03, F21, F40 | Harness oficial, expectativas e imágenes |
+| I1 | F01, F34 | Python opcional y consolidación del agente |
+| I2–I3 | F05, F34 | Proveedores, secretos, AOM y acciones |
+| I4 | F34 | Voz configurable, sin dependencia de servidor personal |
+| I5 | F30, F32–F33 | UX, accesibilidad y herramientas |
+| I6–I8 | F00, F31, F38, F41, F43 | Releases, telemetría opcional y documentación |
+| J1–J3 | F37–F38 | Validar plataformas/paquetes ya configurados |
+| J4 | F42 | Investigación móvil separada |
+| K1–K4 | F19–F22, F39 | Benchmark, perfiles, cachés y transporte |
+| K5 | F29 | Decisión de runtime/JIT basada en datos |
+| K6 | F06, F22, F30, F39 | Memoria total, suspensión y liberación |
+
+Ampliaciones explícitas del nuevo plan: seguridad operativa de IA; actualización autenticada; WebAssembly; accesibilidad de SO; Web Components; extensiones; sincronización; privacidad verificable; pruebas de recuperación; mantenimiento tras estable. Se priorizan según producto y dependencias, no se asumen gratuitas.
+
+## 11. Comandos y evidencias de cierre
+
+### 11.1 Comprobaciones que ya existen
+
+Desde la raíz, salvo indicación distinta:
+
+```powershell
+git status --short
+git rev-parse HEAD
+node --version
+npm --version
+rustc --version
+cargo --version
+
+cargo test --manifest-path engine/Cargo.toml --workspace --locked
+cargo clippy --manifest-path engine/Cargo.toml --workspace --all-targets --locked -- -D warnings
+cargo test --manifest-path engine/Cargo.toml -p engine-core --test api_probe --locked -- --nocapture
+cargo test --manifest-path engine/Cargo.toml -p engine-core --test ndjson_smoke --locked
+cargo test --manifest-path engine/Cargo.toml -p engine-core --test bundle_modulos --locked
+cargo run --manifest-path engine/Cargo.toml -p engine-core --bin wpt_runner --locked -- engine/tests/wpt-style
+
+npm --prefix frontend run build
+npm --prefix frontend run lint:ci
+npm --prefix frontend run lint
+npm --prefix frontend audit --json
+npm --prefix desktop audit --json
+```
+
+La ejecución de `wpt_runner` registrada en esta revisión usó el binario debug existente tras compilar las pruebas, desde `engine`, con argumento `tests/wpt-style`. El comando de arriba es su forma reproducible mediante Cargo desde la raíz. `lint` estricto devuelve fallo en el estado auditado; no debe presentarse como una regresión de esta entrega documental.
+
+`cargo audit` requiere instalar primero una versión fijada de la herramienta; se ejecutará dentro de `engine` y guardará versión de su base de avisos. No se inventa un resultado local que no se ha obtenido. Los comandos de WPT oficial, fuzzing, E2E y benchmarks se añadirán cuando exista su infraestructura; todavía no hay scripts que garanticen esas tareas.
+
+### 11.2 Reproducciones nuevas que deben convertirse en tests
+
+**Ejecutor que aprueba sin ejecutar tests:** servir o guardar un fixture HTML cuyo script lanza una excepción antes de registrar `test(...)`; ejecutar `wpt_runner` sobre él. En el estado auditado imprime `0 pasaron, 0 fallaron, 0 en total` y retorna código 0. El resultado esperado tras F03 es fallo explícito del harness/documento.
+
+**Cambio por timer no enviado a la interfaz:** cargar mediante `engine_server` una página HTTP local con título `ANTES` y `setTimeout` de 500 ms que asigna `DESPUES`. Observar stdout sin enviar comandos durante 1.600 ms tras la respuesta de navegación. En esta revisión hubo cero mensajes de estado espontáneos; un `get_state` posterior devolvió `DESPUES`. El resultado esperado tras F10 es actualización observable por el consumidor sin pedirla manualmente.
+
+Ambas pruebas se hicieron contra fixtures temporales, sin modificar código productivo ni registrar credenciales. La segunda demuestra la carencia del canal de actualización; no pretende ser un benchmark de latencia ni una revisión visual de Electron.
+
+### 11.3 Plantilla para cerrar fases
+
+```text
+Fase / tarea:
+Estado: pendiente | en curso | bloqueada por dependencia | validada
+Responsable:
+Commit y artefacto:
+Problema observado y fixture:
+Comportamiento implementado:
+Comandos / suite / corpus y versiones:
+Resultados: pass, fail, skip, timeout, crash, harness-error:
+Rendimiento antes/después si corresponde:
+Revisión de seguridad y permisos:
+Impacto sobre datos y migraciones:
+Limitaciones y tareas residuales:
+Documentos actualizados:
+Fecha de validación:
+```
+
+Una fase puede tener subtareas cerradas y seguir parcial. Si la implementación difiere del alcance original, se actualizan alcance y criterios antes de declarar el cierre.
+
+## 12. Referencias técnicas
+
+Fuentes primarias consultadas el 21-09-2026. Los estándares vivos y herramientas se fijarán por revisión cuando entren en un test reproducible.
+
+- [Seguridad de Electron](https://www.electronjs.org/docs/latest/tutorial/security): controles de la carcasa, IPC, navegación y mantenimiento del runtime.
+- [safeStorage de Electron](https://www.electronjs.org/docs/latest/api/safe-storage): almacenamiento de secretos y diferencias entre plataformas.
+- [Aislamiento de sitios de Chromium](https://www.chromium.org/Home/chromium-security/site-isolation/): referencia para fronteras de proceso y documentos de sitios diferentes.
+- [API de testharness.js de WPT](https://web-platform-tests.org/writing-tests/testharness-api.html): base para sustituir el harness local incompleto y registrar resultados reales.
+- [HTML: event loops y ejecución de scripts](https://html.spec.whatwg.org/multipage/webappapis.html#event-loops): referencia normativa para tareas y contexto de ejecución.
+- [Fetch Standard](https://fetch.spec.whatwg.org/): referencia para integración de peticiones, respuestas y políticas.
+- [Test262](https://github.com/tc39/test262): conformance de ECMAScript, diferenciada de APIs web.
+- [Speedometer 3.1](https://browserbench.org/Speedometer3.1/): una de las medidas de respuesta de aplicaciones; no reemplaza el corpus de producto.
+- [RUSTSEC-2025-0003](https://rustsec.org/advisories/RUSTSEC-2025-0003.html) y [RUSTSEC-2024-0379](https://rustsec.org/advisories/RUSTSEC-2024-0379.html): avisos de fast-float citados por el repositorio.
+
+**Regla final de seguimiento:** el avance se mide en comportamientos correctos, riesgos retirados y tareas de usuario completadas. El número de fases escritas, APIs registradas o tests internos no constituye por sí solo un navegador terminado ni una ventaja frente a Chrome.
