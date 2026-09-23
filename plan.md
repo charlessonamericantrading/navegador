@@ -132,7 +132,7 @@ Los estados distinguen **reproducido**, **confirmado en código** y **pendiente 
 | H06 | `next_line()` y buffer stdout sin límite de trama; timeout Electron no cancela el trabajo del motor | Confirmado | P0 | F04, F06, F10 |
 | H07 | Tick de 250 ms modifica la pestaña activa y hace relayout, pero la rama de tick no escribe un estado a stdout | Reproducido por protocolo | P1 | F10, F22 |
 | H08 | `window !== globalThis`, globals cortos ausentes | Reproducido por sonda | P1 | F11 |
-| H09 | `el.append/prepend` falla en la sonda aunque existe implementación y se anuncia como conseguido | Discrepancia reproducida; causa exacta pendiente | P1 | F03, F11 |
+| H09 | `el.append/prepend` falla en la sonda aunque existe implementación y se anuncia como conseguido | **Resuelto** (Fase 49): faltaba la interfaz `Node` (`childNodes`, `parentNode`, `firstChild`...) | P1 | F03, F11 |
 | H10 | `modules.rs` ignora `_referrer`, usa base del documento y fuentes previamente descargadas | Confirmado | P1 | F13 |
 | H11 | Métodos en instancias DOM; `dataset` snapshot; algunas colecciones y wrappers tienen simplificaciones | Confirmado parcial; inventario completo pendiente | P1 | F11 |
 | H12 | XHR se implementa de forma síncrona incluso para la forma asíncrona | Confirmado en código y backlog | P1 | F10, F14 |
@@ -317,7 +317,7 @@ Los fallos de fast-float se documentan en [RUSTSEC-2025-0003](https://rustsec.or
 - [x] Separar estado del harness y resultados de subtests; `0/0` nunca cuenta como compatibilidad aprobada. *(Misma fase.)*
 - [x] Añadir un proceso supervisor con timeout por documento, cierre del árbol de procesos y salida estructurada para crashes/hangs. *(23-09-2026, Fase 48: un proceso hijo por documento, `--timeout-ms`, estados `TIMEOUT`/`CRASH`; probado con un bucle infinito contra el binario real.)*
 - [ ] Comparar identidades de tests, no solo la suma: un nuevo aprobado no puede esconder la regresión de otro caso.
-- [ ] Investigar el fallo `el.append/prepend` con fixture mínimo y comparación de mutación, identidad y colección; corregir implementación o sonda según la semántica observada.
+- [x] Investigar el fallo `el.append/prepend` con fixture mínimo y comparación de mutación, identidad y colección; corregir implementación o sonda según la semántica observada. *(23-09-2026, Fase 49: `append` funcionaba; faltaba la interfaz `Node` entera, incluido `childNodes`. Implementada; sonda 86/114.)*
 - [ ] Montar un primer adaptador para harness WPT oficial y servidores locales con HTTP, HTTPS y varios orígenes; fijar commit del corpus.
 - [ ] Mantener expectations por test con motivo, responsable y estado; no editar un test upstream para adaptarlo al motor.
 - [ ] Añadir formato JSON de resultados y conservación de stderr, timeout, semilla y revisión del ejecutable.
@@ -1144,7 +1144,7 @@ Este es el siguiente tramo de trabajo recomendado. El documento no implica que e
 |---|---|---|---|
 | 1 | ~~Corregir falso verde del runner~~ **hecho** (Fase 47) | `core/src/bin/wpt_runner.rs`, harness | Fixture con excepción antes de tests devuelve fallo y diagnóstico |
 | 2 | ~~Añadir timeout por proceso de test~~ **hecho** (Fase 48) | Harness/runner | Fixture infinito termina con TIMEOUT y continúa la suite |
-| 3 | Investigar append/prepend | `api-probe.html`, `dom_bindings.rs` | Causa reducida, caso semántico y corrección sin bajar cobertura |
+| 3 | ~~Investigar append/prepend~~ **hecho** (Fase 49) | `api-probe.html`, `dom_bindings.rs` | Causa reducida, caso semántico y corrección sin bajar cobertura |
 | 4 | Corregir publicación de cambios de timers | `core/src/server.rs`, Electron/viewport | El título/captura cambian sin petición manual posterior |
 | 5 | Corregir cancelación y autoenvío del agente | `AgentSidebar`, orquestador, `App.tsx` | Detener durante llamada no actúa después; escribir no envía |
 | 6 | Propagar resultados y fallos de comandos | `App.tsx`, tipos IPC, orquestador | Error de motor no termina como objetivo completado |

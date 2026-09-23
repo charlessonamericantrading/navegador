@@ -47,7 +47,15 @@ use serde_json::json;
 /// |            |           | `window` (`innerWidth`, `matchMedia`...) y  |
 /// |            |           | `document.readyState`, `activeElement`,     |
 /// |            |           | `getElementsByClassName` (tareas C4, C6, C7)|
-const MINIMO: usize = 85;
+/// | 2026-09-23 | 86/114    | Interfaz `Node`: `parentNode`, `childNodes`,|
+/// |            |           | `firstChild`/`lastChild`, hermanos,         |
+/// |            |           | `nodeType`/`nodeName`/`nodeValue` (plan     |
+/// |            |           | H09). La fila de 73 anunciaba `append/      |
+/// |            |           | prepend` como conseguido, pero esa          |
+/// |            |           | comprobacion fallaba: el metodo funcionaba  |
+/// |            |           | y lo que no existia era `childNodes`, que   |
+/// |            |           | la comprobacion usa para verificarlo        |
+const MINIMO: usize = 86;
 
 /// El total de comprobaciones de la sonda. Se vigila aparte del minimo para
 /// cazar un caso concreto: que alguien "suba" el porcentaje borrando

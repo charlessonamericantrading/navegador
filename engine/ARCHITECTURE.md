@@ -4655,3 +4655,48 @@ posterior sigue corriendo.
   Object en Windows o un grupo de procesos en Unix.
 - Sin salida JSON agregada ni comparacion de identidades de tests entre
   ejecuciones: siguen pendientes en F03.
+
+### Fase 49: la interfaz `Node` que faltaba, y el falso negativo de `append` (2026-09-23)
+
+Tercera tarea del backlog (`plan.md`, hallazgo H09). La sonda daba
+`el.append/prepend` por fallido desde la Fase 44, que lo anunciaba como
+conseguido. Reducido a un fixture minimo, `append` funcionaba
+(`children.length === 1`); lo que fallaba era la comprobacion, que lo verifica
+con `el.childNodes.length`, y `childNodes` no existia. `undefined.length` lanza,
+y la sonda lo contaba como ausencia de `append`.
+
+El hueco real era mayor que la sonda: faltaba la interfaz `Node` entera.
+`parentNode`, `childNodes`, `firstChild`/`lastChild`,
+`nextSibling`/`previousSibling`, `nodeType`, `nodeName` y `nodeValue` daban
+`undefined`. Son justo lo que usan los frameworks para recorrer el arbol
+(Preact y React comparan `nodeType` y avanzan con `nextSibling`).
+
+#### Como encaja
+
+Todo nodo, texto y comentarios incluidos, se envuelve con
+`build_element_object`, asi que la interfaz se anade alli una vez y cubre a
+todos. La navegacion no salta texto, a diferencia de las variantes
+`*ElementSibling`. Las cinco getters de navegacion comparten
+`node_navigation_getter`; solo cambia la funcion que elige el nodo.
+
+`documentElement.parentNode` tiene que ser `document`, no un elemento
+fantasma. En vez de un caso especial en cada getter, el nodo `Document` raiz se
+registra en la cache de identidad apuntando al objeto global `document`, y
+`element_to_js_object` lo devuelve solo. `document` gana `nodeType` 9,
+`nodeName` y `parentNode === null`.
+
+`nodeValue` escribe el texto de nodos de texto y comentarios (con registro
+`characterData` para `MutationObserver`) y es `null` e inerte en elementos.
+
+Sonda: 85/114 a 86/114; el minimo del trinquete sube a 86.
+
+#### Simplificaciones declaradas
+
+- `childNodes` devuelve un `Array` nuevo en cada lectura, igual que
+  `children`: refleja el arbol en ese momento, pero una referencia guardada no
+  ve cambios posteriores. Un `NodeList` vivo es parte de las colecciones de F11.
+- `document.childNodes`/`firstChild`/`lastChild` siguen sin existir; solo se
+  anadio la parte de `Node` de `document` que no requiere navegar.
+- Metodos y accesores siguen siendo propiedades propias de cada instancia, no
+  del prototipo (H11).
+

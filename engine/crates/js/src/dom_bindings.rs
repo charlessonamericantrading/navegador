@@ -56,9 +56,9 @@
 //!   `previousElementSibling` completan la navegacion (real DOM spec,
 //!   `ParentNode`/`ElementTraversal`), todos saltando nodos de texto -
 //!   deliberadamente Element-only, a diferencia de `firstChild`/
-//!   `nextSibling` de `Node` (que SI pueden devolver texto): esos
-//!   exigirian envolver un nodo de texto como objeto JS, que este motor no
-//!   hace todavia (solo los `Element` se envuelven). `style`
+//!   `nextSibling` de `Node` (que SI devuelven texto y comentarios, y
+//!   existen desde la Fase 49 junto a `parentNode`/`childNodes`/`nodeType`).
+//!   `style`
 //!   (getter) devuelve un objeto con `getPropertyValue`/`setProperty`/
 //!   `removeProperty` reales sobre el atributo `style` (parseado con
 //!   `engine_css::CssParser::parse_inline_style`, el mismo tokenizador que
@@ -775,7 +775,18 @@ impl DomBindings {
             .accessor(js_string!("readyState"), Some(ready_state_getter_fn), None, Attribute::all())
             .accessor(js_string!("activeElement"), Some(active_element_getter_fn), None, Attribute::all())
             .accessor(js_string!("currentScript"), Some(current_script_getter_fn), None, Attribute::all())
+            // Interfaz `Node` del documento (Fase 49). Solo la parte que no
+            // requiere navegar: `childNodes`/`firstChild` de `document` siguen
+            // pendientes.
+            .property(js_string!("nodeType"), JsValue::from(9), Attribute::READONLY | Attribute::ENUMERABLE | Attribute::CONFIGURABLE)
+            .property(js_string!("nodeName"), js_string!("#document"), Attribute::READONLY | Attribute::ENUMERABLE | Attribute::CONFIGURABLE)
+            .property(js_string!("parentNode"), JsValue::null(), Attribute::READONLY | Attribute::ENUMERABLE | Attribute::CONFIGURABLE)
             .build();
+
+        // El nodo `Document` raiz se envuelve como ESTE objeto, no como un
+        // elemento mas: asi `documentElement.parentNode === document` sin que
+        // cada getter tenga que conocer el caso especial.
+        bindings.element_objects.lock().unwrap().insert(Arc::as_ptr(&dom_root) as usize, document.clone());
 
         context.register_global_property(js_string!("document"), document, Attribute::all())?;
 
@@ -1488,11 +1499,8 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
     // `firstElementChild`/`lastElementChild`: el primer/ultimo hijo
     // DIRECTO que sea un `Element`, saltando nodos de texto - real DOM
     // spec (`ParentNode`), deliberadamente distinto de `firstChild`/
-    // `lastChild` de `Node` (que SI pueden dar un nodo de texto): esos
-    // exigirian poder envolver un nodo de texto como objeto JS, que este
-    // motor no hace todavia (solo los `Element` se envuelven, ver
-    // `element_to_js_object`) - `firstElementChild` evita ese problema
-    // por diseño del spec real, no por una simplificacion propia.
+    // `lastChild` de `Node` (que SI pueden dar un nodo de texto, ver
+    // `node_navigation_getter`).
     let first_element_child_getter = NativeFunction::from_copy_closure_with_captures(
         |_this, _args, capture: &ElementCapture, context| {
             Ok(match first_element_child(&capture.0) {
@@ -2151,9 +2159,91 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         .constructor(false)
         .build();
 
+    // Interfaz `Node` (plan H09, Fase 49). Antes no existia: un framework que
+    // recorre el arbol con `firstChild`/`nextSibling` o comprueba `nodeType`
+    // leia `undefined`. Como cualquier nodo (texto y comentarios incluidos)
+    // se envuelve con esta misma funcion, aqui cubren a todos.
+    let parent_node_getter_fn = node_navigation_getter("parentNode", parent_node, &capture, context);
+    let first_child_getter_fn = node_navigation_getter("firstChild", first_child, &capture, context);
+    let last_child_getter_fn = node_navigation_getter("lastChild", last_child, &capture, context);
+    let next_sibling_getter_fn = node_navigation_getter("nextSibling", next_sibling, &capture, context);
+    let previous_sibling_getter_fn = node_navigation_getter("previousSibling", previous_sibling, &capture, context);
+
+    // Mismo criterio que `children`: un `Array` nuevo en cada lectura, que
+    // refleja el arbol en ese momento pero NO se actualiza despues. Un
+    // `NodeList` vivo de verdad queda para las colecciones de F11.
+    let child_nodes_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args, capture: &ElementCapture, context| {
+            let hijos = capture.0.read().unwrap().children.clone();
+            let mut nodos: Vec<JsValue> = Vec::with_capacity(hijos.len());
+            for hijo in &hijos {
+                nodos.push(element_to_js_object(hijo, &capture.1, context).into());
+            }
+            Ok(JsArray::from_iter(nodos, context).into())
+        },
+        capture.clone(),
+    );
+    let child_nodes_getter_fn = FunctionObjectBuilder::new(context.realm(), child_nodes_getter).name(js_string!("get childNodes")).length(0).constructor(false).build();
+
+    // `nodeValue`: el texto de un nodo de texto o comentario, `null` en el
+    // resto. Asignarlo solo tiene efecto en esos dos, igual que el spec.
+    let node_value_getter = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args, capture: &ElementCapture, _context| {
+            Ok(match &capture.0.read().unwrap().node_type {
+                NodeType::Text(texto) | NodeType::Comment(texto) => JsValue::from(js_string!(texto.clone())),
+                _ => JsValue::null(),
+            })
+        },
+        capture.clone(),
+    );
+    let node_value_getter_fn = FunctionObjectBuilder::new(context.realm(), node_value_getter).name(js_string!("get nodeValue")).length(0).constructor(false).build();
+    let node_value_setter = NativeFunction::from_copy_closure_with_captures(
+        |_this, args, capture: &ElementCapture, context| {
+            // [LegacyNullToEmptyString], igual que `textContent`.
+            let nuevo = match args.first() {
+                None | Some(JsValue::Null) => String::new(),
+                Some(v) => v.to_string(context)?.to_std_string_escaped(),
+            };
+            let anterior = {
+                let mut n = capture.0.write().unwrap();
+                match &mut n.node_type {
+                    NodeType::Text(texto) | NodeType::Comment(texto) => Some(std::mem::replace(texto, nuevo)),
+                    _ => None,
+                }
+            };
+            if let Some(anterior) = anterior {
+                capture.1.record_mutation(crate::mutation_observer::PendingMutation {
+                    kind: "characterData",
+                    target: capture.0.clone(),
+                    attribute_name: None,
+                    old_value: Some(anterior),
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                });
+            }
+            Ok(JsValue::undefined())
+        },
+        capture.clone(),
+    );
+    let node_value_setter_fn = FunctionObjectBuilder::new(context.realm(), node_value_setter).name(js_string!("set nodeValue")).length(1).constructor(false).build();
+
+    let (node_type_value, node_name_value) = {
+        let n = node.read().unwrap();
+        (node_type_code(&n.node_type), node_name(&n.node_type))
+    };
+
     let mut obj_init = ObjectInitializer::with_native_data(capture.clone(), context);
     obj_init
         .property(js_string!("tagName"), js_string!(tag_name.to_uppercase()), Attribute::all())
+        .property(js_string!("nodeType"), JsValue::from(node_type_value), Attribute::READONLY | Attribute::ENUMERABLE | Attribute::CONFIGURABLE)
+        .property(js_string!("nodeName"), js_string!(node_name_value), Attribute::READONLY | Attribute::ENUMERABLE | Attribute::CONFIGURABLE)
+        .accessor(js_string!("nodeValue"), Some(node_value_getter_fn), Some(node_value_setter_fn), Attribute::all())
+        .accessor(js_string!("parentNode"), Some(parent_node_getter_fn), None, Attribute::all())
+        .accessor(js_string!("childNodes"), Some(child_nodes_getter_fn), None, Attribute::all())
+        .accessor(js_string!("firstChild"), Some(first_child_getter_fn), None, Attribute::all())
+        .accessor(js_string!("lastChild"), Some(last_child_getter_fn), None, Attribute::all())
+        .accessor(js_string!("nextSibling"), Some(next_sibling_getter_fn), None, Attribute::all())
+        .accessor(js_string!("previousSibling"), Some(previous_sibling_getter_fn), None, Attribute::all())
         .accessor(js_string!("textContent"), Some(text_content_getter_fn), Some(text_content_setter_fn), Attribute::all())
         .accessor(js_string!("classList"), Some(class_list_getter_fn), None, Attribute::all())
         .accessor(js_string!("parentElement"), Some(parent_element_getter_fn), None, Attribute::all())
@@ -2311,6 +2401,70 @@ fn position_among_siblings(node: &Arc<RwLock<Node>>) -> Option<(Arc<RwLock<Node>
         parent_n.children.iter().position(|c| Arc::ptr_eq(c, node))
     }?;
     Some((parent, index))
+}
+
+// Navegacion de `Node` (plan H09/F11): a diferencia de las variantes
+// `*Element*`, NO saltan nodos de texto ni comentarios.
+fn parent_node(node: &Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
+    node.read().unwrap().parent.as_ref().and_then(Weak::upgrade)
+}
+
+fn first_child(node: &Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
+    node.read().unwrap().children.first().cloned()
+}
+
+fn last_child(node: &Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
+    node.read().unwrap().children.last().cloned()
+}
+
+fn next_sibling(node: &Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
+    let (parent, index) = position_among_siblings(node)?;
+    let parent_n = parent.read().unwrap();
+    parent_n.children.get(index + 1).cloned()
+}
+
+fn previous_sibling(node: &Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
+    let (parent, index) = position_among_siblings(node)?;
+    let parent_n = parent.read().unwrap();
+    index.checked_sub(1).and_then(|i| parent_n.children.get(i)).cloned()
+}
+
+/// Como se elige el nodo al que lleva un getter de navegacion.
+type NodeNavigation = fn(&Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>>;
+
+/// Getter de `Node` que devuelve otro nodo o `null`. Todos los de navegacion
+/// tienen la misma forma; solo cambia como se elige el nodo.
+fn node_navigation_getter(name: &str, navigate: NodeNavigation, capture: &ElementCapture, context: &mut Context) -> JsFunction {
+    let getter = NativeFunction::from_copy_closure_with_captures(
+        move |_this, _args, capture: &ElementCapture, context| {
+            Ok(match navigate(&capture.0) {
+                Some(node) => element_to_js_object(&node, &capture.1, context).into(),
+                None => JsValue::null(),
+            })
+        },
+        capture.clone(),
+    );
+    FunctionObjectBuilder::new(context.realm(), getter).name(js_string!(format!("get {name}"))).length(0).constructor(false).build()
+}
+
+/// `nodeType`, `nodeName` y `nodeValue` segun el spec de DOM. `nodeName` de
+/// un elemento va en mayusculas porque todo elemento aqui es HTML.
+fn node_type_code(node_type: &NodeType) -> u16 {
+    match node_type {
+        NodeType::Element { .. } => 1,
+        NodeType::Text(_) => 3,
+        NodeType::Comment(_) => 8,
+        NodeType::Document => 9,
+    }
+}
+
+fn node_name(node_type: &NodeType) -> String {
+    match node_type {
+        NodeType::Element { tag_name, .. } => tag_name.to_uppercase(),
+        NodeType::Text(_) => "#text".to_string(),
+        NodeType::Comment(_) => "#comment".to_string(),
+        NodeType::Document => "#document".to_string(),
+    }
 }
 
 fn next_element_sibling(node: &Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
@@ -3793,6 +3947,78 @@ mod tests {
             "document.getElementById('a').previousElementSibling === null",
         );
         assert_eq!(result, "true");
+    }
+
+    /// Interfaz `Node` (Fase 49): a diferencia de `firstElementChild`, no
+    /// salta el texto.
+    #[test]
+    fn first_child_and_next_sibling_include_text_nodes() {
+        let result = eval_with_dom(
+            r#"<html><body><div id="c">hola<span id="a"></span><!--nota--></div></body></html>"#,
+            "var c = document.getElementById('c'); \
+             [c.firstChild.nodeType, c.firstChild.nodeValue, c.firstChild.nodeName, \
+              c.firstChild.nextSibling.nodeName, c.lastChild.nodeType, c.lastChild.nodeName, \
+              c.lastChild.previousSibling.id, c.childNodes.length].join('|')",
+        );
+        assert_eq!(result, "\"3|hola|#text|SPAN|8|#comment|a|3\"");
+    }
+
+    #[test]
+    fn node_navigation_keeps_object_identity() {
+        let result = eval_with_dom(
+            r#"<html><body><div id="c"><span id="a"></span></div></body></html>"#,
+            "var c = document.getElementById('c'); var a = document.getElementById('a'); \
+             c.firstChild === a && a.parentNode === c && c.childNodes[0] === a",
+        );
+        assert_eq!(result, "true");
+    }
+
+    /// `parentElement` se queda en `null` para `<html>`, pero `parentNode`
+    /// llega al documento: es el MISMO objeto que el global `document`.
+    #[test]
+    fn document_element_parent_node_is_the_document_object() {
+        let result = eval_with_dom(
+            "<html><body></body></html>",
+            "var h = document.documentElement; \
+             [h.parentNode === document, h.parentElement === null, document.nodeType, document.nodeName, document.parentNode === null].join('|')",
+        );
+        assert_eq!(result, "\"true|true|9|#document|true\"");
+    }
+
+    #[test]
+    fn node_navigation_is_null_on_a_detached_node() {
+        let result = eval_with_dom(
+            "<html><body></body></html>",
+            "var d = document.createElement('div'); \
+             d.parentNode === null && d.firstChild === null && d.lastChild === null \
+             && d.nextSibling === null && d.previousSibling === null && d.childNodes.length === 0",
+        );
+        assert_eq!(result, "true");
+    }
+
+    /// `nodeValue` escribe el texto de un nodo de texto y no hace nada en un
+    /// elemento, cuyo `nodeValue` es `null`.
+    #[test]
+    fn node_value_writes_text_nodes_and_is_null_for_elements() {
+        let result = eval_with_dom(
+            r#"<html><body><p id="p">antes</p></body></html>"#,
+            "var p = document.getElementById('p'); p.firstChild.nodeValue = 'despues'; \
+             p.nodeValue = 'ignorado'; \
+             [p.textContent, p.nodeValue === null, p.nodeType].join('|')",
+        );
+        assert_eq!(result, "\"despues|true|1\"");
+    }
+
+    /// La reproduccion de H09 en el plan: `append` funcionaba, pero la sonda
+    /// lo verificaba con `childNodes`, que no existia.
+    #[test]
+    fn append_is_visible_through_child_nodes() {
+        let result = eval_with_dom(
+            "<html><body></body></html>",
+            "var d = document.createElement('div'); d.append(document.createElement('i'), 'texto'); \
+             [d.childNodes.length, d.childNodes[1].nodeValue, d.children.length].join('|')",
+        );
+        assert_eq!(result, "\"2|texto|1\"");
     }
 
     /// Un nodo recien creado con `createElement` (todavia sin padre) no

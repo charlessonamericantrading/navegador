@@ -127,10 +127,11 @@ HTMLElement` responde bien y un polyfill instalado en `Element.prototype` lo
 ven los elementos ya creados, que son los dos patrones que un framework ejecuta
 al arrancar. Con ella llegaron `matches`, `closest`, `contains`, `remove`,
 `append`, `prepend`, `cloneNode`, `dataset`, `id`, `className`, `outerHTML` y
-un `innerHTML` de verdad.
+un `innerHTML` de verdad. La Fase 49 añadió la interfaz `Node` (`parentNode`,
+`childNodes`, `firstChild`, `nextSibling`, `nodeType`...), que faltaba entera.
 
-Hay una sonda que mide lo demás, no es una impresión: **85 de 114** el
-2026-09-09.
+Hay una sonda que mide lo demás, no es una impresión: **86 de 114** el
+2026-09-23.
 Se ejecuta con la suite y un test impide que el número baje.
 
 ```bash
