@@ -127,7 +127,7 @@ Los estados distinguen **reproducido**, **confirmado en código** y **pendiente 
 | H01 | Todas las pestañas viven en `EngineServer`; `sandbox.rs` aplica mitigaciones de Windows y declara que no es sandbox | Confirmado | P0 | F06–F09 |
 | H02 | Avisos npm y cinco excepciones Rust en `.github/workflows/engine.yml`; dos de fast-float corresponden a fallos de seguridad documentados | npm medido; Rust pendiente de reauditar | P0 | F02 |
 | H03 | `wpt_runner.rs` ignora resultados de scripts y termina bien si no hubo tests | Reproducido con fixture temporal | P0 | F03 |
-| H04 | `gemini_api_key` se persiste en `localStorage`; petición al proveedor desde el renderer | Confirmado en `AgentSidebar.tsx` y `AgentOrchestrator.ts` | P0 | F05, F34 |
+| H04 | `gemini_api_key` se persiste en `localStorage`; petición al proveedor desde el renderer | **Resuelto** (Fase 53): `safeStorage` y petición desde el proceso principal | P0 | F05, F34 |
 | H05 | `ipcMain.handle('engine:request')` reenvía payload sin validación de esquema ni del emisor; faltan políticas explícitas de navegación de la carcasa | Confirmado; no explotación demostrada | P0 | F04 |
 | H06 | `next_line()` y buffer stdout sin límite de trama; timeout Electron no cancela el trabajo del motor | Confirmado | P0 | F04, F06, F10 |
 | H07 | Tick de 250 ms modifica la pestaña activa y hace relayout, pero la rama de tick no escribe un estado a stdout | **Resuelto** (Fase 50): publicación `state` con `id: null`, deduplicada | P1 | F10, F22 |
@@ -347,8 +347,8 @@ La selección de controles se apoya en la [guía de seguridad de Electron](https
 
 **Prioridad:** P0. **Depende de:** contratos de F04; correcciones iniciales pueden empezar con F03. **Ámbito:** `AgentSidebar`, `AgentOrchestrator`, `App.tsx` y servicio privilegiado nuevo.
 
-- [ ] Retirar claves de `localStorage` y del renderer; migrarlas una vez a almacenamiento protegido o pedir reintroducción, y borrar el valor anterior tras migración verificada.
-- [ ] Mover peticiones de proveedor al servicio autorizado, con redacción de logs y sin devolver secretos al frontend.
+- [x] Retirar claves de `localStorage` y del renderer; migrarlas una vez a almacenamiento protegido o pedir reintroducción, y borrar el valor anterior tras migración verificada. *(23-09-2026, Fase 53: `safeStorage` en el proceso principal, solo sesión si no hay cifrado real; migración única desde `localStorage`.)*
+- [x] Mover peticiones de proveedor al servicio autorizado, con redacción de logs y sin devolver secretos al frontend. *(Fase 53: `ai-provider.js`, clave en cabecera, errores redactados, IPC con validación de emisor.)*
 - [x] Implementar identificador de ejecución y cancelación desde UI hasta proveedor y herramientas; comprobar cancelación también después de cada `await` y antes de actuar. *(23-09-2026, Fase 51: `AbortController` por ejecución hasta `fetch`, puntos de control y `AgentCancelledError`.)*
 - [x] Cambiar rellenado para que no implique Enter/envío; enviar formularios será una acción distinta con política propia. *(Fase 51: `press_enter: false`; enviar es `press Enter`. La política propia de envío sigue pendiente con la autorización de acciones sensibles.)*
 - [x] Hacer que errores del motor rechacen o devuelvan un resultado tipado de fallo; el agente no debe convertir una notificación visual en éxito. *(23-09-2026, Fase 52: `runEngineCommand` lanza `BrowserActionError`; `executeAction` devuelve `failed`.)*
@@ -1148,7 +1148,7 @@ Este es el siguiente tramo de trabajo recomendado. El documento no implica que e
 | 4 | ~~Corregir publicación de cambios de timers~~ **hecho** (Fase 50) | `core/src/server.rs`, Electron/viewport | El título/captura cambian sin petición manual posterior |
 | 5 | ~~Corregir cancelación y autoenvío del agente~~ **hecho** (Fase 51) | `AgentSidebar`, orquestador, `App.tsx` | Detener durante llamada no actúa después; escribir no envía |
 | 6 | ~~Propagar resultados y fallos de comandos~~ **hecho** (Fase 52) | `App.tsx`, tipos IPC, orquestador | Error de motor no termina como objetivo completado |
-| 7 | Retirar clave de renderer | Servicio IA/credenciales, preload | No existe secreto en localStorage, UI o logs |
+| 7 | ~~Retirar clave de renderer~~ **hecho** (Fase 53) | Servicio IA/credenciales, preload | No existe secreto en localStorage, UI o logs |
 | 8 | Auditar y migrar dependencias | Tres árboles npm, Rust y Python opcional | Informe de alcance y PRs de actualización con regresiones |
 | 9 | Endurecer IPC/protocolo | `main.js`, `preload.js`, `protocol.rs` | Payload/emisor inválidos rechazados y límites probados |
 | 10 | Resolver lint por grupos | Frontend | 18 errores/2 advertencias → cero con pruebas de interacción |

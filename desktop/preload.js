@@ -29,5 +29,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('update-status', listener);
     return () => ipcRenderer.removeListener('update-status', listener);
   },
-  installUpdate: () => ipcRenderer.send('install-update')
+  installUpdate: () => ipcRenderer.send('install-update'),
+
+  // IA (plan H04): la clave se entrega al proceso principal y no vuelve; el
+  // renderer solo sabe si hay una. Las peticiones al modelo las hace el
+  // proceso principal.
+  ai: {
+    credentialStatus: () => ipcRenderer.invoke('ai:credentials:status'),
+    setGeminiKey: (key) => ipcRenderer.invoke('ai:credentials:set', key),
+    clearGeminiKey: () => ipcRenderer.invoke('ai:credentials:clear'),
+    generate: (requestId, prompt) => ipcRenderer.invoke('ai:generate', requestId, prompt),
+    cancel: (requestId) => ipcRenderer.invoke('ai:cancel', requestId),
+  },
 });

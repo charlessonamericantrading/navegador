@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { AgentCancelledError, AgentOrchestrator, cancellableDelay, shouldStopAfterFailures, type AgentStepResult, type BrowserInterface } from '../AgentOrchestrator';
+import { electronModelProvider } from '../modelProvider';
+
+// Donde vivia la clave antes de la Fase 53. Solo se lee una vez, para
+// migrarla al proceso principal, y se borra.
+const LEGACY_KEY_STORAGE = 'gemini_api_key';
 
 interface AgentSidebarProps {
   isOpen: boolean;
@@ -10,7 +15,11 @@ interface AgentSidebarProps {
 export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, browserInterface }) => {
   const [goal, setGoal] = useState('');
   const [mode, setMode] = useState<'simulation' | 'gemini'>('simulation');
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_api_key') || '');
+  // La clave ya no vive aqui (plan H04): el renderer solo conoce su estado.
+  // `keyDraft` es lo que se esta escribiendo en el campo, y se vacia al
+  // entregarlo al proceso principal.
+  const [credentialStatus, setCredentialStatus] = useState<AiCredentialStatus | null>(null);
+  const [keyDraft, setKeyDraft] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [currentStep, setCurrentStep] = useState(0);
@@ -27,12 +36,53 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
   const historyEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    orchestratorRef.current = new AgentOrchestrator(browserInterface);
+    orchestratorRef.current = new AgentOrchestrator(browserInterface, electronModelProvider());
   }, [browserInterface]);
 
+  // Estado de la clave y migracion unica desde `localStorage`. La clave vieja
+  // solo se borra cuando el proceso principal confirma que la tiene; si no se
+  // puede entregar (fuera de Electron), se borra igualmente: dejarla en el
+  // almacenamiento del renderer es justo lo que esta fase elimina, y el modo
+  // Gemini tampoco funciona fuera de la aplicacion de escritorio.
   useEffect(() => {
-    localStorage.setItem('gemini_api_key', apiKey);
-  }, [apiKey]);
+    const ai = window.electronAPI?.ai;
+    let legacy: string | null = null;
+    try {
+      legacy = localStorage.getItem(LEGACY_KEY_STORAGE);
+    } catch {
+      legacy = null;
+    }
+    if (!ai) {
+      if (legacy !== null) localStorage.removeItem(LEGACY_KEY_STORAGE);
+      return;
+    }
+    const pending = legacy && legacy.trim() ? ai.setGeminiKey(legacy) : ai.credentialStatus();
+    pending
+      .then((status) => {
+        if (legacy !== null) localStorage.removeItem(LEGACY_KEY_STORAGE);
+        setCredentialStatus(status);
+      })
+      .catch((err) => {
+        console.error('No se pudo consultar la clave de IA:', err instanceof Error ? err.message : err);
+      });
+  }, []);
+
+  const handleSaveKey = async () => {
+    const ai = window.electronAPI?.ai;
+    if (!ai || !keyDraft.trim()) return;
+    try {
+      setCredentialStatus(await ai.setGeminiKey(keyDraft));
+      setKeyDraft('');
+    } catch (err) {
+      setStatusMessage(`No se pudo guardar la clave: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const handleClearKey = async () => {
+    const ai = window.electronAPI?.ai;
+    if (!ai) return;
+    setCredentialStatus(await ai.clearGeminiKey());
+  };
 
   useEffect(() => {
     historyEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -42,9 +92,9 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
     if (e) e.preventDefault();
     if (!goal.trim() || isRunning) return;
 
-    if (mode === 'gemini' && !apiKey.trim()) {
+    if (mode === 'gemini' && !credentialStatus?.configured) {
       setShowSettings(true);
-      setStatusMessage('Por favor ingresa tu API Key de Gemini en los ajustes.');
+      setStatusMessage(window.electronAPI?.ai ? 'Por favor ingresa tu API Key de Gemini en los ajustes.' : 'El modo Gemini solo está disponible en la aplicación de escritorio.');
       return;
     }
 
@@ -73,12 +123,7 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
         // Pequeña pausa para permitir actualización de la UI
         await cancellableDelay(400, signal);
 
-        const result = await orchestratorRef.current!.runStep(
-          goal,
-          mode,
-          mode === 'gemini' ? apiKey : undefined,
-          signal
-        );
+        const result = await orchestratorRef.current!.runStep(goal, mode, signal);
 
         setStepsHistory((prev) => [...prev, result]);
 
@@ -176,18 +221,37 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
             </select>
           </label>
 
-          {mode === 'gemini' && (
+          {mode === 'gemini' && !window.electronAPI?.ai && (
+            <small className="settings-hint">
+              El modo Gemini solo está disponible en la aplicación de escritorio: la clave se guarda en su proceso principal, no en la página.
+            </small>
+          )}
+
+          {mode === 'gemini' && window.electronAPI?.ai && (
             <label className="settings-label" style={{ marginTop: '8px' }}>
               <span>Gemini API Key:</span>
               <input
                 type="password"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder="AIzaSy..."
+                value={keyDraft}
+                onChange={(e) => setKeyDraft(e.target.value)}
+                placeholder={credentialStatus?.configured ? 'Clave configurada — escribe otra para sustituirla' : 'AIzaSy...'}
                 className="settings-input"
+                autoComplete="off"
               />
+              <div className="agent-controls" style={{ marginTop: '6px' }}>
+                <button type="button" className="btn btn-primary" onClick={handleSaveKey} disabled={!keyDraft.trim()}>
+                  Guardar clave
+                </button>
+                <button type="button" className="btn btn-secondary" onClick={handleClearKey} disabled={!credentialStatus?.configured}>
+                  Borrar clave
+                </button>
+              </div>
               <small className="settings-hint">
-                Se guarda únicamente en el almacenamiento local de tu navegador.
+                {!credentialStatus?.configured
+                  ? 'Sin clave configurada.'
+                  : credentialStatus.persisted
+                    ? 'Guardada cifrada por el sistema operativo. La aplicación nunca la devuelve a esta página.'
+                    : 'Este sistema no ofrece almacenamiento cifrado: la clave solo se conserva hasta cerrar la aplicación.'}
               </small>
             </label>
           )}

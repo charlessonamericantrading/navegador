@@ -57,6 +57,14 @@ export class BrowserActionError extends Error {
   }
 }
 
+/**
+ * Quien consulta al modelo. En Electron es el proceso principal (ver
+ * `modelProvider.ts`); la clave nunca pasa por aqui.
+ */
+export interface ModelProvider {
+  generate: (prompt: string, signal?: AbortSignal) => Promise<string>;
+}
+
 export interface BrowserInterface {
   getUrl: () => Promise<string>;
   getTitle: () => Promise<string>;
@@ -149,8 +157,16 @@ export class AgentOrchestrator {
   private browser: BrowserInterface;
   private history: Array<{ thought: string; kind: string; action: string; url: string; title: string; finished: boolean; answer: string }> = [];
 
-  constructor(browser: BrowserInterface) {
+  private model?: ModelProvider;
+
+  /**
+   * `model` es quien habla con el proveedor de IA. Sin el, el modo Gemini
+   * falla de forma explicita: el renderer ya no tiene clave con la que
+   * llamar por su cuenta.
+   */
+  constructor(browser: BrowserInterface, model?: ModelProvider) {
     this.browser = browser;
+    this.model = model;
   }
 
   public reset(): void {
@@ -165,7 +181,7 @@ export class AgentOrchestrator {
    * motor ya no se puede deshacer; lo que garantiza la cancelación es que no
    * se envía ninguna acción nueva después de detener.
    */
-  public async runStep(goal: string, mode: 'simulation' | 'gemini' = 'simulation', apiKey?: string, signal?: AbortSignal): Promise<AgentStepResult> {
+  public async runStep(goal: string, mode: 'simulation' | 'gemini' = 'simulation', signal?: AbortSignal): Promise<AgentStepResult> {
     throwIfCancelled(signal);
     const url = await this.browser.getUrl();
     const title = await this.browser.getTitle();
@@ -190,7 +206,7 @@ export class AgentOrchestrator {
     if (mode === 'simulation') {
       stepResult = await this.runSimulatedStep(goal, url, title, elements, signal);
     } else {
-      stepResult = await this.runGeminiStep(goal, url, title, domText, apiKey, signal);
+      stepResult = await this.runGeminiStep(goal, url, title, domText, signal);
     }
     // La respuesta del modelo puede llegar después de pulsar «Detener»: no
     // se ejecuta.
@@ -369,9 +385,9 @@ export class AgentOrchestrator {
     };
   }
 
-  private async runGeminiStep(goal: string, url: string, title: string, domText: string, apiKey?: string, signal?: AbortSignal): Promise<AgentStepResult> {
-    if (!apiKey) {
-      return modelError('Se requiere una Gemini API Key: introdúcela en Ajustes.');
+  private async runGeminiStep(goal: string, url: string, title: string, domText: string, signal?: AbortSignal): Promise<AgentStepResult> {
+    if (!this.model) {
+      return modelError('La IA remota solo está disponible en la aplicación de escritorio.');
     }
 
     const systemPrompt = `Eres un agente autónomo de navegación web para un navegador nativo ultrarrápido.
@@ -398,34 +414,9 @@ ${domText}
 Decide el siguiente paso y responde en JSON.`;
 
     try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          signal,
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [
-              {
-                role: 'user',
-                parts: [{ text: systemPrompt + '\n\n' + userPrompt }]
-              }
-            ],
-            generationConfig: {
-              responseMimeType: 'application/json',
-              temperature: 0.2
-            }
-          })
-        }
-      );
-
-      if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`API error (${response.status}): ${errText}`);
-      }
-
-      const data = await response.json();
-      let rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+      // La peticion la hace el proceso principal con la clave que solo el
+      // conoce (plan H04). Aqui solo viaja el prompt.
+      let rawText = (await this.model.generate(systemPrompt + '\n\n' + userPrompt, signal)) || '{}';
       rawText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
       const parsed: unknown = JSON.parse(rawText);
       if (typeof parsed !== 'object' || parsed === null || typeof (parsed as AgentStepResult).action !== 'string') {

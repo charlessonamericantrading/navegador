@@ -8,7 +8,8 @@
   "scripts": {
     "start": "electron .",
     "pack": "electron-builder --dir",
-    "dist": "electron-builder"
+    "dist": "electron-builder",
+    "test": "node --test tests/ai.test.js"
   },
   "devDependencies": {
     "electron": "^30.0.0",
@@ -23,6 +24,8 @@
     "files": [
       "main.js",
       "preload.js",
+      "ai-credentials.js",
+      "ai-provider.js",
       "package.json"
     ],
     "extraResources": [

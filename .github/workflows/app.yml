@@ -93,6 +93,11 @@ jobs:
         working-directory: desktop
         run: npm ci
 
+      # Credenciales y proveedor de IA del proceso principal, sin Electron.
+      - name: Tests del proceso principal
+        working-directory: desktop
+        run: npm test
+
       # El motor compilado y el backend viven en `desktop/build-resources/`,
       # que esta en .gitignore porque son binarios de 50 MB. En CI no existen,
       # y `electron-builder` aborta si un `extraResources` apunta a un

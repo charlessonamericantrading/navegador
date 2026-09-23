@@ -259,16 +259,17 @@ crudo.
 
 **Limitaciones actuales del agente, dichas aquí y no enterradas:**
 
-* La clave de Gemini se guarda en el `localStorage` del renderer y las llamadas
-  al modelo salen desde ahí. Debe moverse al proceso principal de Electron con
-  `safeStorage` (cifrado del sistema operativo).
+* La clave de Gemini la guarda el proceso principal de Electron cifrada con
+  `safeStorage`, y las llamadas al modelo salen de ahí: la página no vuelve a
+  verla (Fase 53). Si el sistema no ofrece cifrado real, dura solo la sesión.
+  Por eso el modo Gemini solo funciona en la aplicación de escritorio.
 * Solo Gemini. No hay opción de modelo local ni de otros proveedores.
 * El agente recibe **texto plano** de la página, no el AOM, pese a que el AOM ya
   existe y el protocolo ya lo expone. Conectarlos es tarea pendiente.
 * Hay dos implementaciones del agente, una en TypeScript y otra en Python, que
   hacen lo mismo.
 
-Las cuatro están planificadas en [`plan.md`](plan.md), bloque I.
+Las pendientes están planificadas en [`plan.md`](plan.md) (F05 y F34).
 
 ---
 

@@ -1,8 +1,10 @@
-const { app, BrowserWindow, shell, ipcMain, protocol, net } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, protocol, net, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const child_process = require('child_process');
 const { autoUpdater } = require('electron-updater');
+const { createCredentialStore } = require('./ai-credentials');
+const { createGeminiProvider } = require('./ai-provider');
 
 // Registrar el protocolo "app" como seguro y estándar para permitir ES Modules
 protocol.registerSchemesAsPrivileged([
@@ -417,6 +419,45 @@ app.whenReady().then(() => {
 ipcMain.handle('engine:request', async (_event, payload) => {
   return await sendEngineRequest(payload);
 });
+
+// --- IA: credenciales y proveedor en el proceso principal (plan H04) ---
+//
+// Se crean en la primera petición (siempre después de `ready`, que
+// `safeStorage` necesita) y solo atienden a la ventana propia: una página
+// cualquiera no puede ni guardar ni gastar la clave.
+let aiServices = null;
+
+function ai() {
+  if (!aiServices) {
+    const credentials = createCredentialStore({
+      safeStorage,
+      filePath: path.join(app.getPath('userData'), 'ai-credentials.json'),
+      fs,
+      platform: process.platform,
+    });
+    aiServices = { credentials, provider: createGeminiProvider({ getKey: () => credentials.get(), fetch: net.fetch }) };
+  }
+  return aiServices;
+}
+
+function isTrustedSender(event) {
+  if (!mainWindow || event.sender !== mainWindow.webContents) return false;
+  const url = event.senderFrame?.url || '';
+  return url.startsWith('app://') || (!app.isPackaged && url.startsWith('http://localhost:5173'));
+}
+
+function handleTrusted(channel, handler) {
+  ipcMain.handle(channel, async (event, ...args) => {
+    if (!isTrustedSender(event)) throw new Error(`IPC ${channel} rechazado: emisor no autorizado`);
+    return handler(...args);
+  });
+}
+
+handleTrusted('ai:credentials:status', () => ai().credentials.status());
+handleTrusted('ai:credentials:set', (key) => ai().credentials.set(key));
+handleTrusted('ai:credentials:clear', () => ai().credentials.clear());
+handleTrusted('ai:generate', (requestId, prompt) => ai().provider.generate(requestId, prompt));
+handleTrusted('ai:cancel', (requestId) => ai().provider.cancel(requestId));
 
 ipcMain.on('open-external', (event, url) => {
   if (typeof url === 'string' && /^(https?|mailto):/i.test(url)) {

@@ -4856,3 +4856,53 @@ bloque reescrito.
 - El agente sigue sin comprobar poscondiciones: un comando que el motor
   acepta pero que no produce el efecto esperado cuenta como ejecutado.
 
+### Fase 53: la clave de IA sale del renderer (2026-09-23)
+
+No toca el motor. Septima tarea del backlog (`plan.md`, hallazgo H04). La
+clave de Gemini vivia en `localStorage` de la interfaz y el renderer llamaba al
+proveedor con ella en la URL: cualquier script que corriera en esa pagina, una
+extension o un volcado del perfil la tenian a mano, y la URL con la clave podia
+acabar en logs.
+
+#### Donde vive ahora
+
+- `desktop/ai-credentials.js`: la clave se guarda cifrada con `safeStorage` en
+  `userData/ai-credentials.json`. Si el sistema no ofrece cifrado real (en
+  Linux, el backend `basic_text` usa una clave fija), no se escribe nada y la
+  clave dura solo la sesion: pedirla otra vez es mejor que guardarla en claro.
+- `desktop/ai-provider.js`: la peticion a Gemini la hace el proceso principal
+  con `net.fetch`, la clave en la cabecera `x-goog-api-key` y no en la URL, y
+  cualquier error se limpia de la clave antes de volver al renderer. Cada
+  peticion lleva un `requestId` para que «Detener» aborte la peticion HTTP.
+- IPC `ai:*`: solo atiende a la ventana propia (`isTrustedSender`: el
+  `webContents` principal y un frame en `app://`, o el servidor de Vite en
+  desarrollo). La clave entra por `ai:credentials:set` y nunca sale: el
+  renderer solo recibe `{configured, persisted, secureStorage}`.
+- El orquestador recibe un `ModelProvider` inyectado y ya no hace `fetch`.
+  Fuera de Electron no hay proveedor y el modo Gemini falla de forma explicita.
+
+#### Migracion
+
+Al abrir el panel, si `localStorage` todavia tiene `gemini_api_key`, se entrega
+al proceso principal y se borra en cuanto este confirma. Fuera de Electron se
+borra sin migrar: dejarla ahi es justo lo que esta fase elimina.
+
+#### Verificacion
+
+Once tests del proceso principal (`desktop`, `npm test`, con `safeStorage` y
+`fetch` inyectados) y los del orquestador portados a un modelo falso (12). El
+almacen se probo ademas con el `safeStorage` real de Electron en Windows
+(DPAPI): se guarda cifrado, se recupera tras recrear el almacen y se borra.
+`electron-builder` lista sus ficheros a mano, asi que los dos modulos nuevos se
+anadieron a `build.files`; sin eso el instalador habria arrancado sin ellos.
+
+#### Limitaciones declaradas
+
+- La validacion de emisor cubre solo los canales `ai:*`; `engine:request` sigue
+  sin ella hasta la tarea 9 (endurecer IPC).
+- No se probo la aplicacion completa con una clave real de Gemini: los tests
+  cubren el almacen y el proveedor por separado, y el cableado IPC se verifico
+  solo por sintaxis.
+- El backend Python opcional conserva su propio agente con su propia gestion
+  de clave (F34, consolidar un unico agente).
+

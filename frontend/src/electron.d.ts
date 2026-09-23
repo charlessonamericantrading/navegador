@@ -23,6 +23,14 @@ declare global {
     status: 'available' | 'downloaded';
   }
 
+  /** Lo único que el renderer sabe de la clave de IA (plan H04). */
+  interface AiCredentialStatus {
+    configured: boolean;
+    /** Cifrada en disco. `false` con `configured` = solo para esta sesión. */
+    persisted: boolean;
+    secureStorage: boolean;
+  }
+
   interface Window {
     electronAPI?: {
       isElectron: boolean;
@@ -33,6 +41,13 @@ declare global {
       onBackendStatus: (callback: (data: BackendStatusEvent) => void) => () => void;
       onUpdateStatus: (callback: (data: UpdateStatusEvent) => void) => () => void;
       installUpdate: () => void;
+      ai: {
+        credentialStatus: () => Promise<AiCredentialStatus>;
+        setGeminiKey: (key: string) => Promise<AiCredentialStatus>;
+        clearGeminiKey: () => Promise<AiCredentialStatus>;
+        generate: (requestId: string, prompt: string) => Promise<string>;
+        cancel: (requestId: string) => Promise<void>;
+      };
     };
   }
 }
