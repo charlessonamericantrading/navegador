@@ -97,7 +97,9 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   // tenga exactamente proporción 16:9 quedan franjas vacías a los lados o
   // arriba/abajo. Las insignias/resaltados deben posicionarse relativas a
   // ESTE rectángulo, no al 100%/100% del contenedor (ver bug de desalineación).
-  const [imgRect, setImgRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  // `naturalWidth`/`naturalHeight`: tamano real de la captura. Se guardan aqui
+  // al medir, para que el render no tenga que leer `imgRef.current`.
+  const [imgRect, setImgRect] = useState<{ left: number; top: number; width: number; height: number; naturalWidth: number; naturalHeight: number } | null>(null);
 
   // Informa al backend del tamaño real del contenedor (ver BrowserManager.resize
   // en el backend) - pensado para que, cuando haya un motor de renderizado
@@ -155,7 +157,9 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
         left: imgBox.left - stageBox.left,
         top: imgBox.top - stageBox.top,
         width: imgBox.width,
-        height: imgBox.height
+        height: imgBox.height,
+        naturalWidth: imgRef.current.naturalWidth || imgBox.width,
+        naturalHeight: imgRef.current.naturalHeight || imgBox.height
       });
     };
 
@@ -175,20 +179,21 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   // captura recibida, no un tamaño fijo) a píxeles dentro del "stage",
   // usando el rectángulo real de la imagen.
   const toStagePx = (mx: number, my: number) => {
-    if (!imgRect || !imgRef.current) return { left: 0, top: 0 };
-    const naturalWidth = imgRef.current.naturalWidth || imgRect.width;
-    const naturalHeight = imgRef.current.naturalHeight || imgRect.height;
+    if (!imgRect) return { left: 0, top: 0 };
     return {
-      left: imgRect.left + (mx / naturalWidth) * imgRect.width,
-      top: imgRect.top + (my / naturalHeight) * imgRect.height
+      left: imgRect.left + (mx / imgRect.naturalWidth) * imgRect.width,
+      top: imgRect.top + (my / imgRect.naturalHeight) * imgRect.height
     };
   };
 
-  useEffect(() => {
-    if (url) {
-      setAddressInput(url);
-    }
-  }, [url]);
+  // Cuando el motor navega (la URL cambia desde fuera), la barra muestra la
+  // URL nueva. Se ajusta durante el render comparando con la URL anterior,
+  // no en un efecto: el efecto pintaba primero la URL vieja y luego otra vez.
+  const [previousUrl, setPreviousUrl] = useState(url);
+  if (url !== previousUrl) {
+    setPreviousUrl(url);
+    if (url) setAddressInput(url);
+  }
 
   useEffect(() => {
     if (inputTextPopup && popupInputRef.current) {
@@ -427,7 +432,9 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
                     left: imgBox.left - stageBox.left,
                     top: imgBox.top - stageBox.top,
                     width: imgBox.width,
-                    height: imgBox.height
+                    height: imgBox.height,
+                    naturalWidth: imgRef.current.naturalWidth || imgBox.width,
+                    naturalHeight: imgRef.current.naturalHeight || imgBox.height
                   });
                 }
               }}

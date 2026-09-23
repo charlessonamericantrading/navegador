@@ -143,7 +143,7 @@ Los estados distinguen **reproducido**, **confirmado en código** y **pendiente 
 | H17 | Escritura del agente usa `press_enter: true` desde `App.tsx` y puede enviar el formulario al rellenarlo | **Resuelto** (Fase 51): enviar es un paso explícito | P0 | F05, F15 |
 | H18 | Python es opcional al arrancar Electron, pero `build-app.js` exige compilarlo con PyInstaller | Confirmado | P1 | F01 |
 | H19 | CI de escritorio empaqueta con directorios de motor/backend vacíos | Confirmado | P1 | F01, F38 |
-| H20 | 20 hallazgos de lint, entre ellos refs durante render, dependencias de hooks y uso de `any` | Reproducido | P1 | F01, F30 |
+| H20 | 20 hallazgos de lint, entre ellos refs durante render, dependencias de hooks y uso de `any` | **Resuelto** (Fase 55): lint estricto en cero | P1 | F01, F30 |
 | H21 | `app://` usa comparación textual `absolutePath.startsWith(baseDir)` | **Resuelto** (Fase 54): `path.relative` sobre la URL parseada | P0 | F04 |
 | H22 | Backend opcional acepta WebSocket antes de una validación visible de origen/autenticación; CORS HTTP abierto | Confirmado en endpoint; exposición efectiva por validar | P0 si se habilita | F04 |
 | H23 | Runtime nativo carece de reinicio supervisado equivalente al del backend Python | Confirmado en `desktop/main.js` | P1 | F06 |
@@ -283,8 +283,8 @@ Cada fase contiene objetivo, dependencias, archivos o componentes, tareas y una 
 - [ ] Usar lockfiles y `npm ci` en validación; `--locked` también en la construcción de distribución.
 - [ ] Hacer que el build del navegador normal no requiera Python. Documentar la ruta opcional web/FastAPI y evitar eliminarla antes de migrar sus usuarios o pruebas.
 - [ ] Sustituir nombres de instaladores que contienen `1.0.0` fijo por valores derivados del manifiesto; alinear versiones y canal preestable.
-- [ ] Resolver los 20 hallazgos de lint por grupos: tipado del protocolo, hooks/refs, efectos y organización de componentes.
-- [ ] Mantener el límite de deuda decreciente durante la limpieza; después exigir cero errores y advertencias acordadas.
+- [x] Resolver los 20 hallazgos de lint por grupos: tipado del protocolo, hooks/refs, efectos y organización de componentes. *(23-09-2026, Fases 51-55; comportamiento comprobado en la app empaquetada.)*
+- [x] Mantener el límite de deuda decreciente durante la limpieza; después exigir cero errores y advertencias acordadas. *(Trinquete 20 → 18 → 14 → 0.)*
 - [ ] Probar artefactos completos: el empaquetado con recursos vacíos no será la puerta de lanzamiento.
 - [ ] Revisar scripts `.bat`/`.sh`, rutas con espacios y caracteres no ASCII; sustituir esperas fijas por comprobaciones de disponibilidad.
 - [ ] Normalizar formato por lotes aislados y registrar cambios puramente mecánicos para conservar la utilidad del historial.
@@ -1151,7 +1151,7 @@ Este es el siguiente tramo de trabajo recomendado. El documento no implica que e
 | 7 | ~~Retirar clave de renderer~~ **hecho** (Fase 53) | Servicio IA/credenciales, preload | No existe secreto en localStorage, UI o logs |
 | 8 | Auditar y migrar dependencias — **npm a 0 y rustls corregido**; queda Boa 0.19 → 0.22 | Tres árboles npm, Rust y Python opcional | Informe de alcance y PRs de actualización con regresiones |
 | 9 | ~~Endurecer IPC/protocolo~~ **hecho** (Fase 54) | `main.js`, `preload.js`, `protocol.rs` | Payload/emisor inválidos rechazados y límites probados |
-| 10 | Resolver lint por grupos | Frontend | 18 errores/2 advertencias → cero con pruebas de interacción |
+| 10 | ~~Resolver lint por grupos~~ **hecho** (Fase 55) | Frontend | 18 errores/2 advertencias → cero con pruebas de interacción |
 | 11 | Desacoplar Python del build principal | `build-app.js`, manifiestos, scripts | Build nativo completo sin `.venv` |
 | 12 | Probar paquete con motor real | `.github/workflows/app.yml` | Artefacto instalado responde ping y renderiza fixture |
 | 13 | Diseñar broker y modelo de amenazas | ADR, `SECURITY.md`, prototipo | Dos renderers independientes y caída contenida |

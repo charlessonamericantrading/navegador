@@ -4967,3 +4967,45 @@ promesa sigue sin detener el trabajo del motor, H06/F10), sin esquema
 versionado compartido entre TypeScript y Rust (el espejo se mantiene a mano),
 sin CSP de la aplicacion y con Google Fonts todavia en el arranque.
 
+### Fase 55: el lint de la interfaz llega a cero (2026-09-23)
+
+No toca el motor. Decima tarea del backlog (`plan.md`, F01, hallazgo H20).
+Cierra lo que la Fase 46 dejo como trinquete: 14 hallazgos que quedaban (de
+20; las Fases 51 a 53 ya habian retirado seis). Se arreglaron por grupos,
+porque varios cambian cuando se ejecuta el codigo y no son cosmeticos.
+
+- **Tipado del protocolo** (4 `any`): `electron.d.ts` describe las respuestas
+  del motor como union discriminada por `type` (`state`/`ready`, `tabs`,
+  `error`, el resto) y `sendEngineRequest` deja de ser `any -> any`.
+- **Refs leidas o escritas durante el render** (5): las refs «siempre al dia»
+  del agente se escriben en un `useLayoutEffect` y no en el cuerpo del
+  componente; la ventana emergente de texto guarda el tamano natural de la
+  captura en el mismo estado que su rectangulo, en vez de leer `imgRef.current`
+  al pintar.
+- **Hooks** (3): los helpers de `App.tsx` que solo usan setters y refs pasan a
+  `useCallback` estables, asi que los efectos de conexion pueden declararlos
+  sin re-ejecutarse (y reconectar) en cada render; `refreshTabs` sube antes del
+  efecto que la usa. `flushScroll` se reintenta desde su temporizador por su
+  propio nombre (`function flush`) en vez de leer la constante que la contiene.
+- **`setState` en un efecto** (1): copiar la URL del motor a la barra de
+  direcciones se hace ajustando el estado durante el render cuando la URL
+  cambia (el patron que recomienda React), no en un efecto que pintaba primero
+  la URL vieja.
+- **Fast refresh** (1): `EXAMPLE_GOALS` no lo importaba nadie; deja de
+  exportarse.
+
+El trinquete baja a 0, que equivale a exigir lint limpio: `npm run lint`
+estricto pasa.
+
+#### Verificacion de comportamiento
+
+Arreglar `exhaustive-deps` o mover refs puede cambiar la interfaz sin que falle
+ningun test, asi que se comprobo en la aplicacion empaquetada, manejada por
+DevTools:
+
+- sin bucle de reconexion: entre dos `ping` separados 3 s el contador de
+  peticiones del proceso principal solo avanza por esos dos pings;
+- la barra de direcciones muestra la URL tras una navegacion del motor;
+- un clic en un campo de la captura abre la ventana emergente con su
+  `placeholder`, centrada sobre el campo.
+

@@ -1,12 +1,12 @@
 import React, { useEffect, useState } from 'react';
 
-export interface ExampleGoal {
+interface ExampleGoal {
   emoji: string;
   label: string;
   goal: string;
 }
 
-export const EXAMPLE_GOALS: ExampleGoal[] = [
+const EXAMPLE_GOALS: ExampleGoal[] = [
   {
     emoji: '📚',
     label: 'Resumir un tema en Wikipedia',
