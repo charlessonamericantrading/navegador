@@ -168,17 +168,40 @@ pub struct Motor {
     perfil: std::path::PathBuf,
 }
 
+/// Un directorio de perfil temporal que nadie mas usa.
+pub fn perfil_temporal() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("navegador-ia-test-{}-{}", std::process::id(), SIGUIENTE_PERFIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
+}
+
 impl Motor {
     pub fn arrancar() -> Self {
+        Self::arrancar_con(&[])
+    }
+
+    /// Con un broker remoto: el canal y el token que el broker dio.
+    pub fn arrancar_con_broker(endpoint: &str, token: &str) -> Self {
+        Self::arrancar_con(&[("NAVEGADOR_IA_BROKER", endpoint), ("NAVEGADOR_IA_BROKER_TOKEN", token)])
+    }
+
+    /// El comando del motor con su perfil temporal, sin arrancar.
+    pub fn comando(perfil: &std::path::Path, entorno: &[(&str, &str)]) -> Command {
         // Cargo exporta esta variable para los tests de integracion del mismo
         // paquete: apunta al binario recien compilado, no a uno del PATH que
         // podria ser de otra rama.
+        let mut comando = Command::new(env!("CARGO_BIN_EXE_engine_server"));
         // Perfil propio y temporal: cookies y `localStorage` de estas pruebas
         // no pueden acabar en el perfil real del usuario (plan 6.1). Antes
         // escribian en `%APPDATA%/navegador-ia`.
-        let perfil = std::env::temp_dir().join(format!("navegador-ia-test-{}-{}", std::process::id(), SIGUIENTE_PERFIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-        let mut hijo = Command::new(env!("CARGO_BIN_EXE_engine_server"))
-            .env("NAVEGADOR_IA_PROFILE_DIR", &perfil)
+        comando.env("NAVEGADOR_IA_PROFILE_DIR", perfil);
+        for (clave, valor) in entorno {
+            comando.env(clave, valor);
+        }
+        comando
+    }
+
+    pub fn arrancar_con(entorno: &[(&str, &str)]) -> Self {
+        let perfil = perfil_temporal();
+        let mut hijo = Self::comando(&perfil, entorno)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // stderr se hereda: los `tracing::warn!` y el resumen de
@@ -211,6 +234,11 @@ impl Motor {
         );
 
         motor
+    }
+
+    /// El perfil que se le dio. Con broker remoto no deberia ni existir.
+    pub fn perfil(&self) -> &std::path::Path {
+        &self.perfil
     }
 
     /// Manda una peticion y devuelve la respuesta ya parseada.
@@ -383,4 +411,72 @@ pub fn decodificar_base64(entrada: &str) -> Vec<u8> {
         }
     }
     salida
+}
+
+// ---------------------------------------------------------------------------
+// El proceso broker
+// ---------------------------------------------------------------------------
+
+/// Un `engine_broker` real con su perfil temporal, manejado por su canal de
+/// control como lo haria el supervisor.
+pub struct BrokerProceso {
+    pub hijo: Child,
+    entrada: ChildStdin,
+    salida: BufReader<ChildStdout>,
+    perfil: std::path::PathBuf,
+    pub endpoint: String,
+    siguiente_id: u64,
+}
+
+impl BrokerProceso {
+    pub fn arrancar() -> Self {
+        let perfil = perfil_temporal();
+        let mut hijo = Command::new(env!("CARGO_BIN_EXE_engine_broker"))
+            .env("NAVEGADOR_IA_PROFILE_DIR", &perfil)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("no se pudo arrancar engine_broker");
+        let entrada = hijo.stdin.take().expect("sin stdin");
+        let mut salida = BufReader::new(hijo.stdout.take().expect("sin stdout"));
+        let mut linea = String::new();
+        salida.read_line(&mut linea).expect("error leyendo el saludo del broker");
+        let saludo: Value = serde_json::from_str(&linea).unwrap_or_else(|e| panic!("saludo del broker no es JSON ({e}): {linea:?}"));
+        assert_eq!(saludo["type"], "ready", "el broker debe saludar con `ready`: {saludo}");
+        let endpoint = saludo["endpoint"].as_str().expect("`ready` sin `endpoint`").to_string();
+        Self { hijo, entrada, salida, perfil, endpoint, siguiente_id: 1 }
+    }
+
+    pub fn pedir(&mut self, mut peticion: Value) -> Value {
+        peticion["id"] = self.siguiente_id.into();
+        self.siguiente_id += 1;
+        writeln!(self.entrada, "{peticion}").expect("no se pudo escribir al broker");
+        self.entrada.flush().unwrap();
+        let mut linea = String::new();
+        let leidos = self.salida.read_line(&mut linea).expect("error leyendo del broker");
+        assert!(leidos > 0, "el broker cerro stdout sin responder");
+        let respuesta: Value = serde_json::from_str(&linea).unwrap();
+        assert_eq!(respuesta["id"], peticion["id"], "respuesta del broker sin correlacion: {respuesta}");
+        respuesta
+    }
+
+    /// Da de alta un renderer y devuelve su token.
+    pub fn registrar(&mut self, renderer: &str) -> String {
+        let respuesta = self.pedir(serde_json::json!({ "type": "register", "renderer": renderer }));
+        assert_eq!(respuesta["type"], "registered", "{respuesta}");
+        respuesta["token"].as_str().unwrap().to_string()
+    }
+
+    pub fn perfil(&self) -> &std::path::Path {
+        &self.perfil
+    }
+}
+
+impl Drop for BrokerProceso {
+    fn drop(&mut self) {
+        let _ = self.hijo.kill();
+        let _ = self.hijo.wait();
+        let _ = std::fs::remove_dir_all(&self.perfil);
+    }
 }

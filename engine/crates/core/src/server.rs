@@ -210,6 +210,8 @@ struct EngineServer {
     /// recibe un handle a este mismo broker mas su origen, y solo puede ver
     /// lo suyo. Un broker en otro proceso se conectara sustituyendo esto.
     broker: SharedBroker,
+    /// `"local"` o `"remote"`, para el saludo `ready`.
+    broker_kind: &'static str,
     /// Pestañas (Fase 4.5) - siempre tiene AL MENOS una (invariante
     /// mantenida por `close_tab`, que rechaza cerrar la ultima). `tabs`
     /// nunca se reordena por id, solo se inserta al final (`open_new_tab`)
@@ -233,14 +235,20 @@ struct EngineServer {
 }
 
 impl EngineServer {
+    /// Con el broker en el mismo proceso: cookies y `localStorage` del perfil
+    /// en disco (Fases 15 y 25), que recuperan la sesion de una carga
+    /// anterior del mismo perfil. `sessionStorage` sigue vacio al arrancar.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_broker(engine_net::LocalBroker::persistent().shared(), "local")
+    }
+
+    fn with_broker(broker: SharedBroker, broker_kind: &'static str) -> Self {
         Self {
             width: 1280,
             height: 720,
-            // Cookies y `localStorage` del perfil en disco (Fases 15 y 25):
-            // recupera la sesion de una carga anterior del mismo perfil.
-            // `sessionStorage` sigue vacio siempre al arrancar.
-            broker: engine_net::LocalBroker::persistent().shared(),
+            broker,
+            broker_kind,
             tabs: vec![Tab::new(0)],
             active_tab: 0,
             next_tab_id: 1,
@@ -299,6 +307,7 @@ impl EngineServer {
             renderer_status: "ready",
             width: self.width,
             height: self.height,
+            broker: self.broker_kind,
         }
     }
 
@@ -2099,7 +2108,18 @@ fn encode_form_body(data: &[(String, String)]) -> Vec<u8> {
 pub async fn run_stdio() -> io::Result<()> {
     let mut lines = BoundedLines::new(BufReader::new(tokio::io::stdin()), MAX_REQUEST_LINE_BYTES);
     let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
-    let mut server = EngineServer::new();
+    // Con `NAVEGADOR_IA_BROKER` la red, las cookies y el almacenamiento los
+    // pone otro proceso (ADR 0001, etapa 2) y este no abre el perfil en
+    // disco. Si se pidio broker y no se puede conectar, el motor NO arranca:
+    // seguir con la red y el disco propios en silencio seria justo lo que la
+    // ADR prohibe (principio 7 del plan).
+    let mut server = match engine_net::broker_remote::from_env().await? {
+        Some(remote) => {
+            tracing::info!("[engine] broker remoto: soy {}", remote.renderer());
+            EngineServer::with_broker(std::sync::Arc::new(remote), "remote")
+        }
+        None => EngineServer::with_broker(engine_net::LocalBroker::persistent().shared(), "local"),
+    };
 
     write_response(&mut stdout, server.ready_response(Some("boot".to_string()))).await?;
 

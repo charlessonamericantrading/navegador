@@ -35,6 +35,11 @@ pub enum NetworkError {
     /// un desarrollador necesita para arreglarlo en su servidor.
     #[error("{0}")]
     Cors(String),
+    /// La peticion la hizo (o no pudo hacerla) un broker en otro proceso
+    /// (ADR 0001, etapa 2). El texto es el del error original o el motivo
+    /// por el que el canal fallo; el tipo concreto no cruza el proceso.
+    #[error("{0}")]
+    Remote(String),
 }
 
 /// Descomprime el cuerpo de la respuesta segun `Content-Encoding` - casi

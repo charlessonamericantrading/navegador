@@ -24,6 +24,22 @@ impl Method {
             Method::Patch => "PATCH",
         }
     }
+
+    /// Inverso de `as_str`, para lo que llega por el canal del broker. Solo
+    /// los metodos que el motor sabe hacer: cualquier otro es un error, no un
+    /// `GET` por defecto.
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "GET" => Method::Get,
+            "POST" => Method::Post,
+            "PUT" => Method::Put,
+            "DELETE" => Method::Delete,
+            "HEAD" => Method::Head,
+            "OPTIONS" => Method::Options,
+            "PATCH" => Method::Patch,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]

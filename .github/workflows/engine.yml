@@ -80,6 +80,30 @@ jobs:
         continue-on-error: true
         run: cargo fmt --all --check
 
+  # El canal del broker (Fase 65) tiene dos implementaciones: tuberia con
+  # nombre en Windows y socket Unix en el resto. El job de arriba solo compila
+  # la primera. Este prueba la segunda de verdad, sin esperar a que el motor
+  # entero compile en Linux (J1): `engine-net` no depende de nada del motor.
+  net-unix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache de compilacion
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Tests de engine-net
+        working-directory: engine
+        run: cargo test -p engine-net --locked
+      - name: Clippy de engine-net
+        working-directory: engine
+        run: cargo clippy -p engine-net --all-targets --locked -- -D warnings
+
   # Auditoria de dependencias (tarea F7 del plan). Va en un job aparte para
   # que un aviso de seguridad recien publicado no oculte un fallo de tests:
   # son dos senales distintas y se leen por separado.

@@ -5330,3 +5330,69 @@ Lo que aporta: un broker en otro proceso se conecta implementando esta
 interfaz, sin tocar el motor. Lo que no aporta todavia: seguridad; con
 `LocalBroker` todo sigue en el mismo proceso.
 
+### Fase 65: el broker como proceso (ADR 0001, etapa 2) (2026-09-23)
+
+`engine_broker` es un binario nuevo que tiene la red, las cookies y el perfil,
+y los sirve a los renderers por un canal local. Un `engine_server` arrancado con
+`NAVEGADOR_IA_BROKER` y `NAVEGADOR_IA_BROKER_TOKEN` usa `RemoteBroker` en vez de
+`LocalBroker`: la costura de la Fase 64 se conecta sin tocar el motor.
+
+#### Decisiones
+
+- **Canal directo renderer ↔ broker, no reenviado por Electron.**
+  `localStorage.getItem` y `document.cookie` son síncronos en JavaScript: el
+  hilo de la página espera la respuesta. Pasar cada lectura por el bucle de
+  eventos del proceso principal de Electron, que además pinta la interfaz,
+  metería su latencia en cada una. El canal es una tubería con nombre en
+  Windows y un socket Unix (`0600`) en el resto: locales por construcción.
+- **Autenticación por token de un solo uso.** El supervisor registra cada
+  renderer por el stdin del broker (el canal de confianza) y recibe un token
+  de 256 bits, que pasa al renderer por el entorno. El renderer lo presenta al
+  conectar y todo lo que pide queda atribuido a ese nombre. El token se gasta al
+  usarse: que luego se filtre ya no abre nada. El nombre del canal es aleatorio
+  pero no es el secreto; en Windows se crea como primera instancia, para que
+  otro proceso no pueda ocuparlo antes.
+- **Tramas binarias, no NDJSON.** `[largo][cabecera JSON][largo][cuerpo]`: las
+  imágenes y fuentes viajan en crudo. Los largos se validan antes de reservar
+  memoria (32 MiB de cabecera, suficiente para un valor de `localStorage`
+  escapado; 256 MiB de cuerpo).
+- **Llamadas síncronas sobre un runtime multihilo.** Una tarea escribe, otra lee
+  y reparte las respuestas por `id`. `fetch` espera con un `oneshot`; cookies y
+  almacenamiento bloquean el hilo que llama en un canal de `std`, con un plazo
+  de 10 s. `RemoteBroker::connect` rechaza un runtime de un solo hilo, donde esa
+  espera no terminaría nunca.
+- **`sessionStorage` por renderer.** Con un broker común, dos pestañas
+  compartirían `sessionStorage`; la especificación lo hace de cada pestaña, así
+  que el broker lo separa por renderer.
+- **Fallar cerrado.** Si se pide broker y no hay canal, token o conexión, el
+  motor no arranca, ni saluda con `ready`, ni abre su perfil. Si el broker cae
+  a mitad, las llamadas pendientes y las siguientes fallan enseguida (red:
+  `network_error: broker no disponible`; `setItem`: `QuotaExceededError`) y el
+  motor sigue contestando. El saludo `ready` lleva ahora `broker: "local" |
+  "remote"`, que lo dice el motor y no quien lo arrancó.
+
+#### Verificación
+
+- 16 tests unitarios en `engine-net` sobre el canal real: tramas, límites,
+  CORS que sigue siendo CORS al cruzar, token de un solo uso, retirada de un
+  renderer, rechazo de runtime monohilo.
+- 4 tests de integración con los dos binarios reales (`broker_proceso.rs`):
+  - Dos motores comparten `localStorage` y cookies a través del broker, pero
+    no `sessionStorage`.
+  - Ningún renderer crea su directorio de perfil; el `localStorage` lo
+    persiste el broker.
+  - El motor no arranca sin canal, con un token inventado, sin token o con un
+    token ya usado.
+  - Matar el broker hace fallar la navegación en menos de 5 s, y el motor
+    sigue vivo.
+- 928 tests en total, clippy limpio. Sin broker, nada cambia.
+
+#### Lo que todavía no es
+
+- **No hay regla de origen.** El broker sabe qué renderer pide cada cosa, pero
+  todavía no comprueba que el origen pedido sea el del documento de ese
+  renderer. Es la Fase siguiente.
+- **Electron no lo usa aún.** El supervisor de la Fase 58 no arranca el
+  broker, y el empaquetado no incluye `engine_broker`.
+- **No es una sandbox.** El renderer no usa su red ni su disco porque no
+  quiere, no porque no pueda: restringir su token es el paso de F07.

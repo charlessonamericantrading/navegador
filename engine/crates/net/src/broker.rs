@@ -53,7 +53,7 @@ pub type SharedBroker = Arc<dyn ResourceBroker>;
 /// Broker en el mismo proceso: la red y el disco de siempre, detrás de la
 /// interfaz nueva.
 pub struct LocalBroker {
-    network: NetworkEngine,
+    pub(crate) network: NetworkEngine,
     storage: Mutex<WebStorage>,
 }
 
@@ -74,7 +74,7 @@ impl LocalBroker {
         Arc::new(self)
     }
 
-    fn storage(&self) -> std::sync::MutexGuard<'_, WebStorage> {
+    pub(crate) fn storage(&self) -> std::sync::MutexGuard<'_, WebStorage> {
         // Un pánico con el candado cogido deja el almacén envenenado; los
         // datos siguen siendo válidos (cada operación es atómica), así que se
         // recupera en vez de propagar el pánico a cada lectura posterior.

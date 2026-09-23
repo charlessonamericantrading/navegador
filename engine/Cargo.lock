@@ -1069,6 +1069,7 @@ dependencies = [
  "bytes",
  "dirs",
  "flate2",
+ "getrandom 0.2.17",
  "http-body-util",
  "hyper",
  "hyper-rustls",

@@ -76,10 +76,19 @@ Separar en tres etapas, cada una utilizable y reversible por sí sola.
   `XHR`, `document.cookie`, `localStorage`) depende ya de esa interfaz y no de
   `NetworkEngine`/`WebStorage`. La única implementación, `LocalBroker`, hace lo
   mismo que antes en el mismo proceso.
-- **Siguiente:** el binario `engine_broker` que sirve esa interfaz, un
-  `RemoteBroker` que la implemente sobre un canal, y la regla que da sentido a
-  todo: el broker sabe el origen del documento de cada renderer (porque hace él
-  la navegación) y rechaza cookies o almacenamiento de cualquier otro origen.
+- **Hecho — el proceso (Fase 65):** `engine_broker` sirve la interfaz por un
+  canal local (tubería con nombre / socket Unix) con tramas binarias. Cada
+  renderer se autentica con un token de un solo uso que el supervisor obtiene
+  por el stdin del broker. `RemoteBroker` implementa `ResourceBroker` sobre ese
+  canal y `engine_server` lo usa cuando el entorno lo pide. Si lo pide y no
+  puede conectar, no arranca. Probado con los dos binarios reales: dos
+  renderers comparten `localStorage` y cookies, ninguno abre el perfil, y la
+  caída del broker se contiene. Esto resuelve el problema de estado compartido
+  descrito en «Consecuencias».
+- **Siguiente:** la regla que da sentido a todo. El broker sabe el origen del
+  documento de cada renderer (porque hace él la navegación) y rechaza cookies
+  o almacenamiento de cualquier otro origen. Después, que el supervisor de
+  Electron arranque el broker y lo incluya en el paquete.
 - **Después:** con el renderer sin red ni disco propios, restringir su token.
 
 ### Etapa 3 — Aislamiento por sitio

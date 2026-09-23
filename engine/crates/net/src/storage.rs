@@ -88,8 +88,10 @@ impl StorageArea {
 pub struct QuotaExceeded;
 
 /// Las dos areas del spec. Son almacenes SEPARADOS incluso para el mismo
-/// origen: lo que escribe una no lo ve la otra.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// origen: lo que escribe una no lo ve la otra. Serializable porque viaja
+/// en el protocolo del broker (`crate::broker_wire`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StorageKind {
     Local,
     Session,

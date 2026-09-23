@@ -371,7 +371,7 @@ En Linux, el almacenamiento protegido debe comprobar la disponibilidad real de u
 - [ ] Extraer gestión de sesiones y pestañas de la ejecución de documentos; definir ownership de cada recurso antes de moverlo de proceso.
 - [ ] Introducir broker y renderer por pestaña como primer paso, conservando contrato externo mientras evoluciona el interno. *(23-09-2026, Fase 58: supervisor prototipo con contención probada contra el motor real; sin conectar a la interfaz.)*
 - [ ] Añadir identificadores de contexto, documento y navegación; descartar respuestas de documentos destruidos.
-- [ ] Mover acceso a red, perfil, cookies y archivos a servicios mediados. El renderer solicita capacidades, no rutas arbitrarias.
+- [ ] Mover acceso a red, perfil, cookies y archivos a servicios mediados. El renderer solicita capacidades, no rutas arbitrarias. *(23-09-2026, Fases 64–65: red, cookies y Web Storage detrás de `ResourceBroker`; proceso `engine_broker` con canal autenticado y probado contra los binarios reales. Faltan la regla de origen, conectarlo en Electron y los archivos.)*
 - [ ] Añadir watchdog fuera del proceso que ejecuta JS; una cola de promesas o bucle infinito no puede impedir que el supervisor intervenga.
 - [ ] Hacer que cerrar pestaña cancele cargas, termine tareas y libere handles; probar caída, arranque fallido y proceso huérfano.
 - [ ] Recuperar pestañas con página de fallo y recarga explícita, sin repetir automáticamente POST ni acciones del agente.

@@ -126,6 +126,11 @@ pub enum EngineResponse {
         renderer_status: &'static str,
         width: u32,
         height: u32,
+        /// Quien hace la red y guarda cookies y almacenamiento: `"local"` (este
+        /// mismo proceso) o `"remote"` (un `engine_broker`, ADR 0001 etapa 2).
+        /// Lo dice el motor, no quien lo arranco: asi se comprueba que el modo
+        /// pedido es el que de verdad corre.
+        broker: &'static str,
     },
     Pong {
         id: Option<String>,
@@ -270,6 +275,7 @@ mod tests {
             renderer_status: "ready",
             width: 1280,
             height: 720,
+            broker: "local",
         };
 
         let json = serde_json::to_string(&response).expect("response should serialize");
