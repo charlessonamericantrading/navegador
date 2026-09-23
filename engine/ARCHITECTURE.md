@@ -5396,3 +5396,46 @@ y los sirve a los renderers por un canal local. Un `engine_server` arrancado con
   broker, y el empaquetado no incluye `engine_broker`.
 - **No es una sandbox.** El renderer no usa su red ni su disco porque no
   quiere, no porque no pueda: restringir su token es el paso de F07.
+
+### Fase 66: la regla de origen del broker (ADR 0001, etapa 2) (2026-09-23)
+
+Con la Fase 65 el broker sabía **quién** pedía cada cosa, pero servía cookies y
+almacenamiento de cualquier origen que el renderer nombrara. Ahora un renderer
+solo toca cookies y Web Storage, y solo hace `fetch`/XHR con origen (CORS), en
+nombre de orígenes **concedidos**.
+
+El único modo de conseguir un origen es que el broker sirva una navegación de
+nivel superior a él con respuesta 2xx. Cuenta el origen de la URL final, tras
+las redirecciones, no el que diga el renderer, porque la respuesta la ve el
+broker. `NetworkRequest` lleva un campo nuevo, `navigation`, que el motor marca
+solo en `navigate_with_body`. Una navegación que acaba en 404 no concede nada:
+el motor tampoco la muestra.
+
+La concesión se registra **antes** de devolver la respuesta, así que el primer
+script de la página ya encuentra su origen permitido. Los orígenes se acumulan
+durante la vida del renderer: un `engine_server` puede tener varias pestañas, y
+volver atrás no siempre pide otra vez el documento. Retirar el renderer los
+olvida.
+
+#### Lo que no cierra, dicho claro
+
+- **Un renderer comprometido puede navegar a donde quiera** y obtener así el
+  origen. La regla le obliga a hacer una navegación real, por el broker, por
+  cada sitio; ya no puede vaciar el perfil en silencio y de golpe. Cerrarlo del
+  todo exige atar cada proceso a un sitio y cambiar de proceso al cruzar de
+  sitio (etapa 3), que se construye sobre esta regla.
+- **Subrecursos sin origen (no-cors):** viajan con cookies y su cuerpo llega al
+  renderer. Es el hueco que en los navegadores cierra ORB, y queda anotado.
+
+#### Verificación
+
+- Tests nuevos contra el canal real:
+  - Un renderer que pide el `localStorage`, las cookies o un `fetch` CORS de
+    un origen al que no navegó recibe una negativa en todo, y el almacén queda
+    intacto: ni se lee, ni se escribe, ni se borra.
+  - Un subrecurso o una navegación 404 no conceden el origen; una navegación
+    2xx concede ese origen y ningún otro.
+  - Retirar un renderer le quita sus orígenes.
+- Los tests de integración de la Fase 65 siguen pasando sin cambios: en ellos
+  cada motor navega de verdad a su página.
+- 931 tests, clippy limpio.

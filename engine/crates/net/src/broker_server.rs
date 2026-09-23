@@ -19,13 +19,38 @@
 //! resuelve que dos pestañas en procesos distintos se pisaran los ficheros.
 //! `sessionStorage`, en cambio, es de cada pestaña según la especificación, y
 //! aquí se separa por renderer.
+//!
+//! ## La regla de origen (Fase 66)
+//!
+//! Un renderer solo toca cookies y almacenamiento, y solo hace peticiones CORS
+//! en nombre, de orígenes **que el broker le ha concedido**. Y el único modo de
+//! que se le conceda uno es que el broker le sirva una navegación a ese origen
+//! con éxito: el origen es el de la URL final de la respuesta, tras las
+//! redirecciones, no el que diga el renderer. Así, un renderer comprometido no
+//! puede leer en silencio el `localStorage` o las cookies de todos los sitios
+//! del perfil. Tiene que navegar a cada uno, de verdad y por el broker.
+//!
+//! Lo que esta regla **no** impide todavía, dicho claro:
+//!
+//! - Que un renderer comprometido navegue a donde quiera y obtenga así ese
+//!   origen. Cerrarlo exige atar cada proceso a un sitio y cambiar de proceso
+//!   al cruzar de sitio (etapa 3 de la ADR). Esta regla es la pieza sobre la
+//!   que se construye eso.
+//! - Que lea el cuerpo de subrecursos de otros orígenes (peticiones sin
+//!   origen, modo no-cors), que viajan con cookies. Eso es lo que resuelve ORB
+//!   en los navegadores.
+//!
+//! Los orígenes concedidos se acumulan durante la vida del renderer, no se
+//! sustituyen al navegar: un `engine_server` puede tener varias pestañas, y
+//! volver atrás no siempre vuelve a pedir el documento. No cambia lo que un
+//! atacante consigue, porque cada origen le cuesta una navegación igual.
 
 use crate::broker::LocalBroker;
 use crate::broker_transport::{constant_time_eq, random_hex, Listener, Stream};
 use crate::broker_wire::{encode_header, read_frame, request_from_fetch, send, write_frame, Call, Hello, Op, Outcome, Reply, Welcome};
-use crate::storage::StorageKind;
+use crate::storage::{origin_of, StorageKind};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,6 +66,9 @@ pub struct BrokerServer {
     tokens: Mutex<HashMap<String, String>>,
     /// Renderer conectado → aviso para cortarle el canal.
     live: Mutex<HashMap<String, Arc<Notify>>>,
+    /// Renderer → orígenes que el broker le ha concedido (la regla de
+    /// origen, en la cabecera del módulo).
+    grants: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -49,7 +77,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl BrokerServer {
     pub fn new(local: LocalBroker) -> Arc<Self> {
-        Arc::new(Self { local, tokens: Mutex::default(), live: Mutex::default() })
+        Arc::new(Self { local, tokens: Mutex::default(), live: Mutex::default(), grants: Mutex::default() })
     }
 
     /// Da de alta un renderer y devuelve su token. Un token anterior del
@@ -66,6 +94,7 @@ impl BrokerServer {
     /// conectado, se le corta el canal.
     pub fn revoke(&self, renderer: &str) {
         lock(&self.tokens).retain(|_, owner| owner != renderer);
+        lock(&self.grants).remove(renderer);
         if let Some(notify) = lock(&self.live).remove(renderer) {
             notify.notify_one();
         }
@@ -77,6 +106,22 @@ impl BrokerServer {
         let mut tokens = lock(&self.tokens);
         let found = tokens.keys().find(|known| constant_time_eq(known, token)).cloned()?;
         tokens.remove(&found)
+    }
+
+    /// Concede un origen a un renderer. Solo lo llama una navegación servida.
+    fn grant(&self, renderer: &str, origin: String) {
+        lock(&self.grants).entry(renderer.to_string()).or_default().insert(origin);
+    }
+
+    /// Aplica la regla de origen a una llamada, antes de hacer nada.
+    fn authorize(&self, renderer: &str, op: &Op) -> Result<(), String> {
+        let Some(origin) = required_origin(op)? else { return Ok(()) };
+        let granted = lock(&self.grants).get(renderer).is_some_and(|origins| origins.contains(&origin));
+        if granted {
+            Ok(())
+        } else {
+            Err(format!("{origin} no es el origen de ningún documento que el broker haya servido a {renderer}"))
+        }
     }
 
     /// Acepta renderers hasta que se suelta la tarea.
@@ -147,14 +192,35 @@ impl BrokerServer {
                 }
             };
 
+            if let Err(reason) = self.authorize(&renderer, &call.op) {
+                tracing::warn!("[broker] denegado: {reason}");
+                reply(&outgoing, call.id, Outcome::Denied { reason }, Vec::new());
+                continue;
+            }
+
             match call.op {
-                Op::Fetch { url, method, headers, has_body, origin, include_credentials } => {
+                Op::Fetch { url, method, headers, has_body, origin, include_credentials, navigation } => {
                     let body = has_body.then_some(frame.body);
                     let server = self.clone();
                     let outgoing = outgoing.clone();
+                    let renderer = renderer.clone();
                     tokio::spawn(async move {
-                        let (outcome, body) = match request_from_fetch(&url, &method, headers, body, origin, include_credentials) {
-                            Ok(request) => Outcome::from_fetch(server.local.network.fetch(&request).await),
+                        let (outcome, body) = match request_from_fetch(&url, &method, headers, body, origin, include_credentials, navigation) {
+                            Ok(request) => {
+                                let result = server.local.network.fetch(&request).await;
+                                // El motor solo muestra el documento si la
+                                // respuesta es 2xx (`server.rs`); una 404
+                                // deja el anterior y no concede nada. Se
+                                // concede ANTES de responder: cuando el
+                                // renderer ejecute el primer script de la
+                                // página, su origen ya es suyo.
+                                if let Ok(response) = &result {
+                                    if navigation && response.is_success() {
+                                        server.grant(&renderer, origin_of(&response.url));
+                                    }
+                                }
+                                Outcome::from_fetch(result)
+                            }
                             Err(reason) => (Outcome::Invalid { reason }, Vec::new()),
                         };
                         reply(&outgoing, call.id, outcome, body);
@@ -204,6 +270,28 @@ impl BrokerServer {
             Op::StorageKey { kind, origin, index } => Outcome::MaybeText { value: self.local.storage().key_at(kind, &area(renderer, kind, &origin), index) },
         }
     }
+}
+
+/// El origen que una llamada necesita tener concedido, si necesita alguno.
+fn required_origin(op: &Op) -> Result<Option<String>, String> {
+    Ok(match op {
+        // Navegar se permite siempre (ver la cabecera del módulo), y un
+        // subrecurso sin origen va en modo no-cors.
+        Op::Fetch { navigation: true, .. } | Op::Fetch { origin: None, .. } => None,
+        // `fetch()`/XHR de un script: el origen del script es lo que CORS
+        // compara con el destino, así que tiene que ser de verdad suyo.
+        Op::Fetch { origin: Some(origin), .. } => Some(origin.clone()),
+        Op::CookieGet { page_url } | Op::CookieSet { page_url, .. } => {
+            let url = url::Url::parse(page_url).map_err(|e| format!("URL de página inválida: {e}"))?;
+            Some(origin_of(&url))
+        }
+        Op::StorageGet { origin, .. }
+        | Op::StorageSet { origin, .. }
+        | Op::StorageRemove { origin, .. }
+        | Op::StorageClear { origin, .. }
+        | Op::StorageLength { origin, .. }
+        | Op::StorageKey { origin, .. } => Some(origin.clone()),
+    })
 }
 
 /// La clave del área de almacenamiento. `localStorage` es del origen, lo
@@ -297,6 +385,7 @@ mod tests {
     use super::*;
     use crate::broker::ResourceBroker;
     use crate::broker_remote::RemoteBroker;
+    use crate::request::NetworkRequest;
 
     /// Un broker en memoria sirviendo en su canal real, dentro del test.
     fn arrancar() -> (Arc<BrokerServer>, String) {
@@ -307,11 +396,38 @@ mod tests {
         (server, endpoint)
     }
 
+    /// Servidor HTTP de una sola respuesta por conexión, sin compartir código
+    /// con el cliente que se prueba. Devuelve su origen.
+    fn servidor_http(estado: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let puerto = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for flujo in listener.incoming() {
+                let Ok(mut flujo) = flujo else { break };
+                let mut buffer = [0u8; 4096];
+                let _ = flujo.read(&mut buffer);
+                let _ = write!(flujo, "HTTP/1.1 {estado}\r\nContent-Type: text/html\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            }
+        });
+        format!("http://127.0.0.1:{puerto}")
+    }
+
+    fn navegacion(url: &str) -> NetworkRequest {
+        let mut request = NetworkRequest::new(url).unwrap();
+        request.navigation = true;
+        request
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn two_renderers_share_local_storage_and_cookies_but_not_session_storage() {
         let (server, endpoint) = arrancar();
         let a = RemoteBroker::connect(&endpoint, &server.register("tab-a").unwrap()).await.unwrap();
         let b = RemoteBroker::connect(&endpoint, &server.register("tab-b").unwrap()).await.unwrap();
+        // Lo que concede una navegación, directamente (la navegación real se
+        // prueba en `a_navigation_grants_its_final_origin_and_nothing_else`).
+        server.grant("tab-a", "https://a.test".into());
+        server.grant("tab-b", "https://a.test".into());
         assert_eq!(a.renderer(), "tab-a");
 
         // Las llamadas síncronas bloquean el hilo: fuera del runtime.
@@ -347,6 +463,7 @@ mod tests {
     async fn a_revoked_renderer_fails_fast_instead_of_hanging() {
         let (server, endpoint) = arrancar();
         let a = RemoteBroker::connect(&endpoint, &server.register("tab-a").unwrap()).await.unwrap();
+        server.grant("tab-a", "https://a.test".into());
         server.revoke("tab-a");
         let respuesta = tokio::task::spawn_blocking(move || {
             // Hasta que el lector ve el cierre puede pasar un instante; lo que
@@ -364,6 +481,73 @@ mod tests {
         .unwrap();
         assert!(respuesta.0.is_err(), "tras retirarlo, el renderer ya no puede escribir");
         assert!(respuesta.1 < Duration::from_secs(5), "falla enseguida: {:?}", respuesta.1);
+    }
+
+    /// El renderer comprometido: pide el almacenamiento, las cookies y un
+    /// `fetch` CORS de un origen al que nunca navegó. El broker se niega a
+    /// todo, sin tocar el almacén.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_renderer_cannot_touch_an_origin_it_never_navigated_to() {
+        let (server, endpoint) = arrancar();
+        server.local.storage().set_item(StorageKind::Local, "https://banco.test", "secreto", "1234").unwrap();
+        server.local.network.set_cookie_from_js("sesion=abc; Path=/", "https://banco.test/");
+        let a = RemoteBroker::connect(&endpoint, &server.register("tab-a").unwrap()).await.unwrap();
+
+        let mut cors = NetworkRequest::new("https://banco.test/api").unwrap();
+        cors.origin = Some("https://banco.test".into());
+        let error = a.fetch(&cors).await.unwrap_err();
+        assert!(error.to_string().contains("denegó"), "{error}");
+
+        let a = tokio::task::spawn_blocking(move || {
+            assert_eq!(a.storage_get(StorageKind::Local, "https://banco.test", "secreto"), None);
+            assert_eq!(a.storage_length(StorageKind::Local, "https://banco.test"), 0);
+            assert_eq!(a.cookie_header_for_js("https://banco.test/"), "");
+            assert!(a.storage_set(StorageKind::Local, "https://banco.test", "secreto", "pisado").is_err());
+            a.storage_clear(StorageKind::Local, "https://banco.test");
+            a
+        })
+        .await
+        .unwrap();
+        drop(a);
+        assert_eq!(server.local.storage().get_item(StorageKind::Local, "https://banco.test", "secreto").as_deref(), Some("1234"), "ni escribir ni borrar");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_navigation_grants_its_final_origin_and_nothing_else() {
+        let (server, endpoint) = arrancar();
+        let bueno = servidor_http("200 OK");
+        let roto = servidor_http("404 Not Found");
+        let a = RemoteBroker::connect(&endpoint, &server.register("tab-a").unwrap()).await.unwrap();
+
+        // Un subrecurso con éxito no concede nada: solo la navegación.
+        assert!(a.fetch(&NetworkRequest::new(&format!("{bueno}/")).unwrap()).await.unwrap().is_success());
+        // Una navegación que acaba en 404 tampoco: el motor no la muestra.
+        assert_eq!(a.fetch(&navegacion(&format!("{roto}/"))).await.unwrap().status_code, 404);
+        let (a, bueno, roto) = tokio::task::spawn_blocking(move || {
+            assert!(a.storage_set(StorageKind::Local, &bueno, "k", "v").is_err(), "un subrecurso no concede el origen");
+            assert!(a.storage_set(StorageKind::Local, &roto, "k", "v").is_err(), "una navegación fallida no concede el origen");
+            (a, bueno, roto)
+        })
+        .await
+        .unwrap();
+
+        assert!(a.fetch(&navegacion(&format!("{bueno}/pagina"))).await.unwrap().is_success());
+        tokio::task::spawn_blocking(move || {
+            assert!(a.storage_set(StorageKind::Local, &bueno, "k", "v").is_ok(), "tras navegar, el origen es suyo");
+            assert_eq!(a.storage_get(StorageKind::Local, &bueno, "k").as_deref(), Some("v"));
+            assert!(a.storage_set(StorageKind::Local, &roto, "k", "v").is_err(), "y solo ese");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoking_a_renderer_forgets_its_origins() {
+        let (server, _endpoint) = arrancar();
+        server.grant("tab-a", "https://a.test".into());
+        server.revoke("tab-a");
+        let op = Op::StorageLength { kind: StorageKind::Local, origin: "https://a.test".into() };
+        assert!(server.authorize("tab-a", &op).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]

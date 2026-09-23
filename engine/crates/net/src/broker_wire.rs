@@ -143,6 +143,8 @@ pub enum Op {
         has_body: bool,
         origin: Option<String>,
         include_credentials: bool,
+        #[serde(default)]
+        navigation: bool,
     },
     CookieGet { page_url: String },
     CookieSet { raw: String, page_url: String },
@@ -199,6 +201,7 @@ impl Op {
             has_body: request.body.is_some(),
             origin: request.origin.clone(),
             include_credentials: request.include_credentials,
+            navigation: request.navigation,
         };
         (op, request.body.clone().unwrap_or_default())
     }
@@ -212,10 +215,11 @@ pub fn request_from_fetch(
     body: Option<Vec<u8>>,
     origin: Option<String>,
     include_credentials: bool,
+    navigation: bool,
 ) -> Result<NetworkRequest, String> {
     let url = url::Url::parse(url).map_err(|e| format!("URL inválida: {e}"))?;
     let method = Method::parse(method).ok_or_else(|| format!("método HTTP no soportado: {method}"))?;
-    Ok(NetworkRequest { url, method, headers, body, origin, include_credentials })
+    Ok(NetworkRequest { url, method, headers, body, origin, include_credentials, navigation })
 }
 
 impl Outcome {
@@ -299,8 +303,8 @@ mod tests {
         request.body = Some(b"x=1".to_vec());
         request.origin = Some("https://a.test".into());
         let (op, body) = Op::from_request(&request);
-        let Op::Fetch { url, method, headers, has_body, origin, include_credentials } = op else { panic!() };
-        let back = request_from_fetch(&url, &method, headers, has_body.then_some(body), origin, include_credentials).unwrap();
+        let Op::Fetch { url, method, headers, has_body, origin, include_credentials, navigation } = op else { panic!() };
+        let back = request_from_fetch(&url, &method, headers, has_body.then_some(body), origin, include_credentials, navigation).unwrap();
         assert_eq!(back.url, request.url);
         assert_eq!(back.method.as_str(), "POST");
         assert_eq!(back.body.as_deref(), Some(&b"x=1"[..]));
@@ -317,6 +321,6 @@ mod tests {
 
     #[test]
     fn an_unknown_method_is_rejected_not_turned_into_get() {
-        assert!(request_from_fetch("https://a.test/", "TRACE", HashMap::new(), None, None, false).is_err());
+        assert!(request_from_fetch("https://a.test/", "TRACE", HashMap::new(), None, None, false, false).is_err());
     }
 }

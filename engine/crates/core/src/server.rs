@@ -480,6 +480,7 @@ impl EngineServer {
                 if scheme != "http" && scheme != "https" {
                     return Self::error(id, format!("esquema_no_soportado: solo se admiten peticiones http y https (esquema: {scheme})"));
                 }
+                request.navigation = true;
                 if let Some(body) = body {
                     request.method = engine_net::request::Method::Post;
                     request.headers.insert("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string());

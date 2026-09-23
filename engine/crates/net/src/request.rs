@@ -68,6 +68,11 @@ pub struct NetworkRequest {
     /// terceros sin que nadie lo pida seria justo lo que CORS existe para
     /// evitar. Al mismo origen las cookies viajan siempre, sin mirar esto.
     pub include_credentials: bool,
+    /// Navegacion de nivel superior: el documento que va a ocupar la
+    /// pestaña. Con broker en otro proceso (ADR 0001, etapa 2) es lo que le
+    /// concede al renderer el origen de la respuesta, y con el, sus cookies
+    /// y su almacenamiento. `false` para todo lo demas.
+    pub navigation: bool,
 }
 
 impl NetworkRequest {
@@ -89,6 +94,7 @@ impl NetworkRequest {
             body: None,
             origin: None,
             include_credentials: false,
+            navigation: false,
         })
     }
 }

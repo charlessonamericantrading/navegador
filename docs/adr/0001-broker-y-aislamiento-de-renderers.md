@@ -85,10 +85,15 @@ Separar en tres etapas, cada una utilizable y reversible por sí sola.
   renderers comparten `localStorage` y cookies, ninguno abre el perfil, y la
   caída del broker se contiene. Esto resuelve el problema de estado compartido
   descrito en «Consecuencias».
-- **Siguiente:** la regla que da sentido a todo. El broker sabe el origen del
-  documento de cada renderer (porque hace él la navegación) y rechaza cookies
-  o almacenamiento de cualquier otro origen. Después, que el supervisor de
-  Electron arranque el broker y lo incluya en el paquete.
+- **Hecho — la regla de origen (Fase 66):** un renderer solo toca cookies y
+  almacenamiento, y solo hace peticiones CORS, en nombre de orígenes que el
+  broker le ha concedido. Solo concede uno al servir una navegación 2xx, con el
+  origen de la URL final. Límites, dichos claro: un renderer comprometido
+  todavía puede navegar a cualquier sitio para obtener su origen (lo cierra la
+  etapa 3). Los subrecursos no-cors siguen llegando con cookies (hace falta
+  ORB).
+- **Siguiente:** que el supervisor de Electron arranque el broker, registre
+  cada renderer y lo incluya en el paquete.
 - **Después:** con el renderer sin red ni disco propios, restringir su token.
 
 ### Etapa 3 — Aislamiento por sitio
