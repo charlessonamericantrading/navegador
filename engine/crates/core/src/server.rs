@@ -20,7 +20,7 @@ use engine_net::{NetworkEngine, NetworkRequest};
 use engine_text::FontSet;
 use std::collections::HashMap;
 use std::io;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 struct LoadedPage {
     url: String,
@@ -2107,8 +2107,7 @@ fn encode_form_body(data: &[(String, String)]) -> Vec<u8> {
 }
 
 pub async fn run_stdio() -> io::Result<()> {
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+    let mut lines = BoundedLines::new(BufReader::new(tokio::io::stdin()), MAX_REQUEST_LINE_BYTES);
     let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
     let mut server = EngineServer::new();
 
@@ -2135,7 +2134,17 @@ pub async fn run_stdio() -> io::Result<()> {
     loop {
         tokio::select! {
             line = lines.next_line() => {
-                let Some(line) = line? else { break };
+                let line = match line? {
+                    None => break,
+                    Some(Ok(line)) => line,
+                    // Una linea desmedida o que no es UTF-8 se contesta y se
+                    // sigue: antes la primera crecia sin limite y la segunda
+                    // mataba el proceso entero con `InvalidData`.
+                    Some(Err(rejected)) => {
+                        write_response(&mut stdout, EngineResponse::Error { id: None, message: rejected.message() }).await?;
+                        continue;
+                    }
+                };
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -2187,6 +2196,92 @@ fn state_fingerprint(response: &EngineResponse) -> Option<u64> {
     (tab_id, scroll_offset_y.to_bits(), url, title, screenshot, requires_javascript, can_go_back, can_go_forward).hash(&mut hasher);
     serde_json::to_string(elements).unwrap_or_default().hash(&mut hasher);
     Some(hasher.finish())
+}
+
+/// Tope de una linea de peticion (plan H06). Las peticiones reales son
+/// pequenas; la mayor es `type_text`, cuyo texto la interfaz limita a 100.000
+/// caracteres, que escapados en JSON no llegan a 1 MiB.
+const MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
+
+/// Por que se rechazo una linea sin llegar a parsearla.
+#[derive(Debug, PartialEq, Eq)]
+enum RejectedLine {
+    TooLong { bytes: usize },
+    NotUtf8,
+}
+
+impl RejectedLine {
+    fn message(&self) -> String {
+        match self {
+            RejectedLine::TooLong { bytes } => format!("request_too_large: la linea supera {MAX_REQUEST_LINE_BYTES} bytes ({bytes} leidos)"),
+            RejectedLine::NotUtf8 => "invalid_request: la linea no es UTF-8".to_string(),
+        }
+    }
+}
+
+/// Lector de lineas con tope, sustituto de `AsyncBufReadExt::lines`.
+///
+/// Tiene que ser seguro ante cancelacion: `run_stdio` lo usa dentro de un
+/// `tokio::select!` con el reloj de temporizadores, que puede ganar a mitad
+/// de una linea. Por eso la linea a medias vive en `self.buf` y no en el
+/// futuro: entre `fill_buf` (seguro ante cancelacion) y `consume` no hay
+/// ningun `await`, asi que no se pierde ni se duplica ningun byte.
+struct BoundedLines<R> {
+    reader: R,
+    max: usize,
+    buf: Vec<u8>,
+    /// Bytes de la linea en curso, incluidos los descartados.
+    seen: usize,
+}
+
+impl<R: AsyncBufRead + Unpin> BoundedLines<R> {
+    fn new(reader: R, max: usize) -> Self {
+        Self { reader, max, buf: Vec::new(), seen: 0 }
+    }
+
+    /// `None` al cerrarse la entrada; `Some(Err)` para una linea rechazada,
+    /// que se consume entera para que la siguiente empiece limpia.
+    async fn next_line(&mut self) -> io::Result<Option<Result<String, RejectedLine>>> {
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                // Fin de la entrada: una ultima linea sin salto tambien cuenta.
+                if self.seen == 0 {
+                    return Ok(None);
+                }
+                return Ok(Some(self.finish_line()));
+            }
+            let (chunk, found_newline) = match available.iter().position(|&b| b == b'\n') {
+                Some(i) => (&available[..i], true),
+                None => (available, false),
+            };
+            let chunk_len = chunk.len();
+            self.seen += chunk_len;
+            if self.seen <= self.max {
+                self.buf.extend_from_slice(chunk);
+            } else {
+                // Sin guardar nada mas: la memoria no crece con la linea.
+                self.buf.clear();
+            }
+            self.reader.consume(chunk_len + usize::from(found_newline));
+            if found_newline {
+                return Ok(Some(self.finish_line()));
+            }
+        }
+    }
+
+    fn finish_line(&mut self) -> Result<String, RejectedLine> {
+        let seen = std::mem::take(&mut self.seen);
+        let bytes = std::mem::take(&mut self.buf);
+        if seen > self.max {
+            return Err(RejectedLine::TooLong { bytes: seen });
+        }
+        let mut line = String::from_utf8(bytes).map_err(|_| RejectedLine::NotUtf8)?;
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        Ok(line)
+    }
 }
 
 async fn write_response(
@@ -2317,6 +2412,65 @@ fn collect_elements_recursive(
     }
     for child in &layout_box.children {
         collect_elements_recursive(child, elements);
+    }
+}
+
+#[cfg(test)]
+mod bounded_lines_tests {
+    use super::*;
+
+    /// Capacidad minima a proposito: obliga a que cada linea llegue en
+    /// varios `fill_buf`, que es donde se rompe un lector ingenuo.
+    fn lector(entrada: &'static [u8], max: usize) -> BoundedLines<BufReader<&'static [u8]>> {
+        BoundedLines::new(BufReader::with_capacity(4, entrada), max)
+    }
+
+    #[tokio::test]
+    async fn reads_lines_across_small_buffers_strips_crlf_and_keeps_the_last_unterminated_line() {
+        let mut lines = lector(b"{\"a\":1}\r\nsegunda\nultima", 100);
+        assert_eq!(lines.next_line().await.unwrap(), Some(Ok("{\"a\":1}".to_string())));
+        assert_eq!(lines.next_line().await.unwrap(), Some(Ok("segunda".to_string())));
+        assert_eq!(lines.next_line().await.unwrap(), Some(Ok("ultima".to_string())));
+        assert_eq!(lines.next_line().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_line_over_the_limit_is_rejected_whole_and_the_next_one_is_clean() {
+        let mut lines = lector(b"0123456789ABCDEF\n{\"ok\":1}\n", 10);
+        assert_eq!(lines.next_line().await.unwrap(), Some(Err(RejectedLine::TooLong { bytes: 16 })));
+        assert_eq!(lines.next_line().await.unwrap(), Some(Ok("{\"ok\":1}".to_string())));
+    }
+
+    #[tokio::test]
+    async fn the_rejected_line_is_not_kept_in_memory() {
+        let mut lines = BoundedLines::new(BufReader::with_capacity(4, &[b'x'; 10_000][..]), 10);
+        let rechazada = lines.next_line().await.unwrap();
+        assert_eq!(rechazada, Some(Err(RejectedLine::TooLong { bytes: 10_000 })));
+        assert!(lines.buf.capacity() <= 16, "el buffer no deberia haber crecido con la linea: {}", lines.buf.capacity());
+    }
+
+    /// Antes, un byte que no era UTF-8 hacia que `lines()` devolviera
+    /// `InvalidData` y `run_stdio` terminaba con `?`: el motor moria.
+    #[tokio::test]
+    async fn invalid_utf8_is_a_rejected_line_not_a_fatal_error() {
+        let mut lines = lector(b"\xff\xfe\n{\"ok\":1}\n", 100);
+        assert_eq!(lines.next_line().await.unwrap(), Some(Err(RejectedLine::NotUtf8)));
+        assert_eq!(lines.next_line().await.unwrap(), Some(Ok("{\"ok\":1}".to_string())));
+    }
+
+    /// El caso de `run_stdio`: el reloj gana el `select!` a mitad de una
+    /// linea y el futuro de lectura se descarta. Lo ya leido no se pierde.
+    #[tokio::test]
+    async fn cancelling_mid_line_loses_no_bytes() {
+        let (mut escritor, lectura) = tokio::io::duplex(64);
+        let mut lines = BoundedLines::new(BufReader::new(lectura), 100);
+
+        escritor.write_all(b"{\"type\":").await.unwrap();
+        let cancelada = tokio::time::timeout(std::time::Duration::from_millis(20), lines.next_line()).await;
+        assert!(cancelada.is_err(), "sin salto de linea no deberia haber terminado");
+
+        escritor.write_all(b"\"ping\"}\n").await.unwrap();
+        assert_eq!(lines.next_line().await.unwrap(), Some(Ok("{\"type\":\"ping\"}".to_string())));
     }
 }
 

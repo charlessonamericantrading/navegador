@@ -74,6 +74,31 @@ fn una_linea_vacia_se_ignora_sin_responder() {
     assert_correlacionada(&r, "tras-vacia", "pong");
 }
 
+/// Plan H06 (Fase 54): una linea desmedida o que no es UTF-8 se contesta con
+/// un error y el motor sigue vivo. Antes la primera crecia en memoria sin
+/// limite y la segunda terminaba el proceso.
+#[test]
+fn una_linea_desmedida_o_no_utf8_se_rechaza_sin_matar_el_motor() {
+    let mut motor = Motor::arrancar();
+
+    let mut enorme = vec![b'x'; 2 * 1024 * 1024];
+    enorme.push(b'\n');
+    motor.entrada.write_all(&enorme).unwrap();
+    motor.entrada.flush().unwrap();
+    let r = motor.leer();
+    assert_eq!(r["type"], "error");
+    assert!(r["message"].as_str().unwrap().starts_with("request_too_large"), "{r}");
+
+    motor.entrada.write_all(b"\xff\xfe\xfd\n").unwrap();
+    motor.entrada.flush().unwrap();
+    let r = motor.leer();
+    assert_eq!(r["type"], "error");
+    assert!(r["message"].as_str().unwrap().contains("UTF-8"), "{r}");
+
+    let r = motor.pedir(json!({"type": "ping", "id": "sigue-vivo"}));
+    assert_correlacionada(&r, "sigue-vivo", "pong");
+}
+
 /// Reproduccion 11.2 del plan (H07, Fase 50): un `setTimeout` cambia el
 /// titulo y el cambio tiene que llegar SOLO, sin pedir `get_state`. Antes el
 /// motor relayouteaba en su reloj de fondo pero no escribia nada.

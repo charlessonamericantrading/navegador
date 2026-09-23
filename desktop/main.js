@@ -5,6 +5,8 @@ const child_process = require('child_process');
 const { autoUpdater } = require('electron-updater');
 const { createCredentialStore } = require('./ai-credentials');
 const { createGeminiProvider } = require('./ai-provider');
+const { validateEngineRequest, createLineSplitter, resolveAppPath } = require('./engine-protocol');
+const { pathToFileURL } = require('url');
 
 // Registrar el protocolo "app" como seguro y estándar para permitir ES Modules
 protocol.registerSchemesAsPrivileged([
@@ -34,9 +36,17 @@ app.on('second-instance', () => {
 let mainWindow = null;
 let pythonProcess = null;
 let nativeEngineProcess = null;
-let nativeEngineStdoutBuffer = '';
 let requestCounter = 0;
 const pendingEngineRequests = new Map();
+// Topes de la frontera con el motor (plan H06). Una linea `state` lleva la
+// captura en PNG/Base64: a 4000x4000 (el maximo que acepta `resize`) puede
+// rondar decenas de MB, asi que el tope es holgado; lo que evita es crecer sin
+// limite si el motor no termina nunca una linea.
+const MAX_ENGINE_LINE_CHARS = 128 * 1024 * 1024;
+// Peticiones sin respuesta a la vez. La interfaz rara vez pasa de unas pocas;
+// un bucle que dispare peticiones sin esperar no debe acumular promesas y
+// temporizadores sin fin.
+const MAX_PENDING_ENGINE_REQUESTS = 64;
 let isQuitting = false;
 let restartAttempts = 0;
 let stableTimer = null;
@@ -69,6 +79,9 @@ function sendEngineRequest(payload) {
   return new Promise((resolve, reject) => {
     if (!nativeEngineProcess || !nativeEngineProcess.stdin.writable) {
       return reject(new Error('El motor nativo Rust no está disponible'));
+    }
+    if (pendingEngineRequests.size >= MAX_PENDING_ENGINE_REQUESTS) {
+      return reject(new Error(`Demasiadas peticiones pendientes al motor (${MAX_PENDING_ENGINE_REQUESTS})`));
     }
     requestCounter += 1;
     const reqId = `ipc-${requestCounter}`;
@@ -125,21 +138,20 @@ function startNativeEngine() {
   }
 
   console.log(`[NativeEngine]: Iniciando motor Rust directamente desde ${enginePath}`);
-  nativeEngineStdoutBuffer = '';
 
   nativeEngineProcess = child_process.spawn(enginePath, [], {
     windowsHide: true,
     stdio: ['pipe', 'pipe', 'pipe']
   });
 
-  nativeEngineProcess.stdout.on('data', (chunk) => {
-    nativeEngineStdoutBuffer += chunk.toString();
-    const lines = nativeEngineStdoutBuffer.split('\n');
-    nativeEngineStdoutBuffer = lines.pop(); // Mantener el fragmento incompleto al final
-    for (const line of lines) {
-      handleEngineLine(line);
-    }
+  // Un divisor nuevo por proceso: nada de un trozo a medias del motor
+  // anterior. Decodifica UTF-8 entre trozos y descarta lineas desmedidas.
+  const pushEngineStdout = createLineSplitter({
+    maxLineChars: MAX_ENGINE_LINE_CHARS,
+    onLine: handleEngineLine,
+    onOverflow: (chars) => console.error(`[NativeEngine]: linea de ${chars} caracteres descartada (tope ${MAX_ENGINE_LINE_CHARS})`),
   });
+  nativeEngineProcess.stdout.on('data', pushEngineStdout);
 
   nativeEngineProcess.stderr.on('data', (chunk) => {
     console.error(`[NativeEngine-stderr]: ${chunk.toString().trim()}`);
@@ -365,31 +377,16 @@ ipcMain.on('install-update', () => {
 app.whenReady().then(() => {
   // Manejador del protocolo para cargar los archivos del frontend en producción
   protocol.handle('app', (request) => {
-    let relativePath = request.url.replace(/^app:\/\//, '');
-    
-    // Quitar slashes e indicador de ruta relativa iniciales
-    if (relativePath.startsWith('/')) {
-      relativePath = relativePath.slice(1);
-    }
-    if (relativePath.startsWith('./')) {
-      relativePath = relativePath.slice(2);
-    }
-
-    // Cargar index.html si está vacío
-    if (relativePath === '' || relativePath === '/') {
-      relativePath = 'index.html';
-    }
-
-    // Resolver ruta absoluta en recursos empaquetados
+    // Ver `resolveAppPath` (plan H21): parsea la URL, decodifica y comprueba
+    // la pertenencia con `path.relative`, no con un prefijo de texto.
+    // `pathToFileURL` escapa `#`, `?`, `%` y espacios, que la concatenacion
+    // de antes pasaba tal cual a la URL `file:`.
     const baseDir = path.join(process.resourcesPath, 'frontend', 'dist');
-    const absolutePath = path.normalize(path.join(baseDir, relativePath));
-
-    if (!absolutePath.startsWith(baseDir)) {
+    const absolutePath = resolveAppPath(baseDir, request.url);
+    if (!absolutePath) {
       return new Response('Forbidden', { status: 403 });
     }
-
-    const formattedPath = absolutePath.replace(/\\/g, '/');
-    return net.fetch('file:///' + formattedPath);
+    return net.fetch(pathToFileURL(absolutePath).toString());
   });
 
   // Arrancar el motor nativo Rust directamente (controlador prioritario y único)
@@ -416,9 +413,8 @@ app.whenReady().then(() => {
 });
 
 // Registrar eventos IPC expuestos
-ipcMain.handle('engine:request', async (_event, payload) => {
-  return await sendEngineRequest(payload);
-});
+// `engine:request` se registra mas abajo con `handleTrusted`: solo la ventana
+// propia, y solo peticiones del esquema de `engine-protocol.js` (plan H05).
 
 // --- IA: credenciales y proveedor en el proceso principal (plan H04) ---
 //
@@ -453,6 +449,7 @@ function handleTrusted(channel, handler) {
   });
 }
 
+handleTrusted('engine:request', (payload) => sendEngineRequest(validateEngineRequest(payload)));
 handleTrusted('ai:credentials:status', () => ai().credentials.status());
 handleTrusted('ai:credentials:set', (key) => ai().credentials.set(key));
 handleTrusted('ai:credentials:clear', () => ai().credentials.clear());

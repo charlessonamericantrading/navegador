@@ -4906,3 +4906,64 @@ anadieron a `build.files`; sin eso el instalador habria arrancado sin ellos.
 - El backend Python opcional conserva su propio agente con su propia gestion
   de clave (F34, consolidar un unico agente).
 
+### Fase 54: la frontera interfaz-motor valida, limita y no se sale de su carpeta (2026-09-23)
+
+Novena tarea del backlog (`plan.md`, F04: hallazgos H05, H06 y H21). Toca las
+dos puntas del canal: el proceso principal de Electron y `run_stdio`.
+
+#### H05: cualquier cosa llegaba al motor
+
+`ipcMain.handle('engine:request')` reenviaba el payload tal cual, desde
+cualquier emisor. Ahora pasa por `handleTrusted` (solo la ventana propia, el
+mismo filtro de los canales `ai:*` de la Fase 53) y por
+`validateEngineRequest` (`desktop/engine-protocol.js`): lista cerrada de tipos
+y campos, espejo de `EngineRequest` salvo `shutdown`, que solo puede pedir el
+proceso principal al salir. Rechaza campos desconocidos, numeros no finitos,
+enteros fuera de rango y textos desmedidos; el `id` lo pone siempre el proceso
+principal. Maximo 64 peticiones pendientes a la vez.
+
+#### H06: buffers sin limite en las dos puntas
+
+- **Electron**: el stdout del motor se acumulaba en una cadena sin tope y se
+  decodificaba trozo a trozo con `chunk.toString()`, que rompe un caracter
+  UTF-8 partido entre dos trozos (las lineas `state` son enormes por la
+  captura, asi que los cortes son frecuentes). `createLineSplitter` usa
+  `StringDecoder` y descarta lineas de mas de 128 MiB.
+- **Motor**: `run_stdio` leia con `lines()`, sin tope, y una linea que no era
+  UTF-8 devolvia `InvalidData` y terminaba el proceso con `?`. `BoundedLines`
+  limita cada peticion a 1 MiB (la mayor real, `type_text`, no llega) y
+  contesta `request_too_large` o `invalid_request` sin morir. Es seguro ante
+  cancelacion: el `select!` con el reloj puede ganar a mitad de una linea, y la
+  linea a medias vive en el lector, no en el futuro descartado (hay un test que
+  cancela a mitad de linea y comprueba que no se pierde ningun byte).
+
+#### H21: `app://` comparaba prefijos de texto
+
+`absolutePath.startsWith(baseDir)` daba por buena una carpeta hermana
+(`dist-malo`), no quitaba la consulta (`?v=3` acababa en el nombre de fichero)
+ni decodificaba `%20`, y la URL `file:` se construia concatenando. Ahora
+`resolveAppPath` parsea la URL, decodifica, compara con `path.relative` y
+`pathToFileURL` construye la URL final. Los `..` literales o `%2e%2e` los
+normaliza el propio parser de URL dentro de la raiz; lo que no normaliza
+(separadores codificados `%2F`/`%5C`, rutas absolutas, `%00`, codificacion
+rota) se rechaza. No se habia demostrado un recorrido explotable con la version
+anterior: Chromium ya normaliza la URL de un esquema estandar antes del
+manejador. La comprobacion nueva no depende de eso.
+
+#### Verificacion
+
+- `desktop`: 15 tests nuevos de `engine-protocol.js` (26 en total).
+- Motor: 5 tests de `BoundedLines` y uno de humo contra el binario real (una
+  linea de 2 MiB y otra con bytes no UTF-8, y el motor sigue contestando).
+- Aplicacion empaquetada, comprobada por DevTools: la interfaz arranca y sus
+  propias peticiones pasan la validacion; `shutdown`, `NaN`, un campo extra y
+  una URL de 9.000 caracteres se rechazan desde el renderer real, y el motor
+  sigue vivo.
+
+#### Pendiente en F04
+
+Sin contrapresion hacia el motor ni cancelacion propagada (un timeout de la
+promesa sigue sin detener el trabajo del motor, H06/F10), sin esquema
+versionado compartido entre TypeScript y Rust (el espejo se mantiene a mano),
+sin CSP de la aplicacion y con Google Fonts todavia en el arranque.
+

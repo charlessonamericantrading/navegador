@@ -128,8 +128,8 @@ Los estados distinguen **reproducido**, **confirmado en código** y **pendiente 
 | H02 | Avisos npm y cinco excepciones Rust en `.github/workflows/engine.yml`; dos de fast-float corresponden a fallos de seguridad documentados | npm medido; Rust pendiente de reauditar | P0 | F02 |
 | H03 | `wpt_runner.rs` ignora resultados de scripts y termina bien si no hubo tests | Reproducido con fixture temporal | P0 | F03 |
 | H04 | `gemini_api_key` se persiste en `localStorage`; petición al proveedor desde el renderer | **Resuelto** (Fase 53): `safeStorage` y petición desde el proceso principal | P0 | F05, F34 |
-| H05 | `ipcMain.handle('engine:request')` reenvía payload sin validación de esquema ni del emisor; faltan políticas explícitas de navegación de la carcasa | Confirmado; no explotación demostrada | P0 | F04 |
-| H06 | `next_line()` y buffer stdout sin límite de trama; timeout Electron no cancela el trabajo del motor | Confirmado | P0 | F04, F06, F10 |
+| H05 | `ipcMain.handle('engine:request')` reenvía payload sin validación de esquema ni del emisor; faltan políticas explícitas de navegación de la carcasa | **Validación resuelta** (Fase 54); faltan políticas de navegación de la carcasa | P0 | F04 |
+| H06 | `next_line()` y buffer stdout sin límite de trama; timeout Electron no cancela el trabajo del motor | **Límites resueltos** (Fase 54); la cancelación sigue en F10 | P0 | F04, F06, F10 |
 | H07 | Tick de 250 ms modifica la pestaña activa y hace relayout, pero la rama de tick no escribe un estado a stdout | **Resuelto** (Fase 50): publicación `state` con `id: null`, deduplicada | P1 | F10, F22 |
 | H08 | `window !== globalThis`, globals cortos ausentes | Reproducido por sonda | P1 | F11 |
 | H09 | `el.append/prepend` falla en la sonda aunque existe implementación y se anuncia como conseguido | **Resuelto** (Fase 49): faltaba la interfaz `Node` (`childNodes`, `parentNode`, `firstChild`...) | P1 | F03, F11 |
@@ -144,7 +144,7 @@ Los estados distinguen **reproducido**, **confirmado en código** y **pendiente 
 | H18 | Python es opcional al arrancar Electron, pero `build-app.js` exige compilarlo con PyInstaller | Confirmado | P1 | F01 |
 | H19 | CI de escritorio empaqueta con directorios de motor/backend vacíos | Confirmado | P1 | F01, F38 |
 | H20 | 20 hallazgos de lint, entre ellos refs durante render, dependencias de hooks y uso de `any` | Reproducido | P1 | F01, F30 |
-| H21 | `app://` usa comparación textual `absolutePath.startsWith(baseDir)` | Revisión defensiva necesaria; no se afirma traversal explotable | P0 | F04 |
+| H21 | `app://` usa comparación textual `absolutePath.startsWith(baseDir)` | **Resuelto** (Fase 54): `path.relative` sobre la URL parseada | P0 | F04 |
 | H22 | Backend opcional acepta WebSocket antes de una validación visible de origen/autenticación; CORS HTTP abierto | Confirmado en endpoint; exposición efectiva por validar | P0 si se habilita | F04 |
 | H23 | Runtime nativo carece de reinicio supervisado equivalente al del backend Python | Confirmado en `desktop/main.js` | P1 | F06 |
 | H24 | Selección de fuentes limitada al sans-serif de sistema y variantes | Confirmado en `text/src/font.rs` | P1 | F20 |
@@ -330,12 +330,12 @@ Los fallos de fast-float se documentan en [RUSTSEC-2025-0003](https://rustsec.or
 **Prioridad:** P0. **Depende de:** F01–F03 para validación. **Ámbito:** `desktop/main.js`, `preload.js`, `electron.d.ts`, protocolo Rust y frontend.
 
 - [ ] Definir un esquema versionado de peticiones, respuestas y eventos; generar tipos compartidos o comprobar equivalencia automáticamente.
-- [ ] Validar emisor, frame y origen de cada IPC privilegiado, además de payload, tamaño, tipo y valores finitos.
+- [x] Validar emisor, frame y origen de cada IPC privilegiado, además de payload, tamaño, tipo y valores finitos. *(23-09-2026, Fases 53-54: `handleTrusted` en `engine:request` y `ai:*`; `validateEngineRequest` con lista cerrada.)*
 - [ ] Reducir la API de preload a capacidades explícitas; impedir que contenido de página obtenga el canal general del motor.
 - [ ] Declarar y verificar sandbox de la carcasa, aislamiento de contexto, permisos y restricciones de nuevas ventanas/navegación.
 - [ ] Incorporar CSP de la aplicación, fuentes locales y política de conexiones; quitar dependencias de Google Fonts en el arranque.
-- [ ] Reescribir la resolución de recursos `app://` con parser de URL y comprobación de pertenencia de ruta, contemplando consultas, codificación, mayúsculas y separadores.
-- [ ] Limitar líneas NDJSON, solicitudes pendientes, buffers y tamaño de imágenes; gestionar backpressure y Unicode fragmentado entre chunks.
+- [x] Reescribir la resolución de recursos `app://` con parser de URL y comprobación de pertenencia de ruta, contemplando consultas, codificación, mayúsculas y separadores. *(Fase 54: `resolveAppPath` + `pathToFileURL`.)*
+- [ ] Limitar líneas NDJSON, solicitudes pendientes, buffers y tamaño de imágenes; gestionar backpressure y Unicode fragmentado entre chunks. *(Fase 54: líneas en las dos puntas, pendientes y UTF-8 partido hechos; faltan backpressure y tamaño de imágenes.)*
 - [ ] Tipar errores y propagar cancelación; una expiración de la promesa no equivale a detener una operación.
 - [ ] Si se conserva FastAPI: validar origen WebSocket, autenticar la sesión local, limitar mensajes y probar conexiones desde páginas no autorizadas. CORS HTTP no protege un WebSocket.
 
@@ -1150,7 +1150,7 @@ Este es el siguiente tramo de trabajo recomendado. El documento no implica que e
 | 6 | ~~Propagar resultados y fallos de comandos~~ **hecho** (Fase 52) | `App.tsx`, tipos IPC, orquestador | Error de motor no termina como objetivo completado |
 | 7 | ~~Retirar clave de renderer~~ **hecho** (Fase 53) | Servicio IA/credenciales, preload | No existe secreto en localStorage, UI o logs |
 | 8 | Auditar y migrar dependencias — **npm a 0 y rustls corregido**; queda Boa 0.19 → 0.22 | Tres árboles npm, Rust y Python opcional | Informe de alcance y PRs de actualización con regresiones |
-| 9 | Endurecer IPC/protocolo | `main.js`, `preload.js`, `protocol.rs` | Payload/emisor inválidos rechazados y límites probados |
+| 9 | ~~Endurecer IPC/protocolo~~ **hecho** (Fase 54) | `main.js`, `preload.js`, `protocol.rs` | Payload/emisor inválidos rechazados y límites probados |
 | 10 | Resolver lint por grupos | Frontend | 18 errores/2 advertencias → cero con pruebas de interacción |
 | 11 | Desacoplar Python del build principal | `build-app.js`, manifiestos, scripts | Build nativo completo sin `.venv` |
 | 12 | Probar paquete con motor real | `.github/workflows/app.yml` | Artefacto instalado responde ping y renderiza fixture |
