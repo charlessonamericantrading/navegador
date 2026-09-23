@@ -48,6 +48,19 @@ pub struct JsRuntime {
 /// contenedores de Rust que retienen objetos de JS como raices del GC: sin
 /// esto el documento entero sobrevivia (plan H28, ver
 /// `DocumentBindings::teardown`). Corre antes de soltar el `Context`.
+/// Vacia la cola de trabajos de Boa y REGISTRA un error en vez de tragarlo.
+///
+/// En Boa 0.22 `run_jobs` devuelve `JsResult`, y ante el primer trabajo que
+/// falla descarta el resto de la cola. Los callbacks de `queueMicrotask` ya
+/// reportan sus propias excepciones, y las reacciones de promesas las
+/// convierten en rechazos, asi que un `Err` aqui es un fallo del motor, no
+/// de la pagina: se deja constancia en vez de perderlo.
+pub(crate) fn run_jobs_reporting(context: &mut Context) {
+    if let Err(error) = context.run_jobs() {
+        tracing::warn!("[js] un trabajo pendiente fallo y Boa descarto el resto de la cola: {error}");
+    }
+}
+
 impl Drop for JsRuntime {
     fn drop(&mut self) {
         if let Some(bindings) = &self.document_bindings {
@@ -437,7 +450,7 @@ impl JsRuntime {
     /// ocurre DENTRO de una tarea (el script en curso), no al final de una,
     /// y el `eval` que lo envuelve ya se encarga al terminar.
     fn drain_jobs(&mut self) {
-        self.context.run_jobs();
+        run_jobs_reporting(&mut self.context);
         self.deliver_mutations();
     }
 
@@ -466,7 +479,7 @@ impl JsRuntime {
             if entregados == 0 {
                 return;
             }
-            self.context.run_jobs();
+            run_jobs_reporting(&mut self.context);
         }
         tracing::warn!("[js] un MutationObserver sigue generando mutaciones tras 8 rondas, se corta");
     }

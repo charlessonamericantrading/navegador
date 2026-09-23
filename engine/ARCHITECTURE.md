@@ -5240,3 +5240,50 @@ Los `handlers` de `XMLHttpRequest` siguen en un `Arc` con handles, con el mismo
 patron: una pagina que usa XHR puede retener su objeto. No lo mide el corpus
 actual.
 
+### Fase 62: Boa 0.19 a 0.22 (2026-09-23)
+
+Tarea 8 del backlog, la parte que quedaba (`plan.md`, F02, hallazgo H02). Boa
+0.19 arrastraba `fast-float` 0.2.0 con dos avisos de seguridad reales
+(RUSTSEC-2025-0003, fallo de segmentación por falta de comprobación de
+límites; RUSTSEC-2024-0379), alcanzables por el JavaScript de cualquier
+página. Era la única vulnerabilidad conocida en código distribuido y
+bloqueaba una versión.
+
+#### Qué cambió en la API, y cómo se adaptó
+
+46 errores de compilación, casi todos mecánicos:
+
+- `as_object`/`as_callable` devuelven el objeto por valor: sobraban 22
+  `.cloned()`, y algunas llamadas necesitan ahora `&`.
+- `JsArray::new`, `JsPromise::resolve`/`reject` y el constructor de `JsProxy`
+  devuelven `JsResult`.
+- `JsValue` ya no es un enum público: `Some(JsValue::Null)` pasa a ser una
+  guarda `if v.is_null()`.
+- `JsError::to_opaque(context)` pasa a `into_opaque(context)?`.
+
+Y tres con semántica:
+
+- **Cola de trabajos.** Desaparece `job_queue()`: `queueMicrotask` encola un
+  `Job::PromiseJob` y `fetch` un `Job::AsyncJob` (`NativeAsyncJob`), que recibe
+  el `Context` prestado por un `RefCell` cuando termina la espera de red.
+- **`ModuleLoader` asíncrono.** `load_imported_module` devuelve un `Future` y
+  recibe un `ModuleRequest`; `register_module` desaparece (la caché del
+  cargador ya lo cubría). La resolución sigue siendo contra la página, sin
+  cambios de comportamiento (H10 sigue abierto).
+- **`run_jobs()` devuelve `JsResult`, y ante el primer trabajo que falla Boa
+  0.22 vacía la cola ENTERA.** Tal cual, un `queueMicrotask` que lanzara se
+  llevaría por delante las reacciones de promesas de la página, un fallo
+  silencioso nuevo. El callback de `queueMicrotask` reporta ahora su propia
+  excepción y devuelve `Ok`, como hace un navegador, y cada `run_jobs` restante
+  registra un error en vez de tragárselo (`run_jobs_reporting`). Test nuevo:
+  una microtarea que lanza no cancela las siguientes ni una promesa.
+
+#### Verificación: nada observable cambia
+
+- 908 tests (907 anteriores + el nuevo), clippy limpio.
+- Sonda 87/115, WPT estilo 60/60, corpus 11/12 con el mismo fallo
+  (`modulos-es`, H10) y memoria estable.
+- Aplicación empaquetada con el motor nuevo: prueba de humo 6/6.
+- `cargo audit`: 0 vulnerabilidades. Las dos excepciones de `fast-float` se
+  retiran del CI.
+

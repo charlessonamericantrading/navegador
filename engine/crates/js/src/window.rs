@@ -356,7 +356,7 @@ pub fn register_window_environment(
 
     let global = context.global_object();
     let window = global.get(js_string!("window"), context)?;
-    let Some(window) = window.as_object().cloned() else {
+    let Some(window) = window.as_object() else {
         return Ok(());
     };
 

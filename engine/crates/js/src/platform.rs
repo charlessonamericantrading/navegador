@@ -137,7 +137,7 @@ fn colgar_de_window(context: &mut Context, nombre: &str, valor: JsValue) -> JsRe
     let window = context
         .global_object()
         .get(js_string!("window"), context)?;
-    let Some(window) = window.as_object().cloned() else {
+    let Some(window) = window.as_object() else {
         // Sin `window` registrado (el arnes de tests, o un `Context` sin
         // `register_window`) no hay nada que hacer, y no es un error: el
         // global suelto ya quedo puesto.

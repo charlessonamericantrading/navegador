@@ -5,7 +5,7 @@ con cuentas reales.** Este documento dice por qué, qué protege hoy y qué no, 
 cómo avisar de un fallo. Se revisa en cada fase que toque una frontera de
 seguridad (plan, sección 7.3).
 
-Última revisión: 23-09-2026 (Fases 23 y 50 a 57 de `engine/ARCHITECTURE.md`).
+Última revisión: 23-09-2026 (Fases 23 y 50 a 62 de `engine/ARCHITECTURE.md`).
 
 ## Cómo avisar de una vulnerabilidad
 
@@ -52,7 +52,7 @@ Página hostil ──► engine_server (Rust: parser, CSS, layout, Boa, red, dis
 
 | Frontera | Protección actual | Hueco conocido |
 |---|---|---|
-| Página → motor | Rust; parsers mantenidos (html5ever, rustls); mitigaciones de proceso de Windows (sin código dinámico, sin procesos hijo, sin puntos de extensión — Fase 23); CSP, CORS, SameSite y cookies `HttpOnly` aplicadas por el motor | **Sin sandbox**: el proceso que interpreta la página tiene red, disco y las cookies de todos los sitios. **Todas las pestañas comparten proceso.** Boa arrastra `fast-float` con fallos de memoria conocidos (RUSTSEC-2025-0003, RUSTSEC-2024-0379) |
+| Página → motor | Rust; parsers mantenidos (html5ever, rustls); mitigaciones de proceso de Windows (sin código dinámico, sin procesos hijo, sin puntos de extensión — Fase 23); CSP, CORS, SameSite y cookies `HttpOnly` aplicadas por el motor | **Sin sandbox**: el proceso que interpreta la página tiene red, disco y las cookies de todos los sitios. **Todas las pestañas comparten proceso.** (Los fallos de memoria de `fast-float` que arrastraba Boa 0.19 se cerraron migrando a Boa 0.22, Fase 62.) |
 | Motor → Electron | Líneas limitadas en las dos puntas, UTF-8 validado, el motor no muere con entrada malformada (Fase 54) | Sin contrapresión; un *timeout* no cancela el trabajo del motor |
 | Interfaz → Electron | `contextIsolation`, sin `nodeIntegration`; `engine:request` y `ai:*` solo atienden a la ventana propia y a un esquema cerrado; `shutdown` no se puede pedir desde la página (Fases 53 y 54) | Sin CSP propia de la aplicación; fuentes externas en el arranque |
 | `app://` | Resolución con `path.relative` sobre la URL parseada (Fase 54) | — |

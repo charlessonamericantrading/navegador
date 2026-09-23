@@ -104,16 +104,10 @@ jobs:
           # silencia sin explicar por que. Estan anotados como deuda en
           # `engine/huecos_sin_resolver.md` y como tarea en `plan.md`.
           #
-          # RUSTSEC-2025-0003 y RUSTSEC-2024-0379 (`fast-float` 0.2.0): estos
-          #   dos SI son fallos reales, no de mantenimiento - uno es un fallo
-          #   de segmentacion por falta de comprobacion de limites. Llegan a
-          #   traves de `boa_engine` 0.19, el motor de JavaScript, asi que lo
-          #   que los alcanza es codigo de cualquier pagina. Cerrarlo exige
-          #   subir boa de 0.19 a 0.22: tres versiones menores de un crate
-          #   pre-1.0, o sea una migracion de API real (cambian el cargador de
-          #   modulos y las firmas de `NativeFunction`). Es una tarea propia,
-          #   no un cambio de una linea. Mientras tanto el README ya advierte
-          #   que este navegador no es apto para uso diario y no tiene sandbox.
+          # RUSTSEC-2025-0003 y RUSTSEC-2024-0379 (`fast-float`) YA NO estan:
+          #   llegaban por Boa 0.19 y desaparecieron con la migracion a Boa 0.22
+          #   (2026-09-23). Quitarlos de aqui es lo que hace que, si vuelven,
+          #   el job falle en vez de pasar en silencio.
           # RUSTSEC-2026-0192 (`ttf-parser`) y RUSTSEC-2026-0206 (`rustybuzz`):
           #   sin mantenimiento, NO vulnerables. Son las dos piezas de
           #   tipografia del motor y no hay sustituto equivalente hoy.
@@ -125,6 +119,6 @@ jobs:
           # NUEVO, RUSTSEC-2026-0285 (`rustls` 0.23.42, mensajes de handshake
           # TLS 1.3 aceptados en el nivel de cifrado equivocado), y se cerro
           # actualizando a 0.23.45 en vez de anadirlo aqui. Los dos de
-          # `fast-float` BLOQUEAN una release: se retiran con la migracion de
-          # Boa (plan F02), y esta lista se revisa en cada una.
-          ignore: RUSTSEC-2025-0003,RUSTSEC-2024-0379,RUSTSEC-2026-0192,RUSTSEC-2026-0206,RUSTSEC-2024-0436
+          # `fast-float` bloqueaban una release y se retiraron con la migracion
+          # de Boa (plan F02). Esta lista se revisa en cada auditoria.
+          ignore: RUSTSEC-2026-0192,RUSTSEC-2026-0206,RUSTSEC-2024-0436

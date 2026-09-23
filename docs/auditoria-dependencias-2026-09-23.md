@@ -87,3 +87,16 @@ Verificación:
 Queda Boa 0.19 → 0.22 (`fast-float`, bloquea release) como la única
 vulnerabilidad conocida en rutas distribuidas.
 
+## Actualización: Boa 0.22 (mismo día)
+
+Migración de `boa_engine`, `boa_gc` y `boa_parser` de 0.19 a 0.22 (Fase 62 de
+`engine/ARCHITECTURE.md`). `fast-float` desaparece del árbol y, con él,
+RUSTSEC-2025-0003 y RUSTSEC-2024-0379.
+
+**`cargo audit`: 0 vulnerabilidades.** Quedan tres avisos de mantenimiento
+(`paste`, `rustybuzz`, `ttf-parser`), no de seguridad. Las excepciones de
+`fast-float` se retiraron del CI para que, si reaparecen, el job falle.
+
+Con esto, los tres árboles (`frontend`, `desktop` y `engine`) quedan sin
+vulnerabilidades conocidas a esta fecha. Falta auditar Python.
+

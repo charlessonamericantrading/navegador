@@ -33,8 +33,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use boa_engine::module::{ModuleLoader, Referrer};
-use boa_engine::{Context, JsError, JsNativeError, JsResult, JsString, Module, Source};
+use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
+use boa_engine::{Context, JsError, JsNativeError, JsResult, Module, Source};
 use boa_gc::GcRefCell;
 
 /// Cargador que sirve módulos desde lo que ya se descargó para esta página.
@@ -151,20 +151,24 @@ impl PageModuleLoader {
 }
 
 impl ModuleLoader for PageModuleLoader {
-    fn load_imported_module(
-        &self,
+    // Boa 0.22: el cargador es asíncrono, recibe la petición entera
+    // (`ModuleRequest`) y el `Context` prestado por un `RefCell`. Ya no hay
+    // `register_module`: la caché `parseados` de este cargador cubre lo que
+    // hacía (no volver a parsear una URL ya cargada).
+    async fn load_imported_module(
+        self: Rc<Self>,
         _referrer: Referrer,
-        specifier: JsString,
-        finish_load: Box<dyn FnOnce(JsResult<Module>, &mut Context)>,
-        context: &mut Context,
-    ) {
-        let especificador = specifier.to_std_string_escaped();
+        request: ModuleRequest,
+        context: &RefCell<&mut Context>,
+    ) -> JsResult<Module> {
+        let especificador = request.specifier().to_std_string_escaped();
 
         // Se resuelve contra la URL de la PÁGINA y no contra la del módulo que
         // importa. Es una simplificación declarada, no un descuido: para
         // conocer la URL del importador haría falta llevarla dentro de cada
-        // `Module`, y Boa 0.19 no expone dónde guardarla (`host_defined` es
-        // inmutable y `path` es un `Path` de disco, no una URL).
+        // `Module`, y Boa 0.19 no exponía dónde guardarla (`host_defined` era
+        // inmutable y `path` es un `Path` de disco, no una URL). Revisar con
+        // la API de 0.22 es parte de F13.
         //
         // Lo que esto cubre y lo que no: los bundlers emiten especificadores
         // ABSOLUTOS de ruta (`/assets/index-abc.js`), que se resuelven igual
@@ -173,20 +177,15 @@ impl ModuleLoader for PageModuleLoader {
         // entre dos módulos que NO estén en el mismo directorio que el
         // documento. Anotado en `huecos_sin_resolver.md`.
         let base = self.base.borrow().clone();
-        let resultado = match self.resolver(&especificador, &base) {
-            Ok(url) => self.modulo_de(&url, context),
+        match self.resolver(&especificador, &base) {
+            Ok(url) => {
+                let mut guard = context.borrow_mut();
+                self.modulo_de(&url, &mut guard)
+            }
             Err(motivo) => Err(JsNativeError::typ()
                 .with_message(format!("no se pudo importar {especificador:?}: {motivo}"))
                 .into()),
-        };
-
-        finish_load(resultado, context);
-    }
-
-    fn register_module(&self, specifier: JsString, module: Module) {
-        self.parseados
-            .borrow_mut()
-            .insert(specifier.to_std_string_escaped(), module);
+        }
     }
 }
 
@@ -225,7 +224,7 @@ pub fn evaluar_modulo(
     // promesa queda pendiente para siempre y el módulo no se ejecuta, en
     // silencio.
     let promesa = modulo.load_link_evaluate(context);
-    context.run_jobs();
+    crate::runtime::run_jobs_reporting(context);
 
     match promesa.state() {
         boa_engine::builtins::promise::PromiseState::Fulfilled(_) => ResultadoModulo::Ok,

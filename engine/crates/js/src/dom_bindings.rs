@@ -669,7 +669,7 @@ impl DomBindings {
             |_this, args: &[JsValue], capture: &DomRootCapture, context| {
                 let clase = match args.first() {
                     Some(v) => v.to_string(context)?.to_std_string_escaped(),
-                    None => return Ok(JsArray::new(context).into()),
+                    None => return Ok(JsArray::new(context)?.into()),
                 };
                 let mut encontrados = Vec::new();
                 recolectar_por_clase(&capture.0, &clase, &mut encontrados);
@@ -1226,11 +1226,12 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
     let text_content_setter = NativeFunction::from_copy_closure_with_captures(
         |_this, args, capture: &ElementCapture, context| {
             let value = match args.first() {
-                None | Some(JsValue::Undefined) => "undefined".to_string(),
+                None => "undefined".to_string(),
+                Some(v) if v.is_undefined() => "undefined".to_string(),
                 // [LegacyNullToEmptyString] del spec real: `textContent = null`
                 // limpia el texto en vez de escribir la cadena "null" (que es
                 // lo que haria ToString(null) en cualquier otra propiedad).
-                Some(JsValue::Null) => String::new(),
+                Some(v) if v.is_null() => String::new(),
                 Some(v) => v.to_string(context)?.to_std_string_escaped(),
             };
             // Reemplaza TODOS los hijos por un unico nodo de texto - la
@@ -1342,7 +1343,8 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
             let Some(new_node) = node_from_js_value(new_value) else { return Ok(JsValue::undefined()) };
 
             let reference_node = match args.get(1) {
-                None | Some(JsValue::Null) => None,
+                None => None,
+                Some(v) if v.is_null() => None,
                 Some(v) => match node_from_js_value(v) {
                     Some(node) => Some(node),
                     None => return Ok(JsValue::undefined()),
@@ -1679,7 +1681,7 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         |_this, args, capture: &ElementCapture, context| {
             let Some(type_arg) = args.first() else { return Ok(JsValue::undefined()) };
             let event_type = type_arg.to_string(context)?.to_std_string_escaped();
-            let Some(listener) = args.get(1).and_then(JsValue::as_callable).cloned() else {
+            let Some(listener) = args.get(1).and_then(JsValue::as_callable) else {
                 return Ok(JsValue::undefined());
             };
             let use_capture = event_listener_options_capture(args.get(2), context)?;
@@ -1709,7 +1711,7 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
             let use_capture = event_listener_options_capture(args.get(2), context)?;
             let key = Arc::as_ptr(&capture.0) as usize;
             if let Some(listeners) = capture.1.listeners.lock().unwrap().get_mut(&key) {
-                listeners.retain(|(t, l, c)| !(t == &event_type && l == listener && *c == use_capture));
+                listeners.retain(|(t, l, c)| !(t == &event_type && *l == listener && *c == use_capture));
             }
             Ok(JsValue::undefined())
         },
@@ -2251,7 +2253,8 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         |_this, args, capture: &ElementCapture, context| {
             // [LegacyNullToEmptyString], igual que `textContent`.
             let nuevo = match args.first() {
-                None | Some(JsValue::Null) => String::new(),
+                None => String::new(),
+                Some(v) if v.is_null() => String::new(),
                 Some(v) => v.to_string(context)?.to_std_string_escaped(),
             };
             let anterior = {
@@ -4438,7 +4441,7 @@ fn argumentos_de_evento(
         Some(v) => v.to_string(context)?.to_std_string_escaped(),
         None => "undefined".to_string(),
     };
-    let opciones = args.get(1).and_then(|v| v.as_object()).cloned();
+    let opciones = args.get(1).and_then(|v| v.as_object());
     let bubbles = opcion_bool(opciones.as_ref(), "bubbles", context)?;
     let cancelable = opcion_bool(opciones.as_ref(), "cancelable", context)?;
     Ok((tipo, opciones, bubbles, cancelable))
@@ -4500,7 +4503,7 @@ pub(crate) fn register_event_subclasses(context: &mut Context) -> JsResult<()> {
             obj.set(js_string!("key"), js_string!(key), false, context)?;
             obj.set(js_string!("code"), js_string!(code), false, context)?;
             obj.set(js_string!("repeat"), repeat, false, context)?;
-            anadir_modificadores(obj, opciones.as_ref(), context)?;
+            anadir_modificadores(&obj, opciones.as_ref(), context)?;
         }
         Ok(evento)
     });
@@ -4523,7 +4526,7 @@ pub(crate) fn register_event_subclasses(context: &mut Context) -> JsResult<()> {
             obj.set(js_string!("pageX"), x, false, context)?;
             obj.set(js_string!("pageY"), y, false, context)?;
             obj.set(js_string!("relatedTarget"), JsValue::null(), false, context)?;
-            anadir_modificadores(obj, opciones.as_ref(), context)?;
+            anadir_modificadores(&obj, opciones.as_ref(), context)?;
         }
         Ok(evento)
     });

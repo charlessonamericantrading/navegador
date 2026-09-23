@@ -8,9 +8,9 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
-boa_engine = "0.19"
-boa_gc = "0.19"
-boa_parser = "0.19"
+boa_engine = "0.22"
+boa_gc = "0.22"
+boa_parser = "0.22"
 engine-dom = { path = "../dom" }
 engine-css = { path = "../css" }
 # `fetch()` real (Fase 4.3, ver fetch.rs) - peticiones HTTP de verdad desde

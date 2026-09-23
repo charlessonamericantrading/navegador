@@ -125,7 +125,7 @@ Los estados distinguen **reproducido**, **confirmado en código** y **pendiente 
 | ID | Hallazgo y evidencia | Estado | Prioridad | Fases |
 |---|---|---|---|---|
 | H01 | Todas las pestañas viven en `EngineServer`; `sandbox.rs` aplica mitigaciones de Windows y declara que no es sandbox | Confirmado | P0 | F06–F09 |
-| H02 | Avisos npm y cinco excepciones Rust en `.github/workflows/engine.yml`; dos de fast-float corresponden a fallos de seguridad documentados | npm medido; Rust pendiente de reauditar | P0 | F02 |
+| H02 | Avisos npm y cinco excepciones Rust en `.github/workflows/engine.yml`; dos de fast-float corresponden a fallos de seguridad documentados | **Resuelto** (Fases 62 y anteriores): npm a 0, `cargo audit` a 0; quedan 3 avisos de mantenimiento | P0 | F02 |
 | H03 | `wpt_runner.rs` ignora resultados de scripts y termina bien si no hubo tests | Reproducido con fixture temporal | P0 | F03 |
 | H04 | `gemini_api_key` se persiste en `localStorage`; petición al proveedor desde el renderer | **Resuelto** (Fase 53): `safeStorage` y petición desde el proceso principal | P0 | F05, F34 |
 | H05 | `ipcMain.handle('engine:request')` reenvía payload sin validación de esquema ni del emisor; faltan políticas explícitas de navegación de la carcasa | **Validación resuelta** (Fase 54); faltan políticas de navegación de la carcasa | P0 | F04 |
@@ -302,8 +302,8 @@ Cada fase contiene objetivo, dependencias, archivos o componentes, tareas y una 
 - [x] Clasificar cada aviso por dependencia, ruta, ejecución en build/runtime, entradas controlables y mitigación real. *(Informe del 23-09-2026.)*
 - [x] Migrar Electron y electron-builder a versiones mantenidas, revisando cambios de sandbox, preload, protocolos y actualización. *(23-09-2026: Electron 30.5.1 → 44.4.4 y electron-builder 24 → 26; `npm audit` de `desktop` a 0; app empaquetada comprobada por CDP.)*
 - [ ] Corregir avisos npm mediante actualización controlada; no ejecutar `audit fix --force` sin revisar el diff y los cambios incompatibles. *(23-09-2026: `frontend` a 0 sin saltos mayores; `desktop` a 0 tras migrar Electron y electron-builder.)*
-- [ ] Migrar Boa y su familia de crates a una versión compatible mantenida, o aplicar una solución upstream verificada que retire la ruta vulnerable; probar módulos, GC y bindings.
-- [ ] Retirar excepciones resueltas. Las restantes tienen propietario, justificación técnica, fecha de revisión y condición de bloqueo de release.
+- [x] Migrar Boa y su familia de crates a una versión compatible mantenida, o aplicar una solución upstream verificada que retire la ruta vulnerable; probar módulos, GC y bindings. *(23-09-2026, Fase 62: Boa 0.22; `fast-float` fuera; 908 tests, sonda, WPT, corpus y humo sin cambios.)*
+- [ ] Retirar excepciones resueltas. Las restantes tienen propietario, justificación técnica, fecha de revisión y condición de bloqueo de release. *(Fase 62: retiradas las de `fast-float`; quedan tres de mantenimiento con justificación y fecha, falta asignar propietario.)*
 - [ ] Generar SBOM del instalador, incluyendo runtime Electron y bibliotecas transitivas; incorporar revisión de licencias y avisos de terceros.
 - [ ] Fijar acciones de CI por revisión verificable y reducir permisos de tokens; separar construcción sin secretos y publicación.
 - [ ] Programar auditorías periódicas: una vulnerabilidad puede aparecer sin cambios en el código.
@@ -1152,7 +1152,7 @@ Este es el siguiente tramo de trabajo recomendado. El documento no implica que e
 | 5 | ~~Corregir cancelación y autoenvío del agente~~ **hecho** (Fase 51) | `AgentSidebar`, orquestador, `App.tsx` | Detener durante llamada no actúa después; escribir no envía |
 | 6 | ~~Propagar resultados y fallos de comandos~~ **hecho** (Fase 52) | `App.tsx`, tipos IPC, orquestador | Error de motor no termina como objetivo completado |
 | 7 | ~~Retirar clave de renderer~~ **hecho** (Fase 53) | Servicio IA/credenciales, preload | No existe secreto en localStorage, UI o logs |
-| 8 | Auditar y migrar dependencias — **npm a 0 y rustls corregido**; queda Boa 0.19 → 0.22 | Tres árboles npm, Rust y Python opcional | Informe de alcance y PRs de actualización con regresiones |
+| 8 | ~~Auditar y migrar dependencias~~ **hecho**: npm a 0, rustls corregido y Boa 0.22 (Fase 62); falta auditar Python | Tres árboles npm, Rust y Python opcional | Informe de alcance y PRs de actualización con regresiones |
 | 9 | ~~Endurecer IPC/protocolo~~ **hecho** (Fase 54) | `main.js`, `preload.js`, `protocol.rs` | Payload/emisor inválidos rechazados y límites probados |
 | 10 | ~~Resolver lint por grupos~~ **hecho** (Fase 55) | Frontend | 18 errores/2 advertencias → cero con pruebas de interacción |
 | 11 | ~~Desacoplar Python del build principal~~ **hecho** (Fase 56) | `build-app.js`, manifiestos, scripts | Build nativo completo sin `.venv` |

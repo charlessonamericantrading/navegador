@@ -117,7 +117,7 @@ fn resolve_delay(args: &[JsValue], context: &mut Context) -> Duration {
 /// Cuerpo comun de `setTimeout` y `setInterval` - identicos salvo por si el
 /// temporizador se reprograma tras dispararse.
 fn schedule(args: &[JsValue], queue: &TimerQueue, context: &mut Context, repeating: bool) -> JsResult<JsValue> {
-    let Some(callback) = args.first().and_then(JsValue::as_callable).cloned() else {
+    let Some(callback) = args.first().and_then(JsValue::as_callable) else {
         // Sin funcion invocable no hay nada que programar. Un navegador
         // real acepta ademas una CADENA de codigo aqui (`setTimeout("...")`,
         // que evalua como `eval`) - deliberadamente NO soportado: es un
@@ -154,7 +154,7 @@ fn schedule(args: &[JsValue], queue: &TimerQueue, context: &mut Context, repeati
         .global_object()
         .get(js_string!(CALLBACK_REGISTRY), context)?
         .as_object()
-        .cloned();
+        ;
     if let Some(registry) = registry {
         registry.set(js_string!(id.to_string()), JsValue::from(callback), false, context)?;
     }
@@ -179,7 +179,7 @@ fn cancel(args: &[JsValue], queue: &TimerQueue, context: &mut Context) -> JsResu
         .global_object()
         .get(js_string!(CALLBACK_REGISTRY), context)?
         .as_object()
-        .cloned();
+        ;
     if let Some(registry) = registry {
         registry.delete_property_or_throw(js_string!(id.to_string()), context)?;
     }
@@ -311,9 +311,9 @@ pub fn run_due_timers(queue: &TimerQueue, context: &mut Context) -> usize {
                 .global_object()
                 .get(js_string!(CALLBACK_REGISTRY), context)
                 .ok()
-                .and_then(|r| r.as_object().cloned())
+                .and_then(|r| r.as_object())
                 .and_then(|registry| registry.get(js_string!(id.to_string()), context).ok())
-                .and_then(|v| v.as_callable().cloned());
+                .and_then(|v| v.as_callable());
 
             let Some(callback) = callback else { continue };
 
@@ -330,7 +330,7 @@ pub fn run_due_timers(queue: &TimerQueue, context: &mut Context) -> usize {
             // Cada callback de temporizador es una TAREA del bucle de
             // eventos, y al final de cada tarea se vacian los microtasks -
             // misma razon por la que `eval`/`dispatch_event` ya lo hacen.
-            context.run_jobs();
+            crate::runtime::run_jobs_reporting(context);
 
             // Un `setTimeout` (no `setInterval`) ya disparado deja de tener
             // callback vivo: se borra del registro para que su funcion
@@ -338,7 +338,7 @@ pub fn run_due_timers(queue: &TimerQueue, context: &mut Context) -> usize {
             // la pagina.
             let still_scheduled = queue.lock().is_ok_and(|state| state.timers.iter().any(|t| t.id == id));
             if !still_scheduled {
-                if let Ok(Some(registry)) = context.global_object().get(js_string!(CALLBACK_REGISTRY), context).map(|r| r.as_object().cloned()) {
+                if let Ok(Some(registry)) = context.global_object().get(js_string!(CALLBACK_REGISTRY), context).map(|r| r.as_object()) {
                     let _ = registry.delete_property_or_throw(js_string!(id.to_string()), context);
                 }
             }

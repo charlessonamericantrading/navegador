@@ -41,7 +41,7 @@ unsafe impl Trace for CookieCapture {
 /// diseño completo y las simplificaciones declaradas.
 pub fn register_cookie(context: &mut Context, network: Arc<NetworkEngine>, page_url: Option<String>) -> JsResult<()> {
     let document = context.global_object().get(js_string!("document"), context)?;
-    let Some(document_obj) = document.as_object().cloned() else {
+    let Some(document_obj) = document.as_object() else {
         return Ok(());
     };
 

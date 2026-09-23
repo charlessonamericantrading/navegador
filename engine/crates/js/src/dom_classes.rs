@@ -184,7 +184,7 @@ pub fn register_dom_classes(context: &mut Context) -> JsResult<DomPrototypes> {
         .global_object()
         .get(js_string!("Node"), context)?
         .as_object()
-        .cloned();
+        ;
     for (nombre, valor) in TIPOS {
         node.set(js_string!(nombre), JsValue::from(valor), false, context)?;
         if let Some(c) = &constructor_node {

@@ -145,7 +145,7 @@ pub fn register_mutation_observer(context: &mut Context, bindings: DocumentBindi
     let constructor_bindings = bindings.clone();
     let constructor = NativeFunction::from_copy_closure_with_captures(
         move |_this, args, capture: &ConstructorCapture, context| {
-            let Some(callback) = args.first().and_then(JsValue::as_callable).cloned() else {
+            let Some(callback) = args.first().and_then(JsValue::as_callable) else {
                 return Err(boa_engine::JsNativeError::typ()
                     .with_message("MutationObserver necesita una funcion de callback")
                     .into());
@@ -158,7 +158,7 @@ pub fn register_mutation_observer(context: &mut Context, bindings: DocumentBindi
                     let Some(node) = crate::dom_bindings::node_from_js_value(target_value) else {
                         return Ok(JsValue::undefined());
                     };
-                    let opciones = args.get(1).and_then(|v| v.as_object().cloned());
+                    let opciones = args.get(1).and_then(|v| v.as_object());
                     let bandera = |nombre: &str, context: &mut Context| -> bool {
                         opciones
                             .as_ref()
@@ -173,7 +173,7 @@ pub fn register_mutation_observer(context: &mut Context, bindings: DocumentBindi
                     let attribute_filter: Option<Vec<String>> = opciones
                         .as_ref()
                         .and_then(|o| o.get(js_string!("attributeFilter"), context).ok())
-                        .and_then(|v| v.as_object().cloned())
+                        .and_then(|v| v.as_object())
                         .and_then(|arreglo| {
                             let longitud = arreglo.get(js_string!("length"), context).ok()?.to_number(context).ok()? as usize;
                             let mut nombres = Vec::with_capacity(longitud);
@@ -278,10 +278,10 @@ struct TakeCapture(#[unsafe_ignore_trace] ObserverRegistry, u64, DocumentBinding
 
 /// Construye el array de `MutationRecord` que recibe el callback.
 fn build_records_array(records: &[PendingMutation], bindings: &DocumentBindings, context: &mut Context) -> JsResult<JsObject> {
-    let arreglo = boa_engine::object::builtins::JsArray::new(context);
+    let arreglo = boa_engine::object::builtins::JsArray::new(context)?;
     for record in records {
         let nodos = |lista: &[Arc<RwLock<Node>>], context: &mut Context| -> JsResult<JsObject> {
-            let a = boa_engine::object::builtins::JsArray::new(context);
+            let a = boa_engine::object::builtins::JsArray::new(context)?;
             for n in lista {
                 let obj = element_to_js_object(n, bindings, context);
                 a.push(JsValue::from(obj), context)?;
