@@ -321,6 +321,7 @@ impl EngineServer {
                     id,
                     protocol_version: PROTOCOL_VERSION,
                     renderer_status: "ready",
+                    broker: self.broker_kind,
                 },
                 false,
             ),

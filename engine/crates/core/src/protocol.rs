@@ -136,6 +136,9 @@ pub enum EngineResponse {
         id: Option<String>,
         protocol_version: u32,
         renderer_status: &'static str,
+        /// Lo mismo que en `Ready`: permite comprobar el modo de un motor ya
+        /// arrancado (la prueba de humo del paquete lo hace).
+        broker: &'static str,
     },
     /// Con `id` es la respuesta a una peticion. Con `id: null` es una
     /// publicacion espontanea (Fase 50): un temporizador de la pestaña activa

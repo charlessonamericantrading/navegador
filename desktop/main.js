@@ -6,6 +6,7 @@ const { autoUpdater } = require('electron-updater');
 const { createCredentialStore } = require('./ai-credentials');
 const { createGeminiProvider } = require('./ai-provider');
 const { validateEngineRequest, createLineSplitter, resolveAppPath } = require('./engine-protocol');
+const { createBrokerClient, rendererEnv, usesRemoteBroker } = require('./engine-broker');
 const { pathToFileURL } = require('url');
 
 // Registrar el protocolo "app" como seguro y estándar para permitir ES Modules
@@ -36,6 +37,13 @@ app.on('second-instance', () => {
 let mainWindow = null;
 let pythonProcess = null;
 let nativeEngineProcess = null;
+// El broker (ADR 0001, etapa 2; Fase 67): el proceso que tiene la red, las
+// cookies y el perfil. El motor que interpreta las páginas solo tiene el canal
+// hacia él.
+let brokerClient = null;
+// Nombre con el que el broker conoce al único motor de hoy. Con un renderer
+// por pestaña (supervisor, Fase 58) será el id de cada pestaña.
+const ENGINE_RENDERER_ID = 'main';
 let requestCounter = 0;
 const pendingEngineRequests = new Map();
 // Topes de la frontera con el motor (plan H06). Una linea `state` lleva la
@@ -58,10 +66,12 @@ function notifyBackendStatus(status, extra = {}) {
   }
 }
 
-function getNativeEnginePath() {
+// `engine_server` o `engine_broker`: los dos binarios salen de la misma
+// compilación y viajan juntos en `resources/engine`.
+function getNativeBinaryPath(name) {
   const isWin = process.platform === 'win32';
   const isDev = !app.isPackaged;
-  const nativeEngineName = isWin ? 'engine_server.exe' : 'engine_server';
+  const nativeEngineName = isWin ? `${name}.exe` : name;
   let enginePath = isDev
     ? path.join(__dirname, '..', 'engine', 'target', 'release', nativeEngineName)
     : path.join(process.resourcesPath, 'engine', nativeEngineName);
@@ -113,6 +123,16 @@ function handleEngineLine(line) {
     return;
   }
 
+  // Fallar cerrado (principio 7 del plan): un motor que no confirma usar el
+  // broker está haciendo su propia red y abriendo el perfil. Pasa con un
+  // binario antiguo o si el entorno no le llegó. No se le deja servir nada.
+  if (parsed.type === 'ready' && !usesRemoteBroker(parsed)) {
+    console.error(`[NativeEngine]: el motor no confirma el broker (broker=${parsed.broker}); se detiene`);
+    notifyBackendStatus('failed', { message: 'El motor no usa el broker de red y almacenamiento; se ha detenido por seguridad' });
+    if (nativeEngineProcess) killProcessTree(nativeEngineProcess);
+    return;
+  }
+
   // Notificar al frontend si es un estado o handshake de inicio
   if (parsed.type === 'state' || parsed.type === 'ready') {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -129,19 +149,60 @@ function handleEngineLine(line) {
   }
 }
 
-function startNativeEngine() {
-  const enginePath = getNativeEnginePath();
-  if (!fs.existsSync(enginePath)) {
-    console.warn(`[NativeEngine]: Binario Rust no encontrado en ${enginePath}`);
-    notifyBackendStatus('failed', { message: 'Binario de motor Rust no encontrado' });
-    return;
+/**
+ * Arranca el broker y lo deja listo. Devuelve el canal y el token del motor,
+ * o `null` si no se pudo (ya notificado): sin broker no se arranca el motor.
+ */
+async function startBroker(brokerPath) {
+  brokerClient = createBrokerClient({
+    spawnBroker: () => {
+      const child = child_process.spawn(brokerPath, [], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      child.stderr.on('data', (chunk) => console.error(`[Broker-stderr]: ${chunk.toString().trim()}`));
+      return child;
+    },
+  });
+  try {
+    const { endpoint } = await brokerClient.start();
+    const token = await brokerClient.register(ENGINE_RENDERER_ID);
+    brokerClient.onExit(({ code }) => {
+      if (isQuitting) return;
+      // Sin broker el motor ya no puede cargar nada; se para en vez de dejar
+      // una interfaz que parece viva y no navega.
+      console.error(`[Broker]: terminó con código ${code}; se detiene el motor`);
+      notifyBackendStatus('failed', { message: 'El broker de red y almacenamiento se cerró' });
+      if (nativeEngineProcess) killProcessTree(nativeEngineProcess);
+    });
+    console.log(`[Broker]: escuchando en ${endpoint}`);
+    return { endpoint, token };
+  } catch (err) {
+    console.error('[Broker]: no se pudo arrancar:', err);
+    notifyBackendStatus('failed', { message: `No se pudo arrancar el broker: ${err.message}` });
+    brokerClient.stop();
+    brokerClient = null;
+    return null;
   }
+}
+
+async function startNativeEngine() {
+  const enginePath = getNativeBinaryPath('engine_server');
+  const brokerPath = getNativeBinaryPath('engine_broker');
+  for (const binary of [enginePath, brokerPath]) {
+    if (!fs.existsSync(binary)) {
+      console.warn(`[NativeEngine]: Binario Rust no encontrado en ${binary}`);
+      notifyBackendStatus('failed', { message: `Binario de motor Rust no encontrado: ${path.basename(binary)}` });
+      return;
+    }
+  }
+
+  const channel = await startBroker(brokerPath);
+  if (!channel) return;
 
   console.log(`[NativeEngine]: Iniciando motor Rust directamente desde ${enginePath}`);
 
   nativeEngineProcess = child_process.spawn(enginePath, [], {
     windowsHide: true,
-    stdio: ['pipe', 'pipe', 'pipe']
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: rendererEnv(process.env, channel.endpoint, channel.token),
   });
 
   // Un divisor nuevo por proceso: nada de un trozo a medias del motor
@@ -165,6 +226,9 @@ function startNativeEngine() {
   nativeEngineProcess.on('close', (code) => {
     console.log(`[NativeEngine]: Proceso cerrado con código ${code}`);
     nativeEngineProcess = null;
+    // Su token ya está gastado, pero el canal y los orígenes concedidos
+    // siguen a su nombre hasta que se retire.
+    brokerClient?.revoke(ENGINE_RENDERER_ID).catch(() => {});
     for (const [id, req] of pendingEngineRequests.entries()) {
       clearTimeout(req.timeout);
       req.reject(new Error('El motor Rust se cerró'));
@@ -176,7 +240,9 @@ function startNativeEngine() {
 function startPythonBackend() {
   const isWin = process.platform === 'win32';
   const isDev = !app.isPackaged;
-  const nativeEnginePath = getNativeEnginePath();
+  // Este motor lo lanza el backend Python por su cuenta, sin broker: corre en
+  // modo local, con su red y su perfil (camino opcional, fuera de la Fase 67).
+  const nativeEnginePath = getNativeBinaryPath('engine_server');
   
   // Rutas al entorno virtual según el sistema operativo (Desarrollo)
   const venvPython = isWin
@@ -389,8 +455,11 @@ app.whenReady().then(() => {
     return net.fetch(pathToFileURL(absolutePath).toString());
   });
 
-  // Arrancar el motor nativo Rust directamente (controlador prioritario y único)
-  startNativeEngine();
+  // Arrancar el broker y el motor nativo Rust (controlador prioritario y único)
+  startNativeEngine().catch((err) => {
+    console.error('[NativeEngine]: fallo al arrancar:', err);
+    notifyBackendStatus('failed', { message: err.message });
+  });
 
   // Arrancar opcionalmente el backend de Python solo si se solicita explícitamente
   if (process.env.USE_PYTHON_BACKEND === 'true') {
@@ -480,6 +549,10 @@ app.on('will-quit', () => {
     } catch (_) {}
     killProcessTree(nativeEngineProcess);
     nativeEngineProcess = null;
+  }
+  if (brokerClient) {
+    brokerClient.stop();
+    brokerClient = null;
   }
   if (pythonProcess) {
     console.log("Cerrando el árbol de procesos del backend...");

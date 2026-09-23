@@ -110,7 +110,7 @@ jobs:
           key: desktop-release
 
       - name: Compilar el motor (release)
-        run: cargo build --manifest-path engine/Cargo.toml -p engine-core --bin engine_server --release --locked
+        run: cargo build --manifest-path engine/Cargo.toml -p engine-core --bin engine_server --bin engine_broker --release --locked
 
       # Despues de compilar el motor: el experimento del ADR 0001 (supervisor
       # de renderers) corre contra `engine_server` real y se salta sin el.
@@ -123,6 +123,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path build-resources/engine | Out-Null
           Copy-Item ../engine/target/release/engine_server.exe build-resources/engine/
+          Copy-Item ../engine/target/release/engine_broker.exe build-resources/engine/
 
       # `--dir` empaqueta sin generar el instalador NSIS: comprueba que la
       # configuracion es valida y que los recursos que declara existen, sin

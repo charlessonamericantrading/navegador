@@ -9,7 +9,8 @@
 // lo haría una persona, que:
 //
 //   1. la interfaz carga por `app://` y React monta;
-//   2. el motor Rust empaquetado responde `pong`;
+//   2. el motor Rust empaquetado responde `pong`, y lo hace a través del
+//      broker (`broker: "remote"`, Fase 67), no con su propia red y perfil;
 //   3. navega de verdad a una página local y devuelve su título y su captura;
 //   4. la frontera IPC rechaza una petición fuera del esquema (Fase 54);
 //   5. los efectos de conexión no se re-ejecutan en bucle (Fase 55).
@@ -112,6 +113,7 @@ try {
   // 2. Motor empaquetado.
   const pong = await engine({ type: 'ping' });
   check('el motor empaquetado responde pong', pong?.type === 'pong', pong);
+  check('el motor usa el broker empaquetado', pong?.broker === 'remote', { broker: pong?.broker });
 
   // 3. Navegación real.
   const state = await engine({ type: 'navigate', url: pageUrl });

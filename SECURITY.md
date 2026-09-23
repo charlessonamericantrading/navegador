@@ -18,7 +18,7 @@ reproducir. Se responde primero con el alcance y después con la corrección.
 
 | Activo | Dónde vive hoy |
 |---|---|
-| Cookies y `localStorage` de todos los sitios | Proceso `engine_server`; en disco en `cookies.json` y `local_storage.json` bajo el directorio de datos del usuario |
+| Cookies y `localStorage` de todos los sitios | Proceso `engine_broker` (Fase 67), el único que abre `cookies.json` y `local_storage.json` bajo el directorio de datos del usuario |
 | Clave del proveedor de IA | Proceso principal de Electron, cifrada con `safeStorage` (Fase 53) |
 | Ficheros del usuario | Accesibles con los permisos del usuario por cualquier proceso de la aplicación |
 | Integridad de lo que ejecuta el agente | Orquestador en la interfaz y comandos al motor |
@@ -41,7 +41,9 @@ permisos que el usuario en su equipo.
 ## Fronteras y lo que las protege hoy
 
 ```text
-Página hostil ──► engine_server (Rust: parser, CSS, layout, Boa, red, disco)
+Página hostil ──► engine_server (Rust: parser, CSS, layout, Boa)
+                      │  │ canal local autenticado (token de un solo uso)
+                      │  └──► engine_broker (red, cookies, almacenamiento, perfil)
                       │ NDJSON por stdin/stdout, 1 MiB por petición
                       ▼
                Proceso principal de Electron ──► proveedor de IA (clave en cabecera)
@@ -52,7 +54,7 @@ Página hostil ──► engine_server (Rust: parser, CSS, layout, Boa, red, dis
 
 | Frontera | Protección actual | Hueco conocido |
 |---|---|---|
-| Página → motor | Rust; parsers mantenidos (html5ever, rustls); mitigaciones de proceso de Windows (sin código dinámico, sin procesos hijo, sin puntos de extensión — Fase 23); CSP, CORS, SameSite y cookies `HttpOnly` aplicadas por el motor | **Sin sandbox**: el proceso que interpreta la página tiene red, disco y las cookies de todos los sitios. **Todas las pestañas comparten proceso.** (Los fallos de memoria de `fast-float` que arrastraba Boa 0.19 se cerraron migrando a Boa 0.22, Fase 62.) |
+| Página → motor | Rust; parsers mantenidos (html5ever, rustls); mitigaciones de proceso de Windows (sin código dinámico, sin procesos hijo, sin puntos de extensión — Fase 23); CSP, CORS, SameSite y cookies `HttpOnly` aplicadas por el motor | **Sin sandbox**: el proceso que interpreta la página ya no *usa* red ni perfil propios (los pide al broker, que solo le da cookies y almacenamiento de orígenes a los que navegó — Fases 65–67), pero sigue corriendo con los permisos del usuario, así que **un motor comprometido todavía podría abrir el perfil o la red por su cuenta**. **Todas las pestañas comparten proceso.** (Los fallos de memoria de `fast-float` que arrastraba Boa 0.19 se cerraron migrando a Boa 0.22, Fase 62.) |
 | Motor → Electron | Líneas limitadas en las dos puntas, UTF-8 validado, el motor no muere con entrada malformada (Fase 54) | Sin contrapresión; un *timeout* no cancela el trabajo del motor |
 | Interfaz → Electron | `contextIsolation`, sin `nodeIntegration`; `engine:request` y `ai:*` solo atienden a la ventana propia y a un esquema cerrado; `shutdown` no se puede pedir desde la página (Fases 53 y 54) | Sin CSP propia de la aplicación; fuentes externas en el arranque |
 | `app://` | Resolución con `path.relative` sobre la URL parseada (Fase 54) | — |
@@ -65,7 +67,10 @@ Página hostil ──► engine_server (Rust: parser, CSS, layout, Boa, red, dis
 
 Un fallo explotable en el motor —el componente que procesa contenido hostil—
 da acceso a las cookies de todos los sitios, al almacenamiento local y a los
-ficheros del usuario. Es la razón de que no se recomiende iniciar sesión en
+ficheros del usuario. Que la red y el perfil estén ya en el broker (Fases
+65–67) no cambia esto todavía: el motor comprometido puede abrir el fichero de
+cookies directamente, porque corre como el usuario. Lo cambia restringir su
+token (F07), que ahora es posible precisamente porque ya no los necesita. Es la razón de que no se recomiende iniciar sesión en
 cuentas reales mientras se navega por sitios no confiables.
 
 El plan para cerrarlo está en

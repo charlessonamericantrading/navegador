@@ -1,6 +1,6 @@
 # ADR 0001 — Broker y aislamiento de renderers
 
-- **Estado:** aceptada la etapa 1; etapas 2 y 3 propuestas.
+- **Estado:** aceptada la etapa 1; etapa 2 en curso (broker en producto, falta la sandbox); etapa 3 propuesta.
 - **Fecha:** 23-09-2026.
 - **Plan:** F06, F07, F09; hallazgos H01 y H23; tarea 13 del backlog.
 - **Modelo de amenazas:** [`SECURITY.md`](../../SECURITY.md).
@@ -92,8 +92,13 @@ Separar en tres etapas, cada una utilizable y reversible por sí sola.
   todavía puede navegar a cualquier sitio para obtener su origen (lo cierra la
   etapa 3). Los subrecursos no-cors siguen llegando con cookies (hace falta
   ORB).
-- **Siguiente:** que el supervisor de Electron arranque el broker, registre
-  cada renderer y lo incluya en el paquete.
+- **Hecho — en el producto (Fase 67):** Electron arranca `engine_broker`,
+  registra el motor y lo lanza con el canal y el token. Falla cerrado si falta
+  el broker, si no saluda o si el motor no confirma `broker: "remote"`. Va en el
+  paquete, y la prueba de humo del paquete real lo comprueba.
+- **Siguiente:** restringir el token del renderer (F07), que ya no necesita
+  red ni disco propios. Después, conectar el supervisor de un renderer por
+  pestaña, registrando cada uno en el broker.
 - **Después:** con el renderer sin red ni disco propios, restringir su token.
 
 ### Etapa 3 — Aislamiento por sitio

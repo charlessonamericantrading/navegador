@@ -40,7 +40,8 @@ fn dos_motores_comparten_el_estado_del_broker_y_ninguno_toca_el_disco() {
     let mut a = Motor::arrancar_con_broker(&broker.endpoint, &token_a);
     let mut b = Motor::arrancar_con_broker(&broker.endpoint, &token_b);
     // `arrancar` ya exige el `ready`; aquí, además, que sea con broker remoto.
-    assert_eq!(a.pedir(json!({ "id": "p", "type": "ping" }))["type"], "pong");
+    let pong = a.pedir(json!({ "id": "p", "type": "ping" }));
+    assert_eq!((pong["type"].as_str(), pong["broker"].as_str()), (Some("pong"), Some("remote")), "{pong}");
 
     let escrito = navegar(&mut a, "1", &servidor.url("/escribe"));
     assert_eq!(escrito["type"], "state", "{escrito}");

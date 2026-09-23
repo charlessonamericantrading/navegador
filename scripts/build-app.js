@@ -146,7 +146,7 @@ async function main() {
   // `--locked`: el binario que se distribuye se compila con las versiones
   // exactas de `Cargo.lock`, las mismas que auditó `cargo audit`.
   console.log(`\n[Paso 2/${steps}] Compilando motor nativo Rust...`);
-  runCmd('cargo build --manifest-path engine/Cargo.toml -p engine-core --bin engine_server --release --locked', rootDir);
+  runCmd('cargo build --manifest-path engine/Cargo.toml -p engine-core --bin engine_server --bin engine_broker --release --locked', rootDir);
 
   console.log(`\n[Paso 3/${steps}] Preparando carpeta de recursos de compilación...`);
   if (fs.existsSync(buildResourcesDir)) {
@@ -154,14 +154,17 @@ async function main() {
   }
   fs.mkdirSync(buildResourcesDir, { recursive: true });
 
-  const nativeEngineName = isWin ? 'engine_server.exe' : 'engine_server';
-  const nativeEngineSrc = path.join(rootDir, 'engine', 'target', 'release', nativeEngineName);
-  if (!fs.existsSync(nativeEngineSrc)) {
-    throw new Error(`No se encontró el binario Rust en: ${nativeEngineSrc}`);
-  }
+  // El motor y el broker (Fase 67) viajan juntos: el motor no arranca sin él.
   const nativeEngineDestDir = path.join(buildResourcesDir, 'engine');
   fs.mkdirSync(nativeEngineDestDir, { recursive: true });
-  fs.copyFileSync(nativeEngineSrc, path.join(nativeEngineDestDir, nativeEngineName));
+  for (const binary of ['engine_server', 'engine_broker']) {
+    const nativeEngineName = isWin ? `${binary}.exe` : binary;
+    const nativeEngineSrc = path.join(rootDir, 'engine', 'target', 'release', nativeEngineName);
+    if (!fs.existsSync(nativeEngineSrc)) {
+      throw new Error(`No se encontró el binario Rust en: ${nativeEngineSrc}`);
+    }
+    fs.copyFileSync(nativeEngineSrc, path.join(nativeEngineDestDir, nativeEngineName));
+  }
 
   // Solo el DELTA respecto a `desktop/package.json`: electron-builder lee
   // igualmente el campo `build` y le fusiona este objeto, y las listas las

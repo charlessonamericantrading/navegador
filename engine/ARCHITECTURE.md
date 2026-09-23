@@ -5439,3 +5439,63 @@ olvida.
 - Los tests de integración de la Fase 65 siguen pasando sin cambios: en ellos
   cada motor navega de verdad a su página.
 - 931 tests, clippy limpio.
+
+### Fase 67: Electron arranca el broker; el producto lo usa (2026-09-23)
+
+Hasta aquí el broker existía y estaba probado, pero la aplicación seguía
+arrancando un `engine_server` con su propia red. Ahora el proceso principal de
+Electron:
+
+1. Arranca `engine_broker` y espera su `ready` con el canal.
+2. Registra al motor (`main`) y recibe su token.
+3. Lanza `engine_server` con `NAVEGADOR_IA_BROKER` y `NAVEGADOR_IA_BROKER_TOKEN`.
+
+El cliente del canal de control vive en `desktop/engine-broker.js`, con la
+misma forma que el supervisor (recibe la función que lanza el proceso, así que
+se prueba con un broker falso).
+
+**Fallar cerrado en cada punto:**
+
+- Falta el binario del broker: no se arranca el motor.
+- El broker no saluda o no registra: no se arranca el motor.
+- El motor saluda sin `broker: "remote"` (un binario antiguo, o un entorno que
+  no llegó): se mata el motor y se avisa.
+- El broker muere después: se para el motor, en vez de dejar una interfaz que
+  parece viva y no carga nada.
+- Al cerrarse el motor se retira su nombre en el broker. Al salir de la
+  aplicación, se cierran los dos.
+
+El `pong` lleva ahora también `broker`, que es lo que permite comprobar el modo
+de un motor ya en marcha.
+
+**Empaquetado:** `build:engine`, `build-app.js` y el CI compilan y copian los
+dos binarios. `resources/engine` lleva `engine_server` y `engine_broker`.
+
+#### Verificación
+
+- `desktop/tests/engine-broker.test.js`, 6 tests:
+  - Arranque, registro y retirada.
+  - Un broker mudo, que se rechaza a tiempo y no queda vivo.
+  - Un broker que muere tras saludar, que avisa y rechaza lo pendiente.
+  - Errores del broker, que llegan con su motivo.
+  - Solo `broker: "remote"` cuenta como remoto.
+  - Con los binarios reales: el motor saluda en remoto, `localStorage` funciona
+    a través del broker, el motor no crea perfil y, al retirarlo, deja de poder
+    navegar.
+- Prueba de humo de la aplicación empaquetada: **7/7**, con la comprobación
+  nueva «el motor usa el broker empaquetado» (`pong.broker == "remote"`).
+- Mutación: sin `engine_broker.exe` en el paquete, la prueba de humo cae a 1/7
+  (solo carga la interfaz). El motor no arranca y no hay red propia de reserva.
+- 38 tests del proceso principal; tests de Rust y clippy en verde.
+
+#### Lo que sigue abierto
+
+- **No hay sandbox todavía.** El motor corre como el usuario y podría abrir el
+  perfil por su cuenta si lo comprometen (ver `SECURITY.md`). Restringir su
+  token es el paso siguiente (F07), y ya es posible porque el motor no
+  necesita ni red ni disco.
+- El backend Python opcional (`USE_PYTHON_BACKEND`) lanza su propio motor sin
+  broker, en modo local.
+- Un solo motor para todas las pestañas: el supervisor de la Fase 58 (un
+  renderer por pestaña) sigue sin conectar a la interfaz. El broker ya está
+  preparado para ello: cada renderer tiene su nombre y su token.

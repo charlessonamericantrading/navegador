@@ -199,7 +199,10 @@ navegador-ia/
 ```
 
 El motor corre como un proceso aparte (`engine_server`) que habla **NDJSON
-por stdin/stdout**. Electron se comunica con él directamente por IPC.
+por stdin/stdout**. Electron se comunica con él directamente por IPC. La red,
+las cookies y el almacenamiento los tiene otro proceso, `engine_broker`, que
+Electron arranca primero; el motor se los pide por un canal local (ADR 0001,
+etapa 2). Sin broker, la aplicación no arranca el motor.
 
 > **Nota sobre el backend:** Electron se comunica directamente con el
 > motor nativo de Rust (`engine_server`) vía IPC/NDJSON sin dependencias
@@ -238,7 +241,8 @@ En Windows, `instalar.bat` hace estos pasos y comprueba los requisitos.
 ```bash
 cd engine
 cargo test --workspace          # los 874 tests
-cargo run -p engine-core --bin engine_server   # servidor NDJSON por stdin/stdout
+cargo run -p engine-core --bin engine_server   # servidor NDJSON por stdin/stdout (red propia)
+cargo run -p engine-core --bin engine_broker   # broker: anuncia su canal y reparte tokens
 ```
 
 ### Instalador

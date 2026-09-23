@@ -14,7 +14,7 @@
     "dev:desktop": "cd desktop && npm start",
     "start": "npx concurrently -k -n \"frontend,desktop\" -c \"blue,magenta\" \"npm run dev:frontend\" \"npm run dev:desktop\"",
     "dev": "npx concurrently -k -n \"frontend,backend\" -c \"blue,green\" \"npm run dev:frontend\" \"npm run dev:backend\"",
-    "build:engine": "cargo build --manifest-path engine/Cargo.toml -p engine-core --bin engine_server --release --locked",
+    "build:engine": "cargo build --manifest-path engine/Cargo.toml -p engine-core --bin engine_server --bin engine_broker --release --locked",
     "build:app": "node scripts/build-app.js",
     "build:app:python": "node scripts/build-app.js --with-python-backend",
     "bench": "node scripts/bench/run-corpus.mjs"
