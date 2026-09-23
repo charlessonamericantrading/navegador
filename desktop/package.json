@@ -31,13 +31,6 @@
     ],
     "extraResources": [
       {
-        "from": "build-resources/backend-server",
-        "to": "backend-server",
-        "filter": [
-          "**/*"
-        ]
-      },
-      {
         "from": "../frontend/dist",
         "to": "frontend/dist",
         "filter": [

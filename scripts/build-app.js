@@ -1,3 +1,17 @@
+// Compila y empaqueta la aplicación de escritorio.
+//
+//   npm run build:app                  -> interfaz + motor Rust + Electron
+//   npm run build:app -- --with-python-backend
+//                                      -> además, el backend FastAPI opcional
+//   npm run build:app -- --publish always
+//                                      -> además, sube el release (ver
+//                                         desktop/DISTRIBUCION.md)
+//
+// El backend Python ya no es obligatorio (plan F01, hallazgo H18): Electron
+// solo lo arranca con USE_PYTHON_BACKEND=true, así que exigir PyInstaller y un
+// `.venv` para construir el navegador normal no tenía sentido. Cuando se pide,
+// el backend se añade a `extraResources` desde aquí, con la API de
+// `electron-builder`, en vez de figurar siempre en `desktop/package.json`.
 const { execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -9,6 +23,15 @@ const desktopDir = path.join(rootDir, 'desktop');
 const buildResourcesDir = path.join(desktopDir, 'build-resources');
 
 const isWin = process.platform === 'win32';
+const withPythonBackend = process.argv.includes('--with-python-backend');
+// Publicar es un paso aparte y explicito (`--publish always`, ver
+// desktop/DISTRIBUCION.md): por defecto se construye sin subir nada.
+const publishIndex = process.argv.indexOf('--publish');
+const publish = publishIndex === -1 ? 'never' : process.argv[publishIndex + 1];
+if (!['never', 'always', 'onTag', 'onTagOrDraft'].includes(publish)) {
+  console.error(`--publish no valido: ${publish}`);
+  process.exit(2);
+}
 
 function runCmd(cmd, cwd) {
   console.log(`\n>>> Ejecutando: ${cmd} (en ${cwd})`);
@@ -76,30 +99,13 @@ function prepareWinCodeSignCache() {
   console.log('[ADVERTENCIA] No se pudo pre-configurar la cache de winCodeSign. El build podría fallar si no se ejecuta como Administrador.');
 }
 
-try {
-  console.log('===================================================');
-  console.log('  PROCESO DE COMPILACIÓN Y EMPAQUETADO COMPLETO    ');
-  console.log('===================================================');
-
-  // Preparar caché para evitar problemas de symlinks en Windows
-  prepareWinCodeSignCache();
-
-  // 1. Compilar Frontend
-  console.log('\n[Paso 1/4] Compilando Frontend (Vite + React)...');
-  runCmd('npm run build', frontendDir);
-
-  // 2. Compilar el motor Rust nativo
-  console.log('\n[Paso 2/4] Compilando motor nativo Rust...');
-  runCmd('cargo build --manifest-path engine/Cargo.toml -p engine-core --bin engine_server --release', rootDir);
-
-  // 3. Compilar Backend a binario con PyInstaller
-  console.log('\n[Paso 3/4] Compilando Backend (PyInstaller)...');
+function buildPythonBackend() {
   const pythonPath = isWin
     ? path.join(backendDir, '.venv', 'Scripts', 'python.exe')
     : path.join(backendDir, '.venv', 'bin', 'python');
 
   if (!fs.existsSync(pythonPath)) {
-    throw new Error(`No se encontró el Python del entorno virtual en: ${pythonPath}. Por favor ejecuta la instalación primero.`);
+    throw new Error(`--with-python-backend necesita el entorno virtual en ${pythonPath}. Ejecuta antes \`npm run install:backend\`.`);
   }
 
   // Invocamos PyInstaller como módulo de Python (`python -m PyInstaller`) en vez del
@@ -108,50 +114,89 @@ try {
   const pyinstallerCmd = `"${pythonPath}" -m PyInstaller --onedir --noconfirm --clean --name backend-server --distpath dist --workpath build --paths . --collect-all uvicorn --collect-all fastapi --collect-all websockets --collect-all google --collect-all pydantic app/core/main.py`;
   runCmd(pyinstallerCmd, backendDir);
 
-  // 4. Limpiar y recrear directorio de recursos temporales de Electron
-  console.log('\n[Paso 4/4] Preparando carpeta de recursos de compilación...');
+  const src = path.join(backendDir, 'dist', 'backend-server');
+  const dest = path.join(buildResourcesDir, 'backend-server');
+  console.log(`Copiando servidor compilado desde ${src} a ${dest}...`);
+  fs.cpSync(src, dest, { recursive: true });
+}
+
+/** Instaladores del build actual, por la versión del manifiesto. */
+function findInstallers(version) {
+  const distDir = path.join(desktopDir, 'dist');
+  if (!fs.existsSync(distDir)) return [];
+  return fs.readdirSync(distDir)
+    .filter((f) => f.includes(version) && /\.(exe|dmg|deb|AppImage|rpm)$/.test(f))
+    .map((f) => path.join(distDir, f));
+}
+
+async function main() {
+  const desktopPkg = JSON.parse(fs.readFileSync(path.join(desktopDir, 'package.json'), 'utf8'));
+  const steps = withPythonBackend ? 5 : 4;
+
+  console.log('===================================================');
+  console.log('  PROCESO DE COMPILACIÓN Y EMPAQUETADO COMPLETO    ');
+  console.log(`  Versión ${desktopPkg.version}${withPythonBackend ? ' (con backend Python)' : ''}`);
+  console.log('===================================================');
+
+  prepareWinCodeSignCache();
+
+  console.log(`\n[Paso 1/${steps}] Compilando Frontend (Vite + React)...`);
+  runCmd('npm run build', frontendDir);
+
+  // `--locked`: el binario que se distribuye se compila con las versiones
+  // exactas de `Cargo.lock`, las mismas que auditó `cargo audit`.
+  console.log(`\n[Paso 2/${steps}] Compilando motor nativo Rust...`);
+  runCmd('cargo build --manifest-path engine/Cargo.toml -p engine-core --bin engine_server --release --locked', rootDir);
+
+  console.log(`\n[Paso 3/${steps}] Preparando carpeta de recursos de compilación...`);
   if (fs.existsSync(buildResourcesDir)) {
-    console.log('Limpiando recursos antiguos...');
     fs.rmSync(buildResourcesDir, { recursive: true, force: true });
   }
   fs.mkdirSync(buildResourcesDir, { recursive: true });
 
-  // Copiar el backend compilado
-  const compiledBackendSrc = path.join(backendDir, 'dist', 'backend-server');
-  const compiledBackendDest = path.join(buildResourcesDir, 'backend-server');
-  console.log(`Copiando servidor compilado desde ${compiledBackendSrc} a ${compiledBackendDest}...`);
-  fs.cpSync(compiledBackendSrc, compiledBackendDest, { recursive: true });
-
-  // Copiar el proceso Rust que usa el backend como renderer nativo.
   const nativeEngineName = isWin ? 'engine_server.exe' : 'engine_server';
   const nativeEngineSrc = path.join(rootDir, 'engine', 'target', 'release', nativeEngineName);
-  const nativeEngineDestDir = path.join(buildResourcesDir, 'engine');
   if (!fs.existsSync(nativeEngineSrc)) {
     throw new Error(`No se encontró el binario Rust en: ${nativeEngineSrc}`);
   }
+  const nativeEngineDestDir = path.join(buildResourcesDir, 'engine');
   fs.mkdirSync(nativeEngineDestDir, { recursive: true });
   fs.copyFileSync(nativeEngineSrc, path.join(nativeEngineDestDir, nativeEngineName));
 
-  // 4. Empaquetar con electron-builder
-  console.log('\n[Final] Empaquetando instalador con electron-builder...');
-  runCmd('npx electron-builder', desktopDir);
+  // Solo el DELTA respecto a `desktop/package.json`: electron-builder lee
+  // igualmente el campo `build` y le fusiona este objeto, y las listas las
+  // CONCATENA. Pasar la configuracion entera duplicaba `files` y
+  // `extraResources`, y las dos copias simultaneas del motor chocaban (EBUSY).
+  const configDelta = {};
+  if (withPythonBackend) {
+    console.log(`\n[Paso 4/${steps}] Compilando Backend opcional (PyInstaller)...`);
+    buildPythonBackend();
+    configDelta.extraResources = [{ from: 'build-resources/backend-server', to: 'backend-server', filter: ['**/*'] }];
+  }
 
-  // Copiar el instalador generado a la raíz del proyecto para mayor accesibilidad
-  const installerName = isWin ? 'Navegador IA Setup 1.0.0.exe' : (process.platform === 'darwin' ? 'Navegador IA-1.0.0.dmg' : 'navegador-ia-desktop_1.0.0_amd64.deb');
-  const compiledInstallerPath = path.join(desktopDir, 'dist', installerName);
-  const destInstallerPath = path.join(rootDir, isWin ? 'Navegador IA Setup.exe' : installerName);
+  console.log(`\n[Paso ${steps}/${steps}] Empaquetando instalador con electron-builder...`);
+  const builder = require(path.join(desktopDir, 'node_modules', 'electron-builder'));
+  await builder.build({ projectDir: desktopDir, config: configDelta, publish });
 
-  if (fs.existsSync(compiledInstallerPath)) {
-    console.log(`\nCopiando el instalador generado a la raíz del proyecto...`);
-    fs.copyFileSync(compiledInstallerPath, destInstallerPath);
-    console.log(`¡Instalador disponible en la raíz!: ${destInstallerPath}`);
+  // Copia de cortesía en la raíz, con el nombre real que generó el build (antes
+  // se buscaba un nombre con `1.0.0` fijo, que dejaba de coincidir al subir la
+  // versión).
+  const installers = findInstallers(desktopPkg.version);
+  for (const installer of installers) {
+    const dest = path.join(rootDir, path.basename(installer));
+    fs.copyFileSync(installer, dest);
+    console.log(`Instalador disponible en: ${dest}`);
+  }
+  if (installers.length === 0) {
+    console.log('[ADVERTENCIA] No se encontró ningún instalador con la versión del manifiesto en desktop/dist.');
   }
 
   console.log('\n===================================================');
   console.log('  ¡EMPAQUETADO FINALIZADO CON ÉXITO!               ');
-  console.log('  El instalador gráfico está listo en la raíz de la carpeta del proyecto. ');
   console.log('===================================================');
-} catch (error) {
+}
+
+main().catch((error) => {
   console.error('\n[ERROR CRÍTICO] Falló el proceso de compilación:', error.message);
   process.exit(1);
-}
+});

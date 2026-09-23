@@ -5009,3 +5009,43 @@ DevTools:
 - un clic en un campo de la captura abre la ventana emergente con su
   `placeholder`, centrada sobre el campo.
 
+### Fase 56: construir el navegador ya no exige Python (2026-09-23)
+
+No toca el motor. Undecima tarea del backlog (`plan.md`, F01, hallazgo H18).
+Electron solo arranca el backend FastAPI con `USE_PYTHON_BACKEND=true`, pero
+`npm run build:app` exigia un `.venv` y PyInstaller, e `instalar.bat` y
+`instalar.sh` se negaban a seguir sin Python.
+
+#### Lo que cambia
+
+- `npm run build:app` compila interfaz, motor (`--locked`) y Electron. El
+  backend solo entra con `--with-python-backend` (`npm run build:app:python`),
+  que lo anade a `extraResources` desde el script; ya no figura fijo en
+  `desktop/package.json` y el CI deja de crear su carpeta vacia.
+- `npm run install:all` instala interfaz y Electron **y compila el motor**
+  (`build:engine`). Antes no lo compilaba y `npm run start` abria una ventana
+  sin navegador. Los instaladores `.bat`/`.sh` exigen Rust en vez de Python.
+- El nombre del instalador sale de la version del manifiesto; antes se buscaba
+  `Setup 1.0.0.exe` fijo.
+- `--publish <modo>` explicito para subir un release; por defecto nunca.
+
+#### El fallo que aparecio por el camino
+
+La primera version pasaba a la API de `electron-builder` la configuracion
+entera de `package.json` con el backend anadido. El build fallaba siempre con
+`EBUSY` al copiar el motor. Causa, leida en `app-builder-lib`: aunque se le
+pase `config`, lee igualmente el campo `build` y le fusiona el objeto con
+`deepAssign`, que **concatena** las listas. `files` y `extraResources` iban
+duplicados y las dos copias simultaneas del mismo `.exe` chocaban. Ahora se
+pasa solo el delta (la entrada del backend).
+
+#### Verificacion
+
+- `npm run build:app` de principio a fin, sin paso de Python: instalador de
+  123 MB (143 con el backend) y sin `backend-server` en los recursos.
+- La aplicacion resultante, manejada por DevTools: arranca, sin bucle de
+  reconexion, la barra de direcciones sigue a la navegacion y la ventana
+  emergente de texto funciona.
+- El camino con backend se comprobo solo en su mecanismo (un `backend-server`
+  falso entra en los recursos sin duplicar nada); no se ejecuto PyInstaller.
+

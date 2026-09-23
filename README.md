@@ -215,15 +215,23 @@ proyecto; si algo de este README lo contradice, gana `ARCHITECTURE.md`.
 ## Compilar y ejecutar
 
 ### Requisitos
-* **Rust** 1.75+ (`cargo`)
-* **Node.js** 18+ y `npm`
+* **Rust** (`cargo`). Probado con 1.98; la versión mínima aún no está verificada.
+* **Node.js** 22.12+ y `npm` (Electron 44 lo exige). Probado con Node 24.
+* **Python no hace falta.** Solo lo usa el backend FastAPI opcional
+  (`npm run install:backend`).
 
 ### Desarrollo
 
 ```bash
 npm install
+npm run install:all    # interfaz, Electron y compilación del motor (release)
 npm run start          # frontend (Vite) + aplicación Electron
 ```
+
+`install:all` compila el motor porque la aplicación lo busca en
+`engine/target/release` (o `debug`) al arrancar: sin él, la ventana abre pero
+no hay navegador. Para recompilarlo tras un cambio: `npm run build:engine`.
+En Windows, `instalar.bat` hace estos pasos y comprueba los requisitos.
 
 ### Solo el motor
 
@@ -236,10 +244,12 @@ cargo run -p engine-core --bin engine_server   # servidor NDJSON por stdin/stdou
 ### Instalador
 
 ```bash
-npm run build:app
+npm run build:app          # interfaz + motor + Electron
+npm run build:app:python   # además, el backend FastAPI opcional (necesita su .venv)
 ```
 
-Genera `Navegador IA Setup.exe` en la raíz. **Sin firmar**: Windows
+Genera `Navegador IA Setup <versión>.exe` en la raíz (y en `desktop/dist`).
+**Sin firmar**: Windows
 SmartScreen mostrará un aviso a quien lo descargue. Ver
 `desktop/DISTRIBUCION.md` para las opciones de firma de código.
 

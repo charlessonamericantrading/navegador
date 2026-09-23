@@ -141,7 +141,7 @@ Los estados distinguen **reproducido**, **confirmado en código** y **pendiente 
 | H15 | `sendCommand` muestra errores y no los propaga; el agente puede continuar tras un comando fallido | **Resuelto** (Fase 52); falta E2E con Electron | P1 | F05, F30, F34 |
 | H16 | «Detener» cambia una bandera, pero no aborta la petición del modelo ni impide una acción decidida por el paso en curso | **Resuelto** (Fase 51), con test de respuesta tardía | P0 | F05 |
 | H17 | Escritura del agente usa `press_enter: true` desde `App.tsx` y puede enviar el formulario al rellenarlo | **Resuelto** (Fase 51): enviar es un paso explícito | P0 | F05, F15 |
-| H18 | Python es opcional al arrancar Electron, pero `build-app.js` exige compilarlo con PyInstaller | Confirmado | P1 | F01 |
+| H18 | Python es opcional al arrancar Electron, pero `build-app.js` exige compilarlo con PyInstaller | **Resuelto** (Fase 56) | P1 | F01 |
 | H19 | CI de escritorio empaqueta con directorios de motor/backend vacíos | Confirmado | P1 | F01, F38 |
 | H20 | 20 hallazgos de lint, entre ellos refs durante render, dependencias de hooks y uso de `any` | **Resuelto** (Fase 55): lint estricto en cero | P1 | F01, F30 |
 | H21 | `app://` usa comparación textual `absolutePath.startsWith(baseDir)` | **Resuelto** (Fase 54): `path.relative` sobre la URL parseada | P0 | F04 |
@@ -281,8 +281,8 @@ Cada fase contiene objetivo, dependencias, archivos o componentes, tareas y una 
 - [ ] Definir una ruta de instalación desde checkout limpio: dependencias, build del motor, frontend y arranque; el README actual omite pasos necesarios.
 - [ ] Fijar toolchains compatibles y probar la versión mínima realmente soportada. Añadir `rust-version` y archivo de toolchain cuando estén verificados.
 - [ ] Usar lockfiles y `npm ci` en validación; `--locked` también en la construcción de distribución.
-- [ ] Hacer que el build del navegador normal no requiera Python. Documentar la ruta opcional web/FastAPI y evitar eliminarla antes de migrar sus usuarios o pruebas.
-- [ ] Sustituir nombres de instaladores que contienen `1.0.0` fijo por valores derivados del manifiesto; alinear versiones y canal preestable.
+- [x] Hacer que el build del navegador normal no requiera Python. Documentar la ruta opcional web/FastAPI y evitar eliminarla antes de migrar sus usuarios o pruebas. *(23-09-2026, Fase 56: `--with-python-backend` opcional; la ruta FastAPI se conserva.)*
+- [ ] Sustituir nombres de instaladores que contienen `1.0.0` fijo por valores derivados del manifiesto; alinear versiones y canal preestable. *(Fase 56: el nombre ya sale del manifiesto; falta alinear versiones y canal.)*
 - [x] Resolver los 20 hallazgos de lint por grupos: tipado del protocolo, hooks/refs, efectos y organización de componentes. *(23-09-2026, Fases 51-55; comportamiento comprobado en la app empaquetada.)*
 - [x] Mantener el límite de deuda decreciente durante la limpieza; después exigir cero errores y advertencias acordadas. *(Trinquete 20 → 18 → 14 → 0.)*
 - [ ] Probar artefactos completos: el empaquetado con recursos vacíos no será la puerta de lanzamiento.
@@ -1152,7 +1152,7 @@ Este es el siguiente tramo de trabajo recomendado. El documento no implica que e
 | 8 | Auditar y migrar dependencias — **npm a 0 y rustls corregido**; queda Boa 0.19 → 0.22 | Tres árboles npm, Rust y Python opcional | Informe de alcance y PRs de actualización con regresiones |
 | 9 | ~~Endurecer IPC/protocolo~~ **hecho** (Fase 54) | `main.js`, `preload.js`, `protocol.rs` | Payload/emisor inválidos rechazados y límites probados |
 | 10 | ~~Resolver lint por grupos~~ **hecho** (Fase 55) | Frontend | 18 errores/2 advertencias → cero con pruebas de interacción |
-| 11 | Desacoplar Python del build principal | `build-app.js`, manifiestos, scripts | Build nativo completo sin `.venv` |
+| 11 | ~~Desacoplar Python del build principal~~ **hecho** (Fase 56) | `build-app.js`, manifiestos, scripts | Build nativo completo sin `.venv` |
 | 12 | Probar paquete con motor real | `.github/workflows/app.yml` | Artefacto instalado responde ping y renderiza fixture |
 | 13 | Diseñar broker y modelo de amenazas | ADR, `SECURITY.md`, prototipo | Dos renderers independientes y caída contenida |
 | 14 | Preparar corpus/frameworks y benchmark base | Fixtures nuevos, scripts de medición | Resultados con denominadores y fallos preservados |

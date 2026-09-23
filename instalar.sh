@@ -11,11 +11,14 @@ if ! command -v node &> /dev/null; then
     exit 1
 fi
 
-# Verificar si Python 3 está instalado
-if ! command -v python3 &> /dev/null && ! command -v python &> /dev/null; then
-    echo "[ERROR] Python no está instalado. Por favor instálalo desde https://www.python.org/"
+# Verificar si Rust (cargo) está instalado: el motor del navegador se compila aquí.
+if ! command -v cargo &> /dev/null; then
+    echo "[ERROR] Rust no está instalado. Instálalo desde https://rustup.rs/"
     exit 1
 fi
+
+# Python ya no es necesario: solo lo usa el backend FastAPI opcional
+# (npm run install:backend).
 
 echo "[1/3] Instalando dependencias de Node en la raíz..."
 npm install
@@ -24,8 +27,8 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-echo "[2/3] Ejecutando instalación completa (Frontend, Backend y Electron)..."
-echo "Esto puede tomar unos minutos..."
+echo "[2/3] Instalando la interfaz y Electron y compilando el motor Rust..."
+echo "Esto puede tomar varios minutos la primera vez..."
 npm run install:all
 if [ $? -ne 0 ]; then
     echo "[ERROR] Falló la instalación de dependencias secundarias."

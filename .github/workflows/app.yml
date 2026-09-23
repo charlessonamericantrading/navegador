@@ -115,7 +115,6 @@ jobs:
         working-directory: desktop
         run: |
           New-Item -ItemType Directory -Force -Path build-resources/engine | Out-Null
-          New-Item -ItemType Directory -Force -Path build-resources/backend-server | Out-Null
 
       # `--dir` empaqueta sin generar el instalador NSIS: comprueba que la
       # configuracion es valida y que los recursos que declara existen, sin

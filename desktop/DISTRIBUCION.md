@@ -49,8 +49,8 @@ Para que funcione de verdad, antes de tu primer lanzamiento público:
    siquiera un repositorio git).
 3. En `desktop/package.json`, dentro de `build.publish`, sustituye
    `"TU-USUARIO-DE-GITHUB"` y `"TU-REPOSITORIO"` por los valores reales.
-4. Al ejecutar `npm run build:app` / `electron-builder`, añade `--publish always`
-   (o define `GH_TOKEN` con un token de GitHub con permiso `repo`) para que
+4. Al ejecutar `npm run build:app -- --publish always` (o `electron-builder --publish always`),
+   con `GH_TOKEN` definido (un token de GitHub con permiso `repo`), para que
    suba automáticamente el instalador y el archivo `latest.yml` que
    `electron-updater` necesita para detectar versiones nuevas.
 
