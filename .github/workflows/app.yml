@@ -68,7 +68,8 @@ jobs:
 
   desktop:
     runs-on: windows-latest
-    timeout-minutes: 30
+    # 60: compila el motor en release, que en frio tarda.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -99,22 +100,28 @@ jobs:
         working-directory: desktop
         run: npm test
 
-      # El motor compilado y el backend viven en `desktop/build-resources/`,
-      # que esta en .gitignore porque son binarios de 50 MB. En CI no existen,
-      # y `electron-builder` aborta si un `extraResources` apunta a un
-      # directorio que no esta.
-      #
-      # Se crean vacios en vez de desactivar `extraResources` por linea de
-      # comandos. La primera version usaba `-c.extraResources=null` y fallaba
-      # solo en CI: el paso corre bajo PowerShell, que parte ese argumento en
-      # `-c` mas una ruta, y `electron-builder` intentaba abrir un fichero de
-      # configuracion llamado `.extraResources=null`. Ademas, con los
-      # directorios presentes se valida la configuracion REAL, que es lo que
-      # este job existe para comprobar.
-      - name: Preparar recursos vacios
+      # El paquete se construye con el motor REAL (plan H19). Antes se creaba
+      # la carpeta `build-resources/engine` vacia para que `electron-builder`
+      # no abortara: el paquete salia bien y no funcionaba, y nadie lo sabia.
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache de compilacion
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+          # Clave aparte del job del motor: aqui solo se compila el binario
+          # en release, y compartir cache mezclaria perfiles.
+          key: desktop-release
+
+      - name: Compilar el motor (release)
+        run: cargo build --manifest-path engine/Cargo.toml -p engine-core --bin engine_server --release --locked
+
+      - name: Copiar el motor a los recursos del paquete
         working-directory: desktop
         run: |
           New-Item -ItemType Directory -Force -Path build-resources/engine | Out-Null
+          Copy-Item ../engine/target/release/engine_server.exe build-resources/engine/
 
       # `--dir` empaqueta sin generar el instalador NSIS: comprueba que la
       # configuracion es valida y que los recursos que declara existen, sin
@@ -122,3 +129,12 @@ jobs:
       - name: Empaquetar (sin instalador)
         working-directory: desktop
         run: npx electron-builder --dir
+
+      # Arranca la aplicacion empaquetada y la comprueba desde fuera por el
+      # protocolo de DevTools: interfaz por app://, pong del motor, navegacion
+      # real con titulo y captura, rechazo en la frontera IPC y ausencia de
+      # bucles de reconexion. Ver `desktop/scripts/smoke-packaged.mjs`.
+      - name: Prueba de humo del paquete
+        working-directory: desktop
+        run: npm run smoke
+

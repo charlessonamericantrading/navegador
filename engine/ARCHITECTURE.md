@@ -5049,3 +5049,38 @@ pasa solo el delta (la entrada del backend).
 - El camino con backend se comprobo solo en su mecanismo (un `backend-server`
   falso entra en los recursos sin duplicar nada); no se ejecuto PyInstaller.
 
+### Fase 57: el CI prueba el paquete que se distribuye, con el motor dentro (2026-09-23)
+
+Duodecima tarea del backlog (`plan.md`, hallazgo H19). El job `desktop` del CI
+empaquetaba con `build-resources/engine` vacia para que `electron-builder` no
+abortara: el paquete se generaba, la puerta se ponia en verde y la aplicacion
+no tenia navegador. Nadie lo comprobaba.
+
+#### La prueba de humo
+
+`desktop/scripts/smoke-packaged.mjs` (`npm run smoke`) arranca el ejecutable
+empaquetado con el protocolo de DevTools en un puerto local y lo comprueba
+desde fuera: la interfaz carga por `app://` y React monta; el motor responde
+`pong`; navega a una pagina local servida por el propio script y devuelve su
+titulo y una captura PNG; la IPC rechaza `shutdown` y el motor sigue vivo; y
+en dos segundos el contador de peticiones solo avanza por las de la prueba (sin
+bucles de reconexion). Sale con 1 en cuanto algo falla, con un vigilante de
+120 s, y cierra el arbol de procesos pase lo que pase.
+
+Es la version versionada de las comprobaciones que las Fases 53 a 56 hicieron
+a mano con scripts temporales.
+
+#### Se vio fallar antes de darla por buena
+
+Empaquetando con la carpeta del motor vacia, exactamente como hacia el CI, la
+prueba da 1/6 y sale con 1: la interfaz carga, pero el motor «no esta
+disponible». Con el motor real, 6/6.
+
+#### El CI
+
+El job `desktop` instala Rust, compila `engine_server` en release con
+`--locked` (cache propia), lo copia a los recursos, empaqueta con `--dir` y
+ejecuta `npm run smoke`. El plazo del job sube a 60 minutos por la compilacion
+en frio. **Sin verificar en GitHub**: los cambios de CI no se han subido; la
+secuencia se reprodujo en local (Windows) con el mismo resultado, 6/6.
+

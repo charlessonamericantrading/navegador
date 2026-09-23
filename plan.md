@@ -142,7 +142,7 @@ Los estados distinguen **reproducido**, **confirmado en código** y **pendiente 
 | H16 | «Detener» cambia una bandera, pero no aborta la petición del modelo ni impide una acción decidida por el paso en curso | **Resuelto** (Fase 51), con test de respuesta tardía | P0 | F05 |
 | H17 | Escritura del agente usa `press_enter: true` desde `App.tsx` y puede enviar el formulario al rellenarlo | **Resuelto** (Fase 51): enviar es un paso explícito | P0 | F05, F15 |
 | H18 | Python es opcional al arrancar Electron, pero `build-app.js` exige compilarlo con PyInstaller | **Resuelto** (Fase 56) | P1 | F01 |
-| H19 | CI de escritorio empaqueta con directorios de motor/backend vacíos | Confirmado | P1 | F01, F38 |
+| H19 | CI de escritorio empaqueta con directorios de motor/backend vacíos | **Resuelto** (Fase 57): motor real y prueba de humo; falta ver el CI en GitHub | P1 | F01, F38 |
 | H20 | 20 hallazgos de lint, entre ellos refs durante render, dependencias de hooks y uso de `any` | **Resuelto** (Fase 55): lint estricto en cero | P1 | F01, F30 |
 | H21 | `app://` usa comparación textual `absolutePath.startsWith(baseDir)` | **Resuelto** (Fase 54): `path.relative` sobre la URL parseada | P0 | F04 |
 | H22 | Backend opcional acepta WebSocket antes de una validación visible de origen/autenticación; CORS HTTP abierto | Confirmado en endpoint; exposición efectiva por validar | P0 si se habilita | F04 |
@@ -285,7 +285,7 @@ Cada fase contiene objetivo, dependencias, archivos o componentes, tareas y una 
 - [ ] Sustituir nombres de instaladores que contienen `1.0.0` fijo por valores derivados del manifiesto; alinear versiones y canal preestable. *(Fase 56: el nombre ya sale del manifiesto; falta alinear versiones y canal.)*
 - [x] Resolver los 20 hallazgos de lint por grupos: tipado del protocolo, hooks/refs, efectos y organización de componentes. *(23-09-2026, Fases 51-55; comportamiento comprobado en la app empaquetada.)*
 - [x] Mantener el límite de deuda decreciente durante la limpieza; después exigir cero errores y advertencias acordadas. *(Trinquete 20 → 18 → 14 → 0.)*
-- [ ] Probar artefactos completos: el empaquetado con recursos vacíos no será la puerta de lanzamiento.
+- [x] Probar artefactos completos: el empaquetado con recursos vacíos no será la puerta de lanzamiento. *(23-09-2026, Fase 57: `npm run smoke` sobre el paquete con el motor real; falla 1/6 con el motor vacío. CI actualizado, pendiente de verse en GitHub.)*
 - [ ] Revisar scripts `.bat`/`.sh`, rutas con espacios y caracteres no ASCII; sustituir esperas fijas por comprobaciones de disponibilidad.
 - [ ] Normalizar formato por lotes aislados y registrar cambios puramente mecánicos para conservar la utilidad del historial.
 
@@ -1153,7 +1153,7 @@ Este es el siguiente tramo de trabajo recomendado. El documento no implica que e
 | 9 | ~~Endurecer IPC/protocolo~~ **hecho** (Fase 54) | `main.js`, `preload.js`, `protocol.rs` | Payload/emisor inválidos rechazados y límites probados |
 | 10 | ~~Resolver lint por grupos~~ **hecho** (Fase 55) | Frontend | 18 errores/2 advertencias → cero con pruebas de interacción |
 | 11 | ~~Desacoplar Python del build principal~~ **hecho** (Fase 56) | `build-app.js`, manifiestos, scripts | Build nativo completo sin `.venv` |
-| 12 | Probar paquete con motor real | `.github/workflows/app.yml` | Artefacto instalado responde ping y renderiza fixture |
+| 12 | ~~Probar paquete con motor real~~ **hecho** (Fase 57; CI sin verificar en GitHub) | `.github/workflows/app.yml` | Artefacto instalado responde ping y renderiza fixture |
 | 13 | Diseñar broker y modelo de amenazas | ADR, `SECURITY.md`, prototipo | Dos renderers independientes y caída contenida |
 | 14 | Preparar corpus/frameworks y benchmark base | Fixtures nuevos, scripts de medición | Resultados con denominadores y fallos preservados |
 

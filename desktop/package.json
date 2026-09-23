@@ -9,7 +9,8 @@
     "start": "electron .",
     "pack": "electron-builder --dir",
     "dist": "electron-builder",
-    "test": "node --test tests/ai.test.js tests/engine-protocol.test.js"
+    "test": "node --test tests/ai.test.js tests/engine-protocol.test.js",
+    "smoke": "node scripts/smoke-packaged.mjs"
   },
   "devDependencies": {
     "electron": "^44.4.4",
