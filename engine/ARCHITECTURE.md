@@ -4621,7 +4621,37 @@ La regla vive en una funcion pura (`classify_document`) con sus tests en el
 propio binario; `scripting.rs` fija el contrato del que depende (la excepcion
 llega como `Err` en los resultados de script).
 
-#### Lo que NO cambia todavia
+### Fase 48: un proceso por documento en `wpt_runner`, con plazo (2026-09-23)
 
-Sin timeout por documento ni aislamiento de procesos: un fixture con un bucle
-infinito sigue colgando el runner entero. Es la siguiente tarea del backlog.
+Segunda tarea del backlog (`plan.md`, F03). El motor no tiene limite de
+iteraciones en Boa, asi que un fixture con `while (true) {}` colgaba el runner
+entero y, con el, el job de CI hasta su propio timeout.
+
+El runner se relanza a si mismo con `--document <archivo>` por cada fixture y
+espera al hijo como mucho `--timeout-ms` (10 s por defecto). Al vencer el plazo
+lo mata y el documento termina en `TIMEOUT`; si el hijo muere sin resultado
+(un panico del motor) es `CRASH`. Los dos, junto a `HARNESS-ERROR`, cuentan
+como documento incompleto y dan salida 3. El resumen los cuenta por separado
+porque piden acciones distintas.
+
+El resultado cruza de proceso a proceso como una linea JSON con el prefijo
+`WPT-RESULT`: cualquier otra linea de stdout se ignora en vez de corromper el
+resultado, y los logs van a stderr. stdout y stderr del hijo se leen en hilos
+aparte, para que un hijo que escribe mucho no se bloquee con la tuberia llena
+mientras el padre lo espera; las ultimas lineas de stderr acompanan a un
+`TIMEOUT` o `CRASH` como diagnostico.
+
+`crates/core/tests/wpt_runner_procesos.rs` lo prueba contra el binario real: un
+bucle infinito entre dos documentos sanos termina en `TIMEOUT` y el documento
+posterior sigue corriendo.
+
+#### Simplificaciones declaradas
+
+- El camino `CRASH` no tiene test de punta a punta: no hay forma estable de
+  provocar un panico desde un fixture. Su clasificacion es la rama por defecto
+  (el hijo no devolvio un resultado valido).
+- Matar al hijo basta para cerrar el arbol porque el hijo no lanza procesos.
+  Si algun dia los lanza (red real, servidores de fixtures), hara falta un Job
+  Object en Windows o un grupo de procesos en Unix.
+- Sin salida JSON agregada ni comparacion de identidades de tests entre
+  ejecuciones: siguen pendientes en F03.

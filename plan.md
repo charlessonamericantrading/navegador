@@ -315,7 +315,7 @@ Los fallos de fast-float se documentan en [RUSTSEC-2025-0003](https://rustsec.or
 
 - [x] Corregir el falso verde reproducido: excepción de script, error de carga del harness, fichero ilegible o ausencia inesperada de tests deben producir fallo diferenciado. *(23-09-2026, Fase 47 de `ARCHITECTURE.md`: `HARNESS-ERROR` por documento y código de salida 3; el fixture de 11.2 devuelve 3 y los seis fixtures siguen 60/60.)*
 - [x] Separar estado del harness y resultados de subtests; `0/0` nunca cuenta como compatibilidad aprobada. *(Misma fase.)*
-- [ ] Añadir un proceso supervisor con timeout por documento, cierre del árbol de procesos y salida estructurada para crashes/hangs.
+- [x] Añadir un proceso supervisor con timeout por documento, cierre del árbol de procesos y salida estructurada para crashes/hangs. *(23-09-2026, Fase 48: un proceso hijo por documento, `--timeout-ms`, estados `TIMEOUT`/`CRASH`; probado con un bucle infinito contra el binario real.)*
 - [ ] Comparar identidades de tests, no solo la suma: un nuevo aprobado no puede esconder la regresión de otro caso.
 - [ ] Investigar el fallo `el.append/prepend` con fixture mínimo y comparación de mutación, identidad y colección; corregir implementación o sonda según la semántica observada.
 - [ ] Montar un primer adaptador para harness WPT oficial y servidores locales con HTTP, HTTPS y varios orígenes; fijar commit del corpus.
@@ -1143,7 +1143,7 @@ Este es el siguiente tramo de trabajo recomendado. El documento no implica que e
 | Orden | Tarea | Archivo/área inicial | Resultado verificable |
 |---|---|---|---|
 | 1 | ~~Corregir falso verde del runner~~ **hecho** (Fase 47) | `core/src/bin/wpt_runner.rs`, harness | Fixture con excepción antes de tests devuelve fallo y diagnóstico |
-| 2 | Añadir timeout por proceso de test | Harness/runner | Fixture infinito termina con TIMEOUT y continúa la suite |
+| 2 | ~~Añadir timeout por proceso de test~~ **hecho** (Fase 48) | Harness/runner | Fixture infinito termina con TIMEOUT y continúa la suite |
 | 3 | Investigar append/prepend | `api-probe.html`, `dom_bindings.rs` | Causa reducida, caso semántico y corrección sin bajar cobertura |
 | 4 | Corregir publicación de cambios de timers | `core/src/server.rs`, Electron/viewport | El título/captura cambian sin petición manual posterior |
 | 5 | Corregir cancelación y autoenvío del agente | `AgentSidebar`, orquestador, `App.tsx` | Detener durante llamada no actúa después; escribir no envía |
