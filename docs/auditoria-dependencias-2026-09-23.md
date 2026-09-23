@@ -50,3 +50,40 @@ diez de `desktop` se reducen a dos decisiones (Electron y `electron-builder`).
 `.github/workflows/engine.yml` mantiene las cinco excepciones de Cargo, ahora
 con la fecha de esta revisión. RUSTSEC-2026-0285 (`rustls`) no se añadió: se
 corrigió. Los dos avisos de `fast-float` bloquean una release.
+
+## Actualización: Electron 44 y electron-builder 26 (mismo día)
+
+Decidido con el usuario: migrar Electron y `electron-builder` ahora y dejar Boa
+como tarea propia.
+
+| Paquete | Antes | Después |
+|---|---|---|
+| `electron` | 30.5.1 (sin soporte) | 44.4.4 |
+| `electron-builder` | 24.13.3 | 26.15.3 |
+
+`npm audit` en `desktop`: de 10 (9 altas, 1 crítica) a **0**.
+
+No hizo falta tocar código: `main.js` ya usaba las APIs actuales
+(`protocol.handle`, `net.fetch`, `contextIsolation`) y `electron-updater` 6.x
+es el que espera `electron-builder` 26. Lo que sí cambió:
+
+- `electron-builder` 26 activa la **integridad de ASAR** en el ejecutable, que
+  es la corrección del aviso «ASAR Integrity Bypass».
+- Electron 44 y `@electron/get`/`@electron/rebuild` exigen Node ≥ 22.12: el
+  job `desktop` del CI pasa de Node 20 a 24.
+
+Verificación:
+
+- `desktop`: 11 tests; almacén de claves con el `safeStorage` real de Electron
+  44 (cifra, recupera tras reiniciar, borra).
+- `electron-builder --dir` (lo que corre el CI) y `npm run dist` (instalador
+  NSIS, 143 MB) terminan bien.
+- **Aplicación empaquetada arrancada de verdad** y comprobada desde fuera por el
+  protocolo de DevTools: carga la interfaz por `app://`, la IPC `ai:*` responde
+  (así que la validación de emisor acepta el marco real) y el motor contesta
+  `pong`. No quedan procesos huérfanos al cerrar.
+- No se instaló el instalador en esta máquina.
+
+Queda Boa 0.19 → 0.22 (`fast-float`, bloquea release) como la única
+vulnerabilidad conocida en rutas distribuidas.
+

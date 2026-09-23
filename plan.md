@@ -297,8 +297,8 @@ Cada fase contiene objetivo, dependencias, archivos o componentes, tareas y una 
 
 - [x] Instalar en el entorno de auditoría herramientas versionadas para Rust y revisar el lockfile completo con una base de avisos actualizada. *(23-09-2026: cargo-audit 0.22.2; encontró RUSTSEC-2026-0285 en `rustls`, corregido a 0.23.45. Ver [informe](docs/auditoria-dependencias-2026-09-23.md).)*
 - [x] Clasificar cada aviso por dependencia, ruta, ejecución en build/runtime, entradas controlables y mitigación real. *(Informe del 23-09-2026.)*
-- [ ] Migrar Electron y electron-builder a versiones mantenidas, revisando cambios de sandbox, preload, protocolos y actualización.
-- [ ] Corregir avisos npm mediante actualización controlada; no ejecutar `audit fix --force` sin revisar el diff y los cambios incompatibles. *(23-09-2026: `frontend` a 0 y `desktop` de 13 a 10 sin saltos mayores; lo que queda exige Electron y electron-builder nuevos.)*
+- [x] Migrar Electron y electron-builder a versiones mantenidas, revisando cambios de sandbox, preload, protocolos y actualización. *(23-09-2026: Electron 30.5.1 → 44.4.4 y electron-builder 24 → 26; `npm audit` de `desktop` a 0; app empaquetada comprobada por CDP.)*
+- [ ] Corregir avisos npm mediante actualización controlada; no ejecutar `audit fix --force` sin revisar el diff y los cambios incompatibles. *(23-09-2026: `frontend` a 0 sin saltos mayores; `desktop` a 0 tras migrar Electron y electron-builder.)*
 - [ ] Migrar Boa y su familia de crates a una versión compatible mantenida, o aplicar una solución upstream verificada que retire la ruta vulnerable; probar módulos, GC y bindings.
 - [ ] Retirar excepciones resueltas. Las restantes tienen propietario, justificación técnica, fecha de revisión y condición de bloqueo de release.
 - [ ] Generar SBOM del instalador, incluyendo runtime Electron y bibliotecas transitivas; incorporar revisión de licencias y avisos de terceros.
@@ -1149,7 +1149,7 @@ Este es el siguiente tramo de trabajo recomendado. El documento no implica que e
 | 5 | ~~Corregir cancelación y autoenvío del agente~~ **hecho** (Fase 51) | `AgentSidebar`, orquestador, `App.tsx` | Detener durante llamada no actúa después; escribir no envía |
 | 6 | ~~Propagar resultados y fallos de comandos~~ **hecho** (Fase 52) | `App.tsx`, tipos IPC, orquestador | Error de motor no termina como objetivo completado |
 | 7 | ~~Retirar clave de renderer~~ **hecho** (Fase 53) | Servicio IA/credenciales, preload | No existe secreto en localStorage, UI o logs |
-| 8 | Auditar y migrar dependencias — **auditoría hecha**, migraciones mayores pendientes | Tres árboles npm, Rust y Python opcional | Informe de alcance y PRs de actualización con regresiones |
+| 8 | Auditar y migrar dependencias — **npm a 0 y rustls corregido**; queda Boa 0.19 → 0.22 | Tres árboles npm, Rust y Python opcional | Informe de alcance y PRs de actualización con regresiones |
 | 9 | Endurecer IPC/protocolo | `main.js`, `preload.js`, `protocol.rs` | Payload/emisor inválidos rechazados y límites probados |
 | 10 | Resolver lint por grupos | Frontend | 18 errores/2 advertencias → cero con pruebas de interacción |
 | 11 | Desacoplar Python del build principal | `build-app.js`, manifiestos, scripts | Build nativo completo sin `.venv` |
