@@ -21,11 +21,20 @@ license = "MIT"
 
 [workspace.dependencies]
 tokio = { version = "1.38", features = ["full"] }
+# Concurrencia acotada para descargar subrecursos en paralelo (Fase 39).
+# Ya venia en el arbol de dependencias a traves de hyper: declararlo
+# explicitamente no anade codigo nuevo al binario, solo lo hace visible.
+# Escribir a mano un limitador de concurrencia correcto (orden preservado,
+# cancelacion, backpressure) es justo lo que la doctrina de dependencias
+# dice que no hay que reimplementar.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rustls = { version = "0.23", features = ["ring"] }
 url = "2.5"
 thiserror = "1.0"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+# `env-filter` no viene por defecto y es lo que hace que `RUST_LOG` mande;
+# sin ella el motor solo puede elegir un nivel fijo en tiempo de compilacion.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -39,3 +48,37 @@ brotli = "6.0"
 # a mano, mismo criterio que TLS/parseo HTML: no evitar TODA dependencia,
 # evitar reimplementar cosas con superficie de error real.
 dirs = "5"
+# Lista de sufijos publicos de Mozilla (`net/src/cookie.rs`) - rechaza un
+# `Set-Cookie: Domain=` que sea un TLD/sufijo publico entero (`.co.uk`,
+# `.com`), que un navegador real bloquea para impedir que un sitio ponga
+# una cookie valida para TODOS los dominios de ese sufijo. Tabla de datos
+# generada y embebida (sin red, `#![no_std]`), no una reimplementacion a
+# mano: la lista cambia con el tiempo y tiene miles de entradas, exactamente
+# la clase de dato que la doctrina de dependencias dice que no vale la pena
+# mantener a mano.
+psl = "2.1.226"
+
+# Lints compartidos por los 10 crates (cada uno los hereda con
+# `[lints] workspace = true`). Lo que se permite aqui se permite por una
+# razon escrita, no por comodidad: `cargo clippy -D warnings` es una puerta
+# de CI, y una puerta que se salta con `#[allow]` sueltos por el codigo deja
+# de ser una puerta.
+[workspace.lints.clippy]
+# La documentacion de este motor son parrafos de prosa dentro de `///`, no
+# listas de markdown. Este lint pide reindentar la continuacion de cualquier
+# linea que EMPIECE por un guion, y en un texto en castellano un guion al
+# principio de linea suele ser un inciso, no una vinieta. Reformatear ~35
+# bloques de prosa para satisfacerlo empeoraria justo lo que este proyecto
+# cuida mas.
+doc_lazy_continuation = "allow"
+# Cinco funciones del pipeline (layout de tablas, pintado, `build_page`)
+# reciben 8-12 argumentos porque llevan el estado de una pasada completa.
+# Agruparlos en structs es refactor real con riesgo de regresion, no un
+# arreglo de estilo; esta anotado como deuda tecnica en
+# `huecos_sin_resolver.md` en vez de silenciado y olvidado.
+too_many_arguments = "allow"
+# El DOM es `Arc<RwLock<Node>>` y `Node` no es `Send`/`Sync` a proposito:
+# vive en un solo hilo junto al runtime de JS, que tampoco lo es (`boa`).
+# El `Arc` esta por el grafo compartido con ciclos padre/hijo, no por
+# concurrencia. Ver la doctrina de crates en `ARCHITECTURE.md`.
+arc_with_non_send_sync = "allow"

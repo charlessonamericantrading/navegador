@@ -58,7 +58,7 @@ impl TestHarness {
         // testharness.js real.
         let test_fn = NativeFunction::from_copy_closure_with_captures(
             |_this, args, capture: &ResultsCapture, context| {
-                let Some(func) = args.first().and_then(JsValue::as_callable).cloned() else {
+                let Some(func) = args.first().and_then(JsValue::as_callable) else {
                     return Ok(JsValue::undefined());
                 };
                 let name = match args.get(1) {

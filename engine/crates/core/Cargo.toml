@@ -13,6 +13,7 @@ default-run = "engine-core"
 
 [dependencies]
 tokio.workspace = true
+futures-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
@@ -28,3 +29,6 @@ engine-js = { path = "../js" }
 engine-text = { path = "../text" }
 engine-image = { path = "../image" }
 engine-ai = { path = "../ai" }
+
+[lints]
+workspace = true

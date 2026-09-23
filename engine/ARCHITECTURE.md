@@ -3769,3 +3769,1733 @@ existe, Python mantiene el mensaje de motor no disponible.
   - Estructuras `AccessibilityTree`, `AccessibleNode` y `AccessibleRole` para extracción semántica limpia del árbol DOM/layout con coordenadas de pantalla reales.
   - Método `to_llm_representation` que genera un prompt ultra-compacto optimizado para modelos de lenguaje, ahorrando ~80% de tokens frente al envío de HTML crudo.
 - **Tests del Workspace**: 683 tests pasando al 100% en los 10 crates de Rust (`cargo test --workspace`).
+
+### Fase 39: Aviso de pagina dependiente de JavaScript, rendimiento y shorthands CSS (2026-08-27)
+
+Esta fase no salio de leer el codigo sino de EJECUTAR el navegador contra
+webs reales y mirar las capturas. El sintoma reportado fue "el navegador no
+funciona, ninguna URL carga". El motor cargaba las URLs perfectamente: lo
+que fallaba era todo lo demas.
+
+#### El diagnostico: la pagina en blanco muda
+
+Medido en vivo contra una web real (`ignislove.com`): 14 KB de HTML, 7
+`<script>`, y **cero caracteres de texto visible**. El servidor manda una
+cascara vacia y el contenido lo construye JavaScript en el cliente, que es
+como esta hecha la mayoria de la web moderna (React/Next/Vue/Shopify). El
+motor descargaba esa cascara, no encontraba nada dentro y pintaba blanco.
+
+Lo importante es POR QUE no habia ningun error: no habia fallado nada. La
+descarga fue correcta, el parseo fue correcto, el layout fue correcto. El
+resultado legitimo de todo eso era una pagina vacia. La interfaz mostraba
+avisos de error correctamente (comprobado), pero no habia error que mostrar.
+
+Contraste medido el mismo dia: Google (que si manda su texto en el HTML)
+carga y se ve bien en 457 ms.
+
+- **`requires_javascript` en el protocolo NDJSON** (`core/protocol.rs`,
+  `core/server.rs::page_content_requires_javascript`): se marca cuando el
+  arbol de LAYOUT no tiene practicamente texto visible Y el documento trae
+  `<script>`. Se reusa `collect_visible_text` (que ya filtra `<script>`/
+  `<noscript>`) en vez de mirar el DOM crudo - si no, el codigo fuente de un
+  bundle grande contaria como "contenido" y el aviso no saltaria nunca.
+- Las dos condiciones son necesarias A PROPOSITO: una pagina vacia SIN
+  scripts esta vacia de verdad, y decir "necesita JavaScript" seria mentir.
+  El umbral (40 caracteres) es un juicio, no un valor del spec, y se elige
+  bajo para preferir callar de mas antes que acusar en falso.
+- **Lo que NO afirma**: no dice que la pagina funcionaria con un motor de JS
+  completo, ni distingue "el script no se ejecuto" de "se ejecuto y no pinto
+  nada". Da un falso positivo en una pagina legitimamente casi vacia que
+  ademas lleve un script de analitica - se acepta: el coste es un aviso de
+  mas en una pagina que igualmente se ve vacia.
+
+#### Rendimiento: dos cuellos distintos, aislados con paginas sinteticas
+
+El articulo "Espana" de Wikipedia (1,77 MB) tardaba 150 s. Aislado midiendo
+por separado nodos, reglas y texto:
+
+| Pagina sintetica | Antes |
+|---|---|
+| 13.000 nodos + 5 reglas | 1,8 s |
+| 200 nodos + 2.000 reglas | 0,5 s |
+| 13.000 nodos + 2.000 reglas | **69,7 s** |
+| 13.000 parrafos con texto real | 1,7 s |
+
+Ni los nodos ni las reglas ni el texto por separado: el cuello era el
+PRODUCTO nodos x reglas, la firma de un bucle anidado.
+
+1. **`SelectorMatcher::matches` reparseaba el selector desde la cadena en
+   CADA comparacion** (`css/src/selector.rs`). La cascada compara cada nodo
+   contra cada regla, asi que eran del orden de 26 millones de parseos de un
+   punado de cadenas. Cache `thread_local` de selectores parseados
+   (`with_parsed_selector`), que cachea tambien el FALLO - un selector no
+   soportado se reintentaba igual de veces que uno valido. Es
+   `thread_local` y no un `static` con candado porque los tipos del crate
+   `selectors` no son `Sync`, y ademas evita cualquier bloqueo en el camino
+   mas caliente del motor.
+2. **Prefiltro por selector clave** (`css/src/stylesheet.rs::RuleKey`): cada
+   regla lleva precalculado su simple-selector mas a la derecha (id, clase o
+   tag), y la cascada descarta sin invocar al matcher completo. Es el mismo
+   truco que usan Chromium y Firefox. **Conservador por construccion**: ante
+   cualquier duda (`[`, `(`, comillas, `*`, una rama no descartable de una
+   lista) devuelve `Any`, que significa "pruebala igual" - por eso este
+   atajo no puede perder un estilo, y esa propiedad esta cubierta por tests.
+3. **Los subrecursos se descargaban EN SERIE**
+   (`core/server.rs::fetch_subresources`). Wikipedia trae 161 `<img>` de
+   `upload.wikimedia.org`; a ~200 ms cada una eso solo eran ~38 s. Ahora
+   `futures_util::buffered(6)` - seis es el limite clasico de conexiones por
+   host de un navegador real. Se usa `buffered` y NO `buffer_unordered`
+   porque el orden del documento es obligatorio para las hojas de estilo
+   (donde "la que viene despues gana a igual especificidad"): devolverlas
+   segun quien contestara antes haria que el aspecto de la pagina dependiera
+   de la latencia de la red.
+
+Resultado medido: sintetica 13k x 2k **69,7 s -> 1,8 s**; Wikipedia solo CPU
+**38,9 s -> 4,0 s**; Google 0,46 s -> 0,37 s (sin regresion).
+
+Al medir hay que servir la pagina en LOCAL: la variabilidad de red enmascara
+por completo el efecto (la misma pagina por internet dio 150 s y 215 s en
+dos pasadas del mismo binario).
+
+#### Maquetacion: los shorthands que se ignoraban enteros
+
+Aislado caja a caja con una pagina de prueba y mirando el PNG:
+
+- **`padding`/`margin` de 2, 3 y 4 valores se ignoraban ENTEROS y resolvian
+  a CERO.** Solo funcionaba la forma de un valor. La causa era que
+  `engine-layout` leia la propiedad abreviada como si fuera una longitud
+  suelta, asi que `parse_css_length("20px 60px")` fallaba y devolvia el
+  valor por defecto. No es un caso exotico: es la forma mas comun de
+  escribir padding en CSS real. Ahora se expanden a longhands en el parser
+  (`expand_box_shorthand`, mismo sitio donde ya vivia la expansion de
+  `background`) y `resolve_box_edges` los lee.
+- **`flex: 1` no hacia nada**: el layout solo leia los longhands. Ahora
+  `expand_flex_shorthand` lo expande, con la trampa clasica del spec:
+  `flex: 1` significa `1 1 0`, NO `1 1 auto`.
+- **`gap` se leia solo en `grid_container_style`**, nunca en flex, asi que
+  los items de un contenedor flex salian pegados.
+- **El fondo de `<html>`/`<body>` no se propagaba al lienzo**
+  (`layout::canvas_background`, consumido por `gfx/raster.rs`). Sin esto,
+  cualquier web con tema oscuro se veia como una franja de color del alto
+  del contenido sobre un fondo gris claro - el sintoma clasico de "esto esta
+  roto". NO implementado: que `<body>` deje de pintar su propio fondo cuando
+  se ha propagado (el spec dice que cede el fondo al lienzo); como se pinta
+  el mismo color en ambos sitios el resultado visible es identico, solo se
+  notaria con fondos semitransparentes superpuestos.
+- Valores con `calc()`/`var()` se dejan SIN expandir a proposito: trocearlos
+  por espacios los romperia. Ahi el longhand no se genera y el layout
+  resuelve a cero, igual que antes.
+
+#### APIs de JavaScript: medidas una a una, no supuestas
+
+Se escribio una pagina sonda que prueba 28 APIs y devuelve el resultado por
+`document.title`. El resultado corrige una suposicion equivocada: **el motor
+ya soportaba 22 de 28**. `async`/`await`, clases, arrow functions, template
+literals, destructuring, spread, `Map`/`Set`, `Symbol.iterator`, `Promise`,
+`JSON`, `fetch`, `getComputedStyle`, `addEventListener`, `innerHTML`,
+`querySelector`, `classList` - `boa` cubre la sintaxis moderna entera. No
+faltaba un motor de JavaScript: faltaban funciones sueltas.
+
+El detalle que importa: **la ausencia de UNA sola de ellas lanzaba
+TypeError en la primera linea util del bundle y mataba el script ENTERO**,
+dejando la pagina en blanco. El coste de una API ausente no es proporcional
+a lo usada que sea.
+
+Anadidas (sonda 22/28 -> 26/28):
+- `document.head` - espejo de `document.body`. Casi todo bundle hace
+  `document.head.appendChild(style)` al arrancar para inyectar sus estilos.
+- `document.createTextNode` - el companero de `createElement` que faltaba.
+- `navigator.userAgent`/`language`/`platform`/`onLine`. El User-Agent
+  declara lo que este motor ES; no imita a Chrome a proposito: una pagina
+  que creyera estar hablando con Chrome usaria APIs que aqui no existen y
+  fallaria mas adelante y de forma mas confusa.
+- `requestAnimationFrame`/`cancelAnimationFrame` sobre la MISMA cola que
+  `setTimeout(fn, 0)`. Sin sincronizacion con el refresco de pantalla y sin
+  la marca de tiempo del fotograma - es lo que puede prometer honestamente
+  un motor sin bucle de fotogramas propio. Se registra porque su AUSENCIA
+  era peor que su aproximacion.
+
+**Siguen faltando, y por que no se pusieron:**
+- `location.href` - necesita llevar la URL de la pagina hasta el runtime de
+  JS, lo que cambia la firma de `pipeline::build_page_keeping_runtime` y sus
+  llamadas. Registrarlo DESPUES de construir la pagina no sirve: los scripts
+  inline ya se ejecutaron.
+- `MutationObserver` - no se puso un stub a proposito. Uno que nunca dispara
+  puede ser PEOR que su ausencia: el codigo cree haberse suscrito y espera
+  para siempre, en vez de fallar rapido y visiblemente.
+
+#### Otros
+
+- La captura se declaraba `data:image/jpeg` siendo PNG (`89504e47`
+  comprobado). Chromium lo decodificaba igual por olfateo de contenido - se
+  verifico en un Chrome real antes de descartarlo como causa del problema
+  original - pero declarar mal el tipo es falso y rompe cualquier consumidor
+  mas estricto.
+- `futures-util` pasa a ser dependencia explicita de `engine-core`. Ya venia
+  en el arbol via `hyper`, asi que declararlo no anade codigo al binario;
+  escribir a mano un limitador de concurrencia correcto (orden preservado,
+  cancelacion, backpressure) es justo lo que la doctrina de dependencias de
+  este documento dice que no hay que reimplementar.
+
+**Tests del Workspace**: 703 pasando, 0 fallando, en los 10 crates.
+
+### Fase 40: `background-image` real, y `window` como `EventTarget` completo (2026-08-27)
+
+Cierre de los huecos que quedaron documentados tras la auditoria de 47
+simplificaciones (ver `huecos_sin_resolver.md`): dos hallazgos concretos, no
+una fase de exploracion.
+
+#### `window` no era un `EventTarget` completo
+
+`document.addEventListener('scroll', ...)` ya disparaba de verdad, pero
+`window.addEventListener('scroll'|'resize', ...)` y `window.dispatchEvent`
+no. La causa: `history.rs` (Fase 7) ya reasignaba `window.addEventListener`/
+`removeEventListener` para delegar en `document.documentElement` (lo que
+necesitaba `popstate`), pero `core::server` disparaba los eventos de scroll/
+resize sobre `dom_root`, que nunca hace bubbling hasta `documentElement` (es
+un HIJO suyo, no un ancestro). Arreglado retargeteando el dispatch a
+`documentElement` - el mismo nodo que `fire_popstate` ya usaba - para que la
+burbuja llegue a los dos sitios (`window` y `document`) a la vez.
+
+#### `background-image`: nunca existio, ni el longhand ni el shorthand
+
+Verificado antes de tocar nada: cero referencias a `background-image` en
+`engine-gfx`/`engine-layout` - ni siquiera el longhand se pintaba, aunque el
+parser ya lo guardara como cualquier propiedad no reconocida.
+
+- **`engine-css/parser.rs`**: `insert_declaration` ahora tambien extrae un
+  `url(...)` del shorthand `background` (antes solo extraia color) -
+  `background_image_candidate` busca el tramo entre `url(` y su `)` tal
+  cual, no por token partido por espacios (una URL entre comillas puede
+  llevar espacios dentro). `@supports (background-image: url(...))`
+  actualizado a la vez - antes habria mentido diciendo que no se soportaba.
+- **Descubrimiento y descarga**: mismo patron que `<img src>`
+  (`find_image_srcs`/`fetch_images`), pero las URLs de fondo no estan en el
+  DOM sino en el CSS YA ENSAMBLADO (`<style>` en linea + hojas externas) -
+  por eso `find_background_image_urls`/`find_inline_style_css`
+  (`pipeline.rs`) solo pueden correr DESPUES de que `core::server` descargue
+  las hojas externas, al reves que el resto del descubrimiento (que ocurre
+  todo de golpe antes de descargar nada). Se añaden a la MISMA lista que
+  `<img src>` para reusar el mismo `ImageMap`, el mismo decode y el mismo
+  filtro `img-src` de CSP (una imagen de fondo es tan "imagen" como un
+  `<img>` para el spec).
+- **Pintado** (`DisplayItem::BackgroundImage`, `image_paint::
+  paint_background_image`): tamaño NATURAL en mosaico infinito
+  (`background-repeat: repeat` + `background-size: auto`, los dos valores
+  iniciales reales - no se leen otros valores de ninguna de las dos
+  propiedades). El detalle que no era obvio: un mosaico tiene que recortarse
+  a SU PROPIA caja, no solo a la de un `overflow: hidden` ancestro - a
+  diferencia de `fill_rect`/`paint_image` (que nunca pintan mas alla de su
+  propio `rect` aunque no haya mascara activa), `draw_pixmap` pinta el tile
+  entero sin respetar ningun borde. Se reconstruye la mascara con el propio
+  `rect` metido en la pila de recorte activa antes de pintar. Tope de 8192
+  tiles por caja (no hipotetico: una textura de pocos pixeles repetida sobre
+  una caja grande es un patron real de fondos baratos).
+- **No implementado, a proposito**: `background-position`,
+  `background-size` con valores explicitos, `background-repeat` con
+  variantes (`repeat-x`/`no-repeat`/...), multiples capas de fondo, y
+  funciones de imagen que no sean `url()` (`linear-gradient()`...). El
+  candidato real siguiente es `background-image` sobre `linear-gradient()`
+  o `background-size`/`background-position` explicitos - no `list-style-
+  image` (evaluado y descartado, ver `huecos_sin_resolver.md`: necesitaria
+  esta MISMA infraestructura, que ahora ya existe, pero es un caso mucho mas
+  raro en CSS real).
+
+Verificado en vivo contra `engine_server.exe` (release): shorthand
+`background: <color> url(...) no-repeat` (el color queda tapado por la
+imagen, correcto - la imagen pinta ENCIMA), longhand `background-color` +
+`background-image` por separado, y un mosaico deliberadamente mas grande
+que su caja dentro de un `overflow: hidden` mas pequeño todavia - las tres
+capturas correctas, sin derrame.
+
+**Tests del Workspace**: 805 pasando, 0 fallando, en los 10 crates.
+
+### Fase 41: Puerta de calidad automatica y test de humo del protocolo (2026-09-09)
+
+Esta fase no añade capacidad de motor: añade la infraestructura que impide que
+las 40 anteriores se degraden sin que nadie se entere. Hasta hoy los tests solo
+corrian cuando alguien se acordaba de lanzarlos a mano.
+
+#### La cifra de tests que nadie habia recontado
+
+El README decia 703, la Fase 40 decia 805. Recontado hoy: **805 era correcto**
+(13 binarios de test, 10 de doc-tests vacios). El 703 llevaba obsoleto desde la
+propia Fase 40 y se corrigio. Tras esta fase son **819**.
+
+Merece la pena apuntar por que la discrepancia sobrevivio tanto: `cargo test`
+imprime un `test result` por binario, no un total. Cualquiera que mire el final
+de la salida ve solo el ultimo. La unica forma de tener el numero es sumarlos, y
+por eso el numero se escribia a ojo y envejecia.
+
+#### `huecos_sin_resolver.md`: el fichero que la Fase 40 cito sin crear
+
+La Fase 40 lo referencia dos veces. No existia. Ahora existe, y no es una copia
+de las declaraciones "NO implementado" de este documento: **se verifico cada
+entrada con `grep` contra el codigo**, porque la mayoria de aquellas
+declaraciones ya no eran ciertas — la fase siguiente las cerro y el texto
+historico se quedo (correctamente: esto es un registro, no un estado).
+
+Dos ejemplos de lo que la verificacion corrigio:
+
+- El README afirmaba que faltaban `location.href` y `MutationObserver`. Ambos
+  existen desde la Fase 39/`8a0ea7f`.
+- El borrador del propio `huecos_sin_resolver.md` daba `Event` por ausente.
+  Esta registrado en `dom_bindings.rs:663` y probado en
+  `tests/wpt-style/events-and-microtasks.html`. Lo que falta es `CustomEvent`,
+  `EventTarget` como constructor y los eventos con metadatos
+  (`KeyboardEvent`/`MouseEvent`).
+
+El hallazgo que mas cambia el plan de trabajo: **no hay `<script type="module">`,
+ni `import()`, ni `defer`/`async`**. Se creia que el techo eran las APIs del DOM
+que faltaban; es anterior a eso. Todo bundle de Vite/Next/Svelte se sirve como
+modulo, asi que ninguno puede arrancar por muchas APIs que se añadan. Es la
+tarea C9 del `plan.md` y es la que desbloquea el resto del bloque.
+
+#### Politica de lints, con motivo escrito
+
+`cargo clippy -D warnings` es ahora una puerta de CI. Para llegar a cero avisos
+se arreglaron 7 cosas reales y se permitieron 3 categorias en
+`[workspace.lints.clippy]`, cada una con su razon al lado — un `allow` sin
+motivo escrito convierte la puerta en decorado.
+
+El arreglo que no era cosmetico: en `scripting.rs`, un bloque de 19 lineas de
+documentacion de `execute_inline_scripts_keeping_runtime` habia quedado
+**huerfano**. La definicion de `StorageContext` se colo entre el comentario y su
+funcion, asi que documentaba la nada y no salia en `cargo doc`. Lo detecto
+`empty_line_after_doc_comments`; ningun test podia verlo. Se movio la struct
+por encima.
+
+Lo que se decidio NO exigir: `cargo fmt --check`. rustfmt reordenaria ~1.400
+tramos de un codigo cuyos comentarios llevan el razonamiento de cada decision;
+haria ilegible `git blame` justo donde mas se consulta, a cambio de nada
+funcional. Corre igualmente como paso informativo.
+
+#### Test de humo NDJSON: la capa que ningun test tocaba
+
+`crates/core/tests/ndjson_smoke.rs`, 14 tests. Los tests que ya existian en
+`server.rs` construyen un `EngineServer` en memoria y llaman a `handle()`. Eso
+prueba la logica y se salta justo la capa que el producto usa: el proceso
+aparte, su stdin/stdout, el serde de ida y vuelta, y la regla de que **nada que
+no sea JSON puede salir por stdout**. Un `println!` de depuracion mal puesto no
+lo veia ningun test y rompe la aplicacion entera.
+
+- Arranca el binario `engine_server` real (`env!("CARGO_BIN_EXE_engine_server")`)
+  y habla con el por tuberias, como hace Electron.
+- Sirve el HTML desde un `TcpListener` propio de 30 lineas, **sin `hyper`**
+  aunque ya sea dependencia: si el test usara la misma pila HTTP que el motor,
+  un fallo en esa pila podria cancelarse consigo mismo.
+- Cubre las 16 variantes de `EngineRequest` mas las lineas invalidas y vacias.
+  `todas_las_variantes_del_protocolo_estan_cubiertas` lee el enum del fuente y
+  falla si mañana se añade una variante sin test, para que la cobertura no se
+  degrade en silencio.
+- Comprueba efectos, no solo que la respuesta llegue: que la captura empieza por
+  la firma real de PNG (la Fase 39 encontro justo lo contrario, un PNG declarado
+  como JPEG), que `back` vuelve a la URL anterior, que cada pestaña conserva la
+  suya, que `scroll` mueve de verdad, y que tras `type_text` el `value` del
+  `<input>` contiene el texto.
+- Que una linea basura devuelva `error` **y el proceso siga vivo** tiene test
+  propio: un parser que muere ante entrada invalida convertiria cualquier fallo
+  del cliente en una caida del navegador.
+
+#### Integracion continua
+
+`.github/workflows/engine.yml` (build, tests, clippy, los 24 tests estilo-WPT,
+auditoria de dependencias) y `app.yml` (tipos, build de la interfaz,
+empaquetado de Electron). Solo `windows-latest`: es la unica plataforma donde el
+motor se ha verificado. Ambos comandos se ejecutaron en local antes de
+escribirlos, para que el CI no naciera en rojo.
+
+Un hallazgo colateral de montarlo: **`npm run lint` de la interfaz esta roto**.
+La interfaz declara TypeScript 7 y `typescript-eslint` —incluida su ultima
+version, 8.70— solo soporta `<6.1.0`; el parser revienta antes de leer un
+fichero. No es codigo mal escrito: la pieza compatible aun no existe. `tsc` si
+comprueba los tipos y eso si bloquea; ESLint queda informativo hasta que se
+decida bajar TypeScript a 5.x o aparezca soporte.
+
+**Tests del Workspace**: 819 pasando, 0 fallando, en los 10 crates.
+
+### Fase 42: Sonda de APIs medible y utilidades de plataforma (2026-09-09)
+
+Primer trabajo del bloque C del `plan.md`, el que decide si las webs modernas se
+ven. La regla de esta fase fue medir antes de implementar, porque la historia
+del proyecto dice que la intuicion falla aqui: la Fase 39 creia que faltaba
+medio motor de JavaScript y faltaban seis funciones sueltas.
+
+#### La sonda: 48/114, y por que es un test y no un script
+
+`engine/tests/probes/api-probe.html` prueba 114 APIs; `crates/core/tests/
+api_probe.rs` la ejecuta por el camino REAL (proceso `engine_server` + HTTP, no
+`pipeline::build_page`, que no registra red ni almacenamiento y daria un numero
+pesimista) y convierte el resultado en un numero vigilado.
+
+La sonda de la Fase 39 midio 26/28 y no quedo en el repositorio, asi que aquel
+numero no se pudo volver a comprobar ni comparar. Un dato que no se puede
+reproducir es una anecdota.
+
+El test **no exige que la sonda pase entera** — fallaria hoy y seguiria fallando
+meses, y un test rojo permanente deja de leerse. Exige que el numero no BAJE, y
+ademas que el total de comprobaciones no cambie: sin esa segunda guarda, se
+podria "subir el porcentaje" borrando las comprobaciones incomodas.
+
+Reglas de la propia sonda, que no son obvias: no puede morirse con lo que mide
+(todo va en try/catch, y preguntar por un global inexistente solo es posible con
+`typeof`), y no usa ninguna API que este midiendo en su propia infraestructura.
+
+#### Hallazgo: `window` no es el objeto global
+
+La primera pasada dio `window.addEventListener` como ausente, cuando la Fase 40
+lo implemento. La sonda lo probaba como identificador suelto, y ahi estaba el
+hallazgo de verdad.
+
+En un navegador `window === globalThis`, asi que `addEventListener(...)` a secas
+y `window.addEventListener(...)` son lo mismo, igual que `innerWidth` y
+`window.innerWidth`. Aqui `window` es un objeto normal, asi que **la forma corta
+lanza `ReferenceError`** y se lleva por delante el script entero. Muchisimo
+codigo real la usa.
+
+La limitacion estaba declarada desde la Fase 6.4 en la cabecera de `window.rs`;
+lo nuevo es la medida de cuanto cuesta. Su primera consecuencia practica ya se
+nota en esta misma fase: cada global que ademas deba verse en `window.*` hay que
+ponerlo en los dos sitios a mano (`colgar_de_window` en `platform.rs`).
+
+#### `platform.rs`: 48 -> 56
+
+`console`, `URL`, `URLSearchParams`, `performance.now`, `atob`/`btoa` y
+`TextEncoder`/`TextDecoder`. Se eligieron por lo que rompen al faltar, no por lo
+completas que quedan.
+
+`console` es el caso extremo del principio de la Fase 39. Practicamente todo
+codigo de produccion conserva algun `console.warn`, y muchos frameworks avisan
+por ahi en desarrollo: sin el objeto, ese aviso —que deberia ser informativo—
+mataba la pagina. La salida va a `tracing` y JAMAS a stdout, que es el canal
+NDJSON.
+
+Detalles que costaron mas de lo que parecen y que un test cubre cada uno:
+
+- **`console.log` no serializa con `JSON.stringify`.** Cualquier nodo del DOM
+  tiene `parentNode`, asi que `console.log(elemento)` pasa un ciclo y
+  `stringify` lanzaria. Un log que LANZA es exactamente el problema que este
+  modulo viene a quitar.
+- **`btoa` lanza con caracteres fuera de Latin-1** en vez de truncar: truncar
+  produce datos corruptos que nadie detecta.
+- **`atob` ignora los espacios** porque el Base64 partido en lineas es comun.
+- **`URL` lanza con una cadena invalida.** Codigo real envuelve `new URL` en
+  try/catch para decidir si algo es una URL; devolver un objeto a medias romperia
+  ese patron.
+- **`URL` tiene `toString`.** Sin el, concatenar una URL daria `[object Object]`
+  y el fallo apareceria mucho mas tarde, en la peticion.
+- **`URLSearchParams.get` devuelve el PRIMER valor** con claves repetidas, y
+  `null` (no `undefined`) si no esta.
+- **`TextDecoder` rechaza codificaciones que no soporta** en vez de fingir.
+
+Se resuelven con el crate `url`, el mismo que la capa de red, para que una URL se
+resuelva igual desde JS que desde el motor.
+
+**Lo que NO se registro, a proposito**: `AbortController` (uno que solo marque
+una bandera sin cancelar el `fetch` es el stub que la doctrina prohibe: el codigo
+cree haber cancelado y la peticion sigue viva), `crypto.getRandomValues`
+(rellenarlo con numeros no criptograficos es peor que la ausencia) y
+`performance.getEntries` (devolver una lista vacia fingiria que se midio).
+
+Simplificacion declarada: `TextEncoder.encode` devuelve un Array normal, no un
+`Uint8Array`. Se indexa y se recorre igual; lo que no funcionara es pasarselo a
+algo que exija un TypedArray de verdad.
+
+**Tests del Workspace**: 841 pasando, 0 fallando.
+
+### Fase 43: Modulos ES — `<script type="module">` y el orden real de carga (2026-09-09)
+
+El bloqueo estructural que la Fase 41 identifico al verificar los huecos contra
+el codigo. Se creia que el techo del motor eran las APIs del DOM ausentes; era
+anterior a eso.
+
+#### El problema, con su forma exacta
+
+Todo bundle de Vite, Next o Svelte se sirve como `<script type="module">`, y
+este motor lo ejecutaba como un script CLASICO. En un script clasico, `import`
+y `export` son errores de SINTAXIS: el bundle moria en el parseo, antes de la
+primera linea util, y ninguna cantidad de APIs del DOM anadidas despues lo
+habria cambiado.
+
+Por eso esta fase va antes que el resto del bloque C, y no despues.
+
+#### De donde salen los modulos que se importan
+
+De lo que `core::server` ya descargo antes de arrancar el JavaScript, no de la
+red en caliente. Es el mismo patron que el resto del motor (hojas de estilo,
+imagenes, scripts clasicos): descubrir todas las URLs, descargarlas en paralelo
+con el filtro de CSP aplicado, y solo entonces construir la pagina.
+
+Ir a la red DENTRO del cargador tendria dos problemas, no uno: habria que
+bloquear el hilo del interprete en mitad de la evaluacion, y se saltaria el
+filtro de `script-src` que ya se aplico aguas arriba.
+
+Que eso baste para un bundle real no es casualidad. Un `index.html` de Vite
+declara UN modulo raiz con `<script type="module" src>` y sus fragmentos con
+`<link rel="modulepreload" href>`, precisamente para que el navegador los tenga
+antes de necesitarlos. `pipeline::find_module_preloads` los recoge y
+`core::server` los mete en la MISMA lista que los `<script src>`: para el motor
+son codigo JavaScript que un `import` va a pedir, y tratarlos por un camino
+aparte solo abriria la puerta a que un dia uno de los dos aplicara una politica
+distinta.
+
+#### Orden de ejecucion: de una pasada a tres
+
+`run_scripts` recorria todos los `<script>` en orden de documento, ignorando
+`type`, `defer`, `async` y `nomodule`. Ahora clasifica y hace tres pasadas:
+clasicos, luego `defer` y modulos (un modulo es `defer` por defecto segun el
+spec, sin escribirlo), luego `async`.
+
+Tres cosas que la clasificacion arregla y que no eran obvias:
+
+- **`<script nomodule>` se omite.** Marca el respaldo para navegadores sin
+  modulos. Ejecutarlo ADEMAS del modulo montaria la aplicacion dos veces; en una
+  web real eso se manifiesta como contenido duplicado.
+- **`<script type="application/json">` ya no se ejecuta.** Es un contenedor de
+  datos, comunisimo para datos estructurados y estado inicial. Antes se
+  intentaba ejecutar y producia un error de sintaxis que ensuciaba el
+  diagnostico de la pagina.
+- **`defer` espera de verdad.** Codigo real depende de que, cuando corra, el DOM
+  entero exista.
+
+`async` se ejecuta al final y en orden de documento, no "en cuanto llega": aqui
+todo esta descargado antes de evaluar nada, asi que no hay un "cuando llegue"
+que respetar. Es una aproximacion declarada, y la que menos codigo rompe: lo que
+`async` promete es "no bloqueo el parseo", no un orden concreto.
+
+#### Decisiones del cargador
+
+- **La cache de modulos parseados no es una optimizacion, es obligatoria.** El
+  spec exige que dos `import` del mismo especificador devuelvan EL MISMO modulo.
+  Sin ella, un modulo importado dos veces se evaluaria dos veces y su estado (un
+  contador, un registro de componentes) se duplicaria, con sintomas muy lejos de
+  la causa. Tiene test.
+- **El modulo raiz se identifica por su URL ABSOLUTA**, no por el `src` crudo,
+  para que sea el mismo modulo que veria un `import` a esa ruta. Si no, el mismo
+  fichero cargado como `<script src>` y ademas importado se evaluaria dos veces.
+- **Un especificador desnudo (`import x from "react"`) se rechaza diciendo por
+  que.** En la web no tiene significado sin un import map. Resolverlo como ruta
+  produciria una URL inventada, una descarga fallida y un error que apunta al
+  sitio equivocado.
+- **Un import no descargado falla con el nombre del modulo en el mensaje**, no
+  devuelve un modulo vacio. Un modulo vacio haria que el `import` "funcionara" y
+  que el fallo apareciera mucho despues como un `undefined is not a function`
+  sin relacion con la causa.
+- **Una promesa de modulo que queda pendiente tras drenar los trabajos se
+  reporta como error.** Devolver `Ok` dejaria la pagina a medias sin ninguna
+  pista.
+
+`JsRuntime::with_modules` es un constructor aparte y no un flag: el cargador se
+instala al CONSTRUIR el `Context` de Boa y despues ya no se puede cambiar. Sin
+URL de pagina no hay base contra la que resolver, asi que ese camino
+(`core::main`, los tests sin red) se queda con el runtime clasico y un modulo
+falla ahi con su motivo en vez de ejecutarse mal.
+
+#### Simplificacion declarada: resolucion contra la pagina
+
+Los especificadores se resuelven contra la URL de la PAGINA, no contra la del
+modulo que importa. Boa 0.19 no expone donde guardar la URL de cada modulo
+(`host_defined` es inmutable y `path` es un `Path` de disco, no una URL).
+
+Lo que cubre y lo que no: los bundlers emiten rutas ABSOLUTAS
+(`/assets/index-abc.js`), que se resuelven igual contra la pagina que contra el
+importador, asi que el caso que motiva toda la fase funciona. Falla un
+`./vecino.js` entre dos modulos que no esten en el directorio del documento.
+
+Tampoco hay `import()` dinamico ni `<script type="importmap">`.
+
+#### Verificacion
+
+`crates/core/tests/bundle_modulos.rs`, 7 tests contra el binario real, sirviendo
+la estructura de un bundler desde un servidor local con rutas separadas (el
+`TestServer` compartido gano soporte de rutas para esto: probar varios ficheros
+contra un servidor que devuelve lo mismo para todo no probaria nada).
+
+El test principal comprueba el TEXTO que llega al arbol de LAYOUT, no una
+variable global. Que el script corra sin lanzar no significa que la pagina se
+vea; comprobar una global pasaria aunque el DOM se hubiera quedado sin tocar.
+
+Un fallo del primer intento que merece quedar escrito, porque el diagnostico
+inicial fue equivocado: `requires_javascript` seguia en `true` sobre un bundle
+que SI se habia ejecutado. No era un bug del motor - el umbral son 40 caracteres
+de texto visible (`MIN_VISIBLE_TEXT_CHARS`) y el bundle del test producia 31. La
+heuristica hacia exactamente lo que documenta; lo poco realista era el test.
+
+**Tests del Workspace**: 856 pasando, 0 fallando.
+
+### Fase 44: Jerarquia de clases del DOM y los metodos de Element que faltaban (2026-09-09)
+
+Tareas C3 y C6 del `plan.md`. Con los modulos ES resueltos (Fase 43), el techo
+pasa a ser la superficie de plataforma, y esto es el primer trozo grande de ella.
+
+Sonda de APIs: **56 -> 73 de 114**. Tests estilo-WPT: **24 -> 42**.
+
+#### `instanceof` y los polyfills, los dos patrones que fallaban en silencio
+
+Cada objeto de elemento era un objeto suelto sin ninguna cadena de prototipos.
+Eso rompia dos cosas que un bundle real hace al arrancar:
+
+1. `el instanceof HTMLElement` era `false`. Es la comprobacion con la que media
+   web decide si algo es un nodo o un objeto de configuracion, y una respuesta
+   equivocada manda al codigo por la rama que no es.
+2. `Element.prototype.matches = ...` no hacia nada. Ese es literalmente como se
+   instala un polyfill: se anade al prototipo y se espera que lo vean los
+   elementos ya creados. Sin cadena, el polyfill se instalaba "bien" y el metodo
+   seguia sin existir.
+
+`dom_classes.rs` construye la jerarquia real (`EventTarget` -> `Node` ->
+`Element` -> `HTMLElement` -> subclases) y registra cada clase como global con su
+`prototype` y su `constructor` enlazados en los dos sentidos - sin ese enlace,
+toda la jerarquia existiria y `instanceof` seguiria dando `false`, porque es
+`Clase.prototype` lo que busca.
+
+Los constructores LANZAN con `new`. No es una limitacion: el spec dice
+`TypeError: Illegal constructor` y los elementos se crean con
+`document.createElement`. Devolver un objeto seria peor - pareceria un elemento
+y no estaria en ningun documento.
+
+**Lo que esta fase NO cierra, y por que**: los metodos siguen en la instancia, no
+en el prototipo, porque `build_element_object` los construye con closures que
+capturan su nodo. Un metodo que el motor YA tiene tapa al del prototipo, asi que
+un envoltorio de `Element.prototype.appendChild` se instala y nunca se ejecuta.
+Un metodo que el motor NO tiene si se hereda, que es el caso de todo polyfill.
+Cerrarlo del todo exige que cada metodo recupere su nodo desde `this`, es decir
+reescribir las ~675 lineas de `build_element_object`.
+
+#### El falso positivo que llevaba dos fases dando verde
+
+`innerHTML` **no existia**. La sonda lo daba por presente porque comprobaba
+`el.innerHTML = x; el.innerHTML.indexOf(...)`, y asignar una propiedad
+cualquiera a un objeto JS siempre funciona y devuelve lo asignado. La
+comprobacion pasaba sin que el DOM cambiara, y el mismo fallo estaba en la sonda
+de la Fase 39.
+
+Corregido en los dos sitios: la sonda ahora comprueba el EFECTO
+(`el.firstElementChild.tagName`), e `innerHTML` esta implementado de verdad, con
+getter que reserializa e setter que parsea con `html5ever` - el parser real, no
+uno a mano: su recuperacion de errores es justo lo que hace que `innerHTML`
+funcione con fragmentos mal formados, que es como llegan casi siempre.
+
+Es el mejor argumento a favor de la regla de la sonda que dice que una
+comprobacion debe medir capacidad real y no ausencia de excepcion.
+
+#### Metodos anadidos, elegidos por lo que rompen al faltar
+
+`matches` y `closest` usan el matcher REAL del crate `css` (el de Firefox), el
+mismo que la cascada: reusarlo y no escribir otro comparador es lo que garantiza
+que `el.matches('.a > .b')` responda igual que si esa regla estuviera en una
+hoja de estilos. Son la base de la delegacion de eventos, que es como funciona
+todo framework.
+
+Detalles del spec que tienen test propio porque su ausencia se nota tarde:
+
+- **`closest` empieza por el propio elemento.** Es lo que hace util al metodo:
+  `e.target.closest('button')` acierta tanto si se pulso el boton como si se
+  pulso el icono de dentro.
+- **`contains` se incluye a si mismo.** Es lo que hace correcto el patron
+  "cerrar el menu si el clic fue fuera": sin ello, pulsar el propio menu lo
+  cerraria.
+- **`append` convierte cadenas en nodos de TEXTO**, no las parsea como HTML.
+  Esa es la propiedad que lo hace seguro frente a `innerHTML`:
+  `el.append(nombreDelUsuario)` no puede inyectar etiquetas.
+- **`prepend(a, b)` deja `a` antes que `b`**, no al reves.
+- **`cloneNode` produce un arbol nuevo sin compartir nodos** con el original; si
+  los compartiera, tocar la copia cambiaria el documento.
+
+#### Un hueco que encontro el propio test
+
+Al escribir `tests/wpt-style/element-methods.html`, dos casos fallaron porque
+`boton.id` era `undefined`: los elementos exponian `tagName` pero **no `id` ni
+`className`**, que son de lo mas usado que hay. Se anadieron como accessors
+VIVOS sobre sus atributos - vivos y no una foto como `tagName`, porque la
+etiqueta de un elemento no cambia nunca pero su `id` y sus clases si.
+
+#### Simplificaciones declaradas
+
+- `dataset` es una foto en cada lectura, no un proxy vivo: escribir en el no
+  cambia el atributo. Leerlo, que es el uso mayoritario, funciona.
+- `outerHTML` no tiene setter: reemplazar el nodo dentro de su padre exige
+  parseo de HTML EN CONTEXTO (un `<td>` suelto se parsea distinto fuera de una
+  tabla). Un setter a medias produciria un arbol equivocado en silencio.
+- El serializador esta escrito a mano y no lo hace `html5ever`: el adaptador
+  `TreeSink` no guarda lo necesario para una reserializacion fiel (orden
+  original de atributos, comillas, mayusculas del fuente). Produce HTML
+  equivalente, no un calco. El orden de atributos se ordena alfabeticamente a
+  proposito: un `HashMap` no tiene orden y sin ordenarlo el mismo elemento
+  daria cadenas distintas entre ejecuciones.
+
+**Tests del Workspace**: 874 pasando, 0 fallando.
+
+### Fase 45: Subclases de Event, entorno de `window` y el resto de `document` (2026-09-09)
+
+Tareas C4, C6 y C7 del `plan.md`. Sonda de APIs: **73 -> 85 de 114**. Tests
+estilo-WPT: **42 -> 60**.
+
+#### Subclases de Event
+
+`CustomEvent`, `KeyboardEvent`, `MouseEvent`, `InputEvent` y `FocusEvent`.
+`CustomEvent` es el canal por el que cualquier libreria de estado avisa de un
+cambio; `KeyboardEvent`/`MouseEvent` son los que un framework SINTETIZA para
+probar o para reemitir. Sin sus constructores, ese codigo lanzaba `TypeError` en
+su primera linea util.
+
+Cierra ademas el hueco que este documento declaraba en «Integracion con el
+producto» como «metadatos de tecla todavia no estan implementados»: el tipo
+existe con sus campos, aunque el teclado REAL siga sin rellenarlos (eso es del
+lado de `core::server`, no del binding).
+
+Dos detalles con test propio porque su ausencia se nota tarde:
+
+- **Los modificadores se ponen siempre**, aunque no vinieran en las opciones. El
+  spec dice que son booleanos, no opcionales; `e.ctrlKey` devolviendo
+  `undefined` haria que un `if (e.ctrlKey)` acertara por accidente pero un
+  `e.ctrlKey === false` fallara.
+- **`CustomEvent.detail` sin opciones es `null`, no `undefined`**, e
+  `InputEvent.data` tambien: el spec distingue "no hubo datos" (borrar) de "los
+  datos eran la cadena vacia".
+
+#### El viewport se publicaba demasiado tarde
+
+`window.innerWidth` no funciono al primer intento, y la causa merece quedar
+escrita porque es un fallo de ORDEN, no de implementacion.
+
+`pipeline::build_page_keeping_runtime` ejecuta los scripts, DESPUES calcula el
+layout y DESPUES publica el snapshot. El viewport iba en esa ultima publicacion
+por comodidad, asi que durante toda la ejecucion de los scripts valia cero -
+justo cuando una pagina lo consulta para repartir espacio.
+
+El viewport no depende del layout: es un dato de ENTRADA, no un resultado. Ahora
+se publica antes de correr ningun script.
+
+Se detecto porque la sonda lo seguia dando como ausente despues de
+implementarlo. Verificar en vez de dar por hecho que un cambio funciono es lo
+que convirtio un bug silencioso en un arreglo de dos lineas.
+
+#### `matchMedia` usa el mismo evaluador que `@media`
+
+`engine_css::parse_media_condition` paso a ser publica para eso. Tener dos
+parsers de media queries seria garantizar que un dia respondan distinto sobre la
+misma consulta, y ese es justo el fallo que nadie diagnostica.
+
+El `MediaQueryList` que devuelve tiene `addEventListener`/`addListener` que **no
+disparan**, y eso es deliberado y distinto del caso de los observadores: el
+motor no reevalua consultas al redimensionar, asi que un listener no se
+ejecutara nunca. La diferencia con `IntersectionObserver` (que se sigue sin
+registrar) es que un listener de media query que no dispara deja a la pagina en
+su estado INICIAL, que es un estado valido; un observador que no dispara la deja
+esperando para siempre. Por eso uno se registra y el otro no.
+
+Mismo criterio para `window.scrollTo`/`scrollBy`: aceptan la llamada sin mover
+nada, porque mover el scroll de verdad exige un camino JS -> servidor que
+todavia no existe (hoy el scroll va del servidor hacia JS, no al reves). No
+mover es un resultado que la pagina puede observar y sobrevivir.
+
+#### `document.readyState` devuelve `"interactive"`, no `"loading"`
+
+La diferencia decide como arranca media web:
+
+```js
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+else init();
+```
+
+Aqui los scripts corren con el documento YA parseado entero, asi que `"loading"`
+seria falso y ese codigo esperaria un `DOMContentLoaded` que ya paso o esta a
+punto de pasar. `"interactive"` describe el estado real y hace que ese arranque
+llame a `init()` directamente.
+
+`document.currentScript` es `null`, que es el valor CORRECTO dentro de un modulo
+ES y el honesto para un script clasico aqui: no hay un "script en curso" dentro
+del parseo al que apuntar. Devolver un elemento cualquiera seria peor, porque
+codigo real lo usa para leer los `data-*` de su PROPIA etiqueta.
+
+`document.activeElement` devuelve `body` mientras no haya foco real, que es lo
+que devuelve un navegador cuando nada esta enfocado - no un relleno. `null`
+seria peor: hay codigo que hace `document.activeElement.blur()` sin comprobar.
+
+#### El arnes de tests corria en otro motor
+
+Al escribir `tests/wpt-style/eventos-y-entorno.html`, cuatro tests fallaron con
+`ReferenceError: window is not defined`. La causa: `execute_inline_scripts_with_harness`
+creaba un `JsRuntime` pelado, sin `window`, sin utilidades de plataforma y sin
+entorno. Los tests estilo-WPT estaban probando un motor distinto del que corre
+de verdad.
+
+Ahora el arnes registra el mismo entorno que una pagina real. Lo que sigue sin
+registrar es la RED (`fetch`/`XHR`): el arnes no debe salir a internet, y su
+ausencia ahi es una decision, no un olvido.
+
+#### Simplificaciones declaradas
+
+- `getElementsByClassName` devuelve un Array, no una `HTMLCollection` VIVA: es
+  una foto del momento de la llamada. Compara por TOKEN completo, igual que el
+  selector `.clase` de CSS - responder distinto entre los dos seria una fuente
+  de fallos sin diagnostico.
+- `MouseEvent.pageX`/`pageY` se igualan a `clientX`/`clientY`: sin acceso al
+  scroll desde el constructor, es correcto mientras la pagina no este desplazada
+  y una aproximacion cuando si.
+
+**Tests del Workspace**: 874 pasando, 0 fallando. **Estilo-WPT**: 60.
+
+### Fase 46: El lint de la interfaz vuelve a funcionar, y pasa a bloquear (2026-09-09)
+
+No toca el motor. Cierra el hallazgo colateral de la Fase 41: `npm run lint`
+llevaba roto y nadie lo sabia porque el CI lo tenia marcado como informativo.
+
+#### La causa: una incompatibilidad que no se arregla escribiendo mejor codigo
+
+La interfaz declaraba TypeScript 7 (el port nativo en Go) y `typescript-eslint`
+solo soporta `>=4.8.4 <6.1.0`, incluida su ultima version. Con TS 7 el parser
+revienta antes de analizar un solo fichero:
+
+```
+TypeError: Cannot read properties of undefined (reading 'Cjs')
+```
+
+No habia forma de arreglarlo desde este repositorio: la pieza compatible no
+existe todavia.
+
+#### La decision: bajar TypeScript a 5.9
+
+Se eligio bajar el compilador y recuperar el lint, y no al reves, midiendo lo
+que cuesta cada lado:
+
+- **Lo que se pierde**: la velocidad del compilador nativo. La interfaz son 21
+  modulos y compila en menos de medio segundo con las dos versiones. A esta
+  escala la ventaja de TS 7 no es observable.
+- **Lo que se gana**: las reglas de `react-hooks`, que cazan clases de error
+  reales - dependencias que faltan en un efecto (cierres obsoletos), `setState`
+  dentro de un efecto (bucles de render), lectura de una `ref` durante el
+  render.
+
+Es reversible con una linea en cuanto `typescript-eslint` soporte TS 7.
+
+#### 20 hallazgos de golpe, y por que no se arreglaron todos
+
+Al volver a funcionar, el lint encontro 20 problemas: 9 `no-explicit-any`, 5
+`react-hooks/refs`, 2 `react-hooks/exhaustive-deps`, y cuatro sueltos.
+
+Arreglar los de `react-hooks` a ciegas puede CAMBIAR el comportamiento de la
+interfaz: el "arreglo" de un `exhaustive-deps` es anadir una dependencia, y eso
+altera cuando se re-ejecuta el efecto. No es una limpieza cosmetica.
+
+Asi que el lint pasa a bloquear como TRINQUETE
+(`frontend/scripts/lint-ratchet.mjs`): falla si el numero SUBE, no si es mayor
+que cero. Exigir cero habria dejado la puerta en rojo durante semanas, y un CI
+rojo permanente deja de leerse - que es peor que no tenerlo.
+
+Es el mismo patron que `crates/core/tests/api_probe.rs` usa para la sonda de
+APIs del motor, y por la misma razon: convierte una deuda grande en una que solo
+puede menguar.
+
+El trinquete se probo en las dos direcciones antes de darlo por bueno (falla con
+la base a 19, pasa con la base a 20). Uno que no se ha visto fallar no se sabe
+si funciona.
+
+Detalle de implementacion: usa la API de `eslint` en vez de lanzar `npx`.
+Lanzar un `.cmd` desde Node en Windows falla con `EINVAL`, y el proceso extra no
+aportaba nada.
+
+### Fase 47: `wpt_runner` deja de aprobar documentos que no ejecuto (2026-09-23)
+
+Primera tarea del backlog del plan maestro (`plan.md`, F03 y seccion 9). El
+runner tiraba los resultados de script y trataba un documento sin tests como
+neutro, asi que un fixture cuyo script lanzaba antes de llegar a `test(...)`
+imprimia `0 pasaron, 0 fallaron, 0 en total` y salia con codigo 0.
+
+#### Estado del arnes frente a subtests
+
+Se separa lo mismo que separa `testharness.js`: el estado del documento y el
+resultado de cada subtest. Un documento termina en `HARNESS-ERROR` si no se
+pudo leer, si alguno de sus `<script>` acabo con una excepcion no capturada o
+si no registro ningun `test(...)` (lo que tambien cubre que el propio arnes no
+llegara a registrarse). Una excepcion DESPUES de tests que pasaron conserva
+esos subtests, pero el documento sigue contando como incompleto.
+
+Codigos de salida: `0` aprobado, `1` subtests fallidos, `2` uso, `3` algun
+`HARNESS-ERROR`. El `3` tiene prioridad sobre el `1`: con resultados
+incompletos, el recuento de fallos no es fiable. El CI (`engine.yml`) ya
+invocaba el runner, asi que la puerta endurecida no requirio cambios alli.
+
+La regla vive en una funcion pura (`classify_document`) con sus tests en el
+propio binario; `scripting.rs` fija el contrato del que depende (la excepcion
+llega como `Err` en los resultados de script).
+
+### Fase 48: un proceso por documento en `wpt_runner`, con plazo (2026-09-23)
+
+Segunda tarea del backlog (`plan.md`, F03). El motor no tiene limite de
+iteraciones en Boa, asi que un fixture con `while (true) {}` colgaba el runner
+entero y, con el, el job de CI hasta su propio timeout.
+
+El runner se relanza a si mismo con `--document <archivo>` por cada fixture y
+espera al hijo como mucho `--timeout-ms` (10 s por defecto). Al vencer el plazo
+lo mata y el documento termina en `TIMEOUT`; si el hijo muere sin resultado
+(un panico del motor) es `CRASH`. Los dos, junto a `HARNESS-ERROR`, cuentan
+como documento incompleto y dan salida 3. El resumen los cuenta por separado
+porque piden acciones distintas.
+
+El resultado cruza de proceso a proceso como una linea JSON con el prefijo
+`WPT-RESULT`: cualquier otra linea de stdout se ignora en vez de corromper el
+resultado, y los logs van a stderr. stdout y stderr del hijo se leen en hilos
+aparte, para que un hijo que escribe mucho no se bloquee con la tuberia llena
+mientras el padre lo espera; las ultimas lineas de stderr acompanan a un
+`TIMEOUT` o `CRASH` como diagnostico.
+
+`crates/core/tests/wpt_runner_procesos.rs` lo prueba contra el binario real: un
+bucle infinito entre dos documentos sanos termina en `TIMEOUT` y el documento
+posterior sigue corriendo.
+
+#### Simplificaciones declaradas
+
+- El camino `CRASH` no tiene test de punta a punta: no hay forma estable de
+  provocar un panico desde un fixture. Su clasificacion es la rama por defecto
+  (el hijo no devolvio un resultado valido).
+- Matar al hijo basta para cerrar el arbol porque el hijo no lanza procesos.
+  Si algun dia los lanza (red real, servidores de fixtures), hara falta un Job
+  Object en Windows o un grupo de procesos en Unix.
+- Sin salida JSON agregada ni comparacion de identidades de tests entre
+  ejecuciones: siguen pendientes en F03.
+
+### Fase 49: la interfaz `Node` que faltaba, y el falso negativo de `append` (2026-09-23)
+
+Tercera tarea del backlog (`plan.md`, hallazgo H09). La sonda daba
+`el.append/prepend` por fallido desde la Fase 44, que lo anunciaba como
+conseguido. Reducido a un fixture minimo, `append` funcionaba
+(`children.length === 1`); lo que fallaba era la comprobacion, que lo verifica
+con `el.childNodes.length`, y `childNodes` no existia. `undefined.length` lanza,
+y la sonda lo contaba como ausencia de `append`.
+
+El hueco real era mayor que la sonda: faltaba la interfaz `Node` entera.
+`parentNode`, `childNodes`, `firstChild`/`lastChild`,
+`nextSibling`/`previousSibling`, `nodeType`, `nodeName` y `nodeValue` daban
+`undefined`. Son justo lo que usan los frameworks para recorrer el arbol
+(Preact y React comparan `nodeType` y avanzan con `nextSibling`).
+
+#### Como encaja
+
+Todo nodo, texto y comentarios incluidos, se envuelve con
+`build_element_object`, asi que la interfaz se anade alli una vez y cubre a
+todos. La navegacion no salta texto, a diferencia de las variantes
+`*ElementSibling`. Las cinco getters de navegacion comparten
+`node_navigation_getter`; solo cambia la funcion que elige el nodo.
+
+`documentElement.parentNode` tiene que ser `document`, no un elemento
+fantasma. En vez de un caso especial en cada getter, el nodo `Document` raiz se
+registra en la cache de identidad apuntando al objeto global `document`, y
+`element_to_js_object` lo devuelve solo. `document` gana `nodeType` 9,
+`nodeName` y `parentNode === null`.
+
+`nodeValue` escribe el texto de nodos de texto y comentarios (con registro
+`characterData` para `MutationObserver`) y es `null` e inerte en elementos.
+
+Sonda: 85/114 a 86/114; el minimo del trinquete sube a 86.
+
+#### Simplificaciones declaradas
+
+- `childNodes` devuelve un `Array` nuevo en cada lectura, igual que
+  `children`: refleja el arbol en ese momento, pero una referencia guardada no
+  ve cambios posteriores. Un `NodeList` vivo es parte de las colecciones de F11.
+- `document.childNodes`/`firstChild`/`lastChild` siguen sin existir; solo se
+  anadio la parte de `Node` de `document` que no requiere navegar.
+- Metodos y accesores siguen siendo propiedades propias de cada instancia, no
+  del prototipo (H11).
+
+### Fase 50: lo que cambia un temporizador llega solo a la interfaz (2026-09-23)
+
+Cuarta tarea del backlog (`plan.md`, hallazgo H07). El reloj de fondo de
+`run_stdio` (250 ms) disparaba los temporizadores de la pestaña activa y
+relayouteaba, pero no escribia nada en stdout: un `setTimeout` que cambiaba el
+titulo o el contenido solo se veia cuando llegaba el siguiente comando. La
+reproduccion 11.2 del plan lo confirmaba: cero mensajes espontaneos, y un
+`get_state` posterior ya devolvia el cambio.
+
+#### Publicacion espontanea
+
+`tick_active_tab_timers` devuelve ahora el estado nuevo cuando disparo algun
+temporizador, y `run_stdio` lo escribe como un `state` con `id: null`. El
+protocolo no gana una variante: el `id` ya separaba respuesta de publicacion.
+Electron ya reenviaba cualquier `state` a la interfaz y la interfaz ya lo
+aplicaba, asi que el cambio visible no necesito tocar el frontend.
+
+Un temporizador que dispara sin cambiar nada visible (un `setInterval` de
+sondeo) no genera publicaciones repetidas: `run_stdio` guarda la huella del
+ultimo `State` escrito, sea respuesta o publicacion, y solo publica si la
+nueva es distinta. La huella cubre lo que se pinta (captura, titulo, URL,
+scroll, elementos, historial) y no el `id`.
+
+#### Consumidores que asumian "la siguiente linea es mi respuesta"
+
+Dos lo asumian y se corrigieron:
+
+- El cliente Python (`backend/app/domains/browser/browser.py`) leia una linea
+  por peticion. Ahora lee hasta el `id` que espera y descarta el resto; se
+  comprobo contra el binario real con una publicacion entre dos peticiones.
+- `Motor::pedir` de los tests de protocolo salta las publicaciones; la nueva
+  `leer_publicacion` las espera.
+
+El test de humo `un_temporizador_que_cambia_la_pagina_se_publica_sin_pedirlo`
+mezcla un `setInterval` vacio con el `setTimeout` que cambia el titulo: se
+comprobo que, desactivando la deduplicacion, falla (la primera publicacion
+llega con el titulo viejo).
+
+#### Simplificaciones declaradas
+
+- Cada publicacion rasteriza la pagina entera y viaja como PNG en Base64,
+  igual que cualquier `State` (H13). Una animacion con `setInterval` rapido
+  produce hasta cuatro capturas por segundo; el transporte eficiente es F22.
+- La huella se calcula despues de rasterizar: la deduplicacion ahorra IPC y
+  trabajo de la interfaz, no el rasterizado.
+- Solo la pestaña activa avanza sus temporizadores, como antes.
+- El frontend trata la publicacion como cualquier `state`, incluido
+  `endLoading()`. Una publicacion escrita justo antes de que el motor reciba
+  una navegacion podria quitar el indicador de carga antes de tiempo.
+
+### Fase 51: «Detener» detiene al agente, y rellenar ya no envía (2026-09-23)
+
+No toca el motor. Quinta tarea del backlog (`plan.md`, hallazgos H16 y H17),
+las dos de prioridad de seguridad del agente.
+
+#### H16: detener era una bandera que nadie consultaba a tiempo
+
+«Detener» ponia `isRunningRef.current = false`, y el bucle solo lo miraba
+entre pasos. Un paso en curso (esperando al modelo) seguia: cuando la
+respuesta llegaba, la accion se ejecutaba igual. La peticion a Gemini tampoco
+se abortaba.
+
+Ahora cada ejecucion tiene su `AbortController`. `AgentOrchestrator.runStep`
+recibe la senal, la pasa a `fetch` y la comprueba tras cada espera: antes de
+observar, tras observar y, sobre todo, entre la decision del modelo y la
+accion. Una cancelacion se lanza como `AgentCancelledError` en vez de
+devolverse como paso, para que no se confunda con un resultado; el `catch` de
+la peticion a Gemini ya no la convierte en «error de conexion».
+
+Que el controlador sea por ejecucion cierra otra carrera: antes, el `finally`
+de una ejecucion detenida ponia `isRunning` a `false` aunque el usuario ya
+hubiera lanzado otra.
+
+Una accion ya enviada al motor no se deshace; la garantia es que despues de
+detener no se envia ninguna nueva.
+
+#### H17: escribir pulsaba Enter
+
+El `typeText` que `App.tsx` da al agente mandaba `press_enter: true`: rellenar
+un campo enviaba el formulario. Ahora manda `false`, y enviar es la accion
+`press Enter`, un paso aparte que el modelo tiene que decidir (el prompt lo
+dice explicitamente). El modo simulacion dependia de ese Enter para buscar y
+ahora pulsa Enter como paso propio. La escritura manual del usuario sigue
+enviando: la dispara el al confirmar su ventana emergente.
+
+#### Tests del frontend, por primera vez
+
+`frontend/tests/agentOrchestrator.test.ts`, con el runner de Node sobre el
+`.ts` sin compilar (`npm test`): el proyecto ya exigia `erasableSyntaxOnly`,
+asi que no hizo falta ninguna dependencia. Cubre detener mientras el modelo
+decide, una respuesta que llega despues de detener (con un `fetch` que ignora
+la senal: el peor caso), que la senal llega a `fetch`, la senal ya abortada y
+que escribir y enviar son pasos distintos. Se comprobo que quitar el punto de
+control tras el modelo hace fallar el test de respuesta tardia.
+
+El job `frontend` del CI pasa a Node 24 para poder correrlos (Node 20 no quita
+tipos). De paso, dos `catch (err: any)` tocados se tiparon: el trinquete del
+lint baja de 20 a 18.
+
+#### Pendiente en F05
+
+Sin cubrir aqui: la clave en `localStorage` (tarea 7), errores del motor que
+se muestran pero no se propagan y acciones desconocidas que acaban como
+«completada» (tarea 6), y la autorizacion de acciones sensibles.
+
+### Fase 52: un fallo del agente es un fallo, no «objetivo completado» (2026-09-23)
+
+No toca el motor. Sexta tarea del backlog (`plan.md`, hallazgo H15).
+
+#### Cuatro caminos por los que un fallo se convertia en exito
+
+1. `sendCommand` (`App.tsx`) mostraba el error del motor en un aviso y
+   resolvia normal: el agente nunca se enteraba.
+2. El agente navegaba con `handleManualNavigate`, que volvia sin hacer nada
+   si la pagina estaba cargando.
+3. `runStep` trataba cualquier `action` que no reconocia como «Acción
+   completada» y terminaba la tarea; un elemento inexistente se anotaba como
+   mensaje pero el paso seguia como si nada.
+4. Un error del proveedor o un JSON roto del modelo se devolvian como
+   `finish` con el error como «respuesta»: la tarea acababa cumplida.
+
+#### Lo que cambia
+
+`runEngineCommand` es la unica ruta del agente al motor y lanza
+`BrowserActionError` si el motor responde `error` o el IPC falla. El
+`sendCommand` manual la envuelve y conserva el aviso. Por WebSocket (modo
+desarrollo con FastAPI) no hay respuesta correlacionada: el comando se envia,
+pero para el agente es un fallo explicito, porque no se puede confirmar.
+
+`runStep` delega en `executeAction`, que devuelve un resultado tipado. Una
+accion desconocida, sin sus campos, sobre un elemento que ya no existe o
+rechazada por el motor es `failed`, nunca `finished`. Los fallos del modelo
+(sin clave, error HTTP, JSON roto o sin `action`) son la pseudo-accion
+`model_error`, que tambien falla. El historial que ve el modelo marca el paso
+como `FALLÓ: ...` para que pueda corregir.
+
+#### Politica ante fallos, decidida con el usuario
+
+El fallo vuelve al modelo, pero dos pasos fallidos seguidos detienen la
+ejecucion con el ultimo error (`MAX_CONSECUTIVE_FAILURES`,
+`shouldStopAfterFailures`). Se eligio frente a detener al primer fallo (corta
+tareas que se recuperarian cuando la pagina se re-renderiza entre observar y
+actuar) y frente a reintentar hasta el limite de pasos (gasta llamadas
+repitiendo el mismo error).
+
+Seis tests nuevos en `frontend/tests/agentOrchestrator.test.ts` (11 en total).
+El lint baja de 18 a 14 al desaparecer los `any` y la asignacion inutil del
+bloque reescrito.
+
+#### Pendiente
+
+- La autorizacion de acciones sensibles (compras, envios, borrados) y la
+  vinculacion de cada accion a pestaña y revision observada siguen en F05.
+- El agente sigue sin comprobar poscondiciones: un comando que el motor
+  acepta pero que no produce el efecto esperado cuenta como ejecutado.
+
+### Fase 53: la clave de IA sale del renderer (2026-09-23)
+
+No toca el motor. Septima tarea del backlog (`plan.md`, hallazgo H04). La
+clave de Gemini vivia en `localStorage` de la interfaz y el renderer llamaba al
+proveedor con ella en la URL: cualquier script que corriera en esa pagina, una
+extension o un volcado del perfil la tenian a mano, y la URL con la clave podia
+acabar en logs.
+
+#### Donde vive ahora
+
+- `desktop/ai-credentials.js`: la clave se guarda cifrada con `safeStorage` en
+  `userData/ai-credentials.json`. Si el sistema no ofrece cifrado real (en
+  Linux, el backend `basic_text` usa una clave fija), no se escribe nada y la
+  clave dura solo la sesion: pedirla otra vez es mejor que guardarla en claro.
+- `desktop/ai-provider.js`: la peticion a Gemini la hace el proceso principal
+  con `net.fetch`, la clave en la cabecera `x-goog-api-key` y no en la URL, y
+  cualquier error se limpia de la clave antes de volver al renderer. Cada
+  peticion lleva un `requestId` para que «Detener» aborte la peticion HTTP.
+- IPC `ai:*`: solo atiende a la ventana propia (`isTrustedSender`: el
+  `webContents` principal y un frame en `app://`, o el servidor de Vite en
+  desarrollo). La clave entra por `ai:credentials:set` y nunca sale: el
+  renderer solo recibe `{configured, persisted, secureStorage}`.
+- El orquestador recibe un `ModelProvider` inyectado y ya no hace `fetch`.
+  Fuera de Electron no hay proveedor y el modo Gemini falla de forma explicita.
+
+#### Migracion
+
+Al abrir el panel, si `localStorage` todavia tiene `gemini_api_key`, se entrega
+al proceso principal y se borra en cuanto este confirma. Fuera de Electron se
+borra sin migrar: dejarla ahi es justo lo que esta fase elimina.
+
+#### Verificacion
+
+Once tests del proceso principal (`desktop`, `npm test`, con `safeStorage` y
+`fetch` inyectados) y los del orquestador portados a un modelo falso (12). El
+almacen se probo ademas con el `safeStorage` real de Electron en Windows
+(DPAPI): se guarda cifrado, se recupera tras recrear el almacen y se borra.
+`electron-builder` lista sus ficheros a mano, asi que los dos modulos nuevos se
+anadieron a `build.files`; sin eso el instalador habria arrancado sin ellos.
+
+#### Limitaciones declaradas
+
+- La validacion de emisor cubre solo los canales `ai:*`; `engine:request` sigue
+  sin ella hasta la tarea 9 (endurecer IPC).
+- No se probo la aplicacion completa con una clave real de Gemini: los tests
+  cubren el almacen y el proveedor por separado, y el cableado IPC se verifico
+  solo por sintaxis.
+- El backend Python opcional conserva su propio agente con su propia gestion
+  de clave (F34, consolidar un unico agente).
+
+### Fase 54: la frontera interfaz-motor valida, limita y no se sale de su carpeta (2026-09-23)
+
+Novena tarea del backlog (`plan.md`, F04: hallazgos H05, H06 y H21). Toca las
+dos puntas del canal: el proceso principal de Electron y `run_stdio`.
+
+#### H05: cualquier cosa llegaba al motor
+
+`ipcMain.handle('engine:request')` reenviaba el payload tal cual, desde
+cualquier emisor. Ahora pasa por `handleTrusted` (solo la ventana propia, el
+mismo filtro de los canales `ai:*` de la Fase 53) y por
+`validateEngineRequest` (`desktop/engine-protocol.js`): lista cerrada de tipos
+y campos, espejo de `EngineRequest` salvo `shutdown`, que solo puede pedir el
+proceso principal al salir. Rechaza campos desconocidos, numeros no finitos,
+enteros fuera de rango y textos desmedidos; el `id` lo pone siempre el proceso
+principal. Maximo 64 peticiones pendientes a la vez.
+
+#### H06: buffers sin limite en las dos puntas
+
+- **Electron**: el stdout del motor se acumulaba en una cadena sin tope y se
+  decodificaba trozo a trozo con `chunk.toString()`, que rompe un caracter
+  UTF-8 partido entre dos trozos (las lineas `state` son enormes por la
+  captura, asi que los cortes son frecuentes). `createLineSplitter` usa
+  `StringDecoder` y descarta lineas de mas de 128 MiB.
+- **Motor**: `run_stdio` leia con `lines()`, sin tope, y una linea que no era
+  UTF-8 devolvia `InvalidData` y terminaba el proceso con `?`. `BoundedLines`
+  limita cada peticion a 1 MiB (la mayor real, `type_text`, no llega) y
+  contesta `request_too_large` o `invalid_request` sin morir. Es seguro ante
+  cancelacion: el `select!` con el reloj puede ganar a mitad de una linea, y la
+  linea a medias vive en el lector, no en el futuro descartado (hay un test que
+  cancela a mitad de linea y comprueba que no se pierde ningun byte).
+
+#### H21: `app://` comparaba prefijos de texto
+
+`absolutePath.startsWith(baseDir)` daba por buena una carpeta hermana
+(`dist-malo`), no quitaba la consulta (`?v=3` acababa en el nombre de fichero)
+ni decodificaba `%20`, y la URL `file:` se construia concatenando. Ahora
+`resolveAppPath` parsea la URL, decodifica, compara con `path.relative` y
+`pathToFileURL` construye la URL final. Los `..` literales o `%2e%2e` los
+normaliza el propio parser de URL dentro de la raiz; lo que no normaliza
+(separadores codificados `%2F`/`%5C`, rutas absolutas, `%00`, codificacion
+rota) se rechaza. No se habia demostrado un recorrido explotable con la version
+anterior: Chromium ya normaliza la URL de un esquema estandar antes del
+manejador. La comprobacion nueva no depende de eso.
+
+#### Verificacion
+
+- `desktop`: 15 tests nuevos de `engine-protocol.js` (26 en total).
+- Motor: 5 tests de `BoundedLines` y uno de humo contra el binario real (una
+  linea de 2 MiB y otra con bytes no UTF-8, y el motor sigue contestando).
+- Aplicacion empaquetada, comprobada por DevTools: la interfaz arranca y sus
+  propias peticiones pasan la validacion; `shutdown`, `NaN`, un campo extra y
+  una URL de 9.000 caracteres se rechazan desde el renderer real, y el motor
+  sigue vivo.
+
+#### Pendiente en F04
+
+Sin contrapresion hacia el motor ni cancelacion propagada (un timeout de la
+promesa sigue sin detener el trabajo del motor, H06/F10), sin esquema
+versionado compartido entre TypeScript y Rust (el espejo se mantiene a mano),
+sin CSP de la aplicacion y con Google Fonts todavia en el arranque.
+
+### Fase 55: el lint de la interfaz llega a cero (2026-09-23)
+
+No toca el motor. Decima tarea del backlog (`plan.md`, F01, hallazgo H20).
+Cierra lo que la Fase 46 dejo como trinquete: 14 hallazgos que quedaban (de
+20; las Fases 51 a 53 ya habian retirado seis). Se arreglaron por grupos,
+porque varios cambian cuando se ejecuta el codigo y no son cosmeticos.
+
+- **Tipado del protocolo** (4 `any`): `electron.d.ts` describe las respuestas
+  del motor como union discriminada por `type` (`state`/`ready`, `tabs`,
+  `error`, el resto) y `sendEngineRequest` deja de ser `any -> any`.
+- **Refs leidas o escritas durante el render** (5): las refs «siempre al dia»
+  del agente se escriben en un `useLayoutEffect` y no en el cuerpo del
+  componente; la ventana emergente de texto guarda el tamano natural de la
+  captura en el mismo estado que su rectangulo, en vez de leer `imgRef.current`
+  al pintar.
+- **Hooks** (3): los helpers de `App.tsx` que solo usan setters y refs pasan a
+  `useCallback` estables, asi que los efectos de conexion pueden declararlos
+  sin re-ejecutarse (y reconectar) en cada render; `refreshTabs` sube antes del
+  efecto que la usa. `flushScroll` se reintenta desde su temporizador por su
+  propio nombre (`function flush`) en vez de leer la constante que la contiene.
+- **`setState` en un efecto** (1): copiar la URL del motor a la barra de
+  direcciones se hace ajustando el estado durante el render cuando la URL
+  cambia (el patron que recomienda React), no en un efecto que pintaba primero
+  la URL vieja.
+- **Fast refresh** (1): `EXAMPLE_GOALS` no lo importaba nadie; deja de
+  exportarse.
+
+El trinquete baja a 0, que equivale a exigir lint limpio: `npm run lint`
+estricto pasa.
+
+#### Verificacion de comportamiento
+
+Arreglar `exhaustive-deps` o mover refs puede cambiar la interfaz sin que falle
+ningun test, asi que se comprobo en la aplicacion empaquetada, manejada por
+DevTools:
+
+- sin bucle de reconexion: entre dos `ping` separados 3 s el contador de
+  peticiones del proceso principal solo avanza por esos dos pings;
+- la barra de direcciones muestra la URL tras una navegacion del motor;
+- un clic en un campo de la captura abre la ventana emergente con su
+  `placeholder`, centrada sobre el campo.
+
+### Fase 56: construir el navegador ya no exige Python (2026-09-23)
+
+No toca el motor. Undecima tarea del backlog (`plan.md`, F01, hallazgo H18).
+Electron solo arranca el backend FastAPI con `USE_PYTHON_BACKEND=true`, pero
+`npm run build:app` exigia un `.venv` y PyInstaller, e `instalar.bat` y
+`instalar.sh` se negaban a seguir sin Python.
+
+#### Lo que cambia
+
+- `npm run build:app` compila interfaz, motor (`--locked`) y Electron. El
+  backend solo entra con `--with-python-backend` (`npm run build:app:python`),
+  que lo anade a `extraResources` desde el script; ya no figura fijo en
+  `desktop/package.json` y el CI deja de crear su carpeta vacia.
+- `npm run install:all` instala interfaz y Electron **y compila el motor**
+  (`build:engine`). Antes no lo compilaba y `npm run start` abria una ventana
+  sin navegador. Los instaladores `.bat`/`.sh` exigen Rust en vez de Python.
+- El nombre del instalador sale de la version del manifiesto; antes se buscaba
+  `Setup 1.0.0.exe` fijo.
+- `--publish <modo>` explicito para subir un release; por defecto nunca.
+
+#### El fallo que aparecio por el camino
+
+La primera version pasaba a la API de `electron-builder` la configuracion
+entera de `package.json` con el backend anadido. El build fallaba siempre con
+`EBUSY` al copiar el motor. Causa, leida en `app-builder-lib`: aunque se le
+pase `config`, lee igualmente el campo `build` y le fusiona el objeto con
+`deepAssign`, que **concatena** las listas. `files` y `extraResources` iban
+duplicados y las dos copias simultaneas del mismo `.exe` chocaban. Ahora se
+pasa solo el delta (la entrada del backend).
+
+#### Verificacion
+
+- `npm run build:app` de principio a fin, sin paso de Python: instalador de
+  123 MB (143 con el backend) y sin `backend-server` en los recursos.
+- La aplicacion resultante, manejada por DevTools: arranca, sin bucle de
+  reconexion, la barra de direcciones sigue a la navegacion y la ventana
+  emergente de texto funciona.
+- El camino con backend se comprobo solo en su mecanismo (un `backend-server`
+  falso entra en los recursos sin duplicar nada); no se ejecuto PyInstaller.
+
+### Fase 57: el CI prueba el paquete que se distribuye, con el motor dentro (2026-09-23)
+
+Duodecima tarea del backlog (`plan.md`, hallazgo H19). El job `desktop` del CI
+empaquetaba con `build-resources/engine` vacia para que `electron-builder` no
+abortara: el paquete se generaba, la puerta se ponia en verde y la aplicacion
+no tenia navegador. Nadie lo comprobaba.
+
+#### La prueba de humo
+
+`desktop/scripts/smoke-packaged.mjs` (`npm run smoke`) arranca el ejecutable
+empaquetado con el protocolo de DevTools en un puerto local y lo comprueba
+desde fuera: la interfaz carga por `app://` y React monta; el motor responde
+`pong`; navega a una pagina local servida por el propio script y devuelve su
+titulo y una captura PNG; la IPC rechaza `shutdown` y el motor sigue vivo; y
+en dos segundos el contador de peticiones solo avanza por las de la prueba (sin
+bucles de reconexion). Sale con 1 en cuanto algo falla, con un vigilante de
+120 s, y cierra el arbol de procesos pase lo que pase.
+
+Es la version versionada de las comprobaciones que las Fases 53 a 56 hicieron
+a mano con scripts temporales.
+
+#### Se vio fallar antes de darla por buena
+
+Empaquetando con la carpeta del motor vacia, exactamente como hacia el CI, la
+prueba da 1/6 y sale con 1: la interfaz carga, pero el motor «no esta
+disponible». Con el motor real, 6/6.
+
+#### El CI
+
+El job `desktop` instala Rust, compila `engine_server` en release con
+`--locked` (cache propia), lo copia a los recursos, empaqueta con `--dir` y
+ejecuta `npm run smoke`. El plazo del job sube a 60 minutos por la compilacion
+en frio. **Sin verificar en GitHub**: los cambios de CI no se han subido; la
+secuencia se reprodujo en local (Windows) con el mismo resultado, 6/6.
+
+### Fase 58: modelo de amenazas, ADR del broker y supervisor de renderers (2026-09-23)
+
+Decimotercera tarea del backlog (`plan.md`, F06, hallazgos H01 y H23).
+
+#### Documentos
+
+- `SECURITY.md`: activos, adversarios (la pagina hostil primero), fronteras
+  con lo que las protege hoy y su hueco conocido, y como avisar de un fallo.
+  Cada proteccion citada remite a la fase que la introdujo y se comprobo en el
+  codigo; la consecuencia practica se dice sin rodeos: un fallo explotable en
+  el motor da las cookies de todos los sitios y el disco del usuario.
+- `docs/adr/0001-broker-y-aislamiento-de-renderers.md`: tres etapas. (1) un
+  proceso por pestana supervisado desde fuera, que da contencion de caidas;
+  (2) un broker con red, cookies y disco, que permite restringir el proceso
+  que interpreta la pagina; (3) aislamiento por sitio. Con alternativas
+  descartadas; entre ellas, que `engine_server` lance sus hijos, porque choca
+  con la mitigacion que prohibe procesos hijo (Fase 23).
+
+#### Prototipo de la etapa 1
+
+`desktop/engine-supervisor.js`: un `engine_server` por renderer, cada uno con
+su divisor de lineas y su tabla de peticiones. Si un proceso muere, sus
+peticiones pendientes se rechazan al momento con `EngineCrashedError` (no por
+agotar 30 s), se emite `crash` y los demas siguen. Cerrar a proposito no cuenta
+como caida. Interfaz pequena (`open`, `request`, `close`, `closeAll`, `on`)
+para que un broker Rust pueda sustituirlo.
+
+Probado con un motor falso en Node (caida, cuelgue, muerte antes de saludar) y
+con el **experimento de aceptacion del ADR contra `engine_server` real**: dos
+renderers, se mata uno a mitad de una navegacion lenta, su peticion se rechaza
+por la caida y el otro sigue contestando `ping` y navegando. El job `desktop`
+del CI corre ahora sus tests despues de compilar el motor para que ese
+experimento no se salte.
+
+#### Lo que NO hace todavia
+
+- **No esta conectado a la interfaz.** `main.js` sigue con un solo proceso y
+  las pestanas las gestiona el motor. Conectarlo exige que el supervisor
+  atienda `new_tab`/`switch_tab`/`close_tab`/`list_tabs` y que la interfaz
+  muestre y recupere una pestana caida.
+- Sin confidencialidad: cada renderer hace su red y su disco, y dos procesos
+  escriben los mismos `cookies.json` y `local_storage.json` (el ultimo gana).
+  Es la razon de ser de la etapa 2.
+
+### Fase 59: corpus de tareas y linea base de medicion (2026-09-23)
+
+Decimocuarta y ultima tarea del backlog inicial (`plan.md`, F25 y F39).
+
+#### Perfil redirigible
+
+`engine-net` gana `profile.rs`: `NAVEGADOR_IA_PROFILE_DIR` sustituye el
+directorio del perfil (cookies y `localStorage`). Hacia falta porque
+`dirs::data_dir()` en Windows usa la API de carpetas conocidas y no se puede
+desviar con variables de entorno: **los tests de humo contra el binario real
+escribian en el perfil del usuario**, en contra del plan (6.1). Ahora cada
+`Motor` de los tests tiene un perfil temporal que se borra al terminar, y el
+benchmark tambien.
+
+#### Corpus y medicion
+
+`engine/tests/corpus/` son 12 paginas-tarea con criterio observable (la pagina
+pone `document.title = 'OK'` solo si su tarea funciono): carga estatica,
+formulario, construccion y recorrido del DOM, un mini-framework con diff de
+nodos, modulos ES, JavaScript moderno, temporizador, `fetch`, almacenamiento,
+eventos y `MutationObserver`. `npm run bench` las sirve en local y mide 20
+navegaciones por pagina en un proceso nuevo: exito antes que tiempo, todas las
+muestras guardadas, fallos con motivo, y entorno con commit y hash del binario.
+
+#### Lo que encontro
+
+- 10/12 paginas pasan. Fallan `mini-framework` (**`element.querySelector` no
+  existe**, hallazgo nuevo H26) y `modulos-es` (**los `import` de un modulo no
+  se descargan**, H10).
+- **Fuga de memoria entre navegaciones** (H28): unos 24 MiB mas por cada carga
+  de una pagina que crea 200 elementos, 504 MiB tras 20. Reproducible al byte
+  en dos ejecuciones.
+- Los tiempos varian hasta 3x entre ejecuciones en este equipo: no se publican
+  como resultado. Detalle en `docs/benchmarks/README.md`.
+
+### Fase 60: `element.querySelector`, y una prueba de humo que no da falsos fallos (2026-09-23)
+
+#### H26: `querySelector` en los elementos
+
+Lo encontro el corpus de la Fase 59: `querySelector`/`querySelectorAll`
+existian en `document` pero no en los elementos, y `mini-framework` fallaba
+con `not a callable function`. `engine-css` gana `query_first_descendant` y
+`query_all_descendants`: solo descendientes (nunca el propio elemento), pero
+con el selector evaluado contra el documento entero, asi que
+`el.querySelector('section span')` encuentra un `span` de `el` aunque la
+`section` sea un antepasado. El selector se parsea una sola vez. Tres tests y
+una comprobacion nueva en la sonda: 87/115. El corpus pasa a 11/12.
+
+#### La prueba de humo del paquete, vista en GitHub
+
+Primer CI con la Fase 57 subida: el paquete con el motor dentro funciono entero
+en el runner (interfaz, `pong`, navegacion, captura, rechazo IPC). Fallo la
+comprobacion de bucles: en 2 s el contador avanzo 2 peticiones en vez de 1. Una
+peticion puntual de la interfaz al asentarse la ventana en el runner no es un
+bucle; la comprobacion exigia «exactamente +1» y eso era demasiado.
+
+Ahora son tres pings separados 2 s, y basta con que el ULTIMO intervalo este en
+calma: un bucle genera peticiones sin parar y nunca se calma. Antes de darla
+por buena se comprobo que sigue detectando un bucle real (una dependencia
+inestable metida a proposito en el efecto de conexion): saltos de 438 y 385
+peticiones, falla como debe.
+
+### Fase 61: cada documento se liberaba nunca (fuga de memoria entre navegaciones) (2026-09-23)
+
+Hallazgo H28 del benchmark de la Fase 59: cargar 20 veces una pagina que crea
+200 elementos dejaba el proceso en 504 MiB, unos 24 MiB mas por carga.
+
+#### Reproducido en un test antes de tocar nada
+
+`dropping_the_runtime_releases_the_dom`: se crea un runtime con DOM, se tocan
+elementos desde JS, se suelta todo, se fuerza el GC de Boa y se comprueba con
+un `Weak` que el arbol se libero. Fallaba. Acotando por pasos (solo contexto,
+un cierre suelto, `register` sin JS, `register` + limpieza) se vio que Boa
+libera bien las capturas de un cierre; lo que retenia el documento eran
+**handles `JsObject` guardados en sitios que el GC no traza**, que para Boa
+cuentan como raices permanentes:
+
+1. `DocumentBindings.prototypes` (los prototipos del DOM) estaba marcado
+   `#[unsafe_ignore_trace]`, y cada objeto de elemento lleva un clon de
+   `DocumentBindings` en sus cierres. Desde un prototipo se llega al realm, al
+   objeto global, a `document` y al DOM: todo enraizado para siempre. Ahora
+   `DomPrototypes` deriva `Trace` y el campo se traza.
+2. Las capturas de `MutationObserver` que llevan un `DocumentBindings`
+   declaraban `empty_trace!()`, cierto solo mientras aquel no trazaba nada.
+   Ahora derivan `Trace`.
+3. `element_objects` (cache de identidad), `listeners` y los observadores son
+   contenedores de Rust con handles, y ademas forman ciclo con los cierres que
+   los capturan. `JsRuntime` implementa `Drop` y los vacia
+   (`DocumentBindings::teardown`) al descartarse la pagina.
+
+La regla que se deduce: **un `JsObject` nunca va en un campo excluido de la
+traza**, salvo en un contenedor que alguien vacie explicitamente al terminar
+el documento.
+
+#### Resultado
+
+| Cargas de `construir-dom` | Antes | Ahora |
+|---|---|---|
+| 1 | 50 MiB | 51 MiB |
+| 5 | 148 MiB | 82 MiB |
+| 10 | 267 MiB | 84 MiB |
+| 20 | 504 MiB | 85 MiB |
+
+La memoria deja de crecer con las navegaciones; lo que queda es el tamano de
+trabajo del heap. 907 tests, clippy y los 60 estilo-WPT siguen en verde.
+
+#### Pendiente
+
+Los `handlers` de `XMLHttpRequest` siguen en un `Arc` con handles, con el mismo
+patron: una pagina que usa XHR puede retener su objeto. No lo mide el corpus
+actual.
+
+### Fase 62: Boa 0.19 a 0.22 (2026-09-23)
+
+Tarea 8 del backlog, la parte que quedaba (`plan.md`, F02, hallazgo H02). Boa
+0.19 arrastraba `fast-float` 0.2.0 con dos avisos de seguridad reales
+(RUSTSEC-2025-0003, fallo de segmentación por falta de comprobación de
+límites; RUSTSEC-2024-0379), alcanzables por el JavaScript de cualquier
+página. Era la única vulnerabilidad conocida en código distribuido y
+bloqueaba una versión.
+
+#### Qué cambió en la API, y cómo se adaptó
+
+46 errores de compilación, casi todos mecánicos:
+
+- `as_object`/`as_callable` devuelven el objeto por valor: sobraban 22
+  `.cloned()`, y algunas llamadas necesitan ahora `&`.
+- `JsArray::new`, `JsPromise::resolve`/`reject` y el constructor de `JsProxy`
+  devuelven `JsResult`.
+- `JsValue` ya no es un enum público: `Some(JsValue::Null)` pasa a ser una
+  guarda `if v.is_null()`.
+- `JsError::to_opaque(context)` pasa a `into_opaque(context)?`.
+
+Y tres con semántica:
+
+- **Cola de trabajos.** Desaparece `job_queue()`: `queueMicrotask` encola un
+  `Job::PromiseJob` y `fetch` un `Job::AsyncJob` (`NativeAsyncJob`), que recibe
+  el `Context` prestado por un `RefCell` cuando termina la espera de red.
+- **`ModuleLoader` asíncrono.** `load_imported_module` devuelve un `Future` y
+  recibe un `ModuleRequest`; `register_module` desaparece (la caché del
+  cargador ya lo cubría). La resolución sigue siendo contra la página, sin
+  cambios de comportamiento (H10 sigue abierto).
+- **`run_jobs()` devuelve `JsResult`, y ante el primer trabajo que falla Boa
+  0.22 vacía la cola ENTERA.** Tal cual, un `queueMicrotask` que lanzara se
+  llevaría por delante las reacciones de promesas de la página, un fallo
+  silencioso nuevo. El callback de `queueMicrotask` reporta ahora su propia
+  excepción y devuelve `Ok`, como hace un navegador, y cada `run_jobs` restante
+  registra un error en vez de tragárselo (`run_jobs_reporting`). Test nuevo:
+  una microtarea que lanza no cancela las siguientes ni una promesa.
+
+#### Verificación: nada observable cambia
+
+- 908 tests (907 anteriores + el nuevo), clippy limpio.
+- Sonda 87/115, WPT estilo 60/60, corpus 11/12 con el mismo fallo
+  (`modulos-es`, H10) y memoria estable.
+- Aplicación empaquetada con el motor nuevo: prueba de humo 6/6.
+- `cargo audit`: 0 vulnerabilidades. Las dos excepciones de `fast-float` se
+  retiran del CI.
+
+### Fase 63: el motor corre en un hilo con pila propia (2026-09-23)
+
+La Fase 62 (Boa 0.22) paso toda la suite en local, pero en el runner de GitHub
+la sonda de APIs mato `engine_server` con `thread 'main' has overflowed its
+stack`. No era un fallo de la sonda: `#[tokio::main]` ejecutaba `run_stdio`, y
+con el todo el JavaScript de la pagina, en el hilo PRINCIPAL, que en Windows
+tiene 1 MiB de pila. Boa 0.22 en depuracion gasta algo mas por llamada y la
+pagina de la sonda quedo justo por encima.
+
+Medido en local con `NAVEGADOR_IA_ENGINE_STACK_MB`: con 1 MiB la sonda desborda
+(reproducido), con 2 MiB pasa. `engine_server` corre ahora el motor en un hilo
+`engine` de 64 MiB (unas 30 veces lo necesario; es reserva virtual, no memoria
+comprometida), y el hijo de `wpt_runner` igual. Un desbordamiento de pila
+nativo no es una excepcion de JS que se pueda capturar: mata el proceso, asi
+que el margen importa. Los limites de recursion de JavaScript siguen siendo los
+de Boa.
+
+La leccion para el proceso: pasar en local no bastaba; la verificacion de una
+migracion del motor incluye ver el CI remoto, que es justo lo que lo detecto.
+
+### Fase 64: la costura del broker (ADR 0001, etapa 2) (2026-09-23)
+
+Primer paso de sacar la red, las cookies y el disco del proceso que interpreta
+la pagina. Decidido con el usuario: el broker sera un proceso Rust propio que
+reutilice `engine-net`.
+
+`engine_net::broker::ResourceBroker` es la frontera de capacidades del
+renderer: `fetch`, `cookie_header_for_js`/`set_cookie_from_js` y seis
+operaciones de Web Storage acotadas a un origen. Nada mas: medido en el codigo,
+eso es todo lo que el motor pedia al exterior.
+
+Todo el motor depende ya de `SharedBroker` (`Arc<dyn ResourceBroker>`) en vez de
+`Arc<NetworkEngine>` y `Arc<Mutex<WebStorage>>`: `server.rs` pasa de dos campos
+a uno, y `fetch`, `XHR`, `document.cookie` y `localStorage`/`sessionStorage`
+hablan con el broker. `LocalBroker` implementa la interfaz en el mismo proceso
+con las piezas de siempre, asi que **el comportamiento no cambia**: 910 tests,
+sonda 87/115, WPT 60/60 y corpus 11/12 (con `fetch`, almacenamiento y cookies
+pasando por el broker).
+
+Lo que aporta: un broker en otro proceso se conecta implementando esta
+interfaz, sin tocar el motor. Lo que no aporta todavia: seguridad; con
+`LocalBroker` todo sigue en el mismo proceso.
+
+### Fase 65: el broker como proceso (ADR 0001, etapa 2) (2026-09-23)
+
+`engine_broker` es un binario nuevo que tiene la red, las cookies y el perfil,
+y los sirve a los renderers por un canal local. Un `engine_server` arrancado con
+`NAVEGADOR_IA_BROKER` y `NAVEGADOR_IA_BROKER_TOKEN` usa `RemoteBroker` en vez de
+`LocalBroker`: la costura de la Fase 64 se conecta sin tocar el motor.
+
+#### Decisiones
+
+- **Canal directo renderer ↔ broker, no reenviado por Electron.**
+  `localStorage.getItem` y `document.cookie` son síncronos en JavaScript: el
+  hilo de la página espera la respuesta. Pasar cada lectura por el bucle de
+  eventos del proceso principal de Electron, que además pinta la interfaz,
+  metería su latencia en cada una. El canal es una tubería con nombre en
+  Windows y un socket Unix (`0600`) en el resto: locales por construcción.
+- **Autenticación por token de un solo uso.** El supervisor registra cada
+  renderer por el stdin del broker (el canal de confianza) y recibe un token
+  de 256 bits, que pasa al renderer por el entorno. El renderer lo presenta al
+  conectar y todo lo que pide queda atribuido a ese nombre. El token se gasta al
+  usarse: que luego se filtre ya no abre nada. El nombre del canal es aleatorio
+  pero no es el secreto; en Windows se crea como primera instancia, para que
+  otro proceso no pueda ocuparlo antes.
+- **Tramas binarias, no NDJSON.** `[largo][cabecera JSON][largo][cuerpo]`: las
+  imágenes y fuentes viajan en crudo. Los largos se validan antes de reservar
+  memoria (32 MiB de cabecera, suficiente para un valor de `localStorage`
+  escapado; 256 MiB de cuerpo).
+- **Llamadas síncronas sobre un runtime multihilo.** Una tarea escribe, otra lee
+  y reparte las respuestas por `id`. `fetch` espera con un `oneshot`; cookies y
+  almacenamiento bloquean el hilo que llama en un canal de `std`, con un plazo
+  de 10 s. `RemoteBroker::connect` rechaza un runtime de un solo hilo, donde esa
+  espera no terminaría nunca.
+- **`sessionStorage` por renderer.** Con un broker común, dos pestañas
+  compartirían `sessionStorage`; la especificación lo hace de cada pestaña, así
+  que el broker lo separa por renderer.
+- **Fallar cerrado.** Si se pide broker y no hay canal, token o conexión, el
+  motor no arranca, ni saluda con `ready`, ni abre su perfil. Si el broker cae
+  a mitad, las llamadas pendientes y las siguientes fallan enseguida (red:
+  `network_error: broker no disponible`; `setItem`: `QuotaExceededError`) y el
+  motor sigue contestando. El saludo `ready` lleva ahora `broker: "local" |
+  "remote"`, que lo dice el motor y no quien lo arrancó.
+
+#### Verificación
+
+- 16 tests unitarios en `engine-net` sobre el canal real: tramas, límites,
+  CORS que sigue siendo CORS al cruzar, token de un solo uso, retirada de un
+  renderer, rechazo de runtime monohilo.
+- 4 tests de integración con los dos binarios reales (`broker_proceso.rs`):
+  - Dos motores comparten `localStorage` y cookies a través del broker, pero
+    no `sessionStorage`.
+  - Ningún renderer crea su directorio de perfil; el `localStorage` lo
+    persiste el broker.
+  - El motor no arranca sin canal, con un token inventado, sin token o con un
+    token ya usado.
+  - Matar el broker hace fallar la navegación en menos de 5 s, y el motor
+    sigue vivo.
+- 928 tests en total, clippy limpio. Sin broker, nada cambia.
+
+#### Lo que todavía no es
+
+- **No hay regla de origen.** El broker sabe qué renderer pide cada cosa, pero
+  todavía no comprueba que el origen pedido sea el del documento de ese
+  renderer. Es la Fase siguiente.
+- **Electron no lo usa aún.** El supervisor de la Fase 58 no arranca el
+  broker, y el empaquetado no incluye `engine_broker`.
+- **No es una sandbox.** El renderer no usa su red ni su disco porque no
+  quiere, no porque no pueda: restringir su token es el paso de F07.
+
+### Fase 66: la regla de origen del broker (ADR 0001, etapa 2) (2026-09-23)
+
+Con la Fase 65 el broker sabía **quién** pedía cada cosa, pero servía cookies y
+almacenamiento de cualquier origen que el renderer nombrara. Ahora un renderer
+solo toca cookies y Web Storage, y solo hace `fetch`/XHR con origen (CORS), en
+nombre de orígenes **concedidos**.
+
+El único modo de conseguir un origen es que el broker sirva una navegación de
+nivel superior a él con respuesta 2xx. Cuenta el origen de la URL final, tras
+las redirecciones, no el que diga el renderer, porque la respuesta la ve el
+broker. `NetworkRequest` lleva un campo nuevo, `navigation`, que el motor marca
+solo en `navigate_with_body`. Una navegación que acaba en 404 no concede nada:
+el motor tampoco la muestra.
+
+La concesión se registra **antes** de devolver la respuesta, así que el primer
+script de la página ya encuentra su origen permitido. Los orígenes se acumulan
+durante la vida del renderer: un `engine_server` puede tener varias pestañas, y
+volver atrás no siempre pide otra vez el documento. Retirar el renderer los
+olvida.
+
+#### Lo que no cierra, dicho claro
+
+- **Un renderer comprometido puede navegar a donde quiera** y obtener así el
+  origen. La regla le obliga a hacer una navegación real, por el broker, por
+  cada sitio; ya no puede vaciar el perfil en silencio y de golpe. Cerrarlo del
+  todo exige atar cada proceso a un sitio y cambiar de proceso al cruzar de
+  sitio (etapa 3), que se construye sobre esta regla.
+- **Subrecursos sin origen (no-cors):** viajan con cookies y su cuerpo llega al
+  renderer. Es el hueco que en los navegadores cierra ORB, y queda anotado.
+
+#### Verificación
+
+- Tests nuevos contra el canal real:
+  - Un renderer que pide el `localStorage`, las cookies o un `fetch` CORS de
+    un origen al que no navegó recibe una negativa en todo, y el almacén queda
+    intacto: ni se lee, ni se escribe, ni se borra.
+  - Un subrecurso o una navegación 404 no conceden el origen; una navegación
+    2xx concede ese origen y ningún otro.
+  - Retirar un renderer le quita sus orígenes.
+- Los tests de integración de la Fase 65 siguen pasando sin cambios: en ellos
+  cada motor navega de verdad a su página.
+- 931 tests, clippy limpio.
+
+### Fase 67: Electron arranca el broker; el producto lo usa (2026-09-23)
+
+Hasta aquí el broker existía y estaba probado, pero la aplicación seguía
+arrancando un `engine_server` con su propia red. Ahora el proceso principal de
+Electron:
+
+1. Arranca `engine_broker` y espera su `ready` con el canal.
+2. Registra al motor (`main`) y recibe su token.
+3. Lanza `engine_server` con `NAVEGADOR_IA_BROKER` y `NAVEGADOR_IA_BROKER_TOKEN`.
+
+El cliente del canal de control vive en `desktop/engine-broker.js`, con la
+misma forma que el supervisor (recibe la función que lanza el proceso, así que
+se prueba con un broker falso).
+
+**Fallar cerrado en cada punto:**
+
+- Falta el binario del broker: no se arranca el motor.
+- El broker no saluda o no registra: no se arranca el motor.
+- El motor saluda sin `broker: "remote"` (un binario antiguo, o un entorno que
+  no llegó): se mata el motor y se avisa.
+- El broker muere después: se para el motor, en vez de dejar una interfaz que
+  parece viva y no carga nada.
+- Al cerrarse el motor se retira su nombre en el broker. Al salir de la
+  aplicación, se cierran los dos.
+
+El `pong` lleva ahora también `broker`, que es lo que permite comprobar el modo
+de un motor ya en marcha.
+
+**Empaquetado:** `build:engine`, `build-app.js` y el CI compilan y copian los
+dos binarios. `resources/engine` lleva `engine_server` y `engine_broker`.
+
+#### Verificación
+
+- `desktop/tests/engine-broker.test.js`, 6 tests:
+  - Arranque, registro y retirada.
+  - Un broker mudo, que se rechaza a tiempo y no queda vivo.
+  - Un broker que muere tras saludar, que avisa y rechaza lo pendiente.
+  - Errores del broker, que llegan con su motivo.
+  - Solo `broker: "remote"` cuenta como remoto.
+  - Con los binarios reales: el motor saluda en remoto, `localStorage` funciona
+    a través del broker, el motor no crea perfil y, al retirarlo, deja de poder
+    navegar.
+- Prueba de humo de la aplicación empaquetada: **7/7**, con la comprobación
+  nueva «el motor usa el broker empaquetado» (`pong.broker == "remote"`).
+- Mutación: sin `engine_broker.exe` en el paquete, la prueba de humo cae a 1/7
+  (solo carga la interfaz). El motor no arranca y no hay red propia de reserva.
+- 38 tests del proceso principal; tests de Rust y clippy en verde.
+
+#### Lo que sigue abierto
+
+- **No hay sandbox todavía.** El motor corre como el usuario y podría abrir el
+  perfil por su cuenta si lo comprometen (ver `SECURITY.md`). Restringir su
+  token es el paso siguiente (F07), y ya es posible porque el motor no
+  necesita ni red ni disco.
+- El backend Python opcional (`USE_PYTHON_BACKEND`) lanza su propio motor sin
+  broker, en modo local.
+- Un solo motor para todas las pestañas: el supervisor de la Fase 58 (un
+  renderer por pestaña) sigue sin conectar a la interfaz. El broker ya está
+  preparado para ello: cada renderer tiene su nombre y su token.

@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { AgentOrchestrator, type AgentStepResult, type BrowserInterface } from '../AgentOrchestrator';
+import { AgentCancelledError, AgentOrchestrator, cancellableDelay, shouldStopAfterFailures, type AgentStepResult, type BrowserInterface } from '../AgentOrchestrator';
+import { electronModelProvider } from '../modelProvider';
+
+// Donde vivia la clave antes de la Fase 53. Solo se lee una vez, para
+// migrarla al proceso principal, y se borra.
+const LEGACY_KEY_STORAGE = 'gemini_api_key';
 
 interface AgentSidebarProps {
   isOpen: boolean;
@@ -10,7 +15,11 @@ interface AgentSidebarProps {
 export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, browserInterface }) => {
   const [goal, setGoal] = useState('');
   const [mode, setMode] = useState<'simulation' | 'gemini'>('simulation');
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_api_key') || '');
+  // La clave ya no vive aqui (plan H04): el renderer solo conoce su estado.
+  // `keyDraft` es lo que se esta escribiendo en el campo, y se vacia al
+  // entregarlo al proceso principal.
+  const [credentialStatus, setCredentialStatus] = useState<AiCredentialStatus | null>(null);
+  const [keyDraft, setKeyDraft] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [currentStep, setCurrentStep] = useState(0);
@@ -18,17 +27,62 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
   const [stepsHistory, setStepsHistory] = useState<AgentStepResult[]>([]);
   const [finalAnswer, setFinalAnswer] = useState<string | null>(null);
 
-  const isRunningRef = useRef(false);
+  // Una ejecución = un controlador. «Detener» lo aborta, y eso llega a la
+  // petición al modelo y a cada punto de control del orquestador. Que sea
+  // por ejecución (y no una bandera compartida) impide que un paso de una
+  // ejecución ya detenida toque el estado de la siguiente.
+  const runControllerRef = useRef<AbortController | null>(null);
   const orchestratorRef = useRef<AgentOrchestrator | null>(null);
   const historyEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    orchestratorRef.current = new AgentOrchestrator(browserInterface);
+    orchestratorRef.current = new AgentOrchestrator(browserInterface, electronModelProvider());
   }, [browserInterface]);
 
+  // Estado de la clave y migracion unica desde `localStorage`. La clave vieja
+  // solo se borra cuando el proceso principal confirma que la tiene; si no se
+  // puede entregar (fuera de Electron), se borra igualmente: dejarla en el
+  // almacenamiento del renderer es justo lo que esta fase elimina, y el modo
+  // Gemini tampoco funciona fuera de la aplicacion de escritorio.
   useEffect(() => {
-    localStorage.setItem('gemini_api_key', apiKey);
-  }, [apiKey]);
+    const ai = window.electronAPI?.ai;
+    let legacy: string | null = null;
+    try {
+      legacy = localStorage.getItem(LEGACY_KEY_STORAGE);
+    } catch {
+      legacy = null;
+    }
+    if (!ai) {
+      if (legacy !== null) localStorage.removeItem(LEGACY_KEY_STORAGE);
+      return;
+    }
+    const pending = legacy && legacy.trim() ? ai.setGeminiKey(legacy) : ai.credentialStatus();
+    pending
+      .then((status) => {
+        if (legacy !== null) localStorage.removeItem(LEGACY_KEY_STORAGE);
+        setCredentialStatus(status);
+      })
+      .catch((err) => {
+        console.error('No se pudo consultar la clave de IA:', err instanceof Error ? err.message : err);
+      });
+  }, []);
+
+  const handleSaveKey = async () => {
+    const ai = window.electronAPI?.ai;
+    if (!ai || !keyDraft.trim()) return;
+    try {
+      setCredentialStatus(await ai.setGeminiKey(keyDraft));
+      setKeyDraft('');
+    } catch (err) {
+      setStatusMessage(`No se pudo guardar la clave: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const handleClearKey = async () => {
+    const ai = window.electronAPI?.ai;
+    if (!ai) return;
+    setCredentialStatus(await ai.clearGeminiKey());
+  };
 
   useEffect(() => {
     historyEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -38,14 +92,17 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
     if (e) e.preventDefault();
     if (!goal.trim() || isRunning) return;
 
-    if (mode === 'gemini' && !apiKey.trim()) {
+    if (mode === 'gemini' && !credentialStatus?.configured) {
       setShowSettings(true);
-      setStatusMessage('Por favor ingresa tu API Key de Gemini en los ajustes.');
+      setStatusMessage(window.electronAPI?.ai ? 'Por favor ingresa tu API Key de Gemini en los ajustes.' : 'El modo Gemini solo está disponible en la aplicación de escritorio.');
       return;
     }
 
+    const controller = new AbortController();
+    runControllerRef.current = controller;
+    const { signal } = controller;
+
     setIsRunning(true);
-    isRunningRef.current = true;
     setCurrentStep(0);
     setFinalAnswer(null);
     setStepsHistory([]);
@@ -55,22 +112,18 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
 
     const maxSteps = 15;
     let stepCount = 0;
+    let consecutiveFailures = 0;
 
     try {
-      while (stepCount < maxSteps && isRunningRef.current) {
+      while (stepCount < maxSteps && !signal.aborted) {
         stepCount += 1;
         setCurrentStep(stepCount);
         setStatusMessage(`Paso ${stepCount}: Analizando página y decidiendo acción...`);
 
         // Pequeña pausa para permitir actualización de la UI
-        await new Promise((r) => setTimeout(r, 400));
-        if (!isRunningRef.current) break;
+        await cancellableDelay(400, signal);
 
-        const result = await orchestratorRef.current!.runStep(
-          goal,
-          mode,
-          mode === 'gemini' ? apiKey : undefined
-        );
+        const result = await orchestratorRef.current!.runStep(goal, mode, signal);
 
         setStepsHistory((prev) => [...prev, result]);
 
@@ -80,24 +133,38 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
           break;
         }
 
+        consecutiveFailures = result.failed ? consecutiveFailures + 1 : 0;
+        if (shouldStopAfterFailures(consecutiveFailures)) {
+          setStatusMessage(`Detenido: ${consecutiveFailures} pasos fallidos seguidos. Último error: ${result.execution_msg}`);
+          break;
+        }
+
         // Espera entre pasos para que el motor y la UI se estabilicen
-        await new Promise((r) => setTimeout(r, 1200));
+        await cancellableDelay(1200, signal);
       }
 
-      if (stepCount >= maxSteps && isRunningRef.current) {
+      if (stepCount >= maxSteps && !signal.aborted) {
         setStatusMessage('Se alcanzó el límite máximo de pasos (15).');
       }
-    } catch (err: any) {
-      console.error('Error durante la ejecución del agente:', err);
-      setStatusMessage(`Error: ${err.message || err}`);
+    } catch (err) {
+      // Detener no es un error: `handleStop` ya puso su mensaje.
+      if (!(err instanceof AgentCancelledError)) {
+        console.error('Error durante la ejecución del agente:', err);
+        setStatusMessage(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      }
     } finally {
-      setIsRunning(false);
-      isRunningRef.current = false;
+      // Solo la ejecución vigente limpia el estado: si el usuario detuvo esta
+      // y lanzó otra, esa otra sigue en marcha.
+      if (runControllerRef.current === controller) {
+        runControllerRef.current = null;
+        setIsRunning(false);
+      }
     }
   };
 
   const handleStop = () => {
-    isRunningRef.current = false;
+    runControllerRef.current?.abort();
+    runControllerRef.current = null;
     setIsRunning(false);
     setStatusMessage('Ejecución detenida por el usuario.');
   };
@@ -154,18 +221,37 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
             </select>
           </label>
 
-          {mode === 'gemini' && (
+          {mode === 'gemini' && !window.electronAPI?.ai && (
+            <small className="settings-hint">
+              El modo Gemini solo está disponible en la aplicación de escritorio: la clave se guarda en su proceso principal, no en la página.
+            </small>
+          )}
+
+          {mode === 'gemini' && window.electronAPI?.ai && (
             <label className="settings-label" style={{ marginTop: '8px' }}>
               <span>Gemini API Key:</span>
               <input
                 type="password"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder="AIzaSy..."
+                value={keyDraft}
+                onChange={(e) => setKeyDraft(e.target.value)}
+                placeholder={credentialStatus?.configured ? 'Clave configurada — escribe otra para sustituirla' : 'AIzaSy...'}
                 className="settings-input"
+                autoComplete="off"
               />
+              <div className="agent-controls" style={{ marginTop: '6px' }}>
+                <button type="button" className="btn btn-primary" onClick={handleSaveKey} disabled={!keyDraft.trim()}>
+                  Guardar clave
+                </button>
+                <button type="button" className="btn btn-secondary" onClick={handleClearKey} disabled={!credentialStatus?.configured}>
+                  Borrar clave
+                </button>
+              </div>
               <small className="settings-hint">
-                Se guarda únicamente en el almacenamiento local de tu navegador.
+                {!credentialStatus?.configured
+                  ? 'Sin clave configurada.'
+                  : credentialStatus.persisted
+                    ? 'Guardada cifrada por el sistema operativo. La aplicación nunca la devuelve a esta página.'
+                    : 'Este sistema no ofrece almacenamiento cifrado: la clave solo se conserva hasta cerrar la aplicación.'}
               </small>
             </label>
           )}
@@ -215,7 +301,7 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
             )}
             {step.execution_msg && (
               <div className="step-execution">
-                <strong>⚡ Acción:</strong> {step.execution_msg}
+                <strong>{step.failed ? '❌ Falló:' : '⚡ Acción:'}</strong> {step.execution_msg}
               </div>
             )}
           </div>

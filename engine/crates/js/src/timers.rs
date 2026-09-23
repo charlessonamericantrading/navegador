@@ -8,21 +8,20 @@
 //! el documento termine de cargar. Sin ellos, la mayoria de paginas con JS
 //! se quedaban a medio inicializar sin ningun error visible.
 //!
-//! ## Como avanza el tiempo aqui (la simplificacion que mas importa)
+//! ## Como avanza el tiempo aqui
 //!
-//! Un navegador real tiene un bucle de eventos con un reloj propio: un
-//! temporizador vencido se ejecuta aunque nadie toque nada. **Este motor no
-//! tiene ese reloj**: los temporizadores vencidos corren cuando
-//! `JsRuntime::run_due_timers` se llama, y quien la llama es
-//! `core::server` despues de cada operacion real (cargar una pagina, un
-//! clic, escribir, una tecla).
-//!
-//! Consecuencia honesta: un `setTimeout(fn, 100)` puesto durante la carga
-//! SI se ejecuta (la propia carga lo dispara al terminar, y 100ms ya
-//! pasaron para cuando el usuario interactua), pero un reloj que se
-//! actualice solo cada segundo con la pagina quieta NO avanza hasta que el
-//! usuario haga algo. Cubre el uso dominante real - diferir inicializacion,
-//! reaccionar a una interaccion - no la animacion continua.
+//! `JsRuntime` en si no tiene reloj propio: los temporizadores vencidos
+//! corren cuando `JsRuntime::run_due_timers` se llama, y quien la llama es
+//! `core::server` - tanto tras cada operacion real (cargar una pagina, un
+//! clic, escribir, una tecla) COMO cada 250ms de fondo
+//! (`EngineServer::tick_active_tab_timers`, via `tokio::select!` en
+//! `run_stdio` - no bloquea la lectura de comandos NDJSON mientras
+//! tanto). Con el tick de fondo, un reloj que se actualice cada segundo
+//! con la pagina quieta SI avanza sin que el usuario haga nada - cubre
+//! tambien la animacion/sondeo continuo, no solo diferir inicializacion o
+//! reaccionar a una interaccion. Granularidad de 250ms, no un reloj
+//! continuo: un `setInterval(fn, 16)` (60fps) sigue sin poder dispararse
+//! a su cadencia real.
 //!
 //! ## Orden de ejecucion
 //!
@@ -118,7 +117,7 @@ fn resolve_delay(args: &[JsValue], context: &mut Context) -> Duration {
 /// Cuerpo comun de `setTimeout` y `setInterval` - identicos salvo por si el
 /// temporizador se reprograma tras dispararse.
 fn schedule(args: &[JsValue], queue: &TimerQueue, context: &mut Context, repeating: bool) -> JsResult<JsValue> {
-    let Some(callback) = args.first().and_then(JsValue::as_callable).cloned() else {
+    let Some(callback) = args.first().and_then(JsValue::as_callable) else {
         // Sin funcion invocable no hay nada que programar. Un navegador
         // real acepta ademas una CADENA de codigo aqui (`setTimeout("...")`,
         // que evalua como `eval`) - deliberadamente NO soportado: es un
@@ -155,7 +154,7 @@ fn schedule(args: &[JsValue], queue: &TimerQueue, context: &mut Context, repeati
         .global_object()
         .get(js_string!(CALLBACK_REGISTRY), context)?
         .as_object()
-        .cloned();
+        ;
     if let Some(registry) = registry {
         registry.set(js_string!(id.to_string()), JsValue::from(callback), false, context)?;
     }
@@ -180,7 +179,7 @@ fn cancel(args: &[JsValue], queue: &TimerQueue, context: &mut Context) -> JsResu
         .global_object()
         .get(js_string!(CALLBACK_REGISTRY), context)?
         .as_object()
-        .cloned();
+        ;
     if let Some(registry) = registry {
         registry.delete_property_or_throw(js_string!(id.to_string()), context)?;
     }
@@ -213,7 +212,28 @@ pub fn register_timers(context: &mut Context) -> JsResult<TimerQueue> {
     context.register_global_builtin_callable(js_string!("setTimeout"), 2, set_timeout)?;
     context.register_global_builtin_callable(js_string!("setInterval"), 2, set_interval)?;
     context.register_global_builtin_callable(js_string!("clearTimeout"), 1, clear.clone())?;
-    context.register_global_builtin_callable(js_string!("clearInterval"), 1, clear)?;
+    context.register_global_builtin_callable(js_string!("clearInterval"), 1, clear.clone())?;
+
+    // `requestAnimationFrame` (Fase 39) sobre la MISMA cola que
+    // `setTimeout(fn, 0)`: es lo que de verdad puede prometer un motor que
+    // no tiene un bucle de fotogramas propio (ver el aviso de este modulo
+    // sobre como avanza el tiempo). La diferencia con un navegador real es
+    // que aqui no hay sincronizacion con el refresco de pantalla y la
+    // callback NO recibe la marca de tiempo del fotograma.
+    //
+    // Se registra porque su AUSENCIA era peor que su aproximacion: un
+    // bundle que hace `requestAnimationFrame(render)` sin comprobar antes
+    // que existe moria con un TypeError en la carga, y con el la pagina
+    // entera. Aproximarlo hace que el codigo siga adelante.
+    let request_animation_frame = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], captured, context| {
+            let callback = args.first().cloned().unwrap_or_default();
+            schedule(&[callback], &captured.0, context, false)
+        },
+        TimerCapture(queue.clone()),
+    );
+    context.register_global_builtin_callable(js_string!("requestAnimationFrame"), 1, request_animation_frame)?;
+    context.register_global_builtin_callable(js_string!("cancelAnimationFrame"), 1, clear)?;
 
     // Colgarlos tambien de `window` si ya existe, porque muchisimo codigo
     // real escribe `window.setTimeout(...)` en vez de la forma corta.
@@ -291,9 +311,9 @@ pub fn run_due_timers(queue: &TimerQueue, context: &mut Context) -> usize {
                 .global_object()
                 .get(js_string!(CALLBACK_REGISTRY), context)
                 .ok()
-                .and_then(|r| r.as_object().cloned())
+                .and_then(|r| r.as_object())
                 .and_then(|registry| registry.get(js_string!(id.to_string()), context).ok())
-                .and_then(|v| v.as_callable().cloned());
+                .and_then(|v| v.as_callable());
 
             let Some(callback) = callback else { continue };
 
@@ -310,7 +330,7 @@ pub fn run_due_timers(queue: &TimerQueue, context: &mut Context) -> usize {
             // Cada callback de temporizador es una TAREA del bucle de
             // eventos, y al final de cada tarea se vacian los microtasks -
             // misma razon por la que `eval`/`dispatch_event` ya lo hacen.
-            context.run_jobs();
+            crate::runtime::run_jobs_reporting(context);
 
             // Un `setTimeout` (no `setInterval`) ya disparado deja de tener
             // callback vivo: se borra del registro para que su funcion
@@ -318,7 +338,7 @@ pub fn run_due_timers(queue: &TimerQueue, context: &mut Context) -> usize {
             // la pagina.
             let still_scheduled = queue.lock().is_ok_and(|state| state.timers.iter().any(|t| t.id == id));
             if !still_scheduled {
-                if let Ok(Some(registry)) = context.global_object().get(js_string!(CALLBACK_REGISTRY), context).map(|r| r.as_object().cloned()) {
+                if let Ok(Some(registry)) = context.global_object().get(js_string!(CALLBACK_REGISTRY), context).map(|r| r.as_object()) {
                     let _ = registry.delete_property_or_throw(js_string!(id.to_string()), context);
                 }
             }

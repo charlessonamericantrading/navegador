@@ -1,0 +1,171 @@
+<!doctype html>
+<html>
+<head><title>Metodos de Element (Fase 44)</title></head>
+<body>
+  <div id="raiz" class="contenedor" data-user-id="42" data-simple="x">
+    <p id="parrafo" class="texto">Hola</p>
+    <button id="boton"><span id="icono">i</span></button>
+  </div>
+  <i id="fuera">fuera</i>
+
+<script>
+// Comportamiento de los metodos anadidos en la Fase 44 (tarea C6 del plan).
+// Se comprueban los casos que hacen util a cada metodo, no que exista.
+
+test(function () {
+  const p = document.getElementById('parrafo');
+  assert_true(p.matches('.texto'), 'deberia coincidir con su propia clase');
+  assert_true(p.matches('#raiz > .texto'), 'deberia coincidir con un combinador');
+  assert_false(p.matches('.no-existe'), 'no deberia coincidir con cualquier cosa');
+}, 'matches usa el matcher CSS real, con combinadores incluidos');
+
+test(function () {
+  // El caso que hace util a `closest`: se pulsa el icono de dentro del boton y
+  // aun asi se quiere el boton. Es la base de la delegacion de eventos.
+  const icono = document.getElementById('icono');
+  const boton = icono.closest('button');
+  assert_true(boton !== null, 'deberia encontrar el boton ancestro');
+  assert_equals(boton.id, 'boton');
+}, 'closest sube por los ancestros hasta encontrar el selector');
+
+test(function () {
+  // El spec dice que empieza por el propio elemento, no por su padre.
+  const boton = document.getElementById('boton');
+  assert_equals(boton.closest('button').id, 'boton');
+}, 'closest se incluye a si mismo');
+
+test(function () {
+  const p = document.getElementById('parrafo');
+  assert_true(p.closest('.no-existe-en-ningun-ancestro') === null,
+              'sin coincidencia debe devolver null, no undefined');
+}, 'closest devuelve null cuando no encuentra nada');
+
+test(function () {
+  const raiz = document.getElementById('raiz');
+  const icono = document.getElementById('icono');
+  const fuera = document.getElementById('fuera');
+  assert_true(raiz.contains(icono), 'un nieto sigue estando dentro');
+  assert_false(raiz.contains(fuera), 'un elemento de fuera no esta dentro');
+  // El detalle que hace correcto el patron "cerrar si el clic fue fuera":
+  // sin esto, pulsar el propio contenedor lo cerraria.
+  assert_true(raiz.contains(raiz), 'un nodo se contiene a si mismo');
+}, 'contains cubre descendientes profundos y a si mismo');
+
+test(function () {
+  const raiz = document.getElementById('raiz');
+  // camelCase, como el spec: `data-user-id` pasa a `userId`.
+  assert_equals(raiz.dataset.userId, '42');
+  assert_equals(raiz.dataset.simple, 'x');
+}, 'dataset expone los data-* en camelCase');
+
+test(function () {
+  const d = document.createElement('div');
+  d.innerHTML = '<b>negrita</b><i>cursiva</i>';
+  // Se comprueba el EFECTO sobre el arbol, no que la asignacion devuelva lo
+  // asignado: eso ultimo pasa incluso si `innerHTML` no existe, y fue un falso
+  // positivo real de la sonda de APIs hasta la Fase 44.
+  assert_equals(d.children.length, 2, 'deberian haberse creado dos elementos');
+  assert_equals(d.firstElementChild.tagName.toLowerCase(), 'b');
+}, 'innerHTML parsea HTML de verdad y crea nodos');
+
+test(function () {
+  const d = document.createElement('div');
+  d.innerHTML = '<b>x</b>';
+  assert_true(d.innerHTML.indexOf('<b>') !== -1, 'deberia reserializar sus hijos');
+  assert_true(d.innerHTML.indexOf('<div') === -1, 'innerHTML NO incluye la etiqueta propia');
+}, 'innerHTML devuelve solo los hijos');
+
+test(function () {
+  const d = document.createElement('div');
+  d.setAttribute('id', 'x');
+  d.innerHTML = 'hola';
+  const fuera = d.outerHTML;
+  assert_true(fuera.indexOf('<div') === 0, 'outerHTML SI incluye la etiqueta propia');
+  assert_true(fuera.indexOf('hola') !== -1);
+}, 'outerHTML incluye la etiqueta propia');
+
+test(function () {
+  const d = document.createElement('div');
+  d.innerHTML = '<b>a</b>';
+  d.innerHTML = '<i>b</i>';
+  // Reemplaza, no acumula: si acumulara, cada re-render de una aplicacion
+  // duplicaria su contenido.
+  assert_equals(d.children.length, 1);
+  assert_equals(d.firstElementChild.tagName.toLowerCase(), 'i');
+}, 'asignar innerHTML reemplaza el contenido anterior');
+
+test(function () {
+  const padre = document.createElement('div');
+  const hijo = document.createElement('span');
+  padre.appendChild(hijo);
+  assert_equals(padre.children.length, 1);
+  hijo.remove();
+  assert_equals(padre.children.length, 0, 'remove deberia sacarlo de su padre');
+}, 'remove se quita a si mismo de su padre');
+
+test(function () {
+  const d = document.createElement('div');
+  const b = document.createElement('b');
+  // Una cadena se convierte en nodo de TEXTO, no se parsea como HTML. Esa es
+  // la propiedad que hace seguro a `append` frente a `innerHTML`.
+  d.append('texto ', b);
+  assert_equals(d.children.length, 1, 'la cadena no debe crear un elemento');
+  assert_true(d.textContent.indexOf('texto') !== -1);
+}, 'append acepta varios argumentos y convierte cadenas en texto');
+
+test(function () {
+  const d = document.createElement('div');
+  const a = document.createElement('a');
+  const b = document.createElement('b');
+  d.appendChild(b);
+  d.prepend(a);
+  assert_equals(d.firstElementChild.tagName.toLowerCase(), 'a',
+                'prepend deberia insertar al principio');
+}, 'prepend inserta antes de lo que ya habia');
+
+test(function () {
+  const d = document.createElement('div');
+  d.innerHTML = '<span>x</span>';
+
+  const superficial = d.cloneNode(false);
+  assert_equals(superficial.children.length, 0, 'sin deep no lleva hijos');
+
+  const profundo = d.cloneNode(true);
+  assert_equals(profundo.children.length, 1, 'con deep lleva el subarbol');
+}, 'cloneNode respeta el argumento deep');
+
+test(function () {
+  const suelto = document.createElement('div');
+  assert_false(suelto.isConnected, 'un elemento recien creado no esta en el documento');
+  assert_true(document.getElementById('raiz').isConnected,
+              'un elemento del documento si lo esta');
+}, 'isConnected distingue un nodo montado de uno suelto');
+
+test(function () {
+  // La jerarquia de clases (Fase 44, tarea C3). `instanceof` es como media web
+  // decide si algo es un nodo o un objeto de configuracion.
+  const d = document.createElement('div');
+  assert_true(d instanceof HTMLDivElement, 'un div es un HTMLDivElement');
+  assert_true(d instanceof HTMLElement, 'y tambien un HTMLElement');
+  assert_true(d instanceof Element, 'y un Element');
+  assert_true(d instanceof Node, 'y un Node');
+}, 'un elemento pertenece a toda su cadena de clases');
+
+test(function () {
+  const p = document.createElement('p');
+  assert_false(p instanceof HTMLDivElement,
+               'un p NO es un div: si todo diera true, instanceof no distinguiria nada');
+}, 'instanceof distingue entre clases hermanas');
+
+test(function () {
+  // El patron con el que se instala cualquier polyfill: se anade al prototipo
+  // y lo ven los elementos YA creados. Sin cadena de prototipos, esto se
+  // instalaba "bien" y el metodo seguia sin existir.
+  const d = document.createElement('div');
+  Element.prototype.__sonda44 = function () { return 'heredado'; };
+  assert_equals(d.__sonda44(), 'heredado');
+  delete Element.prototype.__sonda44;
+}, 'un polyfill sobre Element.prototype lo ven los elementos ya creados');
+</script>
+</body>
+</html>

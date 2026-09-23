@@ -61,7 +61,7 @@ use boa_engine::property::Attribute;
 use boa_engine::{js_string, Context, JsArgs, JsNativeError, JsObject, JsResult, JsValue, NativeFunction};
 use boa_gc::{Finalize, Trace};
 use engine_net::request::Method;
-use engine_net::{NetworkEngine, NetworkRequest};
+use engine_net::{SharedBroker, NetworkRequest};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -107,7 +107,7 @@ struct XhrState {
 #[derive(Clone)]
 struct XhrCapture {
     state: Arc<Mutex<XhrState>>,
-    network: Arc<NetworkEngine>,
+    network: SharedBroker,
     /// Los manejadores `on*`. Estos SI son valores de Boa, asi que van
     /// aparte del resto y con el mismo razonamiento ya verificado para el
     /// registro de listeners del DOM (ver el aviso largo de
@@ -138,7 +138,7 @@ impl JsData for XhrCapture {}
 /// todo `JsRuntime` tiene red disponible. Sin llamar a esto, `new
 /// XMLHttpRequest()` lanza `ReferenceError`, que es la respuesta honesta
 /// donde de verdad no hay red, en vez de un objeto que nunca conecta.
-pub fn register_xhr(context: &mut Context, network: Arc<NetworkEngine>, page_url: Option<String>) -> JsResult<()> {
+pub fn register_xhr(context: &mut Context, network: SharedBroker, page_url: Option<String>) -> JsResult<()> {
     let constructor = NativeFunction::from_copy_closure_with_captures(
         |_this, _args, captured: &NetworkOnlyCapture, context| Ok(build_xhr_object(captured.0.clone(), captured.1.clone(), context).into()),
         NetworkOnlyCapture(network, page_url),
@@ -180,7 +180,7 @@ fn parse_method(raw: &str) -> Method {
 }
 
 #[derive(Clone)]
-struct NetworkOnlyCapture(Arc<NetworkEngine>, Option<String>);
+struct NetworkOnlyCapture(SharedBroker, Option<String>);
 
 impl Finalize for NetworkOnlyCapture {}
 unsafe impl Trace for NetworkOnlyCapture {
@@ -188,7 +188,7 @@ unsafe impl Trace for NetworkOnlyCapture {
 }
 
 /// Construye UNA instancia de `XMLHttpRequest` con su propio estado.
-fn build_xhr_object(network: Arc<NetworkEngine>, page_url: Option<String>, context: &mut Context) -> JsObject {
+fn build_xhr_object(network: SharedBroker, page_url: Option<String>, context: &mut Context) -> JsObject {
     let capture = XhrCapture {
         state: Arc::new(Mutex::new(XhrState::default())),
         network,
@@ -577,7 +577,7 @@ mod tests {
     /// `engine_server.exe` con un servidor local, no aqui.
     fn runtime_with_xhr() -> JsRuntime {
         let mut runtime = JsRuntime::new();
-        runtime.register_xhr(Arc::new(NetworkEngine::new()), None).expect("XHR deberia registrarse");
+        runtime.register_xhr(engine_net::LocalBroker::in_memory().shared(), None).expect("XHR deberia registrarse");
         runtime
     }
 

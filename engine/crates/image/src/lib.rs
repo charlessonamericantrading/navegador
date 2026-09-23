@@ -7,11 +7,11 @@
 //! y `layout` no puede depender de `gfx` (es al reves: `gfx` depende de
 //! `layout`, ver ARCHITECTURE.md "Arquitectura de crates").
 //!
-//! Sin SVG (`resvg` sigue sin integrarse - SVG es vectorial, no un simple
-//! decode-a-RGBA como el resto de formatos, fuera del alcance de esta
-//! tarea) y sin cache de imagenes repetidas entre navegaciones (mismo tipo
-//! de simplificacion declarada que ya existe para las hojas de estilo
-//! externas).
+//! SVG tambien se decodifica (`decode_svg`, via `resvg`/`usvg` - se
+//! rasteriza a RGBA8 igual que el resto, `decode_image` lo detecta
+//! automaticamente cuando el formato de trama estandar falla). Sin cache
+//! de imagenes repetidas entre navegaciones (mismo tipo de simplificacion
+//! declarada que ya existe para las hojas de estilo externas).
 
 use std::sync::Arc;
 use usvg::{fontdb, Options, PostProcessingSteps, TreeParsing, TreePostProc};

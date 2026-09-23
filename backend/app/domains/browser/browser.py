@@ -77,7 +77,7 @@ class NativeEngineClient:
                 limit=64 * 1024 * 1024,
             )
             self._stderr_task = asyncio.create_task(self._drain_stderr())
-            ready = await asyncio.wait_for(self._read_response(), timeout=10)
+            ready = await asyncio.wait_for(self._read_response("boot"), timeout=10)
             if (
                 ready.get("type") != "ready"
                 or ready.get("protocol_version") != self.protocol_version
@@ -113,21 +113,30 @@ class NativeEngineClient:
                     (json.dumps(request_payload, separators=(",", ":")) + "\n").encode()
                 )
                 await self.process.stdin.drain()
-                return await asyncio.wait_for(self._read_response(), timeout=30)
+                return await asyncio.wait_for(self._read_response(request_payload["id"]), timeout=30)
             except (BrokenPipeError, ConnectionError, asyncio.TimeoutError, RuntimeError, ValueError):
                 await self.close()
                 raise
 
-    async def _read_response(self) -> Dict[str, Any]:
+    async def _read_response(self, expected_id: str) -> Dict[str, Any]:
+        """Lee hasta la respuesta con `expected_id`.
+
+        Desde la Fase 50 el motor publica estados sin petición (`id: null`)
+        cuando un temporizador cambia la página; se descartan aquí porque esta
+        ruta no tiene a quién entregarlos. Una respuesta con otro `id` es de
+        una petición anterior que expiró y también se descarta.
+        """
         if self.process is None or self.process.stdout is None:
             raise NativeEngineUnavailableError()
-        line = await self.process.stdout.readline()
-        if not line:
-            raise RuntimeError("el proceso Rust cerró stdout")
-        response = json.loads(line.decode("utf-8"))
-        if not isinstance(response, dict):
-            raise ValueError("la respuesta NDJSON no es un objeto")
-        return response
+        while True:
+            line = await self.process.stdout.readline()
+            if not line:
+                raise RuntimeError("el proceso Rust cerró stdout")
+            response = json.loads(line.decode("utf-8"))
+            if not isinstance(response, dict):
+                raise ValueError("la respuesta NDJSON no es un objeto")
+            if response.get("id") == expected_id:
+                return response
 
     async def _drain_stderr(self):
         if self.process is None or self.process.stderr is None:

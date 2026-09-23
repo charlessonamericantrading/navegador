@@ -208,7 +208,7 @@ impl ContentSecurityPolicy {
     /// Si un recurso de esta URL se puede cargar bajo `directive`.
     pub fn allows_url(&self, directive: &str, url: &Url, page_origin: &str) -> bool {
         let Some(sources) = self.sources_for(directive) else { return true };
-        if sources.iter().any(|s| *s == Source::None) {
+        if sources.contains(&Source::None) {
             return false;
         }
         sources.iter().any(|s| s.matches_url(url, page_origin))
@@ -221,7 +221,7 @@ impl ContentSecurityPolicy {
     /// del error.
     pub fn allows_inline(&self, directive: &str) -> bool {
         let Some(sources) = self.sources_for(directive) else { return true };
-        sources.iter().any(|s| *s == Source::UnsafeInline)
+        sources.contains(&Source::UnsafeInline)
     }
 }
 

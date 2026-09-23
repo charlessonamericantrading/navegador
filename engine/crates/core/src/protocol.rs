@@ -126,12 +126,24 @@ pub enum EngineResponse {
         renderer_status: &'static str,
         width: u32,
         height: u32,
+        /// Quien hace la red y guarda cookies y almacenamiento: `"local"` (este
+        /// mismo proceso) o `"remote"` (un `engine_broker`, ADR 0001 etapa 2).
+        /// Lo dice el motor, no quien lo arranco: asi se comprueba que el modo
+        /// pedido es el que de verdad corre.
+        broker: &'static str,
     },
     Pong {
         id: Option<String>,
         protocol_version: u32,
         renderer_status: &'static str,
+        /// Lo mismo que en `Ready`: permite comprobar el modo de un motor ya
+        /// arrancado (la prueba de humo del paquete lo hace).
+        broker: &'static str,
     },
+    /// Con `id` es la respuesta a una peticion. Con `id: null` es una
+    /// publicacion espontanea (Fase 50): un temporizador de la pestaña activa
+    /// cambio lo que se ve. Un consumidor tiene que correlacionar por `id` y
+    /// no asumir que la siguiente linea responde a su ultima peticion.
     State {
         id: Option<String>,
         renderer_status: &'static str,
@@ -145,6 +157,17 @@ pub enum EngineResponse {
         title: String,
         screenshot: String,
         elements: Vec<InteractiveElement>,
+        /// Fase 39: la pagina se descargo SIN error de red pero no tiene
+        /// nada visible que pintar, y trae `<script>` que podrian haberlo
+        /// generado. Es el caso de la inmensa mayoria de webs modernas
+        /// (React/Next/Vue): el servidor manda una cascara vacia y el
+        /// contenido lo construye JavaScript en el cliente. El motor no
+        /// ejecuta todavia esos bundles, asi que pintaba un blanco sin un
+        /// solo mensaje - indistinguible de "la app esta rota". Este flag
+        /// existe para que el frontend pueda DECIRLO en vez de callar.
+        /// NO es una promesa de que la pagina funcionaria con mas JS: es
+        /// una descripcion de lo que se observo (vacia + con scripts).
+        requires_javascript: bool,
         /// Historial atras/adelante (Fase 4.4) - si hay una entrada real a
         /// la que ir con `back`/`forward` en este momento, para que el
         /// frontend pueda habilitar/deshabilitar sus botones sin tener que
@@ -255,6 +278,7 @@ mod tests {
             renderer_status: "ready",
             width: 1280,
             height: 720,
+            broker: "local",
         };
 
         let json = serde_json::to_string(&response).expect("response should serialize");

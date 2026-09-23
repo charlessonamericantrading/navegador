@@ -12,3 +12,6 @@ engine-dom = { path = "../dom" }
 cssparser = "0.37"
 selectors = "0.39"
 precomputed-hash = "0.1"
+
+[lints]
+workspace = true

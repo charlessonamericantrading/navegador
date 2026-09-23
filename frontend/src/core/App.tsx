@@ -1,8 +1,9 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
 import BrowserViewport from '../domains/browser/components/BrowserViewport';
 import WelcomeGuide from '../domains/onboarding/components/WelcomeGuide';
 import AgentSidebar from '../domains/agent/components/AgentSidebar';
-import type { BrowserInterface } from '../domains/agent/AgentOrchestrator';
+import { BrowserActionError, type BrowserInterface } from '../domains/agent/AgentOrchestrator';
+import type { EngineRequestPayload, EngineStateEvent } from '../electron';
 import './App.css';
 
 interface ElementRect {
@@ -34,6 +35,10 @@ function App() {
   const [screenshot, setScreenshot] = useState('');
   const [browserUrl, setBrowserUrl] = useState('');
   const [elements, setElements] = useState<InteractiveElement[]>([]);
+  // Fase 39: el motor avisa cuando la pagina se descargo bien pero su
+  // contenido lo genera JavaScript que todavia no se ejecuta. Sin esto la
+  // pantalla se quedaba en blanco sin un solo mensaje.
+  const [requiresJavascript, setRequiresJavascript] = useState(false);
   const [loading, setLoading] = useState(false);
   // Historial y pestañas: el motor los soporta desde hace tiempo y los
   // reporta en cada `state` (`can_go_back`/`can_go_forward`/`tab_id`),
@@ -51,15 +56,20 @@ function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [isAgentOpen, setIsAgentOpen] = useState(false);
 
-  // Referencias en vivo para que el agente siempre lea el estado actualizado
+  // Referencias en vivo para que el agente siempre lea el estado actualizado.
+  // Se escriben en un efecto de layout (tras el commit, antes de cualquier
+  // otro efecto o callback asincrono) y no durante el render, que React puede
+  // repetir o descartar.
   const browserUrlRef = useRef(browserUrl);
-  browserUrlRef.current = browserUrl;
   const elementsRef = useRef(elements);
-  elementsRef.current = elements;
   const tabsRef = useRef(tabs);
-  tabsRef.current = tabs;
   const activeTabIdRef = useRef(activeTabId);
-  activeTabIdRef.current = activeTabId;
+  useLayoutEffect(() => {
+    browserUrlRef.current = browserUrl;
+    elementsRef.current = elements;
+    tabsRef.current = tabs;
+    activeTabIdRef.current = activeTabId;
+  });
 
   const wsRef = useRef<WebSocket | null>(null);
   const toastTimeoutRef = useRef<number | undefined>(undefined);
@@ -84,22 +94,28 @@ function App() {
   // tres sitios (IPC inicial, evento IPC, respuesta a comando) y cada uno
   // leia un subconjunto distinto de campos - de ahi que el historial y las
   // pestañas se perdieran por el camino.
-  const applyEngineState = (data: any) => {
+  //
+  // Este y los helpers siguientes van en `useCallback` sin dependencias
+  // variables: solo tocan setters y refs, que React mantiene estables. Eso
+  // permite declararlos en los efectos de conexion (lint exhaustivo) sin que
+  // esos efectos se re-ejecuten y reconecten en cada render.
+  const applyEngineState = useCallback((data: EngineStateEvent) => {
     setScreenshot(data.screenshot || '');
     setBrowserUrl(data.url || '');
     setElements(data.elements || []);
+    setRequiresJavascript(Boolean(data.requires_javascript));
     setCanGoBack(Boolean(data.can_go_back));
     setCanGoForward(Boolean(data.can_go_forward));
     if (typeof data.tab_id === 'number') setActiveTabId(data.tab_id);
-  };
+  }, []);
 
-  const showToast = (message: string) => {
+  const showToast = useCallback((message: string) => {
     setToast(message);
     window.clearTimeout(toastTimeoutRef.current);
     toastTimeoutRef.current = window.setTimeout(() => setToast(null), 6000);
-  };
+  }, []);
 
-  const beginLoading = () => {
+  const beginLoading = useCallback(() => {
     setLoading(true);
     window.clearTimeout(loadingTimeoutRef.current);
     loadingTimeoutRef.current = window.setTimeout(() => {
@@ -110,16 +126,18 @@ function App() {
       // ciclo de reconexión en vez de esperar a que WebSocket lo detecte.
       wsRef.current?.close();
     }, 12000);
-  };
+  }, [showToast]);
 
-  const endLoading = () => {
+  const endLoading = useCallback(() => {
     setLoading(false);
     window.clearTimeout(loadingTimeoutRef.current);
-  };
+  }, []);
 
   // Solo toca refs, nunca estado, así que puede llamarse desde el onmessage del
   // WebSocket (que capturó el primer render) sin quedarse obsoleta.
-  const flushScroll = () => {
+  // Funcion con nombre propio (`flush`) para poder reintentarse desde su
+  // temporizador sin leer la constante antes de que exista.
+  const flushScroll = useCallback(function flush() {
     if (scrollBusyRef.current) return;
     const dy = scrollPendingRef.current;
     if (!dy) return;
@@ -134,9 +152,28 @@ function App() {
     window.clearTimeout(scrollTimeoutRef.current);
     scrollTimeoutRef.current = window.setTimeout(() => {
       scrollBusyRef.current = false;
-      flushScroll();
+      flush();
     }, 3000);
-  };
+  }, []);
+
+  // `list_tabs` es la unica peticion que NO devuelve un `state`, sino su
+  // propia respuesta con la lista - de ahi que se pida aparte y no salga
+  // de `applyEngineState`. Se refresca tras cualquier accion que pueda
+  // cambiar el conjunto de pestañas (abrir, cerrar, cambiar, y tambien
+  // navegar, porque el titulo de la pestaña activa cambia con la pagina).
+  const refreshTabs = useCallback(async () => {
+    if (!window.electronAPI?.sendEngineRequest) return;
+    try {
+      const res = await window.electronAPI.sendEngineRequest({ type: 'list_tabs' });
+      if (res?.type === 'tabs') {
+        setTabs(res.tabs || []);
+        if (typeof res.active_tab_id === 'number') setActiveTabId(res.active_tab_id);
+      }
+    } catch {
+      // Sin pestañas que mostrar es un estado valido, no un error que
+      // merezca molestar al usuario con un aviso.
+    }
+  }, []);
 
   // Escuchar reinicios/fallos del proceso backend (solo existe en la app de escritorio Electron)
   const [backendIssue, setBackendIssue] = useState<BackendStatusEvent | null>(null);
@@ -151,7 +188,7 @@ function App() {
       }
     });
     return unsubscribe;
-  }, []);
+  }, [showToast]);
 
   // Escuchar avisos de auto-actualización (solo existe en la app de escritorio Electron)
   const [updateReady, setUpdateReady] = useState(false);
@@ -287,46 +324,51 @@ function App() {
         wsRef.current.close();
       }
     };
-  }, []);
+  }, [applyEngineState, beginLoading, endLoading, flushScroll, refreshTabs, showToast]);
 
-  // Eventos manuales del usuario en el navegador
-  const sendCommand = async (payload: any): Promise<void> => {
+  // Ejecuta un comando y FALLA si el motor no lo confirma (plan H15). Es la
+  // unica ruta que usa el agente: un error del motor tiene que llegarle como
+  // excepcion, no como un aviso en pantalla que el bucle del agente no ve.
+  //
+  // Por WebSocket (modo desarrollo con FastAPI) no hay respuesta
+  // correlacionada, asi que el comando no se puede confirmar: se envia y se
+  // falla de forma explicita en vez de dar por hecho que funciono.
+  const runEngineCommand = useCallback(async (payload: EngineRequestPayload): Promise<void> => {
     if (window.electronAPI?.sendEngineRequest) {
+      beginLoading();
       try {
-        beginLoading();
         const res = await window.electronAPI.sendEngineRequest(payload);
+        if (res?.type === 'error') {
+          throw new BrowserActionError(res.message || 'Error en acción del motor');
+        }
         if (res?.type === 'state') {
           applyEngineState(res);
-        } else if (res?.type === 'error') {
-          showToast(res.message || 'Error en acción del motor');
         }
-      } catch (err: any) {
-        showToast(err.message || 'Error comunicando con el motor nativo');
+      } catch (err) {
+        if (err instanceof BrowserActionError) throw err;
+        throw new BrowserActionError(err instanceof Error ? err.message : 'Error comunicando con el motor nativo');
       } finally {
         endLoading();
       }
-    } else if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      return;
+    }
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       beginLoading();
       wsRef.current.send(JSON.stringify(payload));
+      throw new BrowserActionError('El transporte WebSocket no confirma comandos: no se puede verificar la acción.');
     }
-  };
+    throw new BrowserActionError('No hay conexión con el motor.');
+  }, [applyEngineState, beginLoading, endLoading]);
 
-  // `list_tabs` es la unica peticion que NO devuelve un `state`, sino su
-  // propia respuesta con la lista - de ahi que se pida aparte y no salga
-  // de `applyEngineState`. Se refresca tras cualquier accion que pueda
-  // cambiar el conjunto de pestañas (abrir, cerrar, cambiar, y tambien
-  // navegar, porque el titulo de la pestaña activa cambia con la pagina).
-  const refreshTabs = async () => {
-    if (!window.electronAPI?.sendEngineRequest) return;
+  // Eventos manuales del usuario en el navegador: el mismo comando, con el
+  // fallo convertido en aviso. Por WebSocket la falta de confirmacion es
+  // normal aqui (la respuesta llega luego como `state`), asi que no se avisa.
+  const sendCommand = async (payload: EngineRequestPayload): Promise<void> => {
     try {
-      const res = await window.electronAPI.sendEngineRequest({ type: 'list_tabs' });
-      if (res?.type === 'tabs') {
-        setTabs(res.tabs || []);
-        if (typeof res.active_tab_id === 'number') setActiveTabId(res.active_tab_id);
-      }
-    } catch {
-      // Sin pestañas que mostrar es un estado valido, no un error que
-      // merezca molestar al usuario con un aviso.
+      await runEngineCommand(payload);
+    } catch (err) {
+      if (!window.electronAPI?.sendEngineRequest && wsRef.current?.readyState === WebSocket.OPEN) return;
+      showToast(err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -402,19 +444,27 @@ function App() {
       return currentTab?.title || currentTab?.url || 'Página Web';
     },
     getElements: async () => elementsRef.current,
+    // Todas por `runEngineCommand`: un fallo del motor tiene que llegar al
+    // agente. `navigate` ya no pasa por `handleManualNavigate`, que volvia
+    // sin hacer nada si la pagina estaba cargando.
     navigate: async (url: string) => {
-      await handleManualNavigate(url);
+      await runEngineCommand({ type: 'navigate', url });
+      refreshTabs();
     },
     click: async (x: number, y: number) => {
-      await sendCommand({ type: 'click', x, y });
+      await runEngineCommand({ type: 'click', x, y });
     },
+    // Rellenar no envía (plan H17): enviar es `pressKey('Enter')`, un paso
+    // aparte que el agente tiene que decidir. La escritura manual
+    // (`handleManualType`) sigue enviando: la dispara el propio usuario al
+    // confirmar la ventana emergente de texto del viewport.
     typeText: async (x: number, y: number, text: string) => {
-      await sendCommand({ type: 'type_text', x, y, text, press_enter: true });
+      await runEngineCommand({ type: 'type_text', x, y, text, press_enter: false });
     },
     pressKey: async (key: string) => {
-      await sendCommand({ type: 'press_key', key });
+      await runEngineCommand({ type: 'press_key', key });
     }
-  }), []);
+  }), [runEngineCommand, refreshTabs]);
 
   return (
     <div className="app-container">
@@ -468,6 +518,7 @@ function App() {
           screenshot={screenshot}
           url={browserUrl}
           elements={elements}
+          requiresJavascript={requiresJavascript}
           onManualNavigate={handleManualNavigate}
           onManualClick={handleManualClick}
           onManualType={handleManualType}

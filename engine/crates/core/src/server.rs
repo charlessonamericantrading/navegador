@@ -5,7 +5,7 @@
 //! el layout con tiny-skia y devuelve la captura PNG en Base64. La salida
 //! estándar contiene exclusivamente JSON; los logs van a stderr.
 
-use crate::pipeline::{build_page_keeping_runtime, find_external_script_srcs, find_external_stylesheet_hrefs, find_image_srcs, PageResult};
+use crate::pipeline::{build_page_keeping_runtime, find_background_image_urls, find_external_script_srcs, find_external_stylesheet_hrefs, find_image_srcs, find_inline_style_css, find_module_preloads, PageResult};
 use crate::protocol::{
     ElementAttributes, ElementRect, EngineRequest, EngineResponse, InteractiveElement, TabInfo,
     PROTOCOL_VERSION,
@@ -14,13 +14,13 @@ use base64::Engine as _;
 use engine_dom::{Node, NodeType};
 use engine_gfx::render_layout_to_png;
 use engine_image::decode_image;
-use engine_js::{BoxMetrics, JsRuntime};
+use engine_js::JsRuntime;
 use engine_layout::{BoxType, ImageMap, LayoutBox, LayoutTreeBuilder};
-use engine_net::{NetworkEngine, NetworkRequest};
+use engine_net::{NetworkRequest, SharedBroker};
 use engine_text::FontSet;
 use std::collections::HashMap;
 use std::io;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 struct LoadedPage {
     url: String,
@@ -68,6 +68,18 @@ impl LoadedPage {
             self.font_set.as_ref(),
             &self.images,
         );
+        // `scrollTop`/`scrollLeft` asignados desde JS desde la ultima vez
+        // se aplican AQUI, contra el arbol recien construido - no en el
+        // momento de la asignacion (ver el aviso en `dom_bindings::
+        // scroll_accessor`). `relayout` es el UNICO sitio que reconstruye
+        // el arbol tras la carga inicial (ver el aviso de arriba: clic,
+        // tecla, redimension, todo pasa por aqui), asi que es el sitio
+        // correcto para que el scroll de cualquier contenedor se refleje
+        // de verdad tras la siguiente interaccion.
+        if let Some(offsets) = self.runtime.scroll_offsets() {
+            let copia = offsets.lock().unwrap().clone();
+            engine_layout::apply_scroll_offsets(&mut self.page.layout_root, &copia);
+        }
         self.publish_layout_snapshot();
     }
 
@@ -111,7 +123,7 @@ impl LoadedPage {
         let Some(snapshot) = self.runtime.layout_snapshot() else { return };
         let Ok(mut data) = snapshot.write() else { return };
         data.boxes.clear();
-        collect_box_metrics(&self.page.layout_root, &mut data.boxes);
+        crate::pipeline::collect_box_metrics(&self.page.layout_root, &mut data.boxes);
     }
 
     /// Actualiza SOLO el desplazamiento del snapshot. Separado de
@@ -128,33 +140,9 @@ impl LoadedPage {
     }
 }
 
-/// Aplana el arbol de layout a la lista de `(nodo, metricas)` que espera el
-/// snapshot. Solo entran las cajas CON nodo del DOM detras: las de texto y
-/// la raiz sintetica no corresponden a ningun elemento al que JS pueda
-/// llegar (misma regla que `LayoutBox::hit_test`).
-///
-/// Aqui es donde se paga la copia que `engine_js::cssom` declara: un clon
-/// del `computed_style` por caja. Se hace en `core` y no en `layout` porque
-/// `BoxMetrics` es un tipo de `engine-js`, y es `core` - que depende de los
-/// dos - el unico sitio donde las dos capas pueden encontrarse sin crear
-/// una dependencia nueva entre ellas.
-fn collect_box_metrics(layout: &LayoutBox, out: &mut Vec<(std::sync::Arc<std::sync::RwLock<Node>>, BoxMetrics)>) {
-    if let Some(node) = &layout.dom_node {
-        out.push((
-            node.clone(),
-            BoxMetrics {
-                x: layout.dimensions.x,
-                y: layout.dimensions.y,
-                width: layout.dimensions.width,
-                height: layout.dimensions.height,
-                computed_style: layout.computed_style.clone(),
-            },
-        ));
-    }
-    for child in &layout.children {
-        collect_box_metrics(child, out);
-    }
-}
+// `collect_box_metrics` vive ahora en `pipeline.rs`: `build_page_keeping_
+// runtime` tambien necesita publicar el snapshot, no solo `EngineServer`
+// (ver su doc-comment alli para el porque).
 
 /// Pestaña (Fase 4.5) - agrupa TODO lo que ya era, antes de esta fase,
 /// estado directo de `EngineServer` y que en realidad pertenece a una
@@ -214,20 +202,16 @@ impl Tab {
 struct EngineServer {
     width: u32,
     height: u32,
-    // `Arc` (Fase 4.3, no `NetworkEngine` a secas) - `fetch()` real
-    // necesita su PROPIA copia del mismo cliente HTTP/pool de conexiones
-    // ya construido (`register_fetch`, via `build_page_keeping_runtime`),
-    // no uno nuevo, y vive dentro del `JsRuntime` de cada pagina cargada,
-    // fuera del `&self`/`&mut self` normal de este struct - de ahi la
-    // necesidad de un handle compartido en vez de un prestamo.
-    network: std::sync::Arc<NetworkEngine>,
-    /// Web Storage de TODA la sesion (Fase 15) - vive aqui y no en la
-    /// pagina precisamente porque su razon de ser es sobrevivir a navegar
-    /// a otra. Cada pagina que se carga recibe un puntero a este mismo
-    /// almacen mas su propio origen, y solo puede ver el suyo (ver
-    /// `engine_net::storage`). Mismo criterio que las cookies, que por la
-    /// misma razon viven dentro de `NetworkEngine`.
-    storage: engine_js::storage::SharedWebStorage,
+    /// Todo lo que este renderer pide al exterior - red, cookies desde JS
+    /// y Web Storage - pasa por aqui (ADR 0001, etapa 2; Fase 64). Hoy es un
+    /// `LocalBroker` en el mismo proceso, con el mismo cliente HTTP, las
+    /// cookies y el almacen de siempre, compartidos por todas las paginas de
+    /// la sesion (su razon de ser es sobrevivir a navegar). Cada pagina
+    /// recibe un handle a este mismo broker mas su origen, y solo puede ver
+    /// lo suyo. Un broker en otro proceso se conectara sustituyendo esto.
+    broker: SharedBroker,
+    /// `"local"` o `"remote"`, para el saludo `ready`.
+    broker_kind: &'static str,
     /// Pestañas (Fase 4.5) - siempre tiene AL MENOS una (invariante
     /// mantenida por `close_tab`, que rechaza cerrar la ultima). `tabs`
     /// nunca se reordena por id, solo se inserta al final (`open_new_tab`)
@@ -251,15 +235,20 @@ struct EngineServer {
 }
 
 impl EngineServer {
+    /// Con el broker en el mismo proceso: cookies y `localStorage` del perfil
+    /// en disco (Fases 15 y 25), que recuperan la sesion de una carga
+    /// anterior del mismo perfil. `sessionStorage` sigue vacio al arrancar.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_broker(engine_net::LocalBroker::persistent().shared(), "local")
+    }
+
+    fn with_broker(broker: SharedBroker, broker_kind: &'static str) -> Self {
         Self {
             width: 1280,
             height: 720,
-            network: std::sync::Arc::new(NetworkEngine::new()),
-            // Fase 25: `load_from_disk`, no `new()` - recupera el `local`
-            // de una sesion anterior del mismo perfil. `session` sigue
-            // vacio siempre (ver el aviso de `WebStorage::load_from_disk`).
-            storage: std::sync::Arc::new(std::sync::Mutex::new(engine_net::storage::WebStorage::load_from_disk())),
+            broker,
+            broker_kind,
             tabs: vec![Tab::new(0)],
             active_tab: 0,
             next_tab_id: 1,
@@ -275,6 +264,41 @@ impl EngineServer {
         &mut self.tabs[self.active_tab]
     }
 
+    /// El reloj de fondo real (ver el aviso de `run_stdio`) - se llama
+    /// periodicamente desde una tarea de Tokio aparte, no desde ningun
+    /// comando NDJSON. Solo la pestaña ACTIVA (no todas): una pestaña en
+    /// segundo plano no se esta pintando, tiquearla igual seria trabajo
+    /// tirado (mismo criterio que un navegador real, que tambien
+    /// despriorizca temporizadores de pestañas en segundo plano) - si el
+    /// usuario cambia a ella mas tarde, `switch_tab` ya relayoutea esa
+    /// pestaña por su cuenta.
+    ///
+    /// `run_due_timers()` se llama DIRECTO (no via `relayout`, que lo haria
+    /// de nuevo) solo para decidir barato si merece la pena pagar un
+    /// relayout completo - la inmensa mayoria de los pulsos de este reloj
+    /// no tendran ningun temporizador vencido. Que `relayout()` vuelva a
+    /// comprobar temporizadores vencidos justo despues es inofensivo (no
+    /// hay ninguno nuevo que disparar dos veces), no una duplicacion real.
+    ///
+    /// Devuelve el estado nuevo (con `id: None`) si disparo algun
+    /// temporizador, para que `run_stdio` lo publique sin que nadie lo pida
+    /// (plan H07, Fase 50). Antes el relayout ocurria pero nadie se
+    /// enteraba: el cambio solo aparecia con el siguiente comando.
+    fn tick_active_tab_timers(&mut self) -> Option<EngineResponse> {
+        let (w, h) = (self.width, self.height);
+        let tab = self.active_tab_mut();
+        let page = tab.current_page.as_mut()?;
+        if page.runtime.run_due_timers() == 0 {
+            return None;
+        }
+        page.relayout(w as f32, h as f32);
+        let content_extent = page.page.layout_root.content_extent();
+        let scrolled = clamp_scroll_offset(tab.scroll_offset_y, content_extent, h as f32);
+        page.publish_scroll_offset(scrolled);
+        tab.scroll_offset_y = scrolled;
+        Some(self.state_response(None))
+    }
+
     fn ready_response(&self, id: Option<String>) -> EngineResponse {
         EngineResponse::Ready {
             id,
@@ -283,6 +307,7 @@ impl EngineServer {
             renderer_status: "ready",
             width: self.width,
             height: self.height,
+            broker: self.broker_kind,
         }
     }
 
@@ -296,6 +321,7 @@ impl EngineServer {
                     id,
                     protocol_version: PROTOCOL_VERSION,
                     renderer_status: "ready",
+                    broker: self.broker_kind,
                 },
                 false,
             ),
@@ -310,6 +336,19 @@ impl EngineServer {
                 let (w, h) = (self.width, self.height);
                 let tab = self.active_tab_mut();
                 if let Some(page) = &mut tab.current_page {
+                    // Evento `resize` real sobre `<html>` (mismo objetivo y
+                    // mismo motivo que el `scroll` de arriba: es donde
+                    // `window.addEventListener('resize', ...)` delega, ver
+                    // el aviso de `EngineRequest::Scroll`) ANTES del
+                    // relayout - un listener real de `resize` a menudo
+                    // muta el DOM (mostrar/ocultar un menu segun el ancho),
+                    // y ese cambio tiene que estar YA en el arbol que
+                    // `page.relayout` va a construir, no en el siguiente.
+                    if let Some(html) = Node::document_element(&page.page.dom_root) {
+                        if let Err(error) = page.runtime.dispatch_event(&html, "resize") {
+                            return (Self::error(id, format!("resize_event_error: {error}")), false);
+                        }
+                    }
                     page.relayout(w as f32, h as f32);
                     let content_extent = page.page.layout_root.content_extent();
                     tab.scroll_offset_y = clamp_scroll_offset(tab.scroll_offset_y, content_extent, h as f32);
@@ -319,14 +358,50 @@ impl EngineServer {
             EngineRequest::GetState { .. } => (self.state_response(id), false),
             EngineRequest::Click { x, y, .. } => (self.click(id, x, y).await, false),
             EngineRequest::Scroll { dy, .. } => {
-                let h = self.height;
+                let (w, h) = (self.width, self.height);
                 let tab = self.active_tab_mut();
-                if let Some(page) = &tab.current_page {
+                if let Some(page) = &mut tab.current_page {
                     let content_extent = page.page.layout_root.content_extent();
                     let scrolled = clamp_scroll_offset(tab.scroll_offset_y + dy as f32, content_extent, h as f32);
                     // Fase 8: `getBoundingClientRect` devuelve coordenadas
                     // de VIEWPORT, asi que el snapshot necesita saber
                     // cuanto se ha desplazado el documento.
+                    page.publish_scroll_offset(scrolled);
+                    tab.scroll_offset_y = scrolled;
+
+                    // Evento `scroll` real: el desplazamiento de arriba YA
+                    // era real (`getBoundingClientRect` ya lo reflejaba),
+                    // lo que faltaba era que un listener JS se enterara. Se
+                    // dispara sobre `<html>` (`documentElement`), NO sobre
+                    // `dom_root` directo - mismo objetivo exacto que ya usa
+                    // `fire_popstate`, y no por casualidad: `window.
+                    // addEventListener` (el shim de `register_history`, ver
+                    // su aviso) delega precisamente en `documentElement`,
+                    // asi que dispararlo ahi es lo unico que hace que
+                    // `window.addEventListener('scroll', ...)` tambien se
+                    // entere. `document.addEventListener('scroll', ...)`
+                    // SIGUE funcionando igual: `documentElement.parent` es
+                    // `dom_root`, y la fase de burbuja del dispatch camina
+                    // por los ancestros reales hasta llegar ahi.
+                    // `None` (documento sin ningun elemento raiz - un DOM
+                    // malformado que HTML5 parsing en la practica nunca
+                    // produce) se salta el evento sin tratarlo como error:
+                    // no hay a quien dispararselo, no que la propia
+                    // operacion de scroll haya fallado.
+                    if let Some(html) = Node::document_element(&page.page.dom_root) {
+                        if let Err(error) = page.runtime.dispatch_event(&html, "scroll") {
+                            return (Self::error(id, format!("scroll_event_error: {error}")), false);
+                        }
+                    }
+                    // Un listener de scroll puede mutar el DOM (el patron
+                    // real de "infinite scroll": cargar mas contenido al
+                    // acercarse al final) - mismo criterio que `click`/
+                    // `press_key`: relayout despues de dispatchear, y
+                    // reajustar/republicar el scroll contra el arbol
+                    // fresco (pudo haber crecido o encogido).
+                    page.relayout(w as f32, h as f32);
+                    let content_extent = page.page.layout_root.content_extent();
+                    let scrolled = clamp_scroll_offset(tab.scroll_offset_y, content_extent, h as f32);
                     page.publish_scroll_offset(scrolled);
                     tab.scroll_offset_y = scrolled;
                 }
@@ -366,7 +441,7 @@ impl EngineServer {
     /// autodestruiria el historial "adelante" al que deberia poder volver
     /// despues.
     async fn navigate(&mut self, id: Option<String>, url: String, record_history: bool) -> EngineResponse {
-        self.navigate_with_body(id, url, record_history, None).await
+        self.navigate_with_body(id, url, record_history, None, 0).await
     }
 
     /// Navega enviando un cuerpo `application/x-www-form-urlencoded` por
@@ -378,7 +453,7 @@ impl EngineServer {
     /// navegador de verdad pregunta antes de hacerlo). Aqui `back` la
     /// repetira como GET, que es distinto - declarado en ARCHITECTURE.md.
     async fn navigate_post(&mut self, id: Option<String>, url: String, body: Vec<u8>) -> EngineResponse {
-        self.navigate_with_body(id, url, true, Some(body)).await
+        self.navigate_with_body(id, url, true, Some(body), 0).await
     }
 
     /// El cuerpo comun de las dos: `body` a `None` hace un GET normal,
@@ -386,13 +461,27 @@ impl EngineServer {
     /// duplicar la funcion entera porque TODO lo que viene despues de la
     /// peticion (seguir redirecciones, descubrir sub-recursos, construir
     /// la pagina, historial, temporizadores de carga) es identico.
-    async fn navigate_with_body(&mut self, id: Option<String>, url: String, record_history: bool, body: Option<Vec<u8>>) -> EngineResponse {
+    /// Numero maximo de redirecciones ENCADENADAS que un script puede
+    /// provocar (`location.href = ...` durante la carga). Un navegador real
+    /// tiene un tope equivalente por la misma razon: sin el, una pagina que
+    /// se redirige a si misma cuelga el motor.
+    const MAX_CLIENT_REDIRECTS: u8 = 5;
+
+    async fn navigate_with_body(&mut self, id: Option<String>, url: String, record_history: bool, body: Option<Vec<u8>>, depth: u8) -> EngineResponse {
+        // Cronometro por fases. Sin esto la unica cifra observable era el
+        // total de la navegacion, que no distingue "la red va lenta" de
+        // "el motor tarda en maquetar" - y sin distinguirlo cualquier
+        // intento de optimizar es a ciegas. Se emite a `info`, asi que en
+        // uso normal (nivel `warn`) no cuesta nada; `RUST_LOG=info` lo
+        // enciende. Ver `bin/engine_server.rs`.
+        let nav_start = std::time::Instant::now();
         let request = match NetworkRequest::new(&url) {
             Ok(mut request) => {
                 let scheme = request.url.scheme();
                 if scheme != "http" && scheme != "https" {
                     return Self::error(id, format!("esquema_no_soportado: solo se admiten peticiones http y https (esquema: {scheme})"));
                 }
+                request.navigation = true;
                 if let Some(body) = body {
                     request.method = engine_net::request::Method::Post;
                     request.headers.insert("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string());
@@ -403,7 +492,7 @@ impl EngineServer {
             Err(error) => return Self::error(id, format!("invalid_url: {error}")),
         };
 
-        let response = match self.network.fetch(&request).await {
+        let response = match self.broker.fetch(&request).await {
             Ok(response) => response,
             Err(error) => return Self::error(id, format!("network_error: {error}")),
         };
@@ -426,6 +515,11 @@ impl EngineServer {
         let page_url = response.url.clone();
         let final_url = page_url.to_string();
         let html = response.text();
+        tracing::info!(
+            "[tiempo] documento descargado en {:?} ({} bytes)",
+            nav_start.elapsed(),
+            html.len()
+        );
 
         // Se parsea UNA vez aqui solo para descubrir que recursos externos
         // hacen falta (`<link rel=stylesheet>`, `<script src>`) - un DOM de
@@ -452,21 +546,54 @@ impl EngineServer {
         let page_origin = engine_net::storage::origin_of(&page_url);
 
         let stylesheet_hrefs = find_external_stylesheet_hrefs(&discovery_dom);
-        let script_srcs = find_external_script_srcs(&discovery_dom);
-        let image_srcs = find_image_srcs(&discovery_dom);
+        // Los fragmentos que un bundle declara con `<link rel="modulepreload">`
+        // se descargan junto a los `<script src>` y por el MISMO camino
+        // (mismo filtro de CSP `script-src`, mismo pool paralelo, mismo mapa):
+        // para el motor son codigo JavaScript que un `import` va a pedir, y
+        // tratarlos aparte solo abriria la puerta a que un dia uno de los dos
+        // caminos aplicara una politica distinta.
+        let mut script_srcs = find_external_script_srcs(&discovery_dom);
+        script_srcs.extend(find_module_preloads(&discovery_dom));
 
         // CSP se aplica ANTES de descargar, no despues: el objetivo es no
         // pedirle nada a un origen no autorizado, no descartar lo que ya
         // llego (que ya habria filtrado que la pagina visito ese sitio).
         let stylesheet_hrefs = filter_by_csp(stylesheet_hrefs, "style-src", &csp, &page_url, &page_origin);
         let script_srcs = filter_by_csp(script_srcs, "script-src", &csp, &page_url, &page_origin);
-        let image_srcs = filter_by_csp(image_srcs, "img-src", &csp, &page_url, &page_origin);
 
+        let (n_css, n_js) = (stylesheet_hrefs.len(), script_srcs.len());
+
+        let t = std::time::Instant::now();
         let external_css = self.fetch_external_stylesheets(stylesheet_hrefs, &page_url).await;
-        let external_scripts = self.fetch_external_scripts(script_srcs, &page_url).await;
-        let images = self.fetch_images(image_srcs, &page_url).await;
+        tracing::info!("[tiempo] {n_css} hoja(s) de estilo en {:?} ({} bytes de CSS)", t.elapsed(), external_css.len());
 
+        let t = std::time::Instant::now();
+        let external_scripts = self.fetch_external_scripts(script_srcs, &page_url).await;
+        tracing::info!("[tiempo] {n_js} script(s) externos en {:?}", t.elapsed());
+
+        // `background-image`/`background: url(...)` (Fase 40) - las URLs se
+        // descubren escaneando el CSS YA ENSAMBLADO (el `<style>` en linea
+        // del documento + las hojas externas que se acaban de descargar
+        // arriba), no desde el DOM como `<img src>` - por eso este
+        // descubrimiento no puede ocurrir antes que `external_css`. Se
+        // añaden a la MISMA lista que `<img src>` para reusar exactamente
+        // el mismo fetch/decode/`ImageMap` - `img-src` de CSP tambien
+        // gobierna una imagen de fondo, no solo `<img>`.
+        let allow_inline_style = csp.allows_inline("style-src");
+        let inline_css = if allow_inline_style { find_inline_style_css(&discovery_dom) } else { String::new() };
+        let mut image_srcs = find_image_srcs(&discovery_dom);
+        image_srcs.extend(find_background_image_urls(&format!("{inline_css}\n{external_css}")));
+        let image_srcs = filter_by_csp(image_srcs, "img-src", &csp, &page_url, &page_origin);
+        let n_img = image_srcs.len();
+
+        let t = std::time::Instant::now();
+        let images = self.fetch_images(image_srcs, &page_url).await;
+        tracing::info!("[tiempo] {n_img} imagen(es) en {:?} ({} decodificadas)", t.elapsed(), images.len());
+
+        let t = std::time::Instant::now();
         let font_set = FontSet::load_default_sans_serif();
+        tracing::info!("[tiempo] fuentes cargadas en {:?}", t.elapsed());
+        let t = std::time::Instant::now();
         let (page, mut runtime) = build_page_keeping_runtime(
             &html,
             &external_css,
@@ -475,14 +602,14 @@ impl EngineServer {
             Some(&font_set),
             &external_scripts,
             &images,
-            Some(self.network.clone()),
+            Some(self.broker.clone()),
             // Fase 15: el origen sale de la URL FINAL (`page_url`, tras
             // seguir redirecciones), no de la pedida - si `http://a.test`
             // redirige a `https://a.test`, el almacenamiento que toca es
             // el del origen donde de verdad se aterrizo, igual que en un
             // navegador real.
             Some(crate::scripting::StorageContext {
-                storage: self.storage.clone(),
+                storage: self.broker.clone(),
                 origin: page_origin.clone(),
                 url: page_url.to_string(),
                 csp: csp.clone(),
@@ -496,6 +623,7 @@ impl EngineServer {
         // honrarlas ademas abriria la puerta a que una pagina que llama
         // `window.open` al cargar se abriera a si misma en bucle, ya que
         // cada pestaña nueva vuelve a pasar por aqui.
+        tracing::info!("[tiempo] parseo + JS + cascada + layout en {:?}", t.elapsed());
         let discarded = runtime.take_pending_window_opens();
         if !discarded.is_empty() {
             tracing::info!(
@@ -587,7 +715,50 @@ impl EngineServer {
             .map(|page| page.runtime.take_pending_history_ops())
             .unwrap_or_default();
         self.apply_history_ops(load_time_ops);
-        self.state_response(id)
+
+        // Navegaciones pedidas por un script de CARGA (`location.href =
+        // ...`, tipico de una redireccion en cliente). A diferencia de
+        // `window.open`, esta SI se honra durante la carga: no abre nada
+        // nuevo, sustituye esta misma pagina, que es lo que la pagina esta
+        // pidiendo. El limite de profundidad corta el bucle de una pagina
+        // que se redirija a si misma; sin el, cada carga volveria a pedir
+        // la siguiente sin fin.
+        let navegaciones = self
+            .active_tab_mut()
+            .current_page
+            .as_mut()
+            .map(|page| page.runtime.take_pending_navigations())
+            .unwrap_or_default();
+        // `.last()`, no `.first()`: varias asignaciones sincronas seguidas
+        // (`location.pathname = 'a'; location.hash = 'b';`) son la ULTIMA
+        // ganando, igual que en un navegador real - la primera se estaba
+        // honrando y la ultima se descartaba en silencio.
+        if let Some(destino) = navegaciones.into_iter().last() {
+            if depth < Self::MAX_CLIENT_REDIRECTS {
+                if let Some(page) = self.active_tab().current_page.as_ref() {
+                    match url::Url::parse(&page.url).and_then(|base| base.join(&destino.raw_url)) {
+                        Ok(resuelta) => {
+                            let resuelta = resuelta.to_string();
+                            if resuelta != page.url {
+                                tracing::info!("[server] redireccion desde JS a {resuelta}");
+                                return Box::pin(self.navigate_with_body(id, resuelta, !destino.replace_current_entry, None, depth + 1)).await;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!("[server] URL de location.href invalida, se ignora la redireccion: {} ({error})", destino.raw_url);
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!("[server] demasiadas redirecciones desde JS seguidas, se corta el bucle");
+            }
+        }
+
+        let t = std::time::Instant::now();
+        let response = self.state_response(id);
+        tracing::info!("[tiempo] captura PNG en {:?}", t.elapsed());
+        tracing::info!("[tiempo] TOTAL navegacion {:?}", nav_start.elapsed());
+        response
     }
 
     /// Vuelve a la entrada ANTERIOR del historial (Fase 4.4) - vuelve a
@@ -822,6 +993,85 @@ impl EngineServer {
         EngineResponse::Tabs { id, tabs, active_tab_id }
     }
 
+    /// Cuantos subrecursos (imagenes, hojas, scripts) se descargan A LA VEZ.
+    ///
+    /// Seis es el limite clasico de conexiones por host de un navegador
+    /// real: suficiente para que la latencia deje de dominar, y bajo como
+    /// para no parecer un ataque al servidor ni agotar descriptores.
+    ///
+    /// El numero importa mucho: antes de esto los subrecursos se
+    /// descargaban EN SERIE, asi que el tiempo de carga era la SUMA de
+    /// todas las latencias. Medido en vivo: el articulo "Espana" de
+    /// Wikipedia trae 161 `<img>` de upload.wikimedia.org y tardaba ~38 s
+    /// solo en recorrerlas una a una.
+    const MAX_CONCURRENT_SUBRESOURCES: usize = 6;
+
+    /// Descarga en PARALELO (acotado, ver `MAX_CONCURRENT_SUBRESOURCES`)
+    /// una lista de referencias crudas (`href`/`src` tal como aparecen en
+    /// el HTML), resolviendolas antes contra `page_url` - la URL final tras
+    /// redirecciones, no la pedida originalmente.
+    ///
+    /// Devuelve `(referencia cruda, respuesta)` EN EL ORDEN ORIGINAL del
+    /// documento, no en el de llegada: se usa `buffered` y no
+    /// `buffer_unordered` justo por eso. El orden es indiferente para
+    /// imagenes y scripts (van a un mapa por clave) pero es OBLIGATORIO
+    /// para las hojas de estilo, donde "la que viene despues gana a igual
+    /// especificidad" - devolverlas segun quien contestara antes haria que
+    /// el aspecto de la pagina dependiera de la latencia de la red.
+    ///
+    /// Lo que falla (URL invalida, peticion no construible, 404, red
+    /// caida) se omite con un aviso y NO aborta la pagina, exactamente
+    /// igual que antes y que un navegador real.
+    async fn fetch_subresources(
+        &self,
+        refs: Vec<String>,
+        page_url: &url::Url,
+        kind: &'static str,
+    ) -> Vec<(String, engine_net::NetworkResponse)> {
+        use futures_util::stream::StreamExt;
+
+        let resolved: Vec<(String, url::Url)> = refs
+            .into_iter()
+            .filter_map(|raw| match page_url.join(&raw) {
+                Ok(absolute) => Some((raw, absolute)),
+                Err(_) => {
+                    tracing::warn!("[server] {kind} con URL invalida, se omite: {raw}");
+                    None
+                }
+            })
+            .collect();
+
+        futures_util::stream::iter(resolved)
+            .map(|(raw, absolute)| async move {
+                let request = match NetworkRequest::new(absolute.as_str()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        tracing::warn!("[server] no se pudo construir la peticion para {absolute}: {error}");
+                        return None;
+                    }
+                };
+                match self.broker.fetch(&request).await {
+                    Ok(response) if response.is_success() => Some((raw, response)),
+                    Ok(response) => {
+                        tracing::warn!(
+                            "[server] {absolute} respondio {} {}, se omite",
+                            response.status_code,
+                            response.status_text
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!("[server] no se pudo descargar {absolute}: {error}");
+                        None
+                    }
+                }
+            })
+            .buffered(Self::MAX_CONCURRENT_SUBRESOURCES)
+            .filter_map(|result| async move { result })
+            .collect()
+            .await
+    }
+
     /// Descarga cada href de `<link rel="stylesheet">` ya descubierto por
     /// `find_external_stylesheet_hrefs` y concatena su contenido, en orden
     /// de documento - la inmensa mayoria de la web real no lleva su CSS en
@@ -836,31 +1086,11 @@ impl EngineServer {
     /// estilos aunque una hoja concreta no cargue.
     async fn fetch_external_stylesheets(&self, hrefs: Vec<String>, page_url: &url::Url) -> String {
         let mut combined = String::new();
-        for href in hrefs {
-            let Ok(sheet_url) = page_url.join(&href) else {
-                tracing::warn!("[server] href de <link rel=stylesheet> invalido, se omite: {href}");
-                continue;
-            };
-            let request = match NetworkRequest::new(sheet_url.as_str()) {
-                Ok(request) => request,
-                Err(error) => {
-                    tracing::warn!("[server] no se pudo construir la peticion para {sheet_url}: {error}");
-                    continue;
-                }
-            };
-            match self.network.fetch(&request).await {
-                Ok(response) if response.is_success() => {
-                    let css = response.text();
-                    combined.push_str(&css);
-                    combined.push('\n');
-                }
-                Ok(response) => tracing::warn!(
-                    "[server] {sheet_url} respondio {} {}, se omite",
-                    response.status_code,
-                    response.status_text
-                ),
-                Err(error) => tracing::warn!("[server] no se pudo descargar {sheet_url}: {error}"),
-            }
+        // El orden que devuelve `fetch_subresources` es el del documento,
+        // no el de llegada - imprescindible aqui (ver su doc-comment).
+        for (_href, response) in self.fetch_subresources(hrefs, page_url, "<link rel=stylesheet>").await {
+            combined.push_str(&response.text());
+            combined.push('\n');
         }
         combined
     }
@@ -879,30 +1109,8 @@ impl EngineServer {
     /// descargarse se omite con un aviso, no aborta la pagina entera.
     async fn fetch_external_scripts(&self, srcs: Vec<String>, page_url: &url::Url) -> HashMap<String, String> {
         let mut fetched = HashMap::new();
-        for src in srcs {
-            let Ok(script_url) = page_url.join(&src) else {
-                tracing::warn!("[server] src de <script> invalido, se omite: {src}");
-                continue;
-            };
-            let request = match NetworkRequest::new(script_url.as_str()) {
-                Ok(request) => request,
-                Err(error) => {
-                    tracing::warn!("[server] no se pudo construir la peticion para {script_url}: {error}");
-                    continue;
-                }
-            };
-            match self.network.fetch(&request).await {
-                Ok(response) if response.is_success() => {
-                    let js = response.text();
-                    fetched.insert(src, js);
-                }
-                Ok(response) => tracing::warn!(
-                    "[server] {script_url} respondio {} {}, se omite",
-                    response.status_code,
-                    response.status_text
-                ),
-                Err(error) => tracing::warn!("[server] no se pudo descargar {script_url}: {error}"),
-            }
+        for (src, response) in self.fetch_subresources(srcs, page_url, "<script src>").await {
+            fetched.insert(src, response.text());
         }
         fetched
     }
@@ -918,31 +1126,16 @@ impl EngineServer {
     /// `external_scripts`.
     async fn fetch_images(&self, srcs: Vec<String>, page_url: &url::Url) -> ImageMap {
         let mut fetched = ImageMap::new();
-        for src in srcs {
-            let Ok(image_url) = page_url.join(&src) else {
-                tracing::warn!("[server] src de <img> invalido, se omite: {src}");
-                continue;
-            };
-            let request = match NetworkRequest::new(image_url.as_str()) {
-                Ok(request) => request,
-                Err(error) => {
-                    tracing::warn!("[server] no se pudo construir la peticion para {image_url}: {error}");
-                    continue;
+        for (src, response) in self.fetch_subresources(srcs, page_url, "<img src>").await {
+            // La DECODIFICACION sigue siendo secuencial a proposito: es
+            // trabajo de CPU, no de red, y paralelizarla necesitaria sacarla
+            // a un pool aparte. Lo que dominaba el tiempo era la espera de
+            // red, y eso es lo que se acaba de arreglar.
+            match decode_image(&response.body) {
+                Some(image) => {
+                    fetched.insert(src, image);
                 }
-            };
-            match self.network.fetch(&request).await {
-                Ok(response) if response.is_success() => match decode_image(&response.body) {
-                    Some(image) => {
-                        fetched.insert(src, image);
-                    }
-                    None => tracing::warn!("[server] {image_url} no se pudo decodificar como imagen, se omite"),
-                },
-                Ok(response) => tracing::warn!(
-                    "[server] {image_url} respondio {} {}, se omite",
-                    response.status_code,
-                    response.status_text
-                ),
-                Err(error) => tracing::warn!("[server] no se pudo descargar {image_url}: {error}"),
+                None => tracing::warn!("[server] {src} no se pudo decodificar como imagen, se omite"),
             }
         }
         fetched
@@ -1339,6 +1532,9 @@ impl EngineServer {
                 title: String::new(),
                 screenshot: String::new(),
                 elements: Vec::new(),
+                // Sin pagina cargada no hay nada que diagnosticar: el
+                // frontend pinta su pagina de inicio, no un aviso.
+                requires_javascript: false,
                 can_go_back,
                 can_go_forward,
             };
@@ -1365,6 +1561,10 @@ impl EngineServer {
             title: page.current_title(),
             screenshot,
             elements: collect_interactive_elements(&page.page.layout_root),
+            requires_javascript: page_content_requires_javascript(
+                &page.page.dom_root,
+                &page.page.layout_root,
+            ),
             can_go_back,
             can_go_forward,
         }
@@ -1568,14 +1768,17 @@ fn is_radio(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> bool {
 /// 2. **Un radio desmarca a su grupo**: los demas `input[type=radio]` con
 ///    el MISMO `name` pierden su `checked`.
 ///
-/// El grupo se busca en el documento ENTERO, no dentro del `<form>` que
-/// contenga al radio - simplificacion declarada: el spec real agrupa por
-/// "form owner", asi que dos formularios distintos en la misma pagina que
-/// reutilicen el mismo `name` se pisarian entre si aqui y no deberian.
-/// Poco comun en paginas reales (reutilizar el mismo `name` en dos
-/// formularios de la misma pagina es raro y casi siempre un error), y
-/// arreglarlo exige un concepto de "form owner" que este motor todavia no
-/// tiene.
+/// El grupo se agrupa por "form owner" (§ del spec real): mismo `name` Y
+/// mismo `<form>` ancestro mas cercano (via `find_form_ancestor`) - dos
+/// radios sin NINGUN `<form>` ancestro tambien se agrupan entre si (ambos
+/// tienen "sin dueño" como form owner, que sigue siendo el MISMO valor).
+/// Antes se agrupaba por `name` a secas en el documento ENTERO, asi que
+/// dos formularios distintos que reutilizaran el mismo `name` se pisaban
+/// entre si - poco comun en paginas reales, pero un formulario real no
+/// puede alcanzar ese estado por clics del usuario. Simplificacion que
+/// SIGUE declarada: no resuelve el atributo `form="id-de-otro-form"` (un
+/// radio puede pertenecer a un `<form>` que no sea su ancestro via ese
+/// atributo, caso mas raro todavia) - solo el ancestro mas cercano.
 ///
 /// Un radio SIN `name` (o con el `name` vacio) no forma grupo con nadie:
 /// se marca el solo, sin tocar a ningun otro - igual que el spec real,
@@ -1589,11 +1792,17 @@ fn apply_checkable_click(
         return;
     }
     if let Some(group) = input_name(node) {
+        let form_owner = find_form_ancestor(node);
+        let same_form_owner = |other: &std::sync::Arc<std::sync::RwLock<Node>>| match (&form_owner, find_form_ancestor(other)) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, &b),
+            (None, None) => true,
+            _ => false,
+        };
         for other in Node::find_all_by_tag(dom_root, "input") {
             if std::sync::Arc::ptr_eq(&other, node) {
                 continue;
             }
-            if is_radio(&other) && input_name(&other).as_deref() == Some(group.as_str()) {
+            if is_radio(&other) && input_name(&other).as_deref() == Some(group.as_str()) && same_form_owner(&other) {
                 set_checked(&other, false);
             }
         }
@@ -1899,37 +2108,192 @@ fn encode_form_body(data: &[(String, String)]) -> Vec<u8> {
 }
 
 pub async fn run_stdio() -> io::Result<()> {
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+    let mut lines = BoundedLines::new(BufReader::new(tokio::io::stdin()), MAX_REQUEST_LINE_BYTES);
     let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
-    let mut server = EngineServer::new();
+    // Con `NAVEGADOR_IA_BROKER` la red, las cookies y el almacenamiento los
+    // pone otro proceso (ADR 0001, etapa 2) y este no abre el perfil en
+    // disco. Si se pidio broker y no se puede conectar, el motor NO arranca:
+    // seguir con la red y el disco propios en silencio seria justo lo que la
+    // ADR prohibe (principio 7 del plan).
+    let mut server = match engine_net::broker_remote::from_env().await? {
+        Some(remote) => {
+            tracing::info!("[engine] broker remoto: soy {}", remote.renderer());
+            EngineServer::with_broker(std::sync::Arc::new(remote), "remote")
+        }
+        None => EngineServer::with_broker(engine_net::LocalBroker::persistent().shared(), "local"),
+    };
 
     write_response(&mut stdout, server.ready_response(Some("boot".to_string()))).await?;
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
+    // Reloj de fondo real (ver el aviso de `EngineServer::
+    // tick_active_tab_timers`): antes de esto, un `setTimeout`/
+    // `setInterval` solo avanzaba cuando llegaba un comando NDJSON nuevo
+    // (clic, tecla, navegar, redimensionar...). NO se reparte en una
+    // tarea de Tokio aparte (`tokio::spawn`) - Boa usa `Rc` internamente
+    // (su `Context` no es `Send`), asi que `EngineServer` tampoco lo es y
+    // ninguna tarea separada podria tocarlo. `tokio::select!` dentro de
+    // este MISMO bucle consigue el mismo efecto (reaccionar a "paso el
+    // tiempo" sin bloquear la lectura de la siguiente linea) sin
+    // necesitar compartir nada entre tareas.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
 
-        let response = match serde_json::from_str::<EngineRequest>(&line) {
-            Ok(request) => {
-                let (response, should_shutdown) = server.handle(request).await;
-                write_response(&mut stdout, response).await?;
-                if should_shutdown {
-                    break;
+    // Huella del ultimo `State` escrito, sea respuesta o publicacion
+    // espontanea: es lo ultimo que el consumidor tiene en pantalla. Un
+    // temporizador que dispara sin cambiar nada visible (un `setInterval`
+    // que solo consulta algo) no genera otra publicacion identica.
+    let mut last_state: Option<u64> = None;
+
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let line = match line? {
+                    None => break,
+                    Some(Ok(line)) => line,
+                    // Una linea desmedida o que no es UTF-8 se contesta y se
+                    // sigue: antes la primera crecia sin limite y la segunda
+                    // mataba el proceso entero con `InvalidData`.
+                    Some(Err(rejected)) => {
+                        write_response(&mut stdout, EngineResponse::Error { id: None, message: rejected.message() }).await?;
+                        continue;
+                    }
+                };
+                if line.trim().is_empty() {
+                    continue;
                 }
-                continue;
-            }
-            Err(error) => EngineResponse::Error {
-                id: None,
-                message: format!("invalid_request: {error}"),
-            },
-        };
 
-        write_response(&mut stdout, response).await?;
+                let response = match serde_json::from_str::<EngineRequest>(&line) {
+                    Ok(request) => {
+                        let (response, should_shutdown) = server.handle(request).await;
+                        if let Some(fingerprint) = state_fingerprint(&response) {
+                            last_state = Some(fingerprint);
+                        }
+                        write_response(&mut stdout, response).await?;
+                        if should_shutdown {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(error) => EngineResponse::Error {
+                        id: None,
+                        message: format!("invalid_request: {error}"),
+                    },
+                };
+
+                write_response(&mut stdout, response).await?;
+            }
+            _ = tick.tick() => {
+                let Some(state) = server.tick_active_tab_timers() else { continue };
+                let fingerprint = state_fingerprint(&state);
+                if fingerprint.is_some() && fingerprint != last_state {
+                    last_state = fingerprint;
+                    write_response(&mut stdout, state).await?;
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Huella de lo que un `State` muestra, sin su `id`: dos estados con la
+/// misma huella son indistinguibles para quien los pinta. `None` si la
+/// respuesta no es un `State` (un error de render, por ejemplo), que nunca
+/// se deduplica.
+fn state_fingerprint(response: &EngineResponse) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let EngineResponse::State { tab_id, scroll_offset_y, url, title, screenshot, elements, requires_javascript, can_go_back, can_go_forward, .. } = response else {
+        return None;
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (tab_id, scroll_offset_y.to_bits(), url, title, screenshot, requires_javascript, can_go_back, can_go_forward).hash(&mut hasher);
+    serde_json::to_string(elements).unwrap_or_default().hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// Tope de una linea de peticion (plan H06). Las peticiones reales son
+/// pequenas; la mayor es `type_text`, cuyo texto la interfaz limita a 100.000
+/// caracteres, que escapados en JSON no llegan a 1 MiB.
+const MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
+
+/// Por que se rechazo una linea sin llegar a parsearla.
+#[derive(Debug, PartialEq, Eq)]
+enum RejectedLine {
+    TooLong { bytes: usize },
+    NotUtf8,
+}
+
+impl RejectedLine {
+    fn message(&self) -> String {
+        match self {
+            RejectedLine::TooLong { bytes } => format!("request_too_large: la linea supera {MAX_REQUEST_LINE_BYTES} bytes ({bytes} leidos)"),
+            RejectedLine::NotUtf8 => "invalid_request: la linea no es UTF-8".to_string(),
+        }
+    }
+}
+
+/// Lector de lineas con tope, sustituto de `AsyncBufReadExt::lines`.
+///
+/// Tiene que ser seguro ante cancelacion: `run_stdio` lo usa dentro de un
+/// `tokio::select!` con el reloj de temporizadores, que puede ganar a mitad
+/// de una linea. Por eso la linea a medias vive en `self.buf` y no en el
+/// futuro: entre `fill_buf` (seguro ante cancelacion) y `consume` no hay
+/// ningun `await`, asi que no se pierde ni se duplica ningun byte.
+struct BoundedLines<R> {
+    reader: R,
+    max: usize,
+    buf: Vec<u8>,
+    /// Bytes de la linea en curso, incluidos los descartados.
+    seen: usize,
+}
+
+impl<R: AsyncBufRead + Unpin> BoundedLines<R> {
+    fn new(reader: R, max: usize) -> Self {
+        Self { reader, max, buf: Vec::new(), seen: 0 }
+    }
+
+    /// `None` al cerrarse la entrada; `Some(Err)` para una linea rechazada,
+    /// que se consume entera para que la siguiente empiece limpia.
+    async fn next_line(&mut self) -> io::Result<Option<Result<String, RejectedLine>>> {
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                // Fin de la entrada: una ultima linea sin salto tambien cuenta.
+                if self.seen == 0 {
+                    return Ok(None);
+                }
+                return Ok(Some(self.finish_line()));
+            }
+            let (chunk, found_newline) = match available.iter().position(|&b| b == b'\n') {
+                Some(i) => (&available[..i], true),
+                None => (available, false),
+            };
+            let chunk_len = chunk.len();
+            self.seen += chunk_len;
+            if self.seen <= self.max {
+                self.buf.extend_from_slice(chunk);
+            } else {
+                // Sin guardar nada mas: la memoria no crece con la linea.
+                self.buf.clear();
+            }
+            self.reader.consume(chunk_len + usize::from(found_newline));
+            if found_newline {
+                return Ok(Some(self.finish_line()));
+            }
+        }
+    }
+
+    fn finish_line(&mut self) -> Result<String, RejectedLine> {
+        let seen = std::mem::take(&mut self.seen);
+        let bytes = std::mem::take(&mut self.buf);
+        if seen > self.max {
+            return Err(RejectedLine::TooLong { bytes: seen });
+        }
+        let mut line = String::from_utf8(bytes).map_err(|_| RejectedLine::NotUtf8)?;
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        Ok(line)
+    }
 }
 
 async fn write_response(
@@ -1963,6 +2327,46 @@ fn collect_interactive_elements(layout_root: &engine_layout::LayoutBox) -> Vec<I
 /// interaccion) aunque nunca se pintara en pantalla. Reusar el arbol de
 /// layout en vez de duplicar la lista de tags excluidos aqui: una sola
 /// fuente de verdad sobre que cuenta como "visible".
+/// Minimo de texto visible para dar una pagina por "con contenido".
+/// 40 caracteres es aproximadamente una frase corta: por debajo de eso no
+/// hay nada que un humano reconozca como pagina. El numero es un JUICIO,
+/// no un valor del spec - se elige bajo a proposito para no acusar de
+/// "vacia" a una pagina real y escueta (un 404 de texto plano, una landing
+/// de una sola linea): preferimos callar de mas que mentir.
+const MIN_VISIBLE_TEXT_CHARS: usize = 40;
+
+/// Fase 39: ¿esta pagina esta en blanco PORQUE su contenido lo genera
+/// JavaScript que este motor todavia no ejecuta?
+///
+/// Se responde con lo unico que se puede observar sin ejecutar nada:
+/// 1. el arbol de LAYOUT no tiene practicamente texto visible (se reusa
+///    `collect_visible_text`, que ya filtra `<script>`/`<noscript>`, en vez
+///    de mirar el DOM crudo - si no, el propio codigo del script contaria
+///    como "contenido"), y
+/// 2. el documento SI trae `<script>`.
+///
+/// Las dos condiciones juntas describen exactamente la cascara vacia que
+/// sirven React/Next/Vue/Shopify. Verificado en vivo: `ignislove.com`
+/// devuelve 0 caracteres de texto visible con 7 `<script>`; Google y
+/// Wikipedia mandan su texto en el HTML y no se marcan.
+///
+/// Lo que esto NO hace, a proposito: no afirma que la pagina FUNCIONARIA
+/// con un motor de JS completo (puede fallar por otras razones), no
+/// distingue "el script no se ejecuto" de "se ejecuto y no pinto nada", y
+/// da un falso positivo en una pagina legitimamente casi vacia que ademas
+/// lleve un script (analitica, por ejemplo). Ese falso positivo se acepta:
+/// el coste es un aviso de mas en una pagina que igualmente se ve vacia.
+fn page_content_requires_javascript(
+    dom_root: &std::sync::Arc<std::sync::RwLock<Node>>,
+    layout_root: &LayoutBox,
+) -> bool {
+    let visible = collect_visible_text(layout_root);
+    if visible.trim().chars().count() >= MIN_VISIBLE_TEXT_CHARS {
+        return false;
+    }
+    !Node::find_all_by_tag(dom_root, "script").is_empty()
+}
+
 fn collect_visible_text(layout_box: &LayoutBox) -> String {
     let mut text = String::new();
     collect_visible_text_recursive(layout_box, &mut text);
@@ -2024,6 +2428,65 @@ fn collect_elements_recursive(
 }
 
 #[cfg(test)]
+mod bounded_lines_tests {
+    use super::*;
+
+    /// Capacidad minima a proposito: obliga a que cada linea llegue en
+    /// varios `fill_buf`, que es donde se rompe un lector ingenuo.
+    fn lector(entrada: &'static [u8], max: usize) -> BoundedLines<BufReader<&'static [u8]>> {
+        BoundedLines::new(BufReader::with_capacity(4, entrada), max)
+    }
+
+    #[tokio::test]
+    async fn reads_lines_across_small_buffers_strips_crlf_and_keeps_the_last_unterminated_line() {
+        let mut lines = lector(b"{\"a\":1}\r\nsegunda\nultima", 100);
+        assert_eq!(lines.next_line().await.unwrap(), Some(Ok("{\"a\":1}".to_string())));
+        assert_eq!(lines.next_line().await.unwrap(), Some(Ok("segunda".to_string())));
+        assert_eq!(lines.next_line().await.unwrap(), Some(Ok("ultima".to_string())));
+        assert_eq!(lines.next_line().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_line_over_the_limit_is_rejected_whole_and_the_next_one_is_clean() {
+        let mut lines = lector(b"0123456789ABCDEF\n{\"ok\":1}\n", 10);
+        assert_eq!(lines.next_line().await.unwrap(), Some(Err(RejectedLine::TooLong { bytes: 16 })));
+        assert_eq!(lines.next_line().await.unwrap(), Some(Ok("{\"ok\":1}".to_string())));
+    }
+
+    #[tokio::test]
+    async fn the_rejected_line_is_not_kept_in_memory() {
+        let mut lines = BoundedLines::new(BufReader::with_capacity(4, &[b'x'; 10_000][..]), 10);
+        let rechazada = lines.next_line().await.unwrap();
+        assert_eq!(rechazada, Some(Err(RejectedLine::TooLong { bytes: 10_000 })));
+        assert!(lines.buf.capacity() <= 16, "el buffer no deberia haber crecido con la linea: {}", lines.buf.capacity());
+    }
+
+    /// Antes, un byte que no era UTF-8 hacia que `lines()` devolviera
+    /// `InvalidData` y `run_stdio` terminaba con `?`: el motor moria.
+    #[tokio::test]
+    async fn invalid_utf8_is_a_rejected_line_not_a_fatal_error() {
+        let mut lines = lector(b"\xff\xfe\n{\"ok\":1}\n", 100);
+        assert_eq!(lines.next_line().await.unwrap(), Some(Err(RejectedLine::NotUtf8)));
+        assert_eq!(lines.next_line().await.unwrap(), Some(Ok("{\"ok\":1}".to_string())));
+    }
+
+    /// El caso de `run_stdio`: el reloj gana el `select!` a mitad de una
+    /// linea y el futuro de lectura se descarta. Lo ya leido no se pierde.
+    #[tokio::test]
+    async fn cancelling_mid_line_loses_no_bytes() {
+        let (mut escritor, lectura) = tokio::io::duplex(64);
+        let mut lines = BoundedLines::new(BufReader::new(lectura), 100);
+
+        escritor.write_all(b"{\"type\":").await.unwrap();
+        let cancelada = tokio::time::timeout(std::time::Duration::from_millis(20), lines.next_line()).await;
+        assert!(cancelada.is_err(), "sin salto de linea no deberia haber terminado");
+
+        escritor.write_all(b"\"ping\"}\n").await.unwrap();
+        assert_eq!(lines.next_line().await.unwrap(), Some(Ok("{\"type\":\"ping\"}".to_string())));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::EngineRequest;
@@ -2048,6 +2511,72 @@ mod tests {
         assert!(!text.contains("iframe"), "el marcado de <noscript> no deberia colarse en el texto visible: {text:?}");
         assert!(!text.contains("var x"), "el codigo fuente de <script> no deberia colarse en el texto visible: {text:?}");
         assert!(text.contains("contenido real"), "el contenido normal de la pagina si deberia aparecer");
+    }
+
+    /// Helper de los tests de Fase 39: parsea HTML y construye su layout,
+    /// que es exactamente el par que recibe `page_content_requires_javascript`.
+    fn dom_and_layout(html: &str) -> (std::sync::Arc<std::sync::RwLock<Node>>, LayoutBox) {
+        let dom = engine_dom::HtmlParser::parse(html);
+        let stylesheet = engine_css::CssParser::parse("");
+        let layout_root = LayoutTreeBuilder::build(&dom, &stylesheet, 1280.0, 720.0, None, &ImageMap::new());
+        (dom, layout_root)
+    }
+
+    /// El caso que motivo la Fase 39, medido en vivo contra una web real
+    /// (`ignislove.com`): el servidor manda una cascara sin una sola letra
+    /// visible y 7 `<script>` que construirian la pagina en el cliente.
+    /// Antes esto se pintaba como un blanco mudo.
+    #[test]
+    fn an_empty_shell_with_scripts_is_reported_as_javascript_dependent() {
+        let (dom, layout) = dom_and_layout(
+            r#"<html><head><title>Tienda</title></head><body><div id="root"></div><script src="/app.js"></script></body></html>"#,
+        );
+        assert!(
+            page_content_requires_javascript(&dom, &layout),
+            "una cascara vacia con <script> deberia marcarse como dependiente de JavaScript"
+        );
+    }
+
+    /// Una pagina que SI trae su texto en el HTML no se marca, aunque lleve
+    /// scripts (analitica, por ejemplo) - que es el caso de Wikipedia y
+    /// Google, ambos comprobados en vivo.
+    #[test]
+    fn a_page_that_ships_its_text_is_not_reported_even_with_scripts() {
+        let (dom, layout) = dom_and_layout(
+            r#"<html><body><h1>Espana</h1><p>Espana es un pais soberano situado en el suroeste de Europa.</p><script src="/analytics.js"></script></body></html>"#,
+        );
+        assert!(
+            !page_content_requires_javascript(&dom, &layout),
+            "una pagina con texto real no deberia marcarse aunque tenga scripts"
+        );
+    }
+
+    /// Sin `<script>` no hay nada que culpar: una pagina vacia y SIN
+    /// scripts esta vacia de verdad, y decir "necesita JavaScript" seria
+    /// mentir. Es la mitad de la heuristica que evita el falso positivo mas
+    /// obvio.
+    #[test]
+    fn an_empty_page_without_scripts_is_not_blamed_on_javascript() {
+        let (dom, layout) = dom_and_layout(r#"<html><body></body></html>"#);
+        assert!(
+            !page_content_requires_javascript(&dom, &layout),
+            "sin scripts, una pagina vacia no deberia atribuirse a JavaScript"
+        );
+    }
+
+    /// El codigo fuente del propio script no cuenta como contenido: si
+    /// contara (mirando el DOM crudo en vez del arbol de layout), un bundle
+    /// grande haria que la cascara pareciera llena y el aviso no saltaria
+    /// nunca. Es la razon exacta de reusar `collect_visible_text`.
+    #[test]
+    fn a_long_inline_script_does_not_count_as_visible_content() {
+        let long_code = "var configuracionMuyLarga = { clave: 'valor', otra: 'cosa', mas: 12345 };";
+        let html = format!(r#"<html><body><div id="app"></div><script>{long_code}</script></body></html>"#);
+        let (dom, layout) = dom_and_layout(&html);
+        assert!(
+            page_content_requires_javascript(&dom, &layout),
+            "el codigo del script no deberia contar como contenido visible y tapar el aviso"
+        );
     }
 
     #[tokio::test]
@@ -2113,6 +2642,165 @@ mod tests {
         assert_eq!(clamp_scroll_offset(-100.0, 2000.0, 720.0), 0.0);
         assert_eq!(clamp_scroll_offset(5000.0, 2000.0, 720.0), 1280.0);
         assert_eq!(clamp_scroll_offset(50.0, 400.0, 720.0), 0.0);
+    }
+
+    fn server_with_scrollable_page_and_script(script: &str) -> EngineServer {
+        let html = format!("<html><body style=\"height:4000px\"><script>{script}</script></body></html>");
+        let (page, runtime) = build_page_keeping_runtime(&html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+        let mut server = EngineServer::new();
+        let tab = server.active_tab_mut();
+        tab.current_page = Some(LoadedPage {
+            url: "http://ejemplo.test/".to_string(),
+            title: String::new(),
+            page,
+            runtime,
+            font_set: None,
+            images: ImageMap::new(),
+            focused_node: None,
+        });
+        server
+    }
+
+    /// El punto real de esta tarea: un `document.addEventListener('scroll',
+    /// ...)` real tiene que dispararse cuando llega un comando `Scroll` -
+    /// antes de esto, el desplazamiento de viewport YA era real
+    /// (`getBoundingClientRect` ya lo reflejaba) pero ningun listener JS se
+    /// enteraba nunca.
+    #[tokio::test]
+    async fn scroll_command_fires_a_real_scroll_event_on_document() {
+        let mut server = server_with_scrollable_page_and_script(
+            "var vistoScroll = false; document.addEventListener('scroll', function() { vistoScroll = true; });",
+        );
+        server.handle(EngineRequest::Scroll { id: Some("s1".to_string()), dx: 0, dy: 200 }).await;
+
+        let runtime = &mut server.active_tab_mut().current_page.as_mut().expect("deberia haber pagina").runtime;
+        assert_eq!(runtime.eval("vistoScroll").unwrap(), "true", "el listener 'scroll' de document deberia haberse disparado");
+    }
+
+    /// Un listener de `scroll` puede mutar el DOM (el patron real de
+    /// "infinite scroll") - ese cambio tiene que verse reflejado, no
+    /// perderse hasta la siguiente interaccion.
+    #[tokio::test]
+    async fn a_scroll_listener_that_mutates_the_dom_is_reflected_after_relayout() {
+        let html = "<html><body style=\"height:4000px\"><p id=\"marcador\">antes</p><script>document.addEventListener('scroll', function() { document.getElementById('marcador').textContent = 'despues'; });</script></body></html>";
+        let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+        let mut server = EngineServer::new();
+        let tab = server.active_tab_mut();
+        tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+
+        server.handle(EngineRequest::Scroll { id: Some("s1".to_string()), dx: 0, dy: 200 }).await;
+
+        let page = &server.active_tab().current_page.as_ref().expect("deberia haber pagina").page;
+        let marcador = Node::find_by_id(&page.dom_root, "marcador").expect("deberia existir el marcador");
+        assert_eq!(Node::text_content(&marcador), "despues", "el listener de scroll deberia haber mutado el DOM, y el relayout deberia reflejarlo");
+    }
+
+    /// El punto real de disparar sobre `<html>` en vez de sobre `dom_root`
+    /// directo: `window.addEventListener('scroll', ...)` (el shim de
+    /// `register_history`, que delega en `document.documentElement`)
+    /// tiene que enterarse tambien, no solo `document.addEventListener`.
+    #[tokio::test]
+    async fn scroll_command_also_fires_on_window_addeventlistener() {
+        let mut server = server_with_scrollable_page_and_script(
+            "var vistoEnWindow = false; window.addEventListener('scroll', function() { vistoEnWindow = true; });",
+        );
+        server.handle(EngineRequest::Scroll { id: Some("s1".to_string()), dx: 0, dy: 200 }).await;
+
+        let runtime = &mut server.active_tab_mut().current_page.as_mut().expect("deberia haber pagina").runtime;
+        assert_eq!(runtime.eval("vistoEnWindow").unwrap(), "true", "window.addEventListener('scroll', ...) deberia haberse disparado tambien");
+    }
+
+    /// Misma cobertura que el scroll, para `resize`: un
+    /// `window.addEventListener('resize', ...)` tiene que dispararse
+    /// cuando llega un comando `Resize` real.
+    #[tokio::test]
+    async fn resize_command_fires_a_real_resize_event_on_window() {
+        let html = "<html><body><script>var vistoResize = false; window.addEventListener('resize', function() { vistoResize = true; });</script></body></html>";
+        let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+        let mut server = EngineServer::new();
+        let tab = server.active_tab_mut();
+        tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+
+        server.handle(EngineRequest::Resize { id: Some("r1".to_string()), width: 1000, height: 700 }).await;
+
+        let runtime = &mut server.active_tab_mut().current_page.as_mut().expect("deberia haber pagina").runtime;
+        assert_eq!(runtime.eval("vistoResize").unwrap(), "true", "window.addEventListener('resize', ...) deberia haberse disparado con un comando Resize real");
+    }
+
+    /// Un listener de `resize` puede mutar el DOM (p.ej. mostrar/ocultar
+    /// un menu segun el ancho) - ese cambio tiene que verse reflejado en
+    /// el MISMO relayout que el propio `resize` ya iba a disparar.
+    #[tokio::test]
+    async fn a_resize_listener_that_mutates_the_dom_is_reflected_after_relayout() {
+        let html = "<html><body><p id=\"marcador\">antes</p><script>window.addEventListener('resize', function() { document.getElementById('marcador').textContent = 'despues'; });</script></body></html>";
+        let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+        let mut server = EngineServer::new();
+        let tab = server.active_tab_mut();
+        tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+
+        server.handle(EngineRequest::Resize { id: Some("r1".to_string()), width: 1000, height: 700 }).await;
+
+        let page = &server.active_tab().current_page.as_ref().expect("deberia haber pagina").page;
+        let marcador = Node::find_by_id(&page.dom_root, "marcador").expect("deberia existir el marcador");
+        assert_eq!(Node::text_content(&marcador), "despues", "el listener de resize deberia haber mutado el DOM, y el relayout deberia reflejarlo");
+    }
+
+    /// El punto real del reloj de fondo: un `setTimeout` vencido (delay 0,
+    /// ya vencido en cuanto se registra) dispara SOLO con el tick, sin
+    /// ningun comando NDJSON de por medio - antes de esta tarea, nada
+    /// llamaba nunca a `run_due_timers` fuera de un comando real.
+    #[test]
+    fn tick_active_tab_timers_fires_a_due_timeout_without_any_command() {
+        let html = "<html><body><script>var disparo = false; setTimeout(function() { disparo = true; }, 0);</script></body></html>";
+        let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+        let mut server = EngineServer::new();
+        let tab = server.active_tab_mut();
+        tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+
+        let publicado = server.tick_active_tab_timers();
+
+        let runtime = &mut server.active_tab_mut().current_page.as_mut().expect("deberia haber pagina").runtime;
+        assert_eq!(runtime.eval("disparo").unwrap(), "true", "el tick deberia haber disparado el setTimeout ya vencido, sin ningun comando NDJSON");
+        assert!(matches!(publicado, Some(EngineResponse::State { id: None, .. })), "el tick deberia devolver el estado nuevo, sin id, para publicarlo");
+    }
+
+    /// Plan H07 (Fase 50): el cambio que hace un temporizador tiene que
+    /// llegar en el estado que devuelve el tick, no esperar a otro comando.
+    #[test]
+    fn tick_active_tab_timers_returns_the_state_changed_by_the_timer() {
+        let html = "<html><head><title>ANTES</title></head><body><script>setTimeout(function() { document.title = 'DESPUES'; }, 0);</script></body></html>";
+        let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+        let mut server = EngineServer::new();
+        server.active_tab_mut().current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+
+        let Some(EngineResponse::State { title, .. }) = server.tick_active_tab_timers() else { panic!("deberia haber estado que publicar") };
+        assert_eq!(title, "DESPUES");
+        assert!(server.tick_active_tab_timers().is_none(), "sin temporizadores pendientes no hay nada que publicar");
+    }
+
+    #[test]
+    fn state_fingerprint_ignores_the_id_but_not_what_is_shown() {
+        let server = EngineServer::new();
+        let respuesta = server.state_response(Some("r1".to_string()));
+        let publicacion = server.state_response(None);
+        assert_eq!(state_fingerprint(&respuesta), state_fingerprint(&publicacion), "el mismo estado, pedido o espontaneo, no se publica dos veces");
+
+        let EngineResponse::State { mut title, .. } = server.state_response(None) else { unreachable!() };
+        title.push('!');
+        let mut distinto = server.state_response(None);
+        if let EngineResponse::State { title: t, .. } = &mut distinto {
+            *t = title;
+        }
+        assert_ne!(state_fingerprint(&respuesta), state_fingerprint(&distinto));
+        assert_eq!(state_fingerprint(&EngineResponse::Ok { id: None, message: "ok" }), None);
+    }
+
+    /// Una pestaña SIN pagina cargada (recien abierta) no deberia hacer
+    /// panic al recibir un tick - no-op honesto.
+    #[test]
+    fn tick_active_tab_timers_on_an_empty_tab_is_a_silent_no_op() {
+        let mut server = EngineServer::new();
+        assert!(server.tick_active_tab_timers().is_none());
     }
 
     /// `std::mem::forget(dom)` es deliberado, no un descuido: `Node::parent`
@@ -2573,6 +3261,44 @@ mod tests {
             is_checked(&Node::find_by_id(&root, "caja").unwrap()),
             "un checkbox que comparte name con el grupo NO es parte del grupo de radios y no deberia desmarcarse"
         );
+    }
+
+    /// El punto real del "form owner": dos `<form>` DISTINTOS que
+    /// reutilicen el mismo `name` NO deberian pisarse entre si - antes se
+    /// agrupaba por `name` en el documento entero, asi que marcar un radio
+    /// del segundo formulario desmarcaba al del primero.
+    #[test]
+    fn radios_with_the_same_name_in_different_forms_do_not_share_a_group() {
+        let dom = r#"<html><body>
+            <form id="f1"><input id="a" type="radio" name="opcion" checked></form>
+            <form id="f2"><input id="b" type="radio" name="opcion"></form>
+        </body></html>"#;
+        let root = root_of(dom);
+        let b = Node::find_by_id(&root, "b").expect("deberia existir");
+        apply_checkable_click(&root, &b);
+
+        assert!(is_checked(&b), "el clicado queda marcado");
+        assert!(
+            is_checked(&Node::find_by_id(&root, "a").unwrap()),
+            "un radio de OTRO <form> con el mismo name NO deberia desmarcarse - son grupos distintos (form owner distinto)"
+        );
+    }
+
+    /// Dos radios SIN ningun `<form>` ancestro (mismo `name`, ninguno
+    /// dentro de un formulario) siguen agrupandose entre si - "sin dueño"
+    /// tambien es un form owner, y es el MISMO para los dos.
+    #[test]
+    fn radios_with_no_form_ancestor_at_all_still_share_a_group() {
+        let dom = r#"<html><body>
+            <input id="a" type="radio" name="opcion" checked>
+            <input id="b" type="radio" name="opcion">
+        </body></html>"#;
+        let root = root_of(dom);
+        let b = Node::find_by_id(&root, "b").expect("deberia existir");
+        apply_checkable_click(&root, &b);
+
+        assert!(is_checked(&b));
+        assert!(!is_checked(&Node::find_by_id(&root, "a").unwrap()), "sin ningun <form>, los dos siguen en el mismo grupo (mismo form owner: ninguno)");
     }
 
     #[test]

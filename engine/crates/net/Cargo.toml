@@ -24,3 +24,10 @@ brotli.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
+psl.workspace = true
+# Tokens del canal del broker (ADR 0001, etapa 2): aleatoriedad del sistema.
+# La misma version que ya compila `ring` (rustls), no entra codigo nuevo.
+getrandom = "0.2"
+
+[lints]
+workspace = true

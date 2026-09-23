@@ -28,6 +28,10 @@ interface BrowserViewportProps {
   screenshot: string;
   url: string;
   elements: InteractiveElement[];
+  /// Fase 39: el motor descargo la pagina sin error, pero venia sin
+  /// contenido visible y con `<script>` que lo habrian generado. Se pinta
+  /// un aviso encima en vez de dejar el area en blanco sin explicacion.
+  requiresJavascript: boolean;
   onManualNavigate: (url: string) => void;
   onManualClick: (x: number, y: number) => void;
   onManualType: (x: number, y: number, text: string) => void;
@@ -55,6 +59,7 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   screenshot,
   url,
   elements,
+  requiresJavascript,
   onManualNavigate,
   onManualClick,
   onManualType,
@@ -92,7 +97,9 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   // tenga exactamente proporción 16:9 quedan franjas vacías a los lados o
   // arriba/abajo. Las insignias/resaltados deben posicionarse relativas a
   // ESTE rectángulo, no al 100%/100% del contenedor (ver bug de desalineación).
-  const [imgRect, setImgRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  // `naturalWidth`/`naturalHeight`: tamano real de la captura. Se guardan aqui
+  // al medir, para que el render no tenga que leer `imgRef.current`.
+  const [imgRect, setImgRect] = useState<{ left: number; top: number; width: number; height: number; naturalWidth: number; naturalHeight: number } | null>(null);
 
   // Informa al backend del tamaño real del contenedor (ver BrowserManager.resize
   // en el backend) - pensado para que, cuando haya un motor de renderizado
@@ -150,7 +157,9 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
         left: imgBox.left - stageBox.left,
         top: imgBox.top - stageBox.top,
         width: imgBox.width,
-        height: imgBox.height
+        height: imgBox.height,
+        naturalWidth: imgRef.current.naturalWidth || imgBox.width,
+        naturalHeight: imgRef.current.naturalHeight || imgBox.height
       });
     };
 
@@ -170,20 +179,21 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   // captura recibida, no un tamaño fijo) a píxeles dentro del "stage",
   // usando el rectángulo real de la imagen.
   const toStagePx = (mx: number, my: number) => {
-    if (!imgRect || !imgRef.current) return { left: 0, top: 0 };
-    const naturalWidth = imgRef.current.naturalWidth || imgRect.width;
-    const naturalHeight = imgRef.current.naturalHeight || imgRect.height;
+    if (!imgRect) return { left: 0, top: 0 };
     return {
-      left: imgRect.left + (mx / naturalWidth) * imgRect.width,
-      top: imgRect.top + (my / naturalHeight) * imgRect.height
+      left: imgRect.left + (mx / imgRect.naturalWidth) * imgRect.width,
+      top: imgRect.top + (my / imgRect.naturalHeight) * imgRect.height
     };
   };
 
-  useEffect(() => {
-    if (url) {
-      setAddressInput(url);
-    }
-  }, [url]);
+  // Cuando el motor navega (la URL cambia desde fuera), la barra muestra la
+  // URL nueva. Se ajusta durante el render comparando con la URL anterior,
+  // no en un efecto: el efecto pintaba primero la URL vieja y luego otra vez.
+  const [previousUrl, setPreviousUrl] = useState(url);
+  if (url !== previousUrl) {
+    setPreviousUrl(url);
+    if (url) setAddressInput(url);
+  }
 
   useEffect(() => {
     if (inputTextPopup && popupInputRef.current) {
@@ -410,7 +420,7 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
           <div ref={stageRef} style={{ position: 'relative', width: '100%', height: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
             <img
               ref={imgRef}
-              src={`data:image/jpeg;base64,${screenshot}`}
+              src={`data:image/png;base64,${screenshot}`}
               alt="Browser Viewport"
               className="screenshot-image"
               onClick={handleImageClick}
@@ -422,11 +432,30 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
                     left: imgBox.left - stageBox.left,
                     top: imgBox.top - stageBox.top,
                     width: imgBox.width,
-                    height: imgBox.height
+                    height: imgBox.height,
+                    naturalWidth: imgRef.current.naturalWidth || imgBox.width,
+                    naturalHeight: imgRef.current.naturalHeight || imgBox.height
                   });
                 }
               }}
             />
+
+            {requiresJavascript && (
+              <div className="js-required-overlay" role="status">
+                <div className="js-required-card">
+                  <span className="js-required-icon" aria-hidden="true">📄</span>
+                  <h3>Esta página llega vacía</h3>
+                  <p>
+                    El servidor la ha enviado correctamente, pero sin contenido: lo construye
+                    JavaScript en tu equipo, y el motor todavía no ejecuta ese tipo de código.
+                  </p>
+                  <p className="js-required-hint">
+                    Le pasa a la mayoría de tiendas y aplicaciones web modernas. Las páginas que
+                    envían su contenido ya hecho sí se ven bien.
+                  </p>
+                </div>
+              </div>
+            )}
 
             {inputTextPopup && (() => {
               const { left, top } = toStagePx(inputTextPopup.mx, inputTextPopup.my);

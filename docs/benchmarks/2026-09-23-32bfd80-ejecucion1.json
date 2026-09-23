@@ -1,0 +1,2175 @@
+{
+  "entorno": {
+    "fecha": "2026-09-23T06:27:34.331Z",
+    "commit": "32bfd8079e1d0663e2ece6f574ddd29e15018b07",
+    "arbolLimpio": false,
+    "binarioSha256": "85a2fad3e266f94e9a99ae152dda846d9230f78200526aea2634991897d5eaa7",
+    "so": "Windows_NT 10.0.26200 x64",
+    "cpu": "13th Gen Intel(R) Core(TM) i7-1355U",
+    "nucleos": 12,
+    "memoriaTotalBytes": 34070192128,
+    "node": "v24.14.0",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "repeticiones": 20,
+    "notas": "Un proceso de motor por página; la repetición 0 es la fría. Servidor local sin red externa. Sin comparación con Chrome."
+  },
+  "corpusVersion": 1,
+  "resumen": {
+    "paginasQuePasanSiempre": 10,
+    "paginas": 12
+  },
+  "resultados": [
+    {
+      "id": "estatica",
+      "categoria": "carga",
+      "aprobadas": 20,
+      "total": 20,
+      "fria": {
+        "navigateMs": 364.3,
+        "successMs": 364.3
+      },
+      "caliente": {
+        "navigateMsP50": 27.3,
+        "navigateMsP95": 61.6,
+        "successMsP50": 27.3
+      },
+      "memoriaBytes": 39211008,
+      "motivosDeFallo": [],
+      "muestras": [
+        {
+          "rep": 0,
+          "navigateMs": 364.3,
+          "successMs": 364.3,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 1,
+          "navigateMs": 27.3,
+          "successMs": 27.3,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 2,
+          "navigateMs": 30.9,
+          "successMs": 30.9,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 3,
+          "navigateMs": 24.7,
+          "successMs": 24.7,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 4,
+          "navigateMs": 28,
+          "successMs": 28,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 5,
+          "navigateMs": 25,
+          "successMs": 25,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 6,
+          "navigateMs": 22.2,
+          "successMs": 22.2,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 7,
+          "navigateMs": 42,
+          "successMs": 42,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 8,
+          "navigateMs": 27.9,
+          "successMs": 27.9,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 9,
+          "navigateMs": 33.6,
+          "successMs": 33.6,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 10,
+          "navigateMs": 17.4,
+          "successMs": 17.4,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 11,
+          "navigateMs": 31.9,
+          "successMs": 31.9,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 12,
+          "navigateMs": 61.6,
+          "successMs": 61.6,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 13,
+          "navigateMs": 23.6,
+          "successMs": 23.6,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 14,
+          "navigateMs": 23.3,
+          "successMs": 23.3,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 15,
+          "navigateMs": 19.7,
+          "successMs": 19.7,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 16,
+          "navigateMs": 32.8,
+          "successMs": 32.8,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 17,
+          "navigateMs": 23.2,
+          "successMs": 23.2,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 18,
+          "navigateMs": 20.3,
+          "successMs": 20.3,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        },
+        {
+          "rep": 19,
+          "navigateMs": 50,
+          "successMs": 50,
+          "ok": true,
+          "title": "Página estática",
+          "reason": null
+        }
+      ]
+    },
+    {
+      "id": "formulario",
+      "categoria": "carga",
+      "aprobadas": 20,
+      "total": 20,
+      "fria": {
+        "navigateMs": 319.4,
+        "successMs": 319.4
+      },
+      "caliente": {
+        "navigateMsP50": 26.1,
+        "navigateMsP95": 38.7,
+        "successMsP50": 26.1
+      },
+      "memoriaBytes": 38461440,
+      "motivosDeFallo": [],
+      "muestras": [
+        {
+          "rep": 0,
+          "navigateMs": 319.4,
+          "successMs": 319.4,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 1,
+          "navigateMs": 35.6,
+          "successMs": 35.6,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 2,
+          "navigateMs": 22.6,
+          "successMs": 22.6,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 3,
+          "navigateMs": 28.3,
+          "successMs": 28.3,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 4,
+          "navigateMs": 25.1,
+          "successMs": 25.1,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 5,
+          "navigateMs": 33.2,
+          "successMs": 33.2,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 6,
+          "navigateMs": 27.1,
+          "successMs": 27.1,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 7,
+          "navigateMs": 16.4,
+          "successMs": 16.4,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 8,
+          "navigateMs": 26.1,
+          "successMs": 26.1,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 9,
+          "navigateMs": 22.5,
+          "successMs": 22.5,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 10,
+          "navigateMs": 32.6,
+          "successMs": 32.6,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 11,
+          "navigateMs": 30.3,
+          "successMs": 30.3,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 12,
+          "navigateMs": 17.5,
+          "successMs": 17.5,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 13,
+          "navigateMs": 25.1,
+          "successMs": 25.1,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 14,
+          "navigateMs": 17,
+          "successMs": 17,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 15,
+          "navigateMs": 23.7,
+          "successMs": 23.7,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 16,
+          "navigateMs": 27.4,
+          "successMs": 27.4,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 17,
+          "navigateMs": 38.7,
+          "successMs": 38.7,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 18,
+          "navigateMs": 17.9,
+          "successMs": 17.9,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        },
+        {
+          "rep": 19,
+          "navigateMs": 31.4,
+          "successMs": 31.4,
+          "ok": true,
+          "title": "Formulario",
+          "reason": null
+        }
+      ]
+    },
+    {
+      "id": "construir-dom",
+      "categoria": "dom",
+      "aprobadas": 20,
+      "total": 20,
+      "fria": {
+        "navigateMs": 509,
+        "successMs": 509
+      },
+      "caliente": {
+        "navigateMsP50": 193.6,
+        "navigateMsP95": 268.1,
+        "successMsP50": 193.6
+      },
+      "memoriaBytes": 528773120,
+      "motivosDeFallo": [],
+      "muestras": [
+        {
+          "rep": 0,
+          "navigateMs": 509,
+          "successMs": 509,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 1,
+          "navigateMs": 200,
+          "successMs": 200,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 2,
+          "navigateMs": 187.1,
+          "successMs": 187.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 3,
+          "navigateMs": 220.1,
+          "successMs": 220.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 4,
+          "navigateMs": 192.8,
+          "successMs": 192.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 5,
+          "navigateMs": 230.3,
+          "successMs": 230.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 6,
+          "navigateMs": 166.5,
+          "successMs": 166.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 7,
+          "navigateMs": 208.8,
+          "successMs": 208.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 8,
+          "navigateMs": 185.6,
+          "successMs": 185.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 9,
+          "navigateMs": 171.3,
+          "successMs": 171.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 10,
+          "navigateMs": 239.9,
+          "successMs": 239.9,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 11,
+          "navigateMs": 198.3,
+          "successMs": 198.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 12,
+          "navigateMs": 173.2,
+          "successMs": 173.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 13,
+          "navigateMs": 181.9,
+          "successMs": 181.9,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 14,
+          "navigateMs": 268.1,
+          "successMs": 268.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 15,
+          "navigateMs": 173.5,
+          "successMs": 173.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 16,
+          "navigateMs": 193.6,
+          "successMs": 193.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 17,
+          "navigateMs": 176.8,
+          "successMs": 176.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 18,
+          "navigateMs": 194.5,
+          "successMs": 194.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 19,
+          "navigateMs": 207.6,
+          "successMs": 207.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        }
+      ]
+    },
+    {
+      "id": "recorrer-nodos",
+      "categoria": "dom",
+      "aprobadas": 20,
+      "total": 20,
+      "fria": {
+        "navigateMs": 350.4,
+        "successMs": 350.4
+      },
+      "caliente": {
+        "navigateMsP50": 26.8,
+        "navigateMsP95": 41.5,
+        "successMsP50": 26.8
+      },
+      "memoriaBytes": 62783488,
+      "motivosDeFallo": [],
+      "muestras": [
+        {
+          "rep": 0,
+          "navigateMs": 350.4,
+          "successMs": 350.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 1,
+          "navigateMs": 21.6,
+          "successMs": 21.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 2,
+          "navigateMs": 26.2,
+          "successMs": 26.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 3,
+          "navigateMs": 29.6,
+          "successMs": 29.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 4,
+          "navigateMs": 27.7,
+          "successMs": 27.7,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 5,
+          "navigateMs": 19.9,
+          "successMs": 19.9,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 6,
+          "navigateMs": 29.9,
+          "successMs": 29.9,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 7,
+          "navigateMs": 25.3,
+          "successMs": 25.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 8,
+          "navigateMs": 41.5,
+          "successMs": 41.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 9,
+          "navigateMs": 32.6,
+          "successMs": 32.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 10,
+          "navigateMs": 29.8,
+          "successMs": 29.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 11,
+          "navigateMs": 20.5,
+          "successMs": 20.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 12,
+          "navigateMs": 35.4,
+          "successMs": 35.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 13,
+          "navigateMs": 26.8,
+          "successMs": 26.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 14,
+          "navigateMs": 26.4,
+          "successMs": 26.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 15,
+          "navigateMs": 23.8,
+          "successMs": 23.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 16,
+          "navigateMs": 28.5,
+          "successMs": 28.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 17,
+          "navigateMs": 37.1,
+          "successMs": 37.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 18,
+          "navigateMs": 25.9,
+          "successMs": 25.9,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 19,
+          "navigateMs": 22.6,
+          "successMs": 22.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        }
+      ]
+    },
+    {
+      "id": "mini-framework",
+      "categoria": "framework",
+      "aprobadas": 0,
+      "total": 20,
+      "fria": {
+        "navigateMs": 1096.9,
+        "successMs": null
+      },
+      "caliente": {
+        "navigateMsP50": 21.1,
+        "navigateMsP95": 101.3,
+        "successMsP50": null
+      },
+      "memoriaBytes": 54136832,
+      "motivosDeFallo": [
+        "título «FALLO: not a callable function», se esperaba «OK»"
+      ],
+      "muestras": [
+        {
+          "rep": 0,
+          "navigateMs": 1096.9,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 1,
+          "navigateMs": 44.5,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 2,
+          "navigateMs": 101.3,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 3,
+          "navigateMs": 48.7,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 4,
+          "navigateMs": 55.7,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 5,
+          "navigateMs": 87.1,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 6,
+          "navigateMs": 28.6,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 7,
+          "navigateMs": 26.4,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 8,
+          "navigateMs": 23.1,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 9,
+          "navigateMs": 32.3,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 10,
+          "navigateMs": 13.4,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 11,
+          "navigateMs": 19.5,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 12,
+          "navigateMs": 13,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 13,
+          "navigateMs": 21.1,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 14,
+          "navigateMs": 12.2,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 15,
+          "navigateMs": 8.5,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 16,
+          "navigateMs": 9.7,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 17,
+          "navigateMs": 13.8,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 18,
+          "navigateMs": 15.4,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        },
+        {
+          "rep": 19,
+          "navigateMs": 10.1,
+          "successMs": null,
+          "ok": false,
+          "title": "FALLO: not a callable function",
+          "reason": "título «FALLO: not a callable function», se esperaba «OK»"
+        }
+      ]
+    },
+    {
+      "id": "modulos-es",
+      "categoria": "scripts",
+      "aprobadas": 0,
+      "total": 20,
+      "fria": {
+        "navigateMs": 97.8,
+        "successMs": null
+      },
+      "caliente": {
+        "navigateMsP50": 6.6,
+        "navigateMsP95": 11.9,
+        "successMsP50": null
+      },
+      "memoriaBytes": 40001536,
+      "motivosDeFallo": [
+        "título «PENDIENTE», se esperaba «OK»"
+      ],
+      "muestras": [
+        {
+          "rep": 0,
+          "navigateMs": 97.8,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 1,
+          "navigateMs": 6.6,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 2,
+          "navigateMs": 7.1,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 3,
+          "navigateMs": 6.5,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 4,
+          "navigateMs": 11.9,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 5,
+          "navigateMs": 7.2,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 6,
+          "navigateMs": 7.5,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 7,
+          "navigateMs": 6.9,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 8,
+          "navigateMs": 8.1,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 9,
+          "navigateMs": 6.5,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 10,
+          "navigateMs": 6.4,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 11,
+          "navigateMs": 8.5,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 12,
+          "navigateMs": 6.1,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 13,
+          "navigateMs": 6.3,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 14,
+          "navigateMs": 5.9,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 15,
+          "navigateMs": 8.6,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 16,
+          "navigateMs": 6.2,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 17,
+          "navigateMs": 6.3,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 18,
+          "navigateMs": 6.3,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        },
+        {
+          "rep": 19,
+          "navigateMs": 6.7,
+          "successMs": null,
+          "ok": false,
+          "title": "PENDIENTE",
+          "reason": "título «PENDIENTE», se esperaba «OK»"
+        }
+      ]
+    },
+    {
+      "id": "js-moderno",
+      "categoria": "scripts",
+      "aprobadas": 20,
+      "total": 20,
+      "fria": {
+        "navigateMs": 57.7,
+        "successMs": 57.7
+      },
+      "caliente": {
+        "navigateMsP50": 6.6,
+        "navigateMsP95": 9.4,
+        "successMsP50": 6.6
+      },
+      "memoriaBytes": 40353792,
+      "motivosDeFallo": [],
+      "muestras": [
+        {
+          "rep": 0,
+          "navigateMs": 57.7,
+          "successMs": 57.7,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 1,
+          "navigateMs": 6.6,
+          "successMs": 6.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 2,
+          "navigateMs": 6.2,
+          "successMs": 6.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 3,
+          "navigateMs": 6.1,
+          "successMs": 6.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 4,
+          "navigateMs": 6.1,
+          "successMs": 6.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 5,
+          "navigateMs": 7.4,
+          "successMs": 7.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 6,
+          "navigateMs": 6.4,
+          "successMs": 6.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 7,
+          "navigateMs": 7.4,
+          "successMs": 7.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 8,
+          "navigateMs": 6.6,
+          "successMs": 6.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 9,
+          "navigateMs": 6.5,
+          "successMs": 6.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 10,
+          "navigateMs": 8.1,
+          "successMs": 8.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 11,
+          "navigateMs": 6.6,
+          "successMs": 6.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 12,
+          "navigateMs": 6,
+          "successMs": 6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 13,
+          "navigateMs": 8.2,
+          "successMs": 8.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 14,
+          "navigateMs": 6.3,
+          "successMs": 6.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 15,
+          "navigateMs": 6.1,
+          "successMs": 6.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 16,
+          "navigateMs": 6.6,
+          "successMs": 6.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 17,
+          "navigateMs": 6.8,
+          "successMs": 6.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 18,
+          "navigateMs": 9.4,
+          "successMs": 9.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 19,
+          "navigateMs": 6.3,
+          "successMs": 6.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        }
+      ]
+    },
+    {
+      "id": "temporizador",
+      "categoria": "event-loop",
+      "aprobadas": 20,
+      "total": 20,
+      "fria": {
+        "navigateMs": 62.3,
+        "successMs": 512.5
+      },
+      "caliente": {
+        "navigateMsP50": 6.6,
+        "navigateMsP95": 8.6,
+        "successMsP50": 510.7
+      },
+      "memoriaBytes": 43393024,
+      "motivosDeFallo": [],
+      "muestras": [
+        {
+          "rep": 0,
+          "navigateMs": 62.3,
+          "successMs": 512.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 1,
+          "navigateMs": 7.4,
+          "successMs": 518.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 2,
+          "navigateMs": 7.1,
+          "successMs": 508.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 3,
+          "navigateMs": 6.3,
+          "successMs": 510.7,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 4,
+          "navigateMs": 6.8,
+          "successMs": 511.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 5,
+          "navigateMs": 7.9,
+          "successMs": 464.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 6,
+          "navigateMs": 6.3,
+          "successMs": 520.7,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 7,
+          "navigateMs": 7.7,
+          "successMs": 464.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 8,
+          "navigateMs": 6.2,
+          "successMs": 518,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 9,
+          "navigateMs": 6.2,
+          "successMs": 515.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 10,
+          "navigateMs": 8.2,
+          "successMs": 522.7,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 11,
+          "navigateMs": 6.4,
+          "successMs": 447.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 12,
+          "navigateMs": 6.3,
+          "successMs": 524.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 13,
+          "navigateMs": 6.9,
+          "successMs": 512.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 14,
+          "navigateMs": 8.6,
+          "successMs": 509.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 15,
+          "navigateMs": 6.4,
+          "successMs": 508.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 16,
+          "navigateMs": 6.4,
+          "successMs": 443.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 17,
+          "navigateMs": 6.6,
+          "successMs": 508.9,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 18,
+          "navigateMs": 6.7,
+          "successMs": 519.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 19,
+          "navigateMs": 6.2,
+          "successMs": 508,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        }
+      ]
+    },
+    {
+      "id": "fetch-json",
+      "categoria": "red",
+      "aprobadas": 20,
+      "total": 20,
+      "fria": {
+        "navigateMs": 57.4,
+        "successMs": 57.4
+      },
+      "caliente": {
+        "navigateMsP50": 8.4,
+        "navigateMsP95": 11.4,
+        "successMsP50": 8.4
+      },
+      "memoriaBytes": 50683904,
+      "motivosDeFallo": [],
+      "muestras": [
+        {
+          "rep": 0,
+          "navigateMs": 57.4,
+          "successMs": 57.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 1,
+          "navigateMs": 8.2,
+          "successMs": 8.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 2,
+          "navigateMs": 8.3,
+          "successMs": 8.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 3,
+          "navigateMs": 8.4,
+          "successMs": 8.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 4,
+          "navigateMs": 9.8,
+          "successMs": 9.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 5,
+          "navigateMs": 9.8,
+          "successMs": 9.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 6,
+          "navigateMs": 9.3,
+          "successMs": 9.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 7,
+          "navigateMs": 8.4,
+          "successMs": 8.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 8,
+          "navigateMs": 10,
+          "successMs": 10,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 9,
+          "navigateMs": 8.4,
+          "successMs": 8.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 10,
+          "navigateMs": 8,
+          "successMs": 8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 11,
+          "navigateMs": 11.4,
+          "successMs": 11.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 12,
+          "navigateMs": 8.5,
+          "successMs": 8.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 13,
+          "navigateMs": 8.4,
+          "successMs": 8.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 14,
+          "navigateMs": 9.9,
+          "successMs": 9.9,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 15,
+          "navigateMs": 11.3,
+          "successMs": 11.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 16,
+          "navigateMs": 8.3,
+          "successMs": 8.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 17,
+          "navigateMs": 8.1,
+          "successMs": 8.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 18,
+          "navigateMs": 8.2,
+          "successMs": 8.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 19,
+          "navigateMs": 8.2,
+          "successMs": 8.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        }
+      ]
+    },
+    {
+      "id": "almacenamiento",
+      "categoria": "datos",
+      "aprobadas": 20,
+      "total": 20,
+      "fria": {
+        "navigateMs": 67.2,
+        "successMs": 67.2
+      },
+      "caliente": {
+        "navigateMsP50": 7.9,
+        "navigateMsP95": 17,
+        "successMsP50": 7.9
+      },
+      "memoriaBytes": 40902656,
+      "motivosDeFallo": [],
+      "muestras": [
+        {
+          "rep": 0,
+          "navigateMs": 67.2,
+          "successMs": 67.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 1,
+          "navigateMs": 17,
+          "successMs": 17,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 2,
+          "navigateMs": 7.5,
+          "successMs": 7.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 3,
+          "navigateMs": 7.5,
+          "successMs": 7.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 4,
+          "navigateMs": 7.9,
+          "successMs": 7.9,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 5,
+          "navigateMs": 8.2,
+          "successMs": 8.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 6,
+          "navigateMs": 8.6,
+          "successMs": 8.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 7,
+          "navigateMs": 7.6,
+          "successMs": 7.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 8,
+          "navigateMs": 9,
+          "successMs": 9,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 9,
+          "navigateMs": 7.5,
+          "successMs": 7.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 10,
+          "navigateMs": 7.8,
+          "successMs": 7.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 11,
+          "navigateMs": 11.1,
+          "successMs": 11.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 12,
+          "navigateMs": 9.1,
+          "successMs": 9.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 13,
+          "navigateMs": 8.8,
+          "successMs": 8.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 14,
+          "navigateMs": 8.4,
+          "successMs": 8.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 15,
+          "navigateMs": 10,
+          "successMs": 10,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 16,
+          "navigateMs": 7.3,
+          "successMs": 7.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 17,
+          "navigateMs": 7.8,
+          "successMs": 7.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 18,
+          "navigateMs": 7.5,
+          "successMs": 7.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 19,
+          "navigateMs": 7.7,
+          "successMs": 7.7,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        }
+      ]
+    },
+    {
+      "id": "eventos",
+      "categoria": "eventos",
+      "aprobadas": 20,
+      "total": 20,
+      "fria": {
+        "navigateMs": 68.7,
+        "successMs": 68.7
+      },
+      "caliente": {
+        "navigateMsP50": 7.4,
+        "navigateMsP95": 10,
+        "successMsP50": 7.4
+      },
+      "memoriaBytes": 48238592,
+      "motivosDeFallo": [],
+      "muestras": [
+        {
+          "rep": 0,
+          "navigateMs": 68.7,
+          "successMs": 68.7,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 1,
+          "navigateMs": 7.3,
+          "successMs": 7.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 2,
+          "navigateMs": 7.5,
+          "successMs": 7.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 3,
+          "navigateMs": 7.4,
+          "successMs": 7.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 4,
+          "navigateMs": 10,
+          "successMs": 10,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 5,
+          "navigateMs": 7.8,
+          "successMs": 7.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 6,
+          "navigateMs": 8.5,
+          "successMs": 8.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 7,
+          "navigateMs": 8.2,
+          "successMs": 8.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 8,
+          "navigateMs": 8.9,
+          "successMs": 8.9,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 9,
+          "navigateMs": 7.5,
+          "successMs": 7.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 10,
+          "navigateMs": 7.1,
+          "successMs": 7.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 11,
+          "navigateMs": 7.2,
+          "successMs": 7.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 12,
+          "navigateMs": 9.5,
+          "successMs": 9.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 13,
+          "navigateMs": 7.3,
+          "successMs": 7.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 14,
+          "navigateMs": 7.1,
+          "successMs": 7.1,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 15,
+          "navigateMs": 7,
+          "successMs": 7,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 16,
+          "navigateMs": 6.8,
+          "successMs": 6.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 17,
+          "navigateMs": 9.5,
+          "successMs": 9.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 18,
+          "navigateMs": 6.9,
+          "successMs": 6.9,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 19,
+          "navigateMs": 7,
+          "successMs": 7,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        }
+      ]
+    },
+    {
+      "id": "observadores",
+      "categoria": "framework",
+      "aprobadas": 20,
+      "total": 20,
+      "fria": {
+        "navigateMs": 56.5,
+        "successMs": 56.5
+      },
+      "caliente": {
+        "navigateMsP50": 6.6,
+        "navigateMsP95": 9.5,
+        "successMsP50": 6.6
+      },
+      "memoriaBytes": 46071808,
+      "motivosDeFallo": [],
+      "muestras": [
+        {
+          "rep": 0,
+          "navigateMs": 56.5,
+          "successMs": 56.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 1,
+          "navigateMs": 6.4,
+          "successMs": 6.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 2,
+          "navigateMs": 6.6,
+          "successMs": 6.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 3,
+          "navigateMs": 6.4,
+          "successMs": 6.4,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 4,
+          "navigateMs": 6.5,
+          "successMs": 6.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 5,
+          "navigateMs": 7.6,
+          "successMs": 7.6,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 6,
+          "navigateMs": 6.5,
+          "successMs": 6.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 7,
+          "navigateMs": 7.7,
+          "successMs": 7.7,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 8,
+          "navigateMs": 6.2,
+          "successMs": 6.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 9,
+          "navigateMs": 7.9,
+          "successMs": 7.9,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 10,
+          "navigateMs": 6.7,
+          "successMs": 6.7,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 11,
+          "navigateMs": 6.8,
+          "successMs": 6.8,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 12,
+          "navigateMs": 6.2,
+          "successMs": 6.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 13,
+          "navigateMs": 8.5,
+          "successMs": 8.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 14,
+          "navigateMs": 6.5,
+          "successMs": 6.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 15,
+          "navigateMs": 6.7,
+          "successMs": 6.7,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 16,
+          "navigateMs": 6.3,
+          "successMs": 6.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 17,
+          "navigateMs": 6.3,
+          "successMs": 6.3,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 18,
+          "navigateMs": 9.5,
+          "successMs": 9.5,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        },
+        {
+          "rep": 19,
+          "navigateMs": 7.2,
+          "successMs": 7.2,
+          "ok": true,
+          "title": "OK",
+          "reason": null
+        }
+      ]
+    }
+  ]
+}

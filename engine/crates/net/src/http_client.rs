@@ -35,6 +35,11 @@ pub enum NetworkError {
     /// un desarrollador necesita para arreglarlo en su servidor.
     #[error("{0}")]
     Cors(String),
+    /// La peticion la hizo (o no pudo hacerla) un broker en otro proceso
+    /// (ADR 0001, etapa 2). El texto es el del error original o el motivo
+    /// por el que el canal fallo; el tipo concreto no cruza el proceso.
+    #[error("{0}")]
+    Remote(String),
 }
 
 /// Descomprime el cuerpo de la respuesta segun `Content-Encoding` - casi
@@ -152,8 +157,33 @@ pub struct NetworkEngine {
 /// descubrio ejecutando el binario de verdad, no solo compilandolo.
 static CRYPTO_PROVIDER_INIT: std::sync::Once = std::sync::Once::new();
 
+/// Equivale a `NetworkEngine::new()`: sin persistencia de cookies a disco.
+/// Existe para que el tipo cumpla el contrato que Rust espera de cualquier
+/// tipo con un `new()` sin argumentos, no porque construirlo por defecto sea
+/// el camino del producto (ese es `with_persistent_cookies`).
+impl Default for NetworkEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NetworkEngine {
+    /// Sin persistencia de cookies a disco - la que usan TODOS los tests de
+    /// este archivo y de `engine-js` (ver el aviso de `CookieStore::new`) y
+    /// el arnes de pruebas manual (`core::main`, que no es el camino real
+    /// del producto).
     pub fn new() -> Self {
+        Self::with_cookies(CookieStore::new())
+    }
+
+    /// La version que usa `core::server` en produccion: las cookies
+    /// sobreviven a cerrar la aplicacion (ver `CookieStore::load_from_disk`
+    /// y su aviso de modulo).
+    pub fn with_persistent_cookies() -> Self {
+        Self::with_cookies(CookieStore::load_from_disk())
+    }
+
+    fn with_cookies(cookies: CookieStore) -> Self {
         CRYPTO_PROVIDER_INIT.call_once(|| {
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
@@ -164,7 +194,7 @@ impl NetworkEngine {
             .enable_http1()
             .build();
         let client = Client::builder(TokioExecutor::new()).build(https);
-        Self { client, cookies: Mutex::new(CookieStore::new()) }
+        Self { client, cookies: Mutex::new(cookies) }
     }
 
     /// Sigue redirecciones 301/302/303/307/308 de verdad en vez de devolver

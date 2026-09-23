@@ -3,6 +3,12 @@ pub struct WebGpuPipeline {
     pub backend_name: String,
 }
 
+impl Default for WebGpuPipeline {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WebGpuPipeline {
     pub fn new() -> Self {
         let instance = wgpu::Instance::default();

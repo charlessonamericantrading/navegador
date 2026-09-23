@@ -24,6 +24,22 @@ impl Method {
             Method::Patch => "PATCH",
         }
     }
+
+    /// Inverso de `as_str`, para lo que llega por el canal del broker. Solo
+    /// los metodos que el motor sabe hacer: cualquier otro es un error, no un
+    /// `GET` por defecto.
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "GET" => Method::Get,
+            "POST" => Method::Post,
+            "PUT" => Method::Put,
+            "DELETE" => Method::Delete,
+            "HEAD" => Method::Head,
+            "OPTIONS" => Method::Options,
+            "PATCH" => Method::Patch,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +68,11 @@ pub struct NetworkRequest {
     /// terceros sin que nadie lo pida seria justo lo que CORS existe para
     /// evitar. Al mismo origen las cookies viajan siempre, sin mirar esto.
     pub include_credentials: bool,
+    /// Navegacion de nivel superior: el documento que va a ocupar la
+    /// pestaña. Con broker en otro proceso (ADR 0001, etapa 2) es lo que le
+    /// concede al renderer el origen de la respuesta, y con el, sus cookies
+    /// y su almacenamiento. `false` para todo lo demas.
+    pub navigation: bool,
 }
 
 impl NetworkRequest {
@@ -73,6 +94,7 @@ impl NetworkRequest {
             body: None,
             origin: None,
             include_credentials: false,
+            navigation: false,
         })
     }
 }
