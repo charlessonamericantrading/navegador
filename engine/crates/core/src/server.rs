@@ -281,18 +281,24 @@ impl EngineServer {
     /// no tendran ningun temporizador vencido. Que `relayout()` vuelva a
     /// comprobar temporizadores vencidos justo despues es inofensivo (no
     /// hay ninguno nuevo que disparar dos veces), no una duplicacion real.
-    fn tick_active_tab_timers(&mut self) {
+    ///
+    /// Devuelve el estado nuevo (con `id: None`) si disparo algun
+    /// temporizador, para que `run_stdio` lo publique sin que nadie lo pida
+    /// (plan H07, Fase 50). Antes el relayout ocurria pero nadie se
+    /// enteraba: el cambio solo aparecia con el siguiente comando.
+    fn tick_active_tab_timers(&mut self) -> Option<EngineResponse> {
         let (w, h) = (self.width, self.height);
         let tab = self.active_tab_mut();
-        let Some(page) = &mut tab.current_page else { return };
+        let page = tab.current_page.as_mut()?;
         if page.runtime.run_due_timers() == 0 {
-            return;
+            return None;
         }
         page.relayout(w as f32, h as f32);
         let content_extent = page.page.layout_root.content_extent();
         let scrolled = clamp_scroll_offset(tab.scroll_offset_y, content_extent, h as f32);
         page.publish_scroll_offset(scrolled);
         tab.scroll_offset_y = scrolled;
+        Some(self.state_response(None))
     }
 
     fn ready_response(&self, id: Option<String>) -> EngineResponse {
@@ -2120,6 +2126,12 @@ pub async fn run_stdio() -> io::Result<()> {
     // necesitar compartir nada entre tareas.
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
 
+    // Huella del ultimo `State` escrito, sea respuesta o publicacion
+    // espontanea: es lo ultimo que el consumidor tiene en pantalla. Un
+    // temporizador que dispara sin cambiar nada visible (un `setInterval`
+    // que solo consulta algo) no genera otra publicacion identica.
+    let mut last_state: Option<u64> = None;
+
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -2131,6 +2143,9 @@ pub async fn run_stdio() -> io::Result<()> {
                 let response = match serde_json::from_str::<EngineRequest>(&line) {
                     Ok(request) => {
                         let (response, should_shutdown) = server.handle(request).await;
+                        if let Some(fingerprint) = state_fingerprint(&response) {
+                            last_state = Some(fingerprint);
+                        }
                         write_response(&mut stdout, response).await?;
                         if should_shutdown {
                             break;
@@ -2146,12 +2161,32 @@ pub async fn run_stdio() -> io::Result<()> {
                 write_response(&mut stdout, response).await?;
             }
             _ = tick.tick() => {
-                server.tick_active_tab_timers();
+                let Some(state) = server.tick_active_tab_timers() else { continue };
+                let fingerprint = state_fingerprint(&state);
+                if fingerprint.is_some() && fingerprint != last_state {
+                    last_state = fingerprint;
+                    write_response(&mut stdout, state).await?;
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Huella de lo que un `State` muestra, sin su `id`: dos estados con la
+/// misma huella son indistinguibles para quien los pinta. `None` si la
+/// respuesta no es un `State` (un error de render, por ejemplo), que nunca
+/// se deduplica.
+fn state_fingerprint(response: &EngineResponse) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let EngineResponse::State { tab_id, scroll_offset_y, url, title, screenshot, elements, requires_javascript, can_go_back, can_go_forward, .. } = response else {
+        return None;
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (tab_id, scroll_offset_y.to_bits(), url, title, screenshot, requires_javascript, can_go_back, can_go_forward).hash(&mut hasher);
+    serde_json::to_string(elements).unwrap_or_default().hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 async fn write_response(
@@ -2556,10 +2591,42 @@ mod tests {
         let tab = server.active_tab_mut();
         tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
 
-        server.tick_active_tab_timers();
+        let publicado = server.tick_active_tab_timers();
 
         let runtime = &mut server.active_tab_mut().current_page.as_mut().expect("deberia haber pagina").runtime;
         assert_eq!(runtime.eval("disparo").unwrap(), "true", "el tick deberia haber disparado el setTimeout ya vencido, sin ningun comando NDJSON");
+        assert!(matches!(publicado, Some(EngineResponse::State { id: None, .. })), "el tick deberia devolver el estado nuevo, sin id, para publicarlo");
+    }
+
+    /// Plan H07 (Fase 50): el cambio que hace un temporizador tiene que
+    /// llegar en el estado que devuelve el tick, no esperar a otro comando.
+    #[test]
+    fn tick_active_tab_timers_returns_the_state_changed_by_the_timer() {
+        let html = "<html><head><title>ANTES</title></head><body><script>setTimeout(function() { document.title = 'DESPUES'; }, 0);</script></body></html>";
+        let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+        let mut server = EngineServer::new();
+        server.active_tab_mut().current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+
+        let Some(EngineResponse::State { title, .. }) = server.tick_active_tab_timers() else { panic!("deberia haber estado que publicar") };
+        assert_eq!(title, "DESPUES");
+        assert!(server.tick_active_tab_timers().is_none(), "sin temporizadores pendientes no hay nada que publicar");
+    }
+
+    #[test]
+    fn state_fingerprint_ignores_the_id_but_not_what_is_shown() {
+        let server = EngineServer::new();
+        let respuesta = server.state_response(Some("r1".to_string()));
+        let publicacion = server.state_response(None);
+        assert_eq!(state_fingerprint(&respuesta), state_fingerprint(&publicacion), "el mismo estado, pedido o espontaneo, no se publica dos veces");
+
+        let EngineResponse::State { mut title, .. } = server.state_response(None) else { unreachable!() };
+        title.push('!');
+        let mut distinto = server.state_response(None);
+        if let EngineResponse::State { title: t, .. } = &mut distinto {
+            *t = title;
+        }
+        assert_ne!(state_fingerprint(&respuesta), state_fingerprint(&distinto));
+        assert_eq!(state_fingerprint(&EngineResponse::Ok { id: None, message: "ok" }), None);
     }
 
     /// Una pestaña SIN pagina cargada (recien abierta) no deberia hacer
@@ -2567,7 +2634,7 @@ mod tests {
     #[test]
     fn tick_active_tab_timers_on_an_empty_tab_is_a_silent_no_op() {
         let mut server = EngineServer::new();
-        server.tick_active_tab_timers();
+        assert!(server.tick_active_tab_timers().is_none());
     }
 
     /// `std::mem::forget(dom)` es deliberado, no un descuido: `Node::parent`

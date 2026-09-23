@@ -132,6 +132,10 @@ pub enum EngineResponse {
         protocol_version: u32,
         renderer_status: &'static str,
     },
+    /// Con `id` es la respuesta a una peticion. Con `id: null` es una
+    /// publicacion espontanea (Fase 50): un temporizador de la pestaña activa
+    /// cambio lo que se ve. Un consumidor tiene que correlacionar por `id` y
+    /// no asumir que la siguiente linea responde a su ultima peticion.
     State {
         id: Option<String>,
         renderer_status: &'static str,

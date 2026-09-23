@@ -4700,3 +4700,53 @@ Sonda: 85/114 a 86/114; el minimo del trinquete sube a 86.
 - Metodos y accesores siguen siendo propiedades propias de cada instancia, no
   del prototipo (H11).
 
+### Fase 50: lo que cambia un temporizador llega solo a la interfaz (2026-09-23)
+
+Cuarta tarea del backlog (`plan.md`, hallazgo H07). El reloj de fondo de
+`run_stdio` (250 ms) disparaba los temporizadores de la pestaña activa y
+relayouteaba, pero no escribia nada en stdout: un `setTimeout` que cambiaba el
+titulo o el contenido solo se veia cuando llegaba el siguiente comando. La
+reproduccion 11.2 del plan lo confirmaba: cero mensajes espontaneos, y un
+`get_state` posterior ya devolvia el cambio.
+
+#### Publicacion espontanea
+
+`tick_active_tab_timers` devuelve ahora el estado nuevo cuando disparo algun
+temporizador, y `run_stdio` lo escribe como un `state` con `id: null`. El
+protocolo no gana una variante: el `id` ya separaba respuesta de publicacion.
+Electron ya reenviaba cualquier `state` a la interfaz y la interfaz ya lo
+aplicaba, asi que el cambio visible no necesito tocar el frontend.
+
+Un temporizador que dispara sin cambiar nada visible (un `setInterval` de
+sondeo) no genera publicaciones repetidas: `run_stdio` guarda la huella del
+ultimo `State` escrito, sea respuesta o publicacion, y solo publica si la
+nueva es distinta. La huella cubre lo que se pinta (captura, titulo, URL,
+scroll, elementos, historial) y no el `id`.
+
+#### Consumidores que asumian "la siguiente linea es mi respuesta"
+
+Dos lo asumian y se corrigieron:
+
+- El cliente Python (`backend/app/domains/browser/browser.py`) leia una linea
+  por peticion. Ahora lee hasta el `id` que espera y descarta el resto; se
+  comprobo contra el binario real con una publicacion entre dos peticiones.
+- `Motor::pedir` de los tests de protocolo salta las publicaciones; la nueva
+  `leer_publicacion` las espera.
+
+El test de humo `un_temporizador_que_cambia_la_pagina_se_publica_sin_pedirlo`
+mezcla un `setInterval` vacio con el `setTimeout` que cambia el titulo: se
+comprobo que, desactivando la deduplicacion, falla (la primera publicacion
+llega con el titulo viejo).
+
+#### Simplificaciones declaradas
+
+- Cada publicacion rasteriza la pagina entera y viaja como PNG en Base64,
+  igual que cualquier `State` (H13). Una animacion con `setInterval` rapido
+  produce hasta cuatro capturas por segundo; el transporte eficiente es F22.
+- La huella se calcula despues de rasterizar: la deduplicacion ahorra IPC y
+  trabajo de la interfaz, no el rasterizado.
+- Solo la pestaña activa avanza sus temporizadores, como antes.
+- El frontend trata la publicacion como cualquier `state`, incluido
+  `endLoading()`. Una publicacion escrita justo antes de que el motor reciba
+  una navegacion podria quitar el indicador de carga antes de tiempo.
+

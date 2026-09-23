@@ -74,6 +74,37 @@ fn una_linea_vacia_se_ignora_sin_responder() {
     assert_correlacionada(&r, "tras-vacia", "pong");
 }
 
+/// Reproduccion 11.2 del plan (H07, Fase 50): un `setTimeout` cambia el
+/// titulo y el cambio tiene que llegar SOLO, sin pedir `get_state`. Antes el
+/// motor relayouteaba en su reloj de fondo pero no escribia nada.
+///
+/// El `setInterval` vacio comprueba ademas la deduplicacion: dispara cada
+/// 50 ms sin cambiar nada, asi que si cada disparo generara una publicacion,
+/// la primera llegaria con el titulo ANTES.
+#[test]
+fn un_temporizador_que_cambia_la_pagina_se_publica_sin_pedirlo() {
+    let servidor = TestServer::nuevo(
+        "<!doctype html><html><head><title>ANTES</title></head><body><p>reloj</p><script>\
+         setInterval(function () {}, 50);\
+         setTimeout(function () { document.title = 'DESPUES'; }, 800);\
+         </script></body></html>",
+    );
+    let mut motor = Motor::arrancar();
+
+    let r = motor.pedir(json!({"type": "navigate", "id": "n1", "url": servidor.url("/")}));
+    assert_correlacionada(&r, "n1", "state");
+    assert_eq!(r["title"], "ANTES");
+
+    let publicado = motor.leer_publicacion();
+    assert_eq!(publicado["title"], "DESPUES", "la primera publicacion debe ser el cambio real, no un estado repetido: {}", publicado["title"]);
+    assert!(publicado["screenshot"].as_str().is_some_and(|s| !s.is_empty()), "la publicacion lleva la captura nueva");
+
+    // El canal de peticiones sigue correlacionado despues de publicar.
+    let s = motor.pedir(json!({"type": "get_state", "id": "s1"}));
+    assert_correlacionada(&s, "s1", "state");
+    assert_eq!(s["title"], "DESPUES");
+}
+
 #[test]
 fn navigate_y_get_state_devuelven_la_pagina_real() {
     let servidor = TestServer::nuevo(PAGINA);

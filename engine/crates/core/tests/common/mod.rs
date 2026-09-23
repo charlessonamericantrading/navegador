@@ -204,11 +204,32 @@ impl Motor {
     }
 
     /// Manda una peticion y devuelve la respuesta ya parseada.
+    ///
+    /// Desde la Fase 50 el motor publica estados por su cuenta (`id: null`)
+    /// cuando un temporizador cambia la pagina, y uno puede llegar entre la
+    /// peticion y su respuesta. Se saltan, igual que hace Electron al
+    /// correlacionar por `id`; una peticion sin `id` se queda con la primera
+    /// linea, que es lo que puede esperar de verdad.
     pub fn pedir(&mut self, peticion: Value) -> Value {
         let linea = serde_json::to_string(&peticion).unwrap();
         writeln!(self.entrada, "{linea}").expect("no se pudo escribir la peticion");
         self.entrada.flush().expect("no se pudo vaciar stdin");
-        self.leer()
+        loop {
+            let respuesta = self.leer();
+            if peticion.get("id").is_none() || !es_publicacion(&respuesta) {
+                return respuesta;
+            }
+        }
+    }
+
+    /// Espera el siguiente estado publicado sin peticion (`id: null`).
+    pub fn leer_publicacion(&mut self) -> Value {
+        loop {
+            let linea = self.leer();
+            if es_publicacion(&linea) {
+                return linea;
+            }
+        }
     }
 
     /// Lee UNA linea de stdout y exige que sea JSON.
@@ -257,6 +278,11 @@ impl Drop for Motor {
         let _ = self.hijo.kill();
         let _ = self.hijo.wait();
     }
+}
+
+/// Un `state` que nadie pidio: lo publica el reloj de temporizadores.
+pub fn es_publicacion(linea: &Value) -> bool {
+    linea["type"] == "state" && linea["id"].is_null()
 }
 
 /// Comprueba lo que toda respuesta debe cumplir, sea del tipo que sea.

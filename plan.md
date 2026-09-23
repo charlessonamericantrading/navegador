@@ -130,7 +130,7 @@ Los estados distinguen **reproducido**, **confirmado en código** y **pendiente 
 | H04 | `gemini_api_key` se persiste en `localStorage`; petición al proveedor desde el renderer | Confirmado en `AgentSidebar.tsx` y `AgentOrchestrator.ts` | P0 | F05, F34 |
 | H05 | `ipcMain.handle('engine:request')` reenvía payload sin validación de esquema ni del emisor; faltan políticas explícitas de navegación de la carcasa | Confirmado; no explotación demostrada | P0 | F04 |
 | H06 | `next_line()` y buffer stdout sin límite de trama; timeout Electron no cancela el trabajo del motor | Confirmado | P0 | F04, F06, F10 |
-| H07 | Tick de 250 ms modifica la pestaña activa y hace relayout, pero la rama de tick no escribe un estado a stdout | Reproducido por protocolo | P1 | F10, F22 |
+| H07 | Tick de 250 ms modifica la pestaña activa y hace relayout, pero la rama de tick no escribe un estado a stdout | **Resuelto** (Fase 50): publicación `state` con `id: null`, deduplicada | P1 | F10, F22 |
 | H08 | `window !== globalThis`, globals cortos ausentes | Reproducido por sonda | P1 | F11 |
 | H09 | `el.append/prepend` falla en la sonda aunque existe implementación y se anuncia como conseguido | **Resuelto** (Fase 49): faltaba la interfaz `Node` (`childNodes`, `parentNode`, `firstChild`...) | P1 | F03, F11 |
 | H10 | `modules.rs` ignora `_referrer`, usa base del documento y fuentes previamente descargadas | Confirmado | P1 | F13 |
@@ -425,7 +425,7 @@ En Linux, el almacenamiento protegido debe comprobar la disponibilidad real de u
 
 **Prioridad:** P1, con límites anti-bloqueo P0. **Depende de:** F03–F04; integración con F06. **Ámbito:** `runtime.rs`, `event_loop.rs`, `timers.rs`, `server.rs` y transporte de estados.
 
-- [ ] Corregir primero H07: cuando el temporizador cambia contenido visible, publicar invalidación/estado que llegue a la UI sin clic ni sondeo manual.
+- [x] Corregir primero H07: cuando el temporizador cambia contenido visible, publicar invalidación/estado que llegue a la UI sin clic ni sondeo manual. *(23-09-2026, Fase 50: `state` con `id: null` deduplicado por huella; clientes Python y de tests correlacionan por `id`.)*
 - [ ] Sustituir el tick fijo como mecanismo central por planificación de tareas, microtareas, red y oportunidad de renderizado.
 - [ ] Evitar que `handle(...).await` monopolice la atención de mensajes durante una navegación; permitir cancelar, cerrar o cambiar pestaña.
 - [ ] Integrar I/O con el hilo dueño de Boa sin compartir objetos no `Send` de forma insegura ni bloquear con esperas síncronas.
@@ -1145,7 +1145,7 @@ Este es el siguiente tramo de trabajo recomendado. El documento no implica que e
 | 1 | ~~Corregir falso verde del runner~~ **hecho** (Fase 47) | `core/src/bin/wpt_runner.rs`, harness | Fixture con excepción antes de tests devuelve fallo y diagnóstico |
 | 2 | ~~Añadir timeout por proceso de test~~ **hecho** (Fase 48) | Harness/runner | Fixture infinito termina con TIMEOUT y continúa la suite |
 | 3 | ~~Investigar append/prepend~~ **hecho** (Fase 49) | `api-probe.html`, `dom_bindings.rs` | Causa reducida, caso semántico y corrección sin bajar cobertura |
-| 4 | Corregir publicación de cambios de timers | `core/src/server.rs`, Electron/viewport | El título/captura cambian sin petición manual posterior |
+| 4 | ~~Corregir publicación de cambios de timers~~ **hecho** (Fase 50) | `core/src/server.rs`, Electron/viewport | El título/captura cambian sin petición manual posterior |
 | 5 | Corregir cancelación y autoenvío del agente | `AgentSidebar`, orquestador, `App.tsx` | Detener durante llamada no actúa después; escribir no envía |
 | 6 | Propagar resultados y fallos de comandos | `App.tsx`, tipos IPC, orquestador | Error de motor no termina como objetivo completado |
 | 7 | Retirar clave de renderer | Servicio IA/credenciales, preload | No existe secreto en localStorage, UI o logs |
