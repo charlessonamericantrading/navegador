@@ -281,7 +281,10 @@ pub struct DocumentBindings {
     /// cada elemento del suyo. `None` si el registro fallo - en ese caso los
     /// elementos se construyen sin cadena, exactamente como antes de la Fase
     /// 44, en vez de dejar la pagina sin DOM.
-    #[unsafe_ignore_trace]
+    ///
+    /// SIN `#[unsafe_ignore_trace]`, a proposito (plan H28): son `JsObject`,
+    /// y excluidos de la traza se convertian en raices permanentes que
+    /// retenian el documento entero despues de navegar.
     prototypes: Option<crate::dom_classes::DomPrototypes>,
     /// `scrollTop`/`scrollLeft` de cada elemento con `overflow: auto/
     /// scroll` que los haya recibido - puntero de nodo -> (scrollLeft,
@@ -298,6 +301,23 @@ pub struct DocumentBindings {
 pub type ScrollOffsets = Arc<Mutex<HashMap<usize, (f32, f32)>>>;
 
 impl DocumentBindings {
+    /// Rompe el ciclo que retenia cada documento para siempre (plan H28).
+    ///
+    /// `element_objects` y `listeners` son contenedores de Rust (`Arc`, fuera
+    /// del GC de Boa) que guardan handles `JsObject`, y un handle guardado
+    /// fuera del heap cuenta como RAIZ para el recolector. Esos objetos, a su
+    /// vez, capturan en sus cierres este mismo `DocumentBindings`. Nada rompia
+    /// el ciclo, asi que ni el DOM ni los objetos se liberaban al navegar:
+    /// ~24 MiB por carga de una pagina con 200 elementos. `JsRuntime` llama a
+    /// esto al descartarse; despues el GC puede recoger los objetos y, con
+    /// ellos, los `Arc` del DOM que capturan.
+    pub(crate) fn teardown(&self) {
+        self.element_objects.lock().unwrap().clear();
+        self.listeners.lock().unwrap().clear();
+        self.mutations.lock().unwrap().clear();
+        self.scroll_offsets.lock().unwrap().clear();
+    }
+
     /// El registro de mutaciones de este documento.
     pub fn mutations(&self) -> &crate::mutation_observer::MutationLog {
         &self.mutations
@@ -3979,6 +3999,28 @@ mod tests {
             "document.getElementById('a').previousElementSibling === null",
         );
         assert_eq!(result, "true");
+    }
+
+    /// Plan H28: al descartar el runtime de una pagina, su DOM tiene que
+    /// liberarse. Se mide con un `Weak` a la raiz: si algo sigue reteniendo el
+    /// arbol despues de soltar el runtime y la referencia propia, es una fuga
+    /// que se repite en cada navegacion.
+    #[test]
+    fn dropping_the_runtime_releases_the_dom() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="c"><p>hola</p></div></body></html>"#);
+        let weak_root = std::sync::Arc::downgrade(&dom);
+        let weak_div = std::sync::Arc::downgrade(&Node::find_by_id(&dom, "c").unwrap());
+        {
+            let mut runtime = JsRuntime::new();
+            runtime.bind_dom(dom).expect("bind_dom");
+            // Tocar elementos desde JS llena la cache de identidad.
+            runtime.eval("var c = document.getElementById('c'); c.firstChild.textContent; document.body.children.length").expect("js");
+        }
+        // El GC de Boa recoge de forma perezosa; se fuerza para distinguir
+        // «todavia no recogido» de «retenido por una raiz» (la fuga).
+        boa_gc::force_collect();
+        assert!(weak_div.upgrade().is_none(), "un elemento sigue vivo tras soltar el runtime: fuga");
+        assert!(weak_root.upgrade().is_none(), "el documento sigue vivo tras soltar el runtime: fuga");
     }
 
     /// Plan H26 (Fase 60): `querySelector` de un elemento busca solo entre

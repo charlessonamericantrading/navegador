@@ -265,25 +265,16 @@ pub fn register_mutation_observer(context: &mut Context, bindings: DocumentBindi
     Ok(registry)
 }
 
-#[derive(Clone)]
-struct ConstructorCapture(ObserverRegistry, DocumentBindings);
-
-unsafe impl boa_gc::Trace for ConstructorCapture {
-    boa_gc::empty_trace!();
-}
-
-impl boa_gc::Finalize for ConstructorCapture {}
+// `DocumentBindings` SE TRAZA (lleva los prototipos del DOM, que son
+// `JsObject`): con `empty_trace!` sus handles eran raices permanentes que
+// retenian el documento tras navegar (plan H28). El registro es un `Arc` puro.
+#[derive(Clone, boa_gc::Trace, boa_gc::Finalize)]
+struct ConstructorCapture(#[unsafe_ignore_trace] ObserverRegistry, DocumentBindings);
 
 type ObserveCapture = RegistryCapture;
 
-#[derive(Clone)]
-struct TakeCapture(ObserverRegistry, u64, DocumentBindings);
-
-unsafe impl boa_gc::Trace for TakeCapture {
-    boa_gc::empty_trace!();
-}
-
-impl boa_gc::Finalize for TakeCapture {}
+#[derive(Clone, boa_gc::Trace, boa_gc::Finalize)]
+struct TakeCapture(#[unsafe_ignore_trace] ObserverRegistry, u64, DocumentBindings);
 
 /// Construye el array de `MutationRecord` que recibe el callback.
 fn build_records_array(records: &[PendingMutation], bindings: &DocumentBindings, context: &mut Context) -> JsResult<JsObject> {

@@ -36,7 +36,13 @@ use boa_engine::property::Attribute;
 use boa_engine::{js_string, Context, JsNativeError, JsResult, JsValue, NativeFunction};
 
 /// Los objetos prototipo del documento, ya enlazados entre sí.
-#[derive(Clone)]
+///
+/// `Trace` es obligatorio, no un detalle (plan H28): una copia de esto viaja
+/// dentro de cada `DocumentBindings`, y este dentro de los cierres de cada
+/// objeto de elemento. Si el recolector no los traza, cada `JsObject` de aquí
+/// es una RAÍZ permanente, y desde un prototipo se llega al realm, al objeto
+/// global, a `document` y al DOM entero: ningún documento se liberaba jamás.
+#[derive(Clone, boa_gc::Trace, boa_gc::Finalize)]
 pub struct DomPrototypes {
     /// Prototipo por etiqueta HTML (`div` → `HTMLDivElement.prototype`).
     por_etiqueta: HashMap<String, JsObject>,

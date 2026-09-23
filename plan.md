@@ -151,7 +151,7 @@ Los estados distinguen **reproducido**, **confirmado en código** y **pendiente 
 | H25 | No se han obtenido resultados de WPT oficial, Test262, benchmark comparativo o accesibilidad del SO | Línea base propia hecha (Fase 59); WPT oficial, Test262 y comparación con Chrome pendientes | P1 | F03, F32, F39, F40 |
 | H26 | `element.querySelector`/`querySelectorAll` no existen, solo en `document`; la sonda no lo comprueba | **Resuelto** (Fase 60): implementados y añadidos a la sonda (87/115) | P1 | F11, F14 |
 | H27 | Tests de humo y cualquier arranque escribían cookies y `localStorage` en el perfil real del usuario | **Resuelto** (Fase 59): `NAVEGADOR_IA_PROFILE_DIR` y perfiles temporales | P1 | F03, F31 |
-| H28 | La memoria no se libera entre navegaciones: ~24 MiB más por carga de una página con 200 elementos, 504 MiB tras 20 | Reproducido y medido (Fase 59) | P1 | F11, F22, F39 |
+| H28 | La memoria no se libera entre navegaciones: ~24 MiB más por carga de una página con 200 elementos, 504 MiB tras 20 | **Resuelto** (Fase 61): 85 MiB estables tras 20 cargas; queda revisar XHR | P1 | F11, F22, F39 |
 
 Las mitigaciones de Windows tienen valor, pero no eliminan acceso a archivos, red y datos del usuario. Rust reduce determinadas clases de fallos; no justifica afirmar que elimina toda corrupción de memoria, que no hay errores en dependencias o que desaparece un porcentaje fijo de vulnerabilidades del producto.
 

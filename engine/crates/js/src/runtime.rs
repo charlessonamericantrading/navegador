@@ -44,6 +44,21 @@ pub struct JsRuntime {
     module_loader: Option<std::rc::Rc<crate::modules::PageModuleLoader>>,
 }
 
+/// Al descartar el runtime de una pagina (cada navegacion), se vacian los
+/// contenedores de Rust que retienen objetos de JS como raices del GC: sin
+/// esto el documento entero sobrevivia (plan H28, ver
+/// `DocumentBindings::teardown`). Corre antes de soltar el `Context`.
+impl Drop for JsRuntime {
+    fn drop(&mut self) {
+        if let Some(bindings) = &self.document_bindings {
+            bindings.teardown();
+        }
+        if let Some(observers) = &self.mutation_observers {
+            observers.lock().unwrap().clear();
+        }
+    }
+}
+
 impl Default for JsRuntime {
     fn default() -> Self {
         Self::new()

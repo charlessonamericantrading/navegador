@@ -5190,3 +5190,53 @@ por buena se comprobo que sigue detectando un bucle real (una dependencia
 inestable metida a proposito en el efecto de conexion): saltos de 438 y 385
 peticiones, falla como debe.
 
+### Fase 61: cada documento se liberaba nunca (fuga de memoria entre navegaciones) (2026-09-23)
+
+Hallazgo H28 del benchmark de la Fase 59: cargar 20 veces una pagina que crea
+200 elementos dejaba el proceso en 504 MiB, unos 24 MiB mas por carga.
+
+#### Reproducido en un test antes de tocar nada
+
+`dropping_the_runtime_releases_the_dom`: se crea un runtime con DOM, se tocan
+elementos desde JS, se suelta todo, se fuerza el GC de Boa y se comprueba con
+un `Weak` que el arbol se libero. Fallaba. Acotando por pasos (solo contexto,
+un cierre suelto, `register` sin JS, `register` + limpieza) se vio que Boa
+libera bien las capturas de un cierre; lo que retenia el documento eran
+**handles `JsObject` guardados en sitios que el GC no traza**, que para Boa
+cuentan como raices permanentes:
+
+1. `DocumentBindings.prototypes` (los prototipos del DOM) estaba marcado
+   `#[unsafe_ignore_trace]`, y cada objeto de elemento lleva un clon de
+   `DocumentBindings` en sus cierres. Desde un prototipo se llega al realm, al
+   objeto global, a `document` y al DOM: todo enraizado para siempre. Ahora
+   `DomPrototypes` deriva `Trace` y el campo se traza.
+2. Las capturas de `MutationObserver` que llevan un `DocumentBindings`
+   declaraban `empty_trace!()`, cierto solo mientras aquel no trazaba nada.
+   Ahora derivan `Trace`.
+3. `element_objects` (cache de identidad), `listeners` y los observadores son
+   contenedores de Rust con handles, y ademas forman ciclo con los cierres que
+   los capturan. `JsRuntime` implementa `Drop` y los vacia
+   (`DocumentBindings::teardown`) al descartarse la pagina.
+
+La regla que se deduce: **un `JsObject` nunca va en un campo excluido de la
+traza**, salvo en un contenedor que alguien vacie explicitamente al terminar
+el documento.
+
+#### Resultado
+
+| Cargas de `construir-dom` | Antes | Ahora |
+|---|---|---|
+| 1 | 50 MiB | 51 MiB |
+| 5 | 148 MiB | 82 MiB |
+| 10 | 267 MiB | 84 MiB |
+| 20 | 504 MiB | 85 MiB |
+
+La memoria deja de crecer con las navegaciones; lo que queda es el tamano de
+trabajo del heap. 907 tests, clippy y los 60 estilo-WPT siguen en verde.
+
+#### Pendiente
+
+Los `handlers` de `XMLHttpRequest` siguen en un `Arc` con handles, con el mismo
+patron: una pagina que usa XHR puede retener su objeto. No lo mide el corpus
+actual.
+
