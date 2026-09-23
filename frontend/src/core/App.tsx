@@ -413,8 +413,12 @@ function App() {
     click: async (x: number, y: number) => {
       await sendCommand({ type: 'click', x, y });
     },
+    // Rellenar no envía (plan H17): enviar es `pressKey('Enter')`, un paso
+    // aparte que el agente tiene que decidir. La escritura manual
+    // (`handleManualType`) sigue enviando: la dispara el propio usuario al
+    // confirmar la ventana emergente de texto del viewport.
     typeText: async (x: number, y: number, text: string) => {
-      await sendCommand({ type: 'type_text', x, y, text, press_enter: true });
+      await sendCommand({ type: 'type_text', x, y, text, press_enter: false });
     },
     pressKey: async (key: string) => {
       await sendCommand({ type: 'press_key', key });

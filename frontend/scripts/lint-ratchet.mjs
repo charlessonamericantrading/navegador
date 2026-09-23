@@ -21,7 +21,7 @@
 import { ESLint } from 'eslint';
 
 /** Hallazgos conocidos el 2026-09-09. Solo puede bajar. */
-const BASE = 20;
+const BASE = 18;
 
 const eslint = new ESLint();
 const resultados = await eslint.lintFiles(['.']);

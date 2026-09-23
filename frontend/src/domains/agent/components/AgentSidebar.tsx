@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { AgentOrchestrator, type AgentStepResult, type BrowserInterface } from '../AgentOrchestrator';
+import { AgentCancelledError, AgentOrchestrator, cancellableDelay, type AgentStepResult, type BrowserInterface } from '../AgentOrchestrator';
 
 interface AgentSidebarProps {
   isOpen: boolean;
@@ -18,7 +18,11 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
   const [stepsHistory, setStepsHistory] = useState<AgentStepResult[]>([]);
   const [finalAnswer, setFinalAnswer] = useState<string | null>(null);
 
-  const isRunningRef = useRef(false);
+  // Una ejecución = un controlador. «Detener» lo aborta, y eso llega a la
+  // petición al modelo y a cada punto de control del orquestador. Que sea
+  // por ejecución (y no una bandera compartida) impide que un paso de una
+  // ejecución ya detenida toque el estado de la siguiente.
+  const runControllerRef = useRef<AbortController | null>(null);
   const orchestratorRef = useRef<AgentOrchestrator | null>(null);
   const historyEndRef = useRef<HTMLDivElement>(null);
 
@@ -44,8 +48,11 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
       return;
     }
 
+    const controller = new AbortController();
+    runControllerRef.current = controller;
+    const { signal } = controller;
+
     setIsRunning(true);
-    isRunningRef.current = true;
     setCurrentStep(0);
     setFinalAnswer(null);
     setStepsHistory([]);
@@ -57,19 +64,19 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
     let stepCount = 0;
 
     try {
-      while (stepCount < maxSteps && isRunningRef.current) {
+      while (stepCount < maxSteps && !signal.aborted) {
         stepCount += 1;
         setCurrentStep(stepCount);
         setStatusMessage(`Paso ${stepCount}: Analizando página y decidiendo acción...`);
 
         // Pequeña pausa para permitir actualización de la UI
-        await new Promise((r) => setTimeout(r, 400));
-        if (!isRunningRef.current) break;
+        await cancellableDelay(400, signal);
 
         const result = await orchestratorRef.current!.runStep(
           goal,
           mode,
-          mode === 'gemini' ? apiKey : undefined
+          mode === 'gemini' ? apiKey : undefined,
+          signal
         );
 
         setStepsHistory((prev) => [...prev, result]);
@@ -81,23 +88,31 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
         }
 
         // Espera entre pasos para que el motor y la UI se estabilicen
-        await new Promise((r) => setTimeout(r, 1200));
+        await cancellableDelay(1200, signal);
       }
 
-      if (stepCount >= maxSteps && isRunningRef.current) {
+      if (stepCount >= maxSteps && !signal.aborted) {
         setStatusMessage('Se alcanzó el límite máximo de pasos (15).');
       }
-    } catch (err: any) {
-      console.error('Error durante la ejecución del agente:', err);
-      setStatusMessage(`Error: ${err.message || err}`);
+    } catch (err) {
+      // Detener no es un error: `handleStop` ya puso su mensaje.
+      if (!(err instanceof AgentCancelledError)) {
+        console.error('Error durante la ejecución del agente:', err);
+        setStatusMessage(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      }
     } finally {
-      setIsRunning(false);
-      isRunningRef.current = false;
+      // Solo la ejecución vigente limpia el estado: si el usuario detuvo esta
+      // y lanzó otra, esa otra sigue en marcha.
+      if (runControllerRef.current === controller) {
+        runControllerRef.current = null;
+        setIsRunning(false);
+      }
     }
   };
 
   const handleStop = () => {
-    isRunningRef.current = false;
+    runControllerRef.current?.abort();
+    runControllerRef.current = null;
     setIsRunning(false);
     setStatusMessage('Ejecución detenida por el usuario.');
   };

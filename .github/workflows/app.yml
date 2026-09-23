@@ -35,7 +35,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # 24: `npm test` usa type stripping de Node (>= 22.18); es la version
+          # con la que se mide el proyecto (plan, seccion 1.3).
+          node-version: 24
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -57,6 +59,12 @@ jobs:
       - name: Lint (sin regresiones)
         working-directory: frontend
         run: npm run lint:ci
+
+      # Test runner de Node sobre los `.ts` sin compilar (requiere Node con
+      # type stripping, >= 22.18). Hoy cubre el orquestador del agente.
+      - name: Tests
+        working-directory: frontend
+        run: npm test
 
   desktop:
     runs-on: windows-latest

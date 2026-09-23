@@ -47,6 +47,41 @@ export interface BrowserInterface {
   pressKey: (key: string) => Promise<void>;
 }
 
+/**
+ * El usuario detuvo la ejecución. Se lanza en vez de devolver un paso para
+ * que nadie lo confunda con un resultado: un paso cancelado no actuó.
+ */
+export class AgentCancelledError extends Error {
+  constructor() {
+    super('Ejecución del agente detenida');
+    this.name = 'AgentCancelledError';
+  }
+}
+
+/** Punto de control: tras cada espera, antes de seguir o de actuar. */
+function throwIfCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new AgentCancelledError();
+}
+
+/** Espera que termina antes si se cancela, en vez de agotar el plazo. */
+export function cancellableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new AgentCancelledError());
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new AgentCancelledError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 export function getSimplifiedDomText(elements: InteractiveElement[]): string {
   const textLines: string[] = [];
   for (const el of elements) {
@@ -68,7 +103,7 @@ export function getSimplifiedDomText(elements: InteractiveElement[]): string {
 
 export class AgentOrchestrator {
   private browser: BrowserInterface;
-  private history: Array<{ thought: string; action: string; url: string; title: string; finished: boolean; answer: string }> = [];
+  private history: Array<{ thought: string; kind: string; action: string; url: string; title: string; finished: boolean; answer: string }> = [];
 
   constructor(browser: BrowserInterface) {
     this.browser = browser;
@@ -78,10 +113,20 @@ export class AgentOrchestrator {
     this.history = [];
   }
 
-  public async runStep(goal: string, mode: 'simulation' | 'gemini' = 'simulation', apiKey?: string): Promise<AgentStepResult> {
+  /**
+   * Observa la página, decide una acción y la ejecuta.
+   *
+   * `signal` cancela el paso: se comprueba tras cada espera y justo antes de
+   * actuar, y llega a la petición al modelo. Una vez enviada una acción al
+   * motor ya no se puede deshacer; lo que garantiza la cancelación es que no
+   * se envía ninguna acción nueva después de detener.
+   */
+  public async runStep(goal: string, mode: 'simulation' | 'gemini' = 'simulation', apiKey?: string, signal?: AbortSignal): Promise<AgentStepResult> {
+    throwIfCancelled(signal);
     const url = await this.browser.getUrl();
     const title = await this.browser.getTitle();
     const elements = await this.browser.getElements();
+    throwIfCancelled(signal);
 
     let domText = '';
     if (this.browser.getAccessibilityPrompt) {
@@ -95,12 +140,17 @@ export class AgentOrchestrator {
       domText = getSimplifiedDomText(elements);
     }
 
+    throwIfCancelled(signal);
+
     let stepResult: AgentStepResult;
     if (mode === 'simulation') {
-      stepResult = await this.runSimulatedStep(goal, url, title, elements);
+      stepResult = await this.runSimulatedStep(goal, url, title, elements, signal);
     } else {
-      stepResult = await this.runGeminiStep(goal, url, title, domText, apiKey);
+      stepResult = await this.runGeminiStep(goal, url, title, domText, apiKey, signal);
     }
+    // La respuesta del modelo puede llegar después de pulsar «Detener»: no
+    // se ejecuta.
+    throwIfCancelled(signal);
 
     let executionMsg = '';
     let finished = false;
@@ -159,6 +209,7 @@ export class AgentOrchestrator {
 
     this.history.push({
       thought: stepData.thought,
+      kind: stepResult.action,
       action: executionMsg,
       url,
       title,
@@ -169,11 +220,20 @@ export class AgentOrchestrator {
     return stepData;
   }
 
-  private async runSimulatedStep(goal: string, url: string, title: string, elements: InteractiveElement[]): Promise<AgentStepResult> {
-    await new Promise((resolve) => setTimeout(resolve, 800));
+  private async runSimulatedStep(goal: string, url: string, title: string, elements: InteractiveElement[], signal?: AbortSignal): Promise<AgentStepResult> {
+    await cancellableDelay(800, signal);
 
     const goalLower = goal.toLowerCase();
     const stepCount = this.history.length;
+
+    // Escribir ya no envía el formulario: enviarlo es una acción aparte.
+    if (this.history[stepCount - 1]?.kind === 'type') {
+      return {
+        thought: 'He escrito la consulta; la envío pulsando Enter.',
+        action: 'press',
+        key: 'Enter'
+      };
+    }
 
     if (stepCount === 0) {
       if (goalLower.includes('wikipedia')) {
@@ -255,7 +315,7 @@ export class AgentOrchestrator {
     };
   }
 
-  private async runGeminiStep(goal: string, url: string, title: string, domText: string, apiKey?: string): Promise<AgentStepResult> {
+  private async runGeminiStep(goal: string, url: string, title: string, domText: string, apiKey?: string, signal?: AbortSignal): Promise<AgentStepResult> {
     if (!apiKey) {
       return {
         thought: 'Error: Se requiere una Gemini API Key.',
@@ -270,8 +330,8 @@ Tu objetivo es interactuar con páginas web para cumplir la meta del usuario.
 REGLAS DE ACCIÓN:
 1. "navigate": {"action": "navigate", "url": "https://..."}
 2. "click": {"action": "click", "target_id": <ID_NUMÉRICO>}
-3. "type": {"action": "type", "target_id": <ID_NUMÉRICO>, "text": "texto"}
-4. "press": {"action": "press", "key": "Enter"}
+3. "type": {"action": "type", "target_id": <ID_NUMÉRICO>, "text": "texto"} (solo escribe; NO envía el formulario)
+4. "press": {"action": "press", "key": "Enter"} (para enviar lo escrito, como paso aparte)
 5. "finish": {"action": "finish", "answer": "respuesta final"}
 
 RESPONDE EXCLUSIVAMENTE CON UN OBJETO JSON con las claves: thought, action, target_id, text, key, url, answer.`;
@@ -292,6 +352,7 @@ Decide el siguiente paso y responde en JSON.`;
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
         {
           method: 'POST',
+          signal,
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             contents: [
@@ -317,11 +378,15 @@ Decide el siguiente paso y responde en JSON.`;
       let rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
       rawText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
       return JSON.parse(rawText) as AgentStepResult;
-    } catch (err: any) {
+    } catch (err) {
+      // Una cancelación no es un error de conexión que deba acabar la tarea
+      // con una «respuesta»: se propaga tal cual.
+      throwIfCancelled(signal);
+      const message = err instanceof Error ? err.message : String(err);
       return {
-        thought: `Error al consultar Gemini: ${err.message}`,
+        thought: `Error al consultar Gemini: ${message}`,
         action: 'finish',
-        answer: `Error de conexión con Gemini: ${err.message}`
+        answer: `Error de conexión con Gemini: ${message}`
       };
     }
   }

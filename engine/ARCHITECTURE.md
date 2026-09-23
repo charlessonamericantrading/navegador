@@ -4750,3 +4750,58 @@ llega con el titulo viejo).
   `endLoading()`. Una publicacion escrita justo antes de que el motor reciba
   una navegacion podria quitar el indicador de carga antes de tiempo.
 
+### Fase 51: «Detener» detiene al agente, y rellenar ya no envía (2026-09-23)
+
+No toca el motor. Quinta tarea del backlog (`plan.md`, hallazgos H16 y H17),
+las dos de prioridad de seguridad del agente.
+
+#### H16: detener era una bandera que nadie consultaba a tiempo
+
+«Detener» ponia `isRunningRef.current = false`, y el bucle solo lo miraba
+entre pasos. Un paso en curso (esperando al modelo) seguia: cuando la
+respuesta llegaba, la accion se ejecutaba igual. La peticion a Gemini tampoco
+se abortaba.
+
+Ahora cada ejecucion tiene su `AbortController`. `AgentOrchestrator.runStep`
+recibe la senal, la pasa a `fetch` y la comprueba tras cada espera: antes de
+observar, tras observar y, sobre todo, entre la decision del modelo y la
+accion. Una cancelacion se lanza como `AgentCancelledError` en vez de
+devolverse como paso, para que no se confunda con un resultado; el `catch` de
+la peticion a Gemini ya no la convierte en «error de conexion».
+
+Que el controlador sea por ejecucion cierra otra carrera: antes, el `finally`
+de una ejecucion detenida ponia `isRunning` a `false` aunque el usuario ya
+hubiera lanzado otra.
+
+Una accion ya enviada al motor no se deshace; la garantia es que despues de
+detener no se envia ninguna nueva.
+
+#### H17: escribir pulsaba Enter
+
+El `typeText` que `App.tsx` da al agente mandaba `press_enter: true`: rellenar
+un campo enviaba el formulario. Ahora manda `false`, y enviar es la accion
+`press Enter`, un paso aparte que el modelo tiene que decidir (el prompt lo
+dice explicitamente). El modo simulacion dependia de ese Enter para buscar y
+ahora pulsa Enter como paso propio. La escritura manual del usuario sigue
+enviando: la dispara el al confirmar su ventana emergente.
+
+#### Tests del frontend, por primera vez
+
+`frontend/tests/agentOrchestrator.test.ts`, con el runner de Node sobre el
+`.ts` sin compilar (`npm test`): el proyecto ya exigia `erasableSyntaxOnly`,
+asi que no hizo falta ninguna dependencia. Cubre detener mientras el modelo
+decide, una respuesta que llega despues de detener (con un `fetch` que ignora
+la senal: el peor caso), que la senal llega a `fetch`, la senal ya abortada y
+que escribir y enviar son pasos distintos. Se comprobo que quitar el punto de
+control tras el modelo hace fallar el test de respuesta tardia.
+
+El job `frontend` del CI pasa a Node 24 para poder correrlos (Node 20 no quita
+tipos). De paso, dos `catch (err: any)` tocados se tiparon: el trinquete del
+lint baja de 20 a 18.
+
+#### Pendiente en F05
+
+Sin cubrir aqui: la clave en `localStorage` (tarea 7), errores del motor que
+se muestran pero no se propagan y acciones desconocidas que acaban como
+«completada» (tarea 6), y la autorizacion de acciones sensibles.
+
