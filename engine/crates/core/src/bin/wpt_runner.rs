@@ -63,7 +63,19 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let [flag, file] = args.as_slice() {
         if flag == "--document" {
-            run_document_in_this_process(Path::new(file));
+            // Mismo motivo que en `engine_server`: el hilo principal de
+            // Windows tiene 1 MiB de pila y una pagina con bastante JS la
+            // desborda con Boa 0.22 en depuracion. El documento corre en un
+            // hilo con pila holgada.
+            let file = PathBuf::from(file);
+            let worker = std::thread::Builder::new()
+                .name("documento".to_string())
+                .stack_size(64 * 1024 * 1024)
+                .spawn(move || run_document_in_this_process(&file))
+                .expect("no se pudo crear el hilo del documento");
+            if let Err(panic) = worker.join() {
+                std::panic::resume_unwind(panic);
+            }
             return;
         }
     }

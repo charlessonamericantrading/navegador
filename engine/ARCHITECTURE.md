@@ -5287,3 +5287,23 @@ Y tres con semántica:
 - `cargo audit`: 0 vulnerabilidades. Las dos excepciones de `fast-float` se
   retiran del CI.
 
+### Fase 63: el motor corre en un hilo con pila propia (2026-09-23)
+
+La Fase 62 (Boa 0.22) paso toda la suite en local, pero en el runner de GitHub
+la sonda de APIs mato `engine_server` con `thread 'main' has overflowed its
+stack`. No era un fallo de la sonda: `#[tokio::main]` ejecutaba `run_stdio`, y
+con el todo el JavaScript de la pagina, en el hilo PRINCIPAL, que en Windows
+tiene 1 MiB de pila. Boa 0.22 en depuracion gasta algo mas por llamada y la
+pagina de la sonda quedo justo por encima.
+
+Medido en local con `NAVEGADOR_IA_ENGINE_STACK_MB`: con 1 MiB la sonda desborda
+(reproducido), con 2 MiB pasa. `engine_server` corre ahora el motor en un hilo
+`engine` de 64 MiB (unas 30 veces lo necesario; es reserva virtual, no memoria
+comprometida), y el hijo de `wpt_runner` igual. Un desbordamiento de pila
+nativo no es una excepcion de JS que se pueda capturar: mata el proceso, asi
+que el margen importa. Los limites de recursion de JavaScript siguen siendo los
+de Boa.
+
+La leccion para el proceso: pasar en local no bastaba; la verificacion de una
+migracion del motor incluye ver el CI remoto, que es justo lo que lo detecto.
+
