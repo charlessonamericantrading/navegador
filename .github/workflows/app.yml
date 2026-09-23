@@ -95,11 +95,6 @@ jobs:
         working-directory: desktop
         run: npm ci
 
-      # Credenciales y proveedor de IA del proceso principal, sin Electron.
-      - name: Tests del proceso principal
-        working-directory: desktop
-        run: npm test
-
       # El paquete se construye con el motor REAL (plan H19). Antes se creaba
       # la carpeta `build-resources/engine` vacia para que `electron-builder`
       # no abortara: el paquete salia bien y no funcionaba, y nadie lo sabia.
@@ -116,6 +111,12 @@ jobs:
 
       - name: Compilar el motor (release)
         run: cargo build --manifest-path engine/Cargo.toml -p engine-core --bin engine_server --release --locked
+
+      # Despues de compilar el motor: el experimento del ADR 0001 (supervisor
+      # de renderers) corre contra `engine_server` real y se salta sin el.
+      - name: Tests del proceso principal
+        working-directory: desktop
+        run: npm test
 
       - name: Copiar el motor a los recursos del paquete
         working-directory: desktop

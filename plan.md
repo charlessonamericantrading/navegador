@@ -270,7 +270,7 @@ Cada fase contiene objetivo, dependencias, archivos o componentes, tareas y una 
 - [ ] Separar en arquitectura el estado vigente del relato de fases históricas.
 - [ ] Definir usuarios iniciales, equipos de referencia y corpus crítico de tareas antes de comparar rendimiento.
 - [ ] Verificar la relación real con `main`, estado del CI remoto y política de contribución antes de planear integración.
-- [ ] Abrir un registro de decisiones para broker, runtime JS, almacenamiento, UI y modelo de extensiones.
+- [ ] Abrir un registro de decisiones para broker, runtime JS, almacenamiento, UI y modelo de extensiones. *(23-09-2026: abierto `docs/adr/` con la 0001, broker y aislamiento; faltan las demás.)*
 
 **Aceptación:** un tercero identifica qué funciona, reproduce los resultados y localiza evidencia de cada capacidad sin reconciliar tres cifras incompatibles. No quedan afirmaciones de seguridad total o superioridad sin respaldo.
 
@@ -366,7 +366,7 @@ En Linux, el almacenamiento protegido debe comprobar la disponibilidad real de u
 **Prioridad:** P0. **Depende de:** F02–F04. **Ámbito:** `core/server.rs`, binarios del motor, servicios de red/datos y supervisor de escritorio.
 
 - [ ] Extraer gestión de sesiones y pestañas de la ejecución de documentos; definir ownership de cada recurso antes de moverlo de proceso.
-- [ ] Introducir broker y renderer por pestaña como primer paso, conservando contrato externo mientras evoluciona el interno.
+- [ ] Introducir broker y renderer por pestaña como primer paso, conservando contrato externo mientras evoluciona el interno. *(23-09-2026, Fase 58: supervisor prototipo con contención probada contra el motor real; sin conectar a la interfaz.)*
 - [ ] Añadir identificadores de contexto, documento y navegación; descartar respuestas de documentos destruidos.
 - [ ] Mover acceso a red, perfil, cookies y archivos a servicios mediados. El renderer solicita capacidades, no rutas arbitrarias.
 - [ ] Añadir watchdog fuera del proceso que ejecuta JS; una cola de promesas o bucle infinito no puede impedir que el supervisor intervenga.
@@ -1154,7 +1154,7 @@ Este es el siguiente tramo de trabajo recomendado. El documento no implica que e
 | 10 | ~~Resolver lint por grupos~~ **hecho** (Fase 55) | Frontend | 18 errores/2 advertencias → cero con pruebas de interacción |
 | 11 | ~~Desacoplar Python del build principal~~ **hecho** (Fase 56) | `build-app.js`, manifiestos, scripts | Build nativo completo sin `.venv` |
 | 12 | ~~Probar paquete con motor real~~ **hecho** (Fase 57; CI sin verificar en GitHub) | `.github/workflows/app.yml` | Artefacto instalado responde ping y renderiza fixture |
-| 13 | Diseñar broker y modelo de amenazas | ADR, `SECURITY.md`, prototipo | Dos renderers independientes y caída contenida |
+| 13 | Diseñar broker y modelo de amenazas — **diseño y prototipo hechos** (Fase 58); falta conectarlo a la interfaz | ADR, `SECURITY.md`, prototipo | Dos renderers independientes y caída contenida |
 | 14 | Preparar corpus/frameworks y benchmark base | Fixtures nuevos, scripts de medición | Resultados con denominadores y fallos preservados |
 
 Las tareas 5–9 y el diseño de sandbox tienen prioridad de seguridad aunque aparezcan después de las reproducciones en la tabla. Se pueden trabajar de forma independiente cuando haya responsables, sin esperar a cerrar cuestiones cosméticas.

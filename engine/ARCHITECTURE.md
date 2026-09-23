@@ -5084,3 +5084,47 @@ ejecuta `npm run smoke`. El plazo del job sube a 60 minutos por la compilacion
 en frio. **Sin verificar en GitHub**: los cambios de CI no se han subido; la
 secuencia se reprodujo en local (Windows) con el mismo resultado, 6/6.
 
+### Fase 58: modelo de amenazas, ADR del broker y supervisor de renderers (2026-09-23)
+
+Decimotercera tarea del backlog (`plan.md`, F06, hallazgos H01 y H23).
+
+#### Documentos
+
+- `SECURITY.md`: activos, adversarios (la pagina hostil primero), fronteras
+  con lo que las protege hoy y su hueco conocido, y como avisar de un fallo.
+  Cada proteccion citada remite a la fase que la introdujo y se comprobo en el
+  codigo; la consecuencia practica se dice sin rodeos: un fallo explotable en
+  el motor da las cookies de todos los sitios y el disco del usuario.
+- `docs/adr/0001-broker-y-aislamiento-de-renderers.md`: tres etapas. (1) un
+  proceso por pestana supervisado desde fuera, que da contencion de caidas;
+  (2) un broker con red, cookies y disco, que permite restringir el proceso
+  que interpreta la pagina; (3) aislamiento por sitio. Con alternativas
+  descartadas; entre ellas, que `engine_server` lance sus hijos, porque choca
+  con la mitigacion que prohibe procesos hijo (Fase 23).
+
+#### Prototipo de la etapa 1
+
+`desktop/engine-supervisor.js`: un `engine_server` por renderer, cada uno con
+su divisor de lineas y su tabla de peticiones. Si un proceso muere, sus
+peticiones pendientes se rechazan al momento con `EngineCrashedError` (no por
+agotar 30 s), se emite `crash` y los demas siguen. Cerrar a proposito no cuenta
+como caida. Interfaz pequena (`open`, `request`, `close`, `closeAll`, `on`)
+para que un broker Rust pueda sustituirlo.
+
+Probado con un motor falso en Node (caida, cuelgue, muerte antes de saludar) y
+con el **experimento de aceptacion del ADR contra `engine_server` real**: dos
+renderers, se mata uno a mitad de una navegacion lenta, su peticion se rechaza
+por la caida y el otro sigue contestando `ping` y navegando. El job `desktop`
+del CI corre ahora sus tests despues de compilar el motor para que ese
+experimento no se salte.
+
+#### Lo que NO hace todavia
+
+- **No esta conectado a la interfaz.** `main.js` sigue con un solo proceso y
+  las pestanas las gestiona el motor. Conectarlo exige que el supervisor
+  atienda `new_tab`/`switch_tab`/`close_tab`/`list_tabs` y que la interfaz
+  muestre y recupere una pestana caida.
+- Sin confidencialidad: cada renderer hace su red y su disco, y dos procesos
+  escriben los mismos `cookies.json` y `local_storage.json` (el ultimo gana).
+  Es la razon de ser de la etapa 2.
+
