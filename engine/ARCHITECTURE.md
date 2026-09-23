@@ -4805,3 +4805,54 @@ Sin cubrir aqui: la clave en `localStorage` (tarea 7), errores del motor que
 se muestran pero no se propagan y acciones desconocidas que acaban como
 «completada» (tarea 6), y la autorizacion de acciones sensibles.
 
+### Fase 52: un fallo del agente es un fallo, no «objetivo completado» (2026-09-23)
+
+No toca el motor. Sexta tarea del backlog (`plan.md`, hallazgo H15).
+
+#### Cuatro caminos por los que un fallo se convertia en exito
+
+1. `sendCommand` (`App.tsx`) mostraba el error del motor en un aviso y
+   resolvia normal: el agente nunca se enteraba.
+2. El agente navegaba con `handleManualNavigate`, que volvia sin hacer nada
+   si la pagina estaba cargando.
+3. `runStep` trataba cualquier `action` que no reconocia como «Acción
+   completada» y terminaba la tarea; un elemento inexistente se anotaba como
+   mensaje pero el paso seguia como si nada.
+4. Un error del proveedor o un JSON roto del modelo se devolvian como
+   `finish` con el error como «respuesta»: la tarea acababa cumplida.
+
+#### Lo que cambia
+
+`runEngineCommand` es la unica ruta del agente al motor y lanza
+`BrowserActionError` si el motor responde `error` o el IPC falla. El
+`sendCommand` manual la envuelve y conserva el aviso. Por WebSocket (modo
+desarrollo con FastAPI) no hay respuesta correlacionada: el comando se envia,
+pero para el agente es un fallo explicito, porque no se puede confirmar.
+
+`runStep` delega en `executeAction`, que devuelve un resultado tipado. Una
+accion desconocida, sin sus campos, sobre un elemento que ya no existe o
+rechazada por el motor es `failed`, nunca `finished`. Los fallos del modelo
+(sin clave, error HTTP, JSON roto o sin `action`) son la pseudo-accion
+`model_error`, que tambien falla. El historial que ve el modelo marca el paso
+como `FALLÓ: ...` para que pueda corregir.
+
+#### Politica ante fallos, decidida con el usuario
+
+El fallo vuelve al modelo, pero dos pasos fallidos seguidos detienen la
+ejecucion con el ultimo error (`MAX_CONSECUTIVE_FAILURES`,
+`shouldStopAfterFailures`). Se eligio frente a detener al primer fallo (corta
+tareas que se recuperarian cuando la pagina se re-renderiza entre observar y
+actuar) y frente a reintentar hasta el limite de pasos (gasta llamadas
+repitiendo el mismo error).
+
+Seis tests nuevos en `frontend/tests/agentOrchestrator.test.ts` (11 en total).
+El lint baja de 18 a 14 al desaparecer los `any` y la asignacion inutil del
+bloque reescrito.
+
+#### Pendiente
+
+- La autorizacion de acciones sensibles (compras, envios, borrados) y la
+  vinculacion de cada accion a pestaña y revision observada siguen en F05.
+- El agente sigue sin comprobar poscondiciones: un comando que el motor
+  acepta pero que no produce el efecto esperado cuenta como ejecutado.
+

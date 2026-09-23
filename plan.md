@@ -138,7 +138,7 @@ Los estados distinguen **reproducido**, **confirmado en código** y **pendiente 
 | H12 | XHR se implementa de forma síncrona incluso para la forma asíncrona | Confirmado en código y backlog | P1 | F10, F14 |
 | H13 | `get_state` rasteriza PNG completo/Base64; relayout reconstruye el árbol | Confirmado | P1 | F19, F21, F22 |
 | H14 | `getAccessibilityPrompt` es opcional en el orquestador, pero `App.tsx` no lo proporciona | Confirmado | P1 | F34 |
-| H15 | `sendCommand` muestra errores y no los propaga; el agente puede continuar tras un comando fallido | Confirmado en código; falta E2E de fallo | P1 | F05, F30, F34 |
+| H15 | `sendCommand` muestra errores y no los propaga; el agente puede continuar tras un comando fallido | **Resuelto** (Fase 52); falta E2E con Electron | P1 | F05, F30, F34 |
 | H16 | «Detener» cambia una bandera, pero no aborta la petición del modelo ni impide una acción decidida por el paso en curso | **Resuelto** (Fase 51), con test de respuesta tardía | P0 | F05 |
 | H17 | Escritura del agente usa `press_enter: true` desde `App.tsx` y puede enviar el formulario al rellenarlo | **Resuelto** (Fase 51): enviar es un paso explícito | P0 | F05, F15 |
 | H18 | Python es opcional al arrancar Electron, pero `build-app.js` exige compilarlo con PyInstaller | Confirmado | P1 | F01 |
@@ -351,11 +351,11 @@ La selección de controles se apoya en la [guía de seguridad de Electron](https
 - [ ] Mover peticiones de proveedor al servicio autorizado, con redacción de logs y sin devolver secretos al frontend.
 - [x] Implementar identificador de ejecución y cancelación desde UI hasta proveedor y herramientas; comprobar cancelación también después de cada `await` y antes de actuar. *(23-09-2026, Fase 51: `AbortController` por ejecución hasta `fetch`, puntos de control y `AgentCancelledError`.)*
 - [x] Cambiar rellenado para que no implique Enter/envío; enviar formularios será una acción distinta con política propia. *(Fase 51: `press_enter: false`; enviar es `press Enter`. La política propia de envío sigue pendiente con la autorización de acciones sensibles.)*
-- [ ] Hacer que errores del motor rechacen o devuelvan un resultado tipado de fallo; el agente no debe convertir una notificación visual en éxito.
-- [ ] Rechazar acciones desconocidas o respuestas malformadas del modelo. `else => acción completada` debe desaparecer.
+- [x] Hacer que errores del motor rechacen o devuelvan un resultado tipado de fallo; el agente no debe convertir una notificación visual en éxito. *(23-09-2026, Fase 52: `runEngineCommand` lanza `BrowserActionError`; `executeAction` devuelve `failed`.)*
+- [x] Rechazar acciones desconocidas o respuestas malformadas del modelo. `else => acción completada` debe desaparecer. *(Fase 52; política decidida: el fallo vuelve al modelo y dos seguidos detienen la ejecución.)*
 - [ ] Vincular acciones a pestaña, documento y revisión observada; al cambiar el usuario de pestaña se revalida o cancela el paso.
 - [ ] Exigir autorización concreta para compras, envíos, borrados, publicación y revelación de datos; respetar autorizaciones previas sin preguntar en cada paso inocuo.
-- [ ] Añadir pruebas de detener durante la petición, respuesta tardía, fallo del motor, campo desaparecido y doble ejecución. *(Fase 51: detener durante la petición y respuesta tardía cubiertos con `npm test`; faltan fallo del motor, campo desaparecido y doble ejecución.)*
+- [ ] Añadir pruebas de detener durante la petición, respuesta tardía, fallo del motor, campo desaparecido y doble ejecución. *(Fases 51-52: detener durante la petición, respuesta tardía, fallo del motor y campo desaparecido cubiertos con `npm test`; falta doble ejecución.)*
 
 **Aceptación:** detener impide nuevas acciones pendientes; rellenar no envía; no hay claves en almacenamiento del renderer ni en logs; un fallo real se presenta como fallo y no como objetivo conseguido.
 
@@ -1147,7 +1147,7 @@ Este es el siguiente tramo de trabajo recomendado. El documento no implica que e
 | 3 | ~~Investigar append/prepend~~ **hecho** (Fase 49) | `api-probe.html`, `dom_bindings.rs` | Causa reducida, caso semántico y corrección sin bajar cobertura |
 | 4 | ~~Corregir publicación de cambios de timers~~ **hecho** (Fase 50) | `core/src/server.rs`, Electron/viewport | El título/captura cambian sin petición manual posterior |
 | 5 | ~~Corregir cancelación y autoenvío del agente~~ **hecho** (Fase 51) | `AgentSidebar`, orquestador, `App.tsx` | Detener durante llamada no actúa después; escribir no envía |
-| 6 | Propagar resultados y fallos de comandos | `App.tsx`, tipos IPC, orquestador | Error de motor no termina como objetivo completado |
+| 6 | ~~Propagar resultados y fallos de comandos~~ **hecho** (Fase 52) | `App.tsx`, tipos IPC, orquestador | Error de motor no termina como objetivo completado |
 | 7 | Retirar clave de renderer | Servicio IA/credenciales, preload | No existe secreto en localStorage, UI o logs |
 | 8 | Auditar y migrar dependencias | Tres árboles npm, Rust y Python opcional | Informe de alcance y PRs de actualización con regresiones |
 | 9 | Endurecer IPC/protocolo | `main.js`, `preload.js`, `protocol.rs` | Payload/emisor inválidos rechazados y límites probados |

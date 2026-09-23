@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { AgentCancelledError, AgentOrchestrator, cancellableDelay, type AgentStepResult, type BrowserInterface } from '../AgentOrchestrator';
+import { AgentCancelledError, AgentOrchestrator, cancellableDelay, shouldStopAfterFailures, type AgentStepResult, type BrowserInterface } from '../AgentOrchestrator';
 
 interface AgentSidebarProps {
   isOpen: boolean;
@@ -62,6 +62,7 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
 
     const maxSteps = 15;
     let stepCount = 0;
+    let consecutiveFailures = 0;
 
     try {
       while (stepCount < maxSteps && !signal.aborted) {
@@ -84,6 +85,12 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
         if (result.finished) {
           setFinalAnswer(result.answer || 'Tarea completada exitosamente.');
           setStatusMessage('¡Objetivo completado!');
+          break;
+        }
+
+        consecutiveFailures = result.failed ? consecutiveFailures + 1 : 0;
+        if (shouldStopAfterFailures(consecutiveFailures)) {
+          setStatusMessage(`Detenido: ${consecutiveFailures} pasos fallidos seguidos. Último error: ${result.execution_msg}`);
           break;
         }
 
@@ -230,7 +237,7 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
             )}
             {step.execution_msg && (
               <div className="step-execution">
-                <strong>⚡ Acción:</strong> {step.execution_msg}
+                <strong>{step.failed ? '❌ Falló:' : '⚡ Acción:'}</strong> {step.execution_msg}
               </div>
             )}
           </div>

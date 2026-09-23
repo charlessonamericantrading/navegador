@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import BrowserViewport from '../domains/browser/components/BrowserViewport';
 import WelcomeGuide from '../domains/onboarding/components/WelcomeGuide';
 import AgentSidebar from '../domains/agent/components/AgentSidebar';
-import type { BrowserInterface } from '../domains/agent/AgentOrchestrator';
+import { BrowserActionError, type BrowserInterface } from '../domains/agent/AgentOrchestrator';
 import './App.css';
 
 interface ElementRect {
@@ -294,25 +294,49 @@ function App() {
     };
   }, []);
 
-  // Eventos manuales del usuario en el navegador
-  const sendCommand = async (payload: any): Promise<void> => {
+  // Ejecuta un comando y FALLA si el motor no lo confirma (plan H15). Es la
+  // unica ruta que usa el agente: un error del motor tiene que llegarle como
+  // excepcion, no como un aviso en pantalla que el bucle del agente no ve.
+  //
+  // Por WebSocket (modo desarrollo con FastAPI) no hay respuesta
+  // correlacionada, asi que el comando no se puede confirmar: se envia y se
+  // falla de forma explicita en vez de dar por hecho que funciono.
+  const runEngineCommand = async (payload: Record<string, unknown>): Promise<void> => {
     if (window.electronAPI?.sendEngineRequest) {
+      beginLoading();
       try {
-        beginLoading();
         const res = await window.electronAPI.sendEngineRequest(payload);
+        if (res?.type === 'error') {
+          throw new BrowserActionError(res.message || 'Error en acción del motor');
+        }
         if (res?.type === 'state') {
           applyEngineState(res);
-        } else if (res?.type === 'error') {
-          showToast(res.message || 'Error en acción del motor');
         }
-      } catch (err: any) {
-        showToast(err.message || 'Error comunicando con el motor nativo');
+      } catch (err) {
+        if (err instanceof BrowserActionError) throw err;
+        throw new BrowserActionError(err instanceof Error ? err.message : 'Error comunicando con el motor nativo');
       } finally {
         endLoading();
       }
-    } else if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      return;
+    }
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       beginLoading();
       wsRef.current.send(JSON.stringify(payload));
+      throw new BrowserActionError('El transporte WebSocket no confirma comandos: no se puede verificar la acción.');
+    }
+    throw new BrowserActionError('No hay conexión con el motor.');
+  };
+
+  // Eventos manuales del usuario en el navegador: el mismo comando, con el
+  // fallo convertido en aviso. Por WebSocket la falta de confirmacion es
+  // normal aqui (la respuesta llega luego como `state`), asi que no se avisa.
+  const sendCommand = async (payload: Record<string, unknown>): Promise<void> => {
+    try {
+      await runEngineCommand(payload);
+    } catch (err) {
+      if (!window.electronAPI?.sendEngineRequest && wsRef.current?.readyState === WebSocket.OPEN) return;
+      showToast(err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -407,21 +431,25 @@ function App() {
       return currentTab?.title || currentTab?.url || 'Página Web';
     },
     getElements: async () => elementsRef.current,
+    // Todas por `runEngineCommand`: un fallo del motor tiene que llegar al
+    // agente. `navigate` ya no pasa por `handleManualNavigate`, que volvia
+    // sin hacer nada si la pagina estaba cargando.
     navigate: async (url: string) => {
-      await handleManualNavigate(url);
+      await runEngineCommand({ type: 'navigate', url });
+      refreshTabs();
     },
     click: async (x: number, y: number) => {
-      await sendCommand({ type: 'click', x, y });
+      await runEngineCommand({ type: 'click', x, y });
     },
     // Rellenar no envía (plan H17): enviar es `pressKey('Enter')`, un paso
     // aparte que el agente tiene que decidir. La escritura manual
     // (`handleManualType`) sigue enviando: la dispara el propio usuario al
     // confirmar la ventana emergente de texto del viewport.
     typeText: async (x: number, y: number, text: string) => {
-      await sendCommand({ type: 'type_text', x, y, text, press_enter: false });
+      await runEngineCommand({ type: 'type_text', x, y, text, press_enter: false });
     },
     pressKey: async (key: string) => {
-      await sendCommand({ type: 'press_key', key });
+      await runEngineCommand({ type: 'press_key', key });
     }
   }), []);
 

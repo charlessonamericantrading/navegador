@@ -34,6 +34,27 @@ export interface AgentStepResult {
   answer?: string;
   execution_msg?: string;
   finished?: boolean;
+  /** La acción no se ejecutó o el motor la rechazó. Nunca cuenta como éxito. */
+  failed?: boolean;
+}
+
+interface ActionOutcome {
+  message: string;
+  finished: boolean;
+  failed: boolean;
+  answer: string;
+}
+
+/**
+ * El motor rechazó un comando o no lo confirmó. Lo lanzan las
+ * implementaciones de `BrowserInterface`; el orquestador lo convierte en un
+ * paso `failed`.
+ */
+export class BrowserActionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BrowserActionError';
+  }
 }
 
 export interface BrowserInterface {
@@ -80,6 +101,29 @@ export function cancellableDelay(ms: number, signal?: AbortSignal): Promise<void
     }, ms);
     signal?.addEventListener('abort', onAbort, { once: true });
   });
+}
+
+/**
+ * Pseudo-acción para cuando el modelo no dio una decisión utilizable (sin
+ * clave, error del proveedor, JSON roto o sin `action`). No es una acción
+ * que el modelo pueda pedir con sentido: si la devolviera, también falla.
+ */
+const MODEL_ERROR_ACTION = 'model_error';
+
+function modelError(message: string): AgentStepResult {
+  return { thought: message, action: MODEL_ERROR_ACTION };
+}
+
+/**
+ * Política ante fallos (decidida con el usuario, Fase 52): el fallo vuelve
+ * al modelo en el historial para que corrija, pero dos pasos fallidos
+ * seguidos detienen la ejecución. Tolera una página que cambia entre
+ * observar y actuar sin dejar al agente repitiendo el mismo error.
+ */
+export const MAX_CONSECUTIVE_FAILURES = 2;
+
+export function shouldStopAfterFailures(consecutiveFailures: number): boolean {
+  return consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
 }
 
 export function getSimplifiedDomText(elements: InteractiveElement[]): string {
@@ -152,72 +196,82 @@ export class AgentOrchestrator {
     // se ejecuta.
     throwIfCancelled(signal);
 
-    let executionMsg = '';
-    let finished = false;
-    let answer = '';
-
-    try {
-      if (stepResult.action === 'navigate' && stepResult.url) {
-        executionMsg = `Navegando a ${stepResult.url}`;
-        await this.browser.navigate(stepResult.url);
-      } else if (stepResult.action === 'click' && typeof stepResult.target_id === 'number') {
-        const el = elements.find((e) => e.id === stepResult.target_id);
-        if (el) {
-          const cx = Math.round(el.rect.x + el.rect.width / 2);
-          const cy = Math.round(el.rect.y + el.rect.height / 2);
-          executionMsg = `Haciendo clic en [${el.id}] ${el.tag_name} '${el.text}'`;
-          await this.browser.click(cx, cy);
-        } else {
-          executionMsg = `Error: Elemento [${stepResult.target_id}] no encontrado`;
-        }
-      } else if (stepResult.action === 'type' && typeof stepResult.target_id === 'number') {
-        const el = elements.find((e) => e.id === stepResult.target_id);
-        if (el) {
-          const cx = Math.round(el.rect.x + el.rect.width / 2);
-          const cy = Math.round(el.rect.y + el.rect.height / 2);
-          const text = stepResult.text || '';
-          executionMsg = `Escribiendo '${text}' en [${el.id}] ${el.tag_name}`;
-          await this.browser.typeText(cx, cy, text);
-        } else {
-          executionMsg = `Error: Campo de entrada [${stepResult.target_id}] no encontrado`;
-        }
-      } else if (stepResult.action === 'press' && stepResult.key) {
-        executionMsg = `Presionando tecla '${stepResult.key}'`;
-        await this.browser.pressKey(stepResult.key);
-      } else if (stepResult.action === 'finish') {
-        executionMsg = 'Objetivo completado';
-        finished = true;
-        answer = stepResult.answer || 'He terminado la tarea.';
-      } else {
-        executionMsg = 'Acción completada';
-        finished = true;
-      }
-    } catch (err: any) {
-      executionMsg = `Error al ejecutar acción: ${err.message || err}`;
-      finished = true;
-    }
+    const outcome = await this.executeAction(stepResult, elements);
 
     const stepData = {
       thought: stepResult.thought || '',
       action: stepResult.action,
-      execution_msg: executionMsg,
+      execution_msg: outcome.message,
       url,
       title,
-      finished,
-      answer
+      finished: outcome.finished,
+      failed: outcome.failed,
+      answer: outcome.answer
     };
 
     this.history.push({
       thought: stepData.thought,
       kind: stepResult.action,
-      action: executionMsg,
+      // El modelo ve en el historial si el paso anterior fallo y por que:
+      // es lo que le permite corregir en vez de repetir.
+      action: outcome.failed ? `FALLÓ: ${outcome.message}` : outcome.message,
       url,
       title,
-      finished,
-      answer
+      finished: outcome.finished,
+      answer: outcome.answer
     });
 
     return stepData;
+  }
+
+  /**
+   * Ejecuta la acción decidida. Nunca da por buena una acción que no llegó a
+   * ejecutarse (plan H15): elemento inexistente, acción desconocida o
+   * malformada y error del motor son `failed`, no «completada».
+   */
+  private async executeAction(step: AgentStepResult, elements: InteractiveElement[]): Promise<ActionOutcome> {
+    const fallo = (message: string): ActionOutcome => ({ message, finished: false, failed: true, answer: '' });
+    const centro = (el: InteractiveElement) => [Math.round(el.rect.x + el.rect.width / 2), Math.round(el.rect.y + el.rect.height / 2)] as const;
+
+    try {
+      switch (step.action) {
+        case 'navigate': {
+          if (!step.url) return fallo('Acción navigate sin URL');
+          await this.browser.navigate(step.url);
+          return { message: `Navegando a ${step.url}`, finished: false, failed: false, answer: '' };
+        }
+        case 'click': {
+          const el = elements.find((e) => e.id === step.target_id);
+          if (!el) return fallo(`Elemento [${step.target_id}] no encontrado`);
+          const [x, y] = centro(el);
+          await this.browser.click(x, y);
+          return { message: `Haciendo clic en [${el.id}] ${el.tag_name} '${el.text}'`, finished: false, failed: false, answer: '' };
+        }
+        case 'type': {
+          const el = elements.find((e) => e.id === step.target_id);
+          if (!el) return fallo(`Campo de entrada [${step.target_id}] no encontrado`);
+          const [x, y] = centro(el);
+          const text = step.text || '';
+          await this.browser.typeText(x, y, text);
+          return { message: `Escribiendo '${text}' en [${el.id}] ${el.tag_name}`, finished: false, failed: false, answer: '' };
+        }
+        case 'press': {
+          if (!step.key) return fallo('Acción press sin tecla');
+          await this.browser.pressKey(step.key);
+          return { message: `Presionando tecla '${step.key}'`, finished: false, failed: false, answer: '' };
+        }
+        case 'finish':
+          return { message: 'Objetivo completado', finished: true, failed: false, answer: step.answer || 'He terminado la tarea.' };
+        case MODEL_ERROR_ACTION:
+          return fallo(step.thought || 'El modelo no devolvió una acción válida');
+        default:
+          // Antes: «Acción completada» y fin de la tarea. Una respuesta que no
+          // es ninguna acción conocida no completa nada.
+          return fallo(`Acción desconocida: ${JSON.stringify(step.action)}`);
+      }
+    } catch (err) {
+      return fallo(`Error al ejecutar acción: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private async runSimulatedStep(goal: string, url: string, title: string, elements: InteractiveElement[], signal?: AbortSignal): Promise<AgentStepResult> {
@@ -317,11 +371,7 @@ export class AgentOrchestrator {
 
   private async runGeminiStep(goal: string, url: string, title: string, domText: string, apiKey?: string, signal?: AbortSignal): Promise<AgentStepResult> {
     if (!apiKey) {
-      return {
-        thought: 'Error: Se requiere una Gemini API Key.',
-        action: 'finish',
-        answer: 'Introduce tu Gemini API Key en Ajustes.'
-      };
+      return modelError('Se requiere una Gemini API Key: introdúcela en Ajustes.');
     }
 
     const systemPrompt = `Eres un agente autónomo de navegación web para un navegador nativo ultrarrápido.
@@ -377,17 +427,19 @@ Decide el siguiente paso y responde en JSON.`;
       const data = await response.json();
       let rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
       rawText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-      return JSON.parse(rawText) as AgentStepResult;
+      const parsed: unknown = JSON.parse(rawText);
+      if (typeof parsed !== 'object' || parsed === null || typeof (parsed as AgentStepResult).action !== 'string') {
+        throw new Error(`respuesta sin acción: ${rawText.slice(0, 200)}`);
+      }
+      return parsed as AgentStepResult;
     } catch (err) {
       // Una cancelación no es un error de conexión que deba acabar la tarea
       // con una «respuesta»: se propaga tal cual.
       throwIfCancelled(signal);
-      const message = err instanceof Error ? err.message : String(err);
-      return {
-        thought: `Error al consultar Gemini: ${message}`,
-        action: 'finish',
-        answer: `Error de conexión con Gemini: ${message}`
-      };
+      // Antes esto era `finish` con el error como «respuesta»: un fallo del
+      // proveedor o un JSON roto terminaban la tarea como si se hubiera
+      // cumplido. Ahora es un paso fallido y cuenta para el tope de fallos.
+      return modelError(`Error al consultar Gemini: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 }
