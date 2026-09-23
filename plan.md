@@ -149,7 +149,7 @@ Los estados distinguen **reproducido**, **confirmado en código** y **pendiente 
 | H23 | Runtime nativo carece de reinicio supervisado equivalente al del backend Python | Confirmado en `desktop/main.js` | P1 | F06 |
 | H24 | Selección de fuentes limitada al sans-serif de sistema y variantes | Confirmado en `text/src/font.rs` | P1 | F20 |
 | H25 | No se han obtenido resultados de WPT oficial, Test262, benchmark comparativo o accesibilidad del SO | Línea base propia hecha (Fase 59); WPT oficial, Test262 y comparación con Chrome pendientes | P1 | F03, F32, F39, F40 |
-| H26 | `element.querySelector`/`querySelectorAll` no existen, solo en `document`; la sonda no lo comprueba | Reproducido por el corpus (23-09-2026) | P1 | F11, F14 |
+| H26 | `element.querySelector`/`querySelectorAll` no existen, solo en `document`; la sonda no lo comprueba | **Resuelto** (Fase 60): implementados y añadidos a la sonda (87/115) | P1 | F11, F14 |
 | H27 | Tests de humo y cualquier arranque escribían cookies y `localStorage` en el perfil real del usuario | **Resuelto** (Fase 59): `NAVEGADOR_IA_PROFILE_DIR` y perfiles temporales | P1 | F03, F31 |
 | H28 | La memoria no se libera entre navegaciones: ~24 MiB más por carga de una página con 200 elementos, 504 MiB tras 20 | Reproducido y medido (Fase 59) | P1 | F11, F22, F39 |
 

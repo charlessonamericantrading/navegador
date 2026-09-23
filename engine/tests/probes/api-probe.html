@@ -294,6 +294,12 @@
     padre.appendChild(el);
     return el.closest('section') === padre;
   }));
+  comprobar('el.querySelector/querySelectorAll', conElemento(function (el) {
+    if (typeof el.querySelector !== 'function' || typeof el.querySelectorAll !== 'function') return false;
+    var hijo = document.createElement('i');
+    el.appendChild(hijo);
+    return el.querySelector('i') === hijo && el.querySelectorAll('i').length === 1 && el.querySelector('div') === null;
+  }));
   comprobar('el.append/prepend', conElemento(function (el) {
     if (typeof el.append !== 'function') return false;
     el.append(document.createElement('i'));

@@ -1790,6 +1790,36 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         capture.clone(),
     );
 
+    // `querySelector`/`querySelectorAll` en un elemento (plan H26, Fase 60):
+    // solo descendientes, nunca el propio elemento. Faltaban - existian en
+    // `document` y no aqui -, y es de lo primero que usa cualquier framework
+    // para buscar dentro de su contenedor. Misma forma de respuesta que en
+    // `document`: `null` o un `Array` (no un `NodeList` vivo).
+    let query_selector_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let Some(arg) = args.first() else { return Ok(JsValue::null()) };
+            let selector = arg.to_string(context)?.to_std_string_escaped();
+            Ok(match SelectorMatcher::query_first_descendant(&selector, &capture.0) {
+                Some(node) => element_to_js_object(&node, &capture.1, context).into(),
+                None => JsValue::null(),
+            })
+        },
+        capture.clone(),
+    );
+    let query_selector_all_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let Some(arg) = args.first() else { return Ok(JsArray::from_iter(Vec::new(), context).into()) };
+            let selector = arg.to_string(context)?.to_std_string_escaped();
+            let nodes = SelectorMatcher::query_all_descendants(&selector, &capture.0);
+            let mut elements: Vec<JsValue> = Vec::with_capacity(nodes.len());
+            for node in &nodes {
+                elements.push(element_to_js_object(node, &capture.1, context).into());
+            }
+            Ok(JsArray::from_iter(elements, context).into())
+        },
+        capture.clone(),
+    );
+
     // `closest(selector)` sube por los ancestros EMPEZANDO POR EL PROPIO
     // elemento, que es lo que dice el spec y lo que hace util al metodo:
     // `e.target.closest('button')` acierta tanto si se pulso el boton como si
@@ -2270,6 +2300,8 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         .function(to_data_url, js_string!("toDataURL"), 0)
         // Fase 44 (tarea C6)
         .function(matches_fn, js_string!("matches"), 1)
+        .function(query_selector_fn, js_string!("querySelector"), 1)
+        .function(query_selector_all_fn, js_string!("querySelectorAll"), 1)
         .function(closest_fn, js_string!("closest"), 1)
         .function(contains_fn, js_string!("contains"), 1)
         .function(remove_fn, js_string!("remove"), 0)
@@ -3947,6 +3979,41 @@ mod tests {
             "document.getElementById('a').previousElementSibling === null",
         );
         assert_eq!(result, "true");
+    }
+
+    /// Plan H26 (Fase 60): `querySelector` de un elemento busca solo entre
+    /// sus descendientes, nunca devuelve el propio elemento.
+    #[test]
+    fn element_query_selector_searches_descendants_only() {
+        let result = eval_with_dom(
+            r#"<html><body><div id="c" class="x"><p class="x" id="p1"><span class="x" id="s1"></span></p><p class="x" id="p2"></p></div><p class="x" id="fuera"></p></body></html>"#,
+            "var c = document.getElementById('c'); \
+             [c.querySelector('.x').id, c.querySelectorAll('.x').map(function (e) { return e.id; }).join(','), \
+              c.querySelector('#fuera') === null, c.querySelector('#c') === null].join('|')",
+        );
+        assert_eq!(result, "\"p1|p1,s1,p2|true|true\"");
+    }
+
+    /// El selector se evalua en el contexto del documento: un antepasado del
+    /// elemento puede satisfacer la parte izquierda de un combinador.
+    #[test]
+    fn element_query_selector_matches_combinators_against_the_whole_document() {
+        let result = eval_with_dom(
+            r#"<html><body><section><div id="c"><span id="s"></span></div></section></body></html>"#,
+            "document.getElementById('c').querySelector('section span').id",
+        );
+        assert_eq!(result, "\"s\"");
+    }
+
+    #[test]
+    fn element_query_selector_keeps_identity_and_handles_no_match_and_invalid_selectors() {
+        let result = eval_with_dom(
+            r#"<html><body><div id="c"><b id="b"></b></div></body></html>"#,
+            "var c = document.getElementById('c'); \
+             [c.querySelector('b') === document.getElementById('b'), c.querySelector('i') === null, \
+              c.querySelectorAll('i').length, c.querySelector('[[[') === null].join('|')",
+        );
+        assert_eq!(result, "\"true|true|0|true\"");
     }
 
     /// Interfaz `Node` (Fase 49): a diferencia de `firstElementChild`, no

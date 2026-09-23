@@ -123,12 +123,19 @@ try {
   const sigue = await engine({ type: 'ping' });
   check('la IPC rechaza shutdown desde la página y el motor sigue vivo', typeof rechazo?.rechazada === 'string' && sigue?.type === 'pong', { rechazo, sigue: sigue?.type });
 
-  // 5. Sin bucle de reconexión: en 2 s solo avanzan los ids de estas peticiones.
-  const antes = (await engine({ type: 'ping' }))?.id;
+  // 5. Sin bucle de reconexión. Tres pings separados 2 s: un bucle genera
+  //    peticiones SIN PARAR, así que el último intervalo tampoco estaría en
+  //    calma. Una petición puntual de la interfaz (un `resize` al asentarse la
+  //    ventana, como pasó en el runner de GitHub) solo afecta al primero.
+  //    Antes se exigía «exactamente +1» en un único intervalo, y eso daba
+  //    falsos fallos.
+  const idDe = (r) => Number(r?.id?.split('-')[1]);
+  const p0 = idDe(await engine({ type: 'ping' }));
   await sleep(2000);
-  const despues = (await engine({ type: 'ping' }))?.id;
-  const salto = Number(despues?.split('-')[1]) - Number(antes?.split('-')[1]);
-  check('los efectos de conexión no se re-ejecutan en bucle', salto === 1, { antes, despues });
+  const p1 = idDe(await engine({ type: 'ping' }));
+  await sleep(2000);
+  const p2 = idDe(await engine({ type: 'ping' }));
+  check('los efectos de conexión no se re-ejecutan en bucle', p2 - p1 === 1 && p1 - p0 <= 3, { saltos: [p1 - p0, p2 - p1] });
 } catch (err) {
   check('la prueba llegó al final', false, err instanceof Error ? err.message : String(err));
 } finally {

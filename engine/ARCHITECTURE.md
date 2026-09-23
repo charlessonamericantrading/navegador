@@ -5163,3 +5163,30 @@ muestras guardadas, fallos con motivo, y entorno con commit y hash del binario.
 - Los tiempos varian hasta 3x entre ejecuciones en este equipo: no se publican
   como resultado. Detalle en `docs/benchmarks/README.md`.
 
+### Fase 60: `element.querySelector`, y una prueba de humo que no da falsos fallos (2026-09-23)
+
+#### H26: `querySelector` en los elementos
+
+Lo encontro el corpus de la Fase 59: `querySelector`/`querySelectorAll`
+existian en `document` pero no en los elementos, y `mini-framework` fallaba
+con `not a callable function`. `engine-css` gana `query_first_descendant` y
+`query_all_descendants`: solo descendientes (nunca el propio elemento), pero
+con el selector evaluado contra el documento entero, asi que
+`el.querySelector('section span')` encuentra un `span` de `el` aunque la
+`section` sea un antepasado. El selector se parsea una sola vez. Tres tests y
+una comprobacion nueva en la sonda: 87/115. El corpus pasa a 11/12.
+
+#### La prueba de humo del paquete, vista en GitHub
+
+Primer CI con la Fase 57 subida: el paquete con el motor dentro funciono entero
+en el runner (interfaz, `pong`, navegacion, captura, rechazo IPC). Fallo la
+comprobacion de bucles: en 2 s el contador avanzo 2 peticiones en vez de 1. Una
+peticion puntual de la interfaz al asentarse la ventana en el runner no es un
+bucle; la comprobacion exigia «exactamente +1» y eso era demasiado.
+
+Ahora son tres pings separados 2 s, y basta con que el ULTIMO intervalo este en
+calma: un bucle genera peticiones sin parar y nunca se calma. Antes de darla
+por buena se comprobo que sigue detectando un bucle real (una dependencia
+inestable metida a proposito en el efecto de conexion): saltos de 438 y 385
+peticiones, falla como debe.
+

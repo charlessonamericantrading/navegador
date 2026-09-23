@@ -356,6 +356,33 @@ impl SelectorMatcher {
         });
         out
     }
+
+    /// Como `query_first`, pero SIN la raiz: solo sus descendientes. Es la
+    /// semantica de `element.querySelector` (plan H26). El selector se sigue
+    /// evaluando contra el documento entero, asi que `el.querySelector('div
+    /// span')` encuentra un `span` de `el` aunque el `div` sea un antepasado
+    /// de `el`, igual que en un navegador.
+    pub fn query_first_descendant(selector_str: &str, root: &Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
+        let children = root.read().unwrap().children.clone();
+        with_parsed_selector(selector_str, |list| {
+            let list = list?;
+            children.iter().find_map(|child| first_match_in_subtree(list, child))
+        })
+    }
+
+    /// Como `query_all`, pero sin la raiz - `element.querySelectorAll`.
+    pub fn query_all_descendants(selector_str: &str, root: &Arc<RwLock<Node>>) -> Vec<Arc<RwLock<Node>>> {
+        let children = root.read().unwrap().children.clone();
+        let mut out = Vec::new();
+        with_parsed_selector(selector_str, |list| {
+            if let Some(list) = list {
+                for child in &children {
+                    collect_matches_in_subtree(list, child, &mut out);
+                }
+            }
+        });
+        out
+    }
 }
 
 /// No se mantiene el read-lock de `node` mientras se llama a

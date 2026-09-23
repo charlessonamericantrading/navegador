@@ -55,12 +55,16 @@ use serde_json::json;
 /// |            |           | comprobacion fallaba: el metodo funcionaba  |
 /// |            |           | y lo que no existia era `childNodes`, que   |
 /// |            |           | la comprobacion usa para verificarlo        |
-const MINIMO: usize = 86;
+/// | 2026-09-23 | 87/115    | `el.querySelector`/`querySelectorAll`       |
+/// |            |           | (plan H26). La comprobacion es NUEVA: la    |
+/// |            |           | encontro el corpus de la Fase 59, no la     |
+/// |            |           | sonda, que no la tenia. Sube el total       |
+const MINIMO: usize = 87;
 
 /// El total de comprobaciones de la sonda. Se vigila aparte del minimo para
 /// cazar un caso concreto: que alguien "suba" el porcentaje borrando
 /// comprobaciones incomodas en vez de implementando lo que falta.
-const TOTAL_ESPERADO: usize = 114;
+const TOTAL_ESPERADO: usize = 115;
 
 const SONDA: &str = include_str!("../../../tests/probes/api-probe.html");
 
