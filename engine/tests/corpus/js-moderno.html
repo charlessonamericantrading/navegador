@@ -1,0 +1,20 @@
+<!doctype html><html><head><meta charset="utf-8"><title>PENDIENTE</title>
+<script>
+function ok(cond, motivo) { document.title = cond ? 'OK' : 'FALLO: ' + motivo; }
+function fallo(e) { document.title = 'FALLO: ' + (e && e.message ? e.message : String(e)); }
+</script></head><body>
+<script>
+(async function () {
+  try {
+    class Pila { #items = []; meter(x) { this.#items.push(x); return this; } get tamano() { return this.#items.length; } }
+    const p = new Pila().meter(1).meter(2);
+    const mapa = new Map([['a', 1], ['b', 2]]);
+    const { a, ...resto } = { a: 1, b: 2, c: 3 };
+    const valores = await Promise.all([1, 2, 3].map(async (x) => x * 2));
+    const opcional = ({ x: { y: null } }).x?.y ?? 'defecto';
+    ok(p.tamano === 2 && mapa.get('b') === 2 && Object.keys(resto).join() === 'b,c' && a === 1
+       && valores.join() === '2,4,6' && opcional === 'defecto', 'algun resultado no coincide');
+  } catch (e) { fallo(e); }
+})();
+</script>
+</body></html>

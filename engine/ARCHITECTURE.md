@@ -5128,3 +5128,38 @@ experimento no se salte.
   escriben los mismos `cookies.json` y `local_storage.json` (el ultimo gana).
   Es la razon de ser de la etapa 2.
 
+### Fase 59: corpus de tareas y linea base de medicion (2026-09-23)
+
+Decimocuarta y ultima tarea del backlog inicial (`plan.md`, F25 y F39).
+
+#### Perfil redirigible
+
+`engine-net` gana `profile.rs`: `NAVEGADOR_IA_PROFILE_DIR` sustituye el
+directorio del perfil (cookies y `localStorage`). Hacia falta porque
+`dirs::data_dir()` en Windows usa la API de carpetas conocidas y no se puede
+desviar con variables de entorno: **los tests de humo contra el binario real
+escribian en el perfil del usuario**, en contra del plan (6.1). Ahora cada
+`Motor` de los tests tiene un perfil temporal que se borra al terminar, y el
+benchmark tambien.
+
+#### Corpus y medicion
+
+`engine/tests/corpus/` son 12 paginas-tarea con criterio observable (la pagina
+pone `document.title = 'OK'` solo si su tarea funciono): carga estatica,
+formulario, construccion y recorrido del DOM, un mini-framework con diff de
+nodos, modulos ES, JavaScript moderno, temporizador, `fetch`, almacenamiento,
+eventos y `MutationObserver`. `npm run bench` las sirve en local y mide 20
+navegaciones por pagina en un proceso nuevo: exito antes que tiempo, todas las
+muestras guardadas, fallos con motivo, y entorno con commit y hash del binario.
+
+#### Lo que encontro
+
+- 10/12 paginas pasan. Fallan `mini-framework` (**`element.querySelector` no
+  existe**, hallazgo nuevo H26) y `modulos-es` (**los `import` de un modulo no
+  se descargan**, H10).
+- **Fuga de memoria entre navegaciones** (H28): unos 24 MiB mas por cada carga
+  de una pagina que crea 200 elementos, 504 MiB tras 20. Reproducible al byte
+  en dos ejecuciones.
+- Los tiempos varian hasta 3x entre ejecuciones en este equipo: no se publican
+  como resultado. Detalle en `docs/benchmarks/README.md`.
+

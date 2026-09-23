@@ -5,6 +5,7 @@ pub mod cors;
 pub mod cookie;
 pub mod csp;
 pub mod storage;
+pub mod profile;
 
 pub use http_client::{NetworkEngine, NetworkError};
 pub use request::NetworkRequest;

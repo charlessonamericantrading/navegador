@@ -122,7 +122,7 @@ impl WebStorage {
     /// realista fuera de un contenedor roto), tratado como "sin
     /// persistencia disponible" en vez de un error fatal.
     fn default_persist_path() -> Option<PathBuf> {
-        Some(dirs::data_dir()?.join("navegador-ia").join("local_storage.json"))
+        Some(crate::profile::profile_dir()?.join("local_storage.json"))
     }
 
     /// La version que usa `core::server` en produccion: carga `local` de

@@ -148,7 +148,10 @@ Los estados distinguen **reproducido**, **confirmado en código** y **pendiente 
 | H22 | Backend opcional acepta WebSocket antes de una validación visible de origen/autenticación; CORS HTTP abierto | Confirmado en endpoint; exposición efectiva por validar | P0 si se habilita | F04 |
 | H23 | Runtime nativo carece de reinicio supervisado equivalente al del backend Python | Confirmado en `desktop/main.js` | P1 | F06 |
 | H24 | Selección de fuentes limitada al sans-serif de sistema y variantes | Confirmado en `text/src/font.rs` | P1 | F20 |
-| H25 | No se han obtenido resultados de WPT oficial, Test262, benchmark comparativo o accesibilidad del SO | No evaluado | P1 | F03, F32, F39, F40 |
+| H25 | No se han obtenido resultados de WPT oficial, Test262, benchmark comparativo o accesibilidad del SO | Línea base propia hecha (Fase 59); WPT oficial, Test262 y comparación con Chrome pendientes | P1 | F03, F32, F39, F40 |
+| H26 | `element.querySelector`/`querySelectorAll` no existen, solo en `document`; la sonda no lo comprueba | Reproducido por el corpus (23-09-2026) | P1 | F11, F14 |
+| H27 | Tests de humo y cualquier arranque escribían cookies y `localStorage` en el perfil real del usuario | **Resuelto** (Fase 59): `NAVEGADOR_IA_PROFILE_DIR` y perfiles temporales | P1 | F03, F31 |
+| H28 | La memoria no se libera entre navegaciones: ~24 MiB más por carga de una página con 200 elementos, 504 MiB tras 20 | Reproducido y medido (Fase 59) | P1 | F11, F22, F39 |
 
 Las mitigaciones de Windows tienen valor, pero no eliminan acceso a archivos, red y datos del usuario. Rust reduce determinadas clases de fallos; no justifica afirmar que elimina toda corrupción de memoria, que no hay errores en dependencias o que desaparece un porcentaje fijo de vulnerabilidades del producto.
 
@@ -1155,7 +1158,7 @@ Este es el siguiente tramo de trabajo recomendado. El documento no implica que e
 | 11 | ~~Desacoplar Python del build principal~~ **hecho** (Fase 56) | `build-app.js`, manifiestos, scripts | Build nativo completo sin `.venv` |
 | 12 | ~~Probar paquete con motor real~~ **hecho** (Fase 57; CI sin verificar en GitHub) | `.github/workflows/app.yml` | Artefacto instalado responde ping y renderiza fixture |
 | 13 | Diseñar broker y modelo de amenazas — **diseño y prototipo hechos** (Fase 58); falta conectarlo a la interfaz | ADR, `SECURITY.md`, prototipo | Dos renderers independientes y caída contenida |
-| 14 | Preparar corpus/frameworks y benchmark base | Fixtures nuevos, scripts de medición | Resultados con denominadores y fallos preservados |
+| 14 | ~~Preparar corpus/frameworks y benchmark base~~ **hecho** (Fase 59) | Fixtures nuevos, scripts de medición | Resultados con denominadores y fallos preservados |
 
 Las tareas 5–9 y el diseño de sandbox tienen prioridad de seguridad aunque aparezcan después de las reproducciones en la tabla. Se pueden trabajar de forma independiente cuando haya responsables, sin esperar a cerrar cuestiones cosméticas.
 

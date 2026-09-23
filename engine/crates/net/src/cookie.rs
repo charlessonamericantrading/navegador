@@ -448,7 +448,7 @@ impl CookieStore {
     /// `WebStorage::default_persist_path`, `None` si `dirs` no logra
     /// determinarlo.
     fn default_persist_path() -> Option<PathBuf> {
-        Some(dirs::data_dir()?.join("navegador-ia").join("cookies.json"))
+        Some(crate::profile::profile_dir()?.join("cookies.json"))
     }
 
     /// La version que usa `NetworkEngine::with_persistent_cookies` en

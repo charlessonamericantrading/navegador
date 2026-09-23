@@ -158,10 +158,14 @@ pub const PAGINA: &str = r#"<!doctype html>
 // El proceso del motor
 // ---------------------------------------------------------------------------
 
+/// Contador para que cada `Motor` de un mismo proceso de tests tenga su perfil.
+static SIGUIENTE_PERFIL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub struct Motor {
     pub hijo: Child,
     pub entrada: ChildStdin,
     pub salida: BufReader<ChildStdout>,
+    perfil: std::path::PathBuf,
 }
 
 impl Motor {
@@ -169,7 +173,12 @@ impl Motor {
         // Cargo exporta esta variable para los tests de integracion del mismo
         // paquete: apunta al binario recien compilado, no a uno del PATH que
         // podria ser de otra rama.
+        // Perfil propio y temporal: cookies y `localStorage` de estas pruebas
+        // no pueden acabar en el perfil real del usuario (plan 6.1). Antes
+        // escribian en `%APPDATA%/navegador-ia`.
+        let perfil = std::env::temp_dir().join(format!("navegador-ia-test-{}-{}", std::process::id(), SIGUIENTE_PERFIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         let mut hijo = Command::new(env!("CARGO_BIN_EXE_engine_server"))
+            .env("NAVEGADOR_IA_PROFILE_DIR", &perfil)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // stderr se hereda: los `tracing::warn!` y el resumen de
@@ -187,6 +196,7 @@ impl Motor {
             hijo,
             entrada,
             salida,
+            perfil,
         };
 
         // El servidor saluda solo, antes de que nadie le pida nada.
@@ -277,6 +287,7 @@ impl Drop for Motor {
         // puerto ni memoria en la maquina de CI.
         let _ = self.hijo.kill();
         let _ = self.hijo.wait();
+        let _ = std::fs::remove_dir_all(&self.perfil);
     }
 }
 

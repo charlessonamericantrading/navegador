@@ -1,0 +1,17 @@
+<!doctype html><html><head><meta charset="utf-8"><title>PENDIENTE</title>
+<script>
+function ok(cond, motivo) { document.title = cond ? 'OK' : 'FALLO: ' + motivo; }
+function fallo(e) { document.title = 'FALLO: ' + (e && e.message ? e.message : String(e)); }
+</script></head><body>
+<ul id="lista"></ul>
+<script>
+fetch('datos.json')
+  .then(function (r) { return r.json(); })
+  .then(function (datos) {
+    var ul = document.getElementById('lista');
+    datos.elementos.forEach(function (t) { var li = document.createElement('li'); li.textContent = t; ul.appendChild(li); });
+    ok(ul.children.length === 3, 'hijos=' + ul.children.length);
+  })
+  .catch(fallo);
+</script>
+</body></html>
