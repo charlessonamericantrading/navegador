@@ -1,7 +1,7 @@
 use boa_engine::{Context, Source};
 use thiserror::Error;
 use engine_dom::Node;
-use engine_net::NetworkEngine;
+use engine_net::SharedBroker;
 use std::sync::{Arc, RwLock};
 use crate::cssom::LayoutSnapshot;
 use crate::dom_bindings::{DocumentBindings, DomBindings};
@@ -204,7 +204,7 @@ impl JsRuntime {
     /// `page_origin` (Fase 20) activa la politica de mismo origen sobre
     /// las peticiones que haga este `fetch`. `None` en un documento sin
     /// URL propia, donde no hay origen contra el que comparar nada.
-    pub fn register_fetch(&mut self, network: Arc<NetworkEngine>, page_url: Option<String>) -> Result<(), JsError> {
+    pub fn register_fetch(&mut self, network: SharedBroker, page_url: Option<String>) -> Result<(), JsError> {
         fetch::register_fetch(&mut self.context, network, page_url).map_err(|e| JsError::Execution(e.to_string()))
     }
 
@@ -216,7 +216,7 @@ impl JsRuntime {
     /// la respuesta honesta donde no hay red disponible.
     /// Mismo `page_origin` que `register_fetch`, por la misma razon:
     /// `XMLHttpRequest` esta sujeto a CORS igual que `fetch`.
-    pub fn register_xhr(&mut self, network: Arc<NetworkEngine>, page_url: Option<String>) -> Result<(), JsError> {
+    pub fn register_xhr(&mut self, network: SharedBroker, page_url: Option<String>) -> Result<(), JsError> {
         crate::xhr::register_xhr(&mut self.context, network, page_url).map_err(|e| JsError::Execution(e.to_string()))
     }
 
@@ -231,7 +231,7 @@ impl JsRuntime {
     /// Requiere que `bind_dom` ya haya corrido - sin `document` en el
     /// `Context`, es un no-op honesto (ver `cookie::register_cookie`), no
     /// un error.
-    pub fn register_cookie(&mut self, network: Arc<NetworkEngine>, page_url: Option<String>) -> Result<(), JsError> {
+    pub fn register_cookie(&mut self, network: SharedBroker, page_url: Option<String>) -> Result<(), JsError> {
         crate::cookie::register_cookie(&mut self.context, network, page_url).map_err(|e| JsError::Execution(e.to_string()))
     }
 

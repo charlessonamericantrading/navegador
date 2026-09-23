@@ -6,9 +6,11 @@ pub mod cookie;
 pub mod csp;
 pub mod storage;
 pub mod profile;
+pub mod broker;
 
 pub use http_client::{NetworkEngine, NetworkError};
 pub use request::NetworkRequest;
 pub use response::NetworkResponse;
 pub use csp::ContentSecurityPolicy;
 pub use storage::WebStorage;
+pub use broker::{LocalBroker, ResourceBroker, SharedBroker};

@@ -29,7 +29,7 @@
 
 use engine_dom::{Node, NodeType};
 use engine_js::{JsRuntime, TestHarness, TestResult};
-use engine_net::NetworkEngine;
+use engine_net::SharedBroker;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -156,7 +156,7 @@ pub struct StorageContext {
 pub fn execute_inline_scripts_keeping_runtime(
     dom_root: &Arc<RwLock<Node>>,
     external_scripts: &HashMap<String, String>,
-    network: Option<Arc<NetworkEngine>>,
+    network: Option<SharedBroker>,
     storage: Option<StorageContext>,
     viewport: (f32, f32),
 ) -> (Vec<Result<String, String>>, JsRuntime) {

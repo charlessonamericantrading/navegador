@@ -16,7 +16,7 @@ use engine_gfx::render_layout_to_png;
 use engine_image::decode_image;
 use engine_js::JsRuntime;
 use engine_layout::{BoxType, ImageMap, LayoutBox, LayoutTreeBuilder};
-use engine_net::{NetworkEngine, NetworkRequest};
+use engine_net::{NetworkRequest, SharedBroker};
 use engine_text::FontSet;
 use std::collections::HashMap;
 use std::io;
@@ -202,20 +202,14 @@ impl Tab {
 struct EngineServer {
     width: u32,
     height: u32,
-    // `Arc` (Fase 4.3, no `NetworkEngine` a secas) - `fetch()` real
-    // necesita su PROPIA copia del mismo cliente HTTP/pool de conexiones
-    // ya construido (`register_fetch`, via `build_page_keeping_runtime`),
-    // no uno nuevo, y vive dentro del `JsRuntime` de cada pagina cargada,
-    // fuera del `&self`/`&mut self` normal de este struct - de ahi la
-    // necesidad de un handle compartido en vez de un prestamo.
-    network: std::sync::Arc<NetworkEngine>,
-    /// Web Storage de TODA la sesion (Fase 15) - vive aqui y no en la
-    /// pagina precisamente porque su razon de ser es sobrevivir a navegar
-    /// a otra. Cada pagina que se carga recibe un puntero a este mismo
-    /// almacen mas su propio origen, y solo puede ver el suyo (ver
-    /// `engine_net::storage`). Mismo criterio que las cookies, que por la
-    /// misma razon viven dentro de `NetworkEngine`.
-    storage: engine_js::storage::SharedWebStorage,
+    /// Todo lo que este renderer pide al exterior - red, cookies desde JS
+    /// y Web Storage - pasa por aqui (ADR 0001, etapa 2; Fase 64). Hoy es un
+    /// `LocalBroker` en el mismo proceso, con el mismo cliente HTTP, las
+    /// cookies y el almacen de siempre, compartidos por todas las paginas de
+    /// la sesion (su razon de ser es sobrevivir a navegar). Cada pagina
+    /// recibe un handle a este mismo broker mas su origen, y solo puede ver
+    /// lo suyo. Un broker en otro proceso se conectara sustituyendo esto.
+    broker: SharedBroker,
     /// Pestañas (Fase 4.5) - siempre tiene AL MENOS una (invariante
     /// mantenida por `close_tab`, que rechaza cerrar la ultima). `tabs`
     /// nunca se reordena por id, solo se inserta al final (`open_new_tab`)
@@ -243,14 +237,10 @@ impl EngineServer {
         Self {
             width: 1280,
             height: 720,
-            // Cookies persistentes a disco - mismo criterio que
-            // `WebStorage::load_from_disk` justo abajo: recupera la sesion
-            // de una carga anterior del mismo perfil.
-            network: std::sync::Arc::new(NetworkEngine::with_persistent_cookies()),
-            // Fase 25: `load_from_disk`, no `new()` - recupera el `local`
-            // de una sesion anterior del mismo perfil. `session` sigue
-            // vacio siempre (ver el aviso de `WebStorage::load_from_disk`).
-            storage: std::sync::Arc::new(std::sync::Mutex::new(engine_net::storage::WebStorage::load_from_disk())),
+            // Cookies y `localStorage` del perfil en disco (Fases 15 y 25):
+            // recupera la sesion de una carga anterior del mismo perfil.
+            // `sessionStorage` sigue vacio siempre al arrancar.
+            broker: engine_net::LocalBroker::persistent().shared(),
             tabs: vec![Tab::new(0)],
             active_tab: 0,
             next_tab_id: 1,
@@ -491,7 +481,7 @@ impl EngineServer {
             Err(error) => return Self::error(id, format!("invalid_url: {error}")),
         };
 
-        let response = match self.network.fetch(&request).await {
+        let response = match self.broker.fetch(&request).await {
             Ok(response) => response,
             Err(error) => return Self::error(id, format!("network_error: {error}")),
         };
@@ -601,14 +591,14 @@ impl EngineServer {
             Some(&font_set),
             &external_scripts,
             &images,
-            Some(self.network.clone()),
+            Some(self.broker.clone()),
             // Fase 15: el origen sale de la URL FINAL (`page_url`, tras
             // seguir redirecciones), no de la pedida - si `http://a.test`
             // redirige a `https://a.test`, el almacenamiento que toca es
             // el del origen donde de verdad se aterrizo, igual que en un
             // navegador real.
             Some(crate::scripting::StorageContext {
-                storage: self.storage.clone(),
+                storage: self.broker.clone(),
                 origin: page_origin.clone(),
                 url: page_url.to_string(),
                 csp: csp.clone(),
@@ -1049,7 +1039,7 @@ impl EngineServer {
                         return None;
                     }
                 };
-                match self.network.fetch(&request).await {
+                match self.broker.fetch(&request).await {
                     Ok(response) if response.is_success() => Some((raw, response)),
                     Ok(response) => {
                         tracing::warn!(

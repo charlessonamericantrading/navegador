@@ -64,6 +64,24 @@ Separar en tres etapas, cada una utilizable y reversible por sí sola.
 - **Un fallo al aplicar la sandbox impide arrancar contenido no confiable**
   (principio 7 del plan): nada de continuar sin ella en silencio.
 
+#### Progreso de la etapa 2
+
+- **Decidido (23-09-2026):** el broker es un **proceso Rust propio**
+  (`engine_broker`) que reutiliza `engine-net`, no el proceso principal de
+  Electron. Así la política de red, cookies, CORS y CSP sigue en un solo sitio
+  y el motor no queda atado a Electron.
+- **Hecho — la costura (Fase 64):** `engine_net::ResourceBroker` reúne todo lo
+  que el renderer pide al exterior: `fetch`, cookies desde JavaScript y seis
+  operaciones de Web Storage por origen. El motor entero (navegación, `fetch`,
+  `XHR`, `document.cookie`, `localStorage`) depende ya de esa interfaz y no de
+  `NetworkEngine`/`WebStorage`. La única implementación, `LocalBroker`, hace lo
+  mismo que antes en el mismo proceso.
+- **Siguiente:** el binario `engine_broker` que sirve esa interfaz, un
+  `RemoteBroker` que la implemente sobre un canal, y la regla que da sentido a
+  todo: el broker sabe el origen del documento de cada renderer (porque hace él
+  la navegación) y rechaza cookies o almacenamiento de cualquier otro origen.
+- **Después:** con el renderer sin red ni disco propios, restringir su token.
+
 ### Etapa 3 — Aislamiento por sitio
 
 - La unidad de aislamiento pasa a ser el sitio (esquema + dominio registrable),

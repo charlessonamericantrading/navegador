@@ -19,7 +19,7 @@ use engine_css::{CssParser, StyleSheet};
 use engine_dom::{HtmlParser, Node, NodeType};
 use engine_js::{BoxMetrics, JsRuntime, TestResult};
 use engine_layout::{ImageMap, LayoutBox, LayoutTreeBuilder};
-use engine_net::NetworkEngine;
+use engine_net::SharedBroker;
 use engine_text::FontSet;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -147,7 +147,7 @@ pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewp
 /// sitio - los `<style>` se concatenaban SIEMPRE, con o sin CSP. `None`
 /// (sin `StorageContext`, ver el resto de este archivo) se permite, igual
 /// que "sin politica" en el spec real.
-pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap, network: Option<Arc<NetworkEngine>>, storage: Option<crate::scripting::StorageContext>) -> (PageResult, JsRuntime) {
+pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap, network: Option<SharedBroker>, storage: Option<crate::scripting::StorageContext>) -> (PageResult, JsRuntime) {
     // Mismo cronometro por fases que `server::navigate_with_body`, un nivel
     // mas abajo: sin el, las cuatro etapas caras del motor (parsear HTML,
     // ejecutar JS, parsear CSS, maquetar) son un unico numero opaco.
@@ -553,7 +553,7 @@ mod tests {
 
     fn storage_context_with_csp(csp: engine_net::ContentSecurityPolicy) -> crate::scripting::StorageContext {
         crate::scripting::StorageContext {
-            storage: std::sync::Arc::new(std::sync::Mutex::new(engine_net::storage::WebStorage::new())),
+            storage: engine_net::LocalBroker::in_memory().shared(),
             origin: "https://ejemplo.test".to_string(),
             csp,
             url: "https://ejemplo.test/".to_string(),

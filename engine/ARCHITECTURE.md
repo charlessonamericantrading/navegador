@@ -5307,3 +5307,26 @@ de Boa.
 La leccion para el proceso: pasar en local no bastaba; la verificacion de una
 migracion del motor incluye ver el CI remoto, que es justo lo que lo detecto.
 
+### Fase 64: la costura del broker (ADR 0001, etapa 2) (2026-09-23)
+
+Primer paso de sacar la red, las cookies y el disco del proceso que interpreta
+la pagina. Decidido con el usuario: el broker sera un proceso Rust propio que
+reutilice `engine-net`.
+
+`engine_net::broker::ResourceBroker` es la frontera de capacidades del
+renderer: `fetch`, `cookie_header_for_js`/`set_cookie_from_js` y seis
+operaciones de Web Storage acotadas a un origen. Nada mas: medido en el codigo,
+eso es todo lo que el motor pedia al exterior.
+
+Todo el motor depende ya de `SharedBroker` (`Arc<dyn ResourceBroker>`) en vez de
+`Arc<NetworkEngine>` y `Arc<Mutex<WebStorage>>`: `server.rs` pasa de dos campos
+a uno, y `fetch`, `XHR`, `document.cookie` y `localStorage`/`sessionStorage`
+hablan con el broker. `LocalBroker` implementa la interfaz en el mismo proceso
+con las piezas de siempre, asi que **el comportamiento no cambia**: 910 tests,
+sonda 87/115, WPT 60/60 y corpus 11/12 (con `fetch`, almacenamiento y cookies
+pasando por el broker).
+
+Lo que aporta: un broker en otro proceso se conecta implementando esta
+interfaz, sin tocar el motor. Lo que no aporta todavia: seguridad; con
+`LocalBroker` todo sigue en el mismo proceso.
+

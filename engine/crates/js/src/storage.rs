@@ -43,12 +43,14 @@ use boa_engine::object::builtins::JsProxy;
 use boa_engine::object::{JsData, ObjectInitializer};
 use boa_engine::property::{Attribute, PropertyKey};
 use boa_engine::{js_string, Context, JsError, JsNativeError, JsObject, JsResult, JsValue, NativeFunction};
-use engine_net::storage::{StorageKind, WebStorage};
-use std::sync::{Arc, Mutex};
+use engine_net::storage::StorageKind;
+use engine_net::SharedBroker;
 
 /// El almacen compartido de toda la sesion - lo crea y conserva
 /// `core::server`, y se lo presta a cada pagina que carga.
-pub type SharedWebStorage = Arc<Mutex<WebStorage>>;
+/// El almacen se pide al broker del renderer (ADR 0001, etapa 2): esta capa
+/// ya no toca `WebStorage` directamente, solo lo que el broker le deja.
+pub type SharedWebStorage = SharedBroker;
 
 /// Lo que cada funcion nativa necesita capturar: el almacen compartido,
 /// que area de las dos es, y el origen de ESTA pagina.
@@ -120,8 +122,8 @@ fn proxy_get(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
     // (`localStorage.getItem('x')` es `null`, pero `localStorage.x` es
     // `undefined` si `x` no esta guardado).
     let Some(capture) = capture_from_target(&target) else { return Ok(JsValue::undefined()) };
-    let Ok(store) = capture.storage.lock() else { return Ok(JsValue::undefined()) };
-    Ok(match store.get_item(capture.kind, &capture.origin, &key) {
+    let store = &capture.storage;
+    Ok(match store.storage_get(capture.kind, &capture.origin, &key) {
         Some(value) => js_string!(value).into(),
         None => JsValue::undefined(),
     })
@@ -144,8 +146,8 @@ fn proxy_set(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
 
     let Some(capture) = capture_from_target(&target) else { return Ok(JsValue::from(false)) };
     let value_str = to_storage_string(Some(&value), context)?;
-    let Ok(mut store) = capture.storage.lock() else { return Ok(JsValue::from(false)) };
-    match store.set_item(capture.kind, &capture.origin, &key, &value_str) {
+    let store = &capture.storage;
+    match store.storage_set(capture.kind, &capture.origin, &key, &value_str) {
         Ok(()) => Ok(JsValue::from(true)),
         Err(_) => Err(JsError::from_native(
             JsNativeError::error().with_message("QuotaExceededError: se supero la cuota de almacenamiento de este origen"),
@@ -169,8 +171,8 @@ fn proxy_has(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
         return Ok(JsValue::from(true));
     }
     let Some(capture) = capture_from_target(&target) else { return Ok(JsValue::from(false)) };
-    let Ok(store) = capture.storage.lock() else { return Ok(JsValue::from(false)) };
-    Ok(JsValue::from(store.get_item(capture.kind, &capture.origin, &key).is_some()))
+    let store = &capture.storage;
+    Ok(JsValue::from(store.storage_get(capture.kind, &capture.origin, &key).is_some()))
 }
 
 /// Trampa `deleteProperty` (`delete localStorage.tema`): borra la clave de
@@ -187,8 +189,9 @@ fn proxy_delete_property(_this: &JsValue, args: &[JsValue], context: &mut Contex
         return Ok(JsValue::from(false));
     }
     let Some(capture) = capture_from_target(&target) else { return Ok(JsValue::from(true)) };
-    if let Ok(mut store) = capture.storage.lock() {
-        store.remove_item(capture.kind, &capture.origin, &key);
+    {
+            let store = &capture.storage;
+        store.storage_remove(capture.kind, &capture.origin, &key);
     }
     Ok(JsValue::from(true))
 }
@@ -208,8 +211,8 @@ fn build_storage_object(context: &mut Context, storage: SharedWebStorage, kind: 
     let get_item = NativeFunction::from_copy_closure_with_captures(
         |_this, args: &[JsValue], cap: &StorageCapture, context| {
             let key = to_storage_string(args.first(), context)?;
-            let Ok(store) = cap.storage.lock() else { return Ok(JsValue::null()) };
-            Ok(match store.get_item(cap.kind, &cap.origin, &key) {
+            let store = &cap.storage;
+            Ok(match store.storage_get(cap.kind, &cap.origin, &key) {
                 Some(value) => js_string!(value).into(),
                 // `null`, NO `undefined`: el codigo real comprueba
                 // `=== null` para distinguir "no hay" de "hay vacio".
@@ -223,8 +226,8 @@ fn build_storage_object(context: &mut Context, storage: SharedWebStorage, kind: 
         |_this, args: &[JsValue], cap: &StorageCapture, context| {
             let key = to_storage_string(args.first(), context)?;
             let value = to_storage_string(args.get(1), context)?;
-            let Ok(mut store) = cap.storage.lock() else { return Ok(JsValue::undefined()) };
-            match store.set_item(cap.kind, &cap.origin, &key, &value) {
+            let store = &cap.storage;
+            match store.storage_set(cap.kind, &cap.origin, &key, &value) {
                 Ok(()) => Ok(JsValue::undefined()),
                 // Un `QuotaExceededError` de verdad, que es lo que una
                 // pagina real captura para degradar con elegancia cuando
@@ -240,8 +243,9 @@ fn build_storage_object(context: &mut Context, storage: SharedWebStorage, kind: 
     let remove_item = NativeFunction::from_copy_closure_with_captures(
         |_this, args: &[JsValue], cap: &StorageCapture, context| {
             let key = to_storage_string(args.first(), context)?;
-            if let Ok(mut store) = cap.storage.lock() {
-                store.remove_item(cap.kind, &cap.origin, &key);
+            {
+            let store = &cap.storage;
+                store.storage_remove(cap.kind, &cap.origin, &key);
             }
             Ok(JsValue::undefined())
         },
@@ -250,8 +254,9 @@ fn build_storage_object(context: &mut Context, storage: SharedWebStorage, kind: 
 
     let clear = NativeFunction::from_copy_closure_with_captures(
         |_this, _args: &[JsValue], cap: &StorageCapture, _context| {
-            if let Ok(mut store) = cap.storage.lock() {
-                store.clear(cap.kind, &cap.origin);
+            {
+            let store = &cap.storage;
+                store.storage_clear(cap.kind, &cap.origin);
             }
             Ok(JsValue::undefined())
         },
@@ -264,8 +269,8 @@ fn build_storage_object(context: &mut Context, storage: SharedWebStorage, kind: 
             if !index.is_finite() || index < 0.0 {
                 return Ok(JsValue::null());
             }
-            let Ok(store) = cap.storage.lock() else { return Ok(JsValue::null()) };
-            Ok(match store.key_at(cap.kind, &cap.origin, index as usize) {
+            let store = &cap.storage;
+            Ok(match store.storage_key(cap.kind, &cap.origin, index as usize) {
                 Some(key) => js_string!(key).into(),
                 None => JsValue::null(),
             })
@@ -277,8 +282,8 @@ fn build_storage_object(context: &mut Context, storage: SharedWebStorage, kind: 
     // parentesis (`localStorage.length`), igual que en un navegador real.
     let length_getter = NativeFunction::from_copy_closure_with_captures(
         |_this, _args: &[JsValue], cap: &StorageCapture, _context| {
-            let Ok(store) = cap.storage.lock() else { return Ok(JsValue::from(0)) };
-            Ok(JsValue::from(store.length(cap.kind, &cap.origin) as u32))
+            let store = &cap.storage;
+            Ok(JsValue::from(store.storage_length(cap.kind, &cap.origin) as u32))
         },
         capture.clone(),
     );
@@ -347,7 +352,7 @@ mod tests {
     fn runtime_at(origin: &str) -> JsRuntime {
         let mut runtime = JsRuntime::new();
         runtime
-            .register_storage(Arc::new(Mutex::new(WebStorage::new())), origin.to_string())
+            .register_storage(engine_net::LocalBroker::in_memory().shared(), origin.to_string())
             .expect("el almacenamiento deberia registrarse");
         runtime
     }
@@ -355,7 +360,7 @@ mod tests {
     /// Dos runtimes (dos "paginas") que comparten el MISMO almacen, como
     /// pasa de verdad al navegar de una pagina a otra.
     fn two_runtimes_sharing_storage(origin_a: &str, origin_b: &str) -> (JsRuntime, JsRuntime) {
-        let shared: SharedWebStorage = Arc::new(Mutex::new(WebStorage::new()));
+        let shared: SharedWebStorage = engine_net::LocalBroker::in_memory().shared();
         let mut a = JsRuntime::new();
         a.register_storage(shared.clone(), origin_a.to_string()).unwrap();
         let mut b = JsRuntime::new();

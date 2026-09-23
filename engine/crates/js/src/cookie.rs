@@ -26,11 +26,10 @@ use boa_engine::object::FunctionObjectBuilder;
 use boa_engine::property::PropertyDescriptor;
 use boa_engine::{js_string, Context, JsResult, JsValue, NativeFunction};
 use boa_gc::{Finalize, Trace};
-use engine_net::NetworkEngine;
-use std::sync::Arc;
+use engine_net::SharedBroker;
 
 #[derive(Clone)]
-struct CookieCapture(Arc<NetworkEngine>, Option<String>);
+struct CookieCapture(SharedBroker, Option<String>);
 
 impl Finalize for CookieCapture {}
 unsafe impl Trace for CookieCapture {
@@ -39,7 +38,7 @@ unsafe impl Trace for CookieCapture {
 
 /// Registra el accessor `document.cookie`. Ver el aviso del modulo para el
 /// diseño completo y las simplificaciones declaradas.
-pub fn register_cookie(context: &mut Context, network: Arc<NetworkEngine>, page_url: Option<String>) -> JsResult<()> {
+pub fn register_cookie(context: &mut Context, network: SharedBroker, page_url: Option<String>) -> JsResult<()> {
     let document = context.global_object().get(js_string!("document"), context)?;
     let Some(document_obj) = document.as_object() else {
         return Ok(());
@@ -78,11 +77,11 @@ mod tests {
     use crate::runtime::JsRuntime;
     use engine_dom::HtmlParser;
 
-    fn runtime_with_network_at(page_url: &str) -> (JsRuntime, Arc<NetworkEngine>) {
+    fn runtime_with_network_at(page_url: &str) -> (JsRuntime, SharedBroker) {
         let dom = HtmlParser::parse("<html><body></body></html>");
         let mut runtime = JsRuntime::new();
         runtime.bind_dom(dom).expect("bind_dom deberia funcionar");
-        let network = Arc::new(NetworkEngine::new());
+        let network = engine_net::LocalBroker::in_memory().shared();
         runtime.register_cookie(network.clone(), Some(page_url.to_string())).expect("registrar document.cookie no deberia fallar");
         (runtime, network)
     }
@@ -118,7 +117,7 @@ mod tests {
         let dom = HtmlParser::parse("<html><body></body></html>");
         let mut runtime = JsRuntime::new();
         runtime.bind_dom(dom).expect("bind_dom deberia funcionar");
-        let network = Arc::new(NetworkEngine::new());
+        let network = engine_net::LocalBroker::in_memory().shared();
         runtime.register_cookie(network, None).expect("registrar sin page_url no deberia fallar");
 
         assert_eq!(runtime.eval("document.cookie").unwrap(), "\"\"");

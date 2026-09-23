@@ -63,8 +63,7 @@ use boa_engine::{
 };
 use boa_gc::{Finalize, Trace};
 use engine_net::request::Method;
-use engine_net::{NetworkEngine, NetworkRequest, NetworkResponse};
-use std::sync::Arc;
+use engine_net::{NetworkRequest, NetworkResponse, SharedBroker};
 
 /// El metodo HTTP que pidio `options.method`, traducido al enum de
 /// `engine-net` - mismo criterio que `xhr::parse_method` (un metodo que
@@ -153,7 +152,7 @@ fn apply_fetch_options(request: &mut NetworkRequest, options: FetchOptions) {
     }
 }
 
-/// Envoltorio `Trace`-able sobre `Arc<NetworkEngine>` - las "captures" de
+/// Envoltorio `Trace`-able sobre `SharedBroker` - las "captures" de
 /// `NativeFunction::from_copy_closure_with_captures` deben implementar
 /// `Trace` (el recolector de basura de Boa necesita saber que recorrer),
 /// pero `NetworkEngine` no contiene NINGUN valor de Boa (`JsValue`/
@@ -161,7 +160,7 @@ fn apply_fetch_options(request: &mut NetworkRequest, options: FetchOptions) {
 /// completo al heap de Boa. `empty_trace!()` declara "nada que recorrer
 /// aqui", que es la verdad, no un atajo inseguro.
 #[derive(Clone)]
-struct NetworkCapture(Arc<NetworkEngine>, Option<String>);
+struct NetworkCapture(SharedBroker, Option<String>);
 
 impl Finalize for NetworkCapture {}
 unsafe impl Trace for NetworkCapture {
@@ -186,7 +185,7 @@ unsafe impl Trace for BodyCapture {
 /// (el mismo `NetworkEngine` que usa el resto del motor - reusa su cliente
 /// HTTP/pool de conexiones ya construido, no crea uno nuevo). Ver el
 /// doc-comment del modulo para las simplificaciones declaradas.
-pub fn register_fetch(context: &mut Context, network: Arc<NetworkEngine>, page_origin: Option<String>) -> JsResult<()> {
+pub fn register_fetch(context: &mut Context, network: SharedBroker, page_origin: Option<String>) -> JsResult<()> {
     let capture = NetworkCapture(network, page_origin);
     let fetch_fn = NativeFunction::from_copy_closure_with_captures(
         |_this, args, capture, context| {
@@ -444,7 +443,7 @@ mod tests {
     #[test]
     fn fetch_is_registered_as_a_real_global_function() {
         let mut context = Context::default();
-        register_fetch(&mut context, Arc::new(NetworkEngine::new()), None).unwrap();
+        register_fetch(&mut context, engine_net::LocalBroker::in_memory().shared(), None).unwrap();
         let result = context.eval(Source::from_bytes("typeof fetch")).unwrap();
         assert_eq!(result.to_string(&mut context).unwrap().to_std_string_escaped(), "function");
     }
@@ -455,7 +454,7 @@ mod tests {
     #[test]
     fn fetch_with_an_invalid_url_rejects_without_touching_the_network() {
         let mut context = Context::default();
-        register_fetch(&mut context, Arc::new(NetworkEngine::new()), None).unwrap();
+        register_fetch(&mut context, engine_net::LocalBroker::in_memory().shared(), None).unwrap();
         let result = context.eval(Source::from_bytes("fetch('esto no es una url')")).unwrap();
         let promise = JsPromise::from_object(result.as_object().unwrap().clone()).unwrap();
         context.run_jobs().expect("los trabajos pendientes no deberian fallar");
@@ -550,7 +549,7 @@ mod tests {
     #[test]
     fn a_get_request_with_a_body_rejects_synchronously_without_touching_the_network() {
         let mut context = Context::default();
-        register_fetch(&mut context, Arc::new(NetworkEngine::new()), None).unwrap();
+        register_fetch(&mut context, engine_net::LocalBroker::in_memory().shared(), None).unwrap();
         let result = context.eval(Source::from_bytes("fetch('https://ejemplo.test/', {method: 'GET', body: 'no deberia llevar cuerpo'})")).unwrap();
         let promise = JsPromise::from_object(result.as_object().unwrap().clone()).unwrap();
         context.run_jobs().expect("los trabajos pendientes no deberian fallar");
