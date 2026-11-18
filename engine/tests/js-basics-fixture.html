@@ -1,0 +1,74 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS basico - fixture de PLAN.md</title>
+<!--
+  Fixture de la Fase 4 de PLAN.md. Cada <p> debe acabar empezando por "OK".
+  Un "ERR" o un "esperando" es una API que casi toda web real usa y que
+  el motor todavia no tiene.
+  Medir:  python3 scripts/dev/engine_driver.py --fixture js-basics-fixture.html --texts
+-->
+</head>
+<body>
+<p id="a">a</p><p id="b">b</p><p id="c">c</p><p id="d">d</p><p id="e">e</p><p id="f">f</p>
+<p id="g">g</p><p id="h">h</p><p id="i">i</p><p id="j">j</p><p id="k">k</p><p id="l">l</p>
+<script>
+function check(id, fn) {
+  var result;
+  try { result = 'OK ' + fn(); } catch (error) { result = 'ERR ' + error; }
+  document.getElementById(id).textContent = id + ': ' + result;
+}
+function must(condition, label) { if (!condition) throw new Error('falta ' + label); return label; }
+
+check('a', function () { console.log('hola'); console.warn('x'); console.error('y'); return 'console'; });
+check('b', function () { return must(typeof navigator.userAgent === 'string', 'navigator.userAgent'); });
+check('c', function () { return must(location.href.indexOf('http') === 0, 'location.href'); });
+check('d', function () {
+  var div = document.createElement('div');
+  div.innerHTML = '<b>x</b><i>y</i>';
+  return must(div.children.length === 2, 'innerHTML que crea nodos reales');
+});
+check('e', function () {
+  must(document.getElementsByTagName('p').length === 12, 'getElementsByTagName');
+  return must(typeof document.getElementsByClassName === 'function', 'getElementsByClassName');
+});
+check('f', function () {
+  must(typeof setInterval === 'function', 'setInterval');
+  must(typeof requestAnimationFrame === 'function', 'requestAnimationFrame');
+  must(typeof Promise === 'function', 'Promise');
+  return must(typeof MutationObserver === 'function', 'MutationObserver');
+});
+check('g', function () {
+  var a = document.getElementById('a');
+  must(a.parentNode && a.parentNode.tagName === 'BODY', 'parentNode');
+  must(a.id === 'a', 'element.id');
+  must(typeof a.className === 'string', 'element.className');
+  return must(typeof document.readyState === 'string', 'document.readyState');
+});
+document.getElementById('h').textContent = 'h: esperando DOMContentLoaded';
+try {
+  document.addEventListener('DOMContentLoaded', function () {
+    document.getElementById('h').textContent = 'h: OK DOMContentLoaded';
+  });
+} catch (error) { document.getElementById('h').textContent = 'h: ERR ' + error; }
+document.getElementById('i').textContent = 'i: esperando load';
+try {
+  window.addEventListener('load', function () { document.getElementById('i').textContent = 'i: OK load'; });
+} catch (error) { document.getElementById('i').textContent = 'i: ERR ' + error; }
+check('j', function () {
+  must(window.innerWidth > 0 && window.innerHeight > 0, 'window.innerWidth/innerHeight');
+  return must(typeof document.createTextNode === 'function', 'createTextNode');
+});
+check('k', function () {
+  must(typeof localStorage === 'object', 'localStorage');
+  must(typeof fetch === 'function', 'fetch');
+  return must(typeof XMLHttpRequest === 'function', 'XMLHttpRequest');
+});
+document.getElementById('l').textContent = 'l: esperando setTimeout';
+setTimeout(function () { document.getElementById('l').textContent = 'l: OK setTimeout'; }, 0);
+</script>
+<!-- Esto NO es JavaScript y no debe ejecutarse ni dar error: -->
+<script type="application/ld+json">{"@context": "https://schema.org"}</script>
+</body>
+</html>

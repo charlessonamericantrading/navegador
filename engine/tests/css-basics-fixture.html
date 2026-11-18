@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CSS basico - fixture de PLAN.md</title>
+<!--
+  Fixture de la Fase 2 de PLAN.md. Cada linea dice que deberia verse.
+  Referencia: abrir este mismo archivo en Chrome o Firefox.
+  Medir:  python3 scripts/dev/engine_driver.py --fixture css-basics-fixture.html --out css.png
+-->
+<style>
+:root { --rojo: #cc0000; --ancho: 300px; }
+body { margin: 0; background: #ffffff; }
+.box { width: 300px; height: 40px; margin: 10px auto; background: #3399ff; color: #ffffff; }
+.var { background: var(--rojo); width: var(--ancho); }
+.calc { width: calc(100% - 200px); margin: 10px 0; background: #009900; }
+.vh { height: 10vh; width: 50vw; background: #ff9900; }
+.pct { width: 50%; background: #990099; }
+.em { width: 20em; background: #009999; }
+.grad { background: linear-gradient(#000000, #ffffff); }
+.lh { line-height: 40px; background: #dddddd; }
+.op { opacity: 0.3; background: #000000; }
+.serif { font-family: Georgia, serif; font-size: 24px; }
+.mono { font-family: monospace; font-size: 24px; }
+.ib span { display: inline-block; width: 100px; height: 30px; background: #cc0000; margin-right: 10px; }
+</style>
+</head>
+<body>
+<div class="box">1. azul 300px CENTRADO, 10px de margen arriba</div>
+<div class="box var">2. ROJO 300px centrado (var)</div>
+<div class="box calc">3. verde: ancho total menos 200px, pegado a la izquierda</div>
+<div class="box vh">4. naranja: mitad del ancho, alto 10% de la ventana</div>
+<div class="box pct">5. morado: mitad del ancho, centrado</div>
+<div class="box em">6. turquesa: 320px (20em), centrado</div>
+<div class="box grad">7. degradado negro a blanco (o azul si no hay degradados)</div>
+<div class="lh">8. fila gris de 40px de alto, texto centrado en vertical</div>
+<div class="box op">9. gris claro (negro al 30%), no negro solido</div>
+<p class="serif">10. Fuente con serifa</p>
+<p class="mono">11. Fuente monoespaciada iiii WWWW</p>
+<p>12. Texto <b>negrita</b> <i>cursiva</i> <a href="#">enlace</a> con UN espacio entre cada palabra.</p>
+<div class="ib"><span></span><span></span><span></span></div>
+<p>13. Arriba: tres cuadrados rojos de 100x30 en fila.</p>
+<table border="1" bgcolor="#ffff00" width="50%"><tr><td>14.</td><td>Tabla amarilla con borde, mitad de ancho; esta celda ocupa casi todo y la primera es estrecha</td></tr></table>
+<p style="text-align:center">15. centrado</p>
+<p>16. Acentos: &aacute;&eacute;&iacute;&oacute;&uacute; &ntilde; &euro; - áéíóú ñ €</p>
+<p>17. El fondo de TODA la ventana es blanco, tambien debajo de esta linea.</p>
+</body>
+</html>
