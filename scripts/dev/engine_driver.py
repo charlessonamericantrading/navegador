@@ -4,7 +4,7 @@
 Herramienta de desarrollo, no forma parte del producto. Arranca el motor,
 carga una pagina, guarda la captura y mide cuanto tarda cada operacion
 (navegar, scroll, clic en zona vacia, redimensionar). Es la forma de
-comprobar cada tarea de PLAN.md con numeros en vez de a ojo.
+comprobar cada tarea de PLAN_SONNET.md con numeros en vez de a ojo.
 
 Uso:
   python3 scripts/dev/engine_driver.py https://es.wikipedia.org/wiki/Navegador_web
@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -35,7 +36,11 @@ class Engine:
     def __init__(self, path):
         if not os.path.exists(path):
             sys.exit(f"No existe {path}. Compila primero el motor en release (ver cabecera de este archivo).")
-        self.proc = subprocess.Popen([path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr)
+        # Perfil temporal: sin esto, medir escribiria cookies y localStorage
+        # en el perfil real de quien ejecuta el script.
+        env = dict(os.environ)
+        env.setdefault("NAVEGADOR_IA_PROFILE_DIR", tempfile.mkdtemp(prefix="navegador-ia-medida-"))
+        self.proc = subprocess.Popen([path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, env=env)
         self.count = 0
         self.proc.stdout.readline()  # mensaje "ready"
 
