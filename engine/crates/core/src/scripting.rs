@@ -328,6 +328,12 @@ pub fn execute_inline_scripts_keeping_runtime(
 /// `core::server::filter_by_csp` - si su contenido esta en el mapa, es que
 /// estaba autorizado y se descargo.
 fn run_scripts(runtime: &mut JsRuntime, scripts: &[Arc<RwLock<Node>>], external_scripts: &HashMap<String, String>, allow_inline: bool) -> Vec<Result<String, String>> {
+    run_scripts_within(runtime, scripts, external_scripts, allow_inline, SCRIPT_TIME_BUDGET)
+}
+
+/// Igual que `run_scripts`, con el tope de tiempo como parametro: asi los
+/// tests fijan el tope sin depender de lo rapida que sea la maquina.
+fn run_scripts_within(runtime: &mut JsRuntime, scripts: &[Arc<RwLock<Node>>], external_scripts: &HashMap<String, String>, allow_inline: bool, time_budget: std::time::Duration) -> Vec<Result<String, String>> {
     let clasificados: Vec<ScriptClasificado> = scripts
         .iter()
         .filter_map(|nodo| ScriptClasificado::de_nodo(nodo, runtime.supports_modules()))
@@ -353,8 +359,8 @@ fn run_scripts(runtime: &mut JsRuntime, scripts: &[Arc<RwLock<Node>>], external_
             // una pagina con muchos scripts lentos no deje al usuario esperando
             // minutos antes de ver nada. Los que quedan se omiten y la pagina
             // se pinta con lo que ya corrio, que es mejor que no pintarla.
-            if inicio.elapsed() > SCRIPT_TIME_BUDGET {
-                tracing::warn!("[js] tope de {SCRIPT_TIME_BUDGET:?} de scripts por pagina agotado: se omiten los que faltan");
+            if inicio.elapsed() >= time_budget {
+                tracing::warn!("[js] tope de {time_budget:?} de scripts por pagina agotado: se omiten los que faltan");
                 return resultados;
             }
             if let Some(r) = ejecutar_script(runtime, script, external_scripts, allow_inline) {
@@ -555,24 +561,58 @@ mod tests {
         assert_eq!(results[0].as_deref(), Ok("40"));
     }
 
-    /// Tarea 1.1 del plan, de punta a punta con el limite POR DEFECTO: una
-    /// pagina con un bucle infinito en un script se carga igual, el script
-    /// se reporta como fallido y el siguiente corre con normalidad. Antes el
-    /// motor no volvia nunca de la primera evaluacion.
+    /// El documento, su runtime enlazado y sus `<script>`.
+    type PageUnderTest = (Arc<RwLock<Node>>, JsRuntime, Vec<Arc<RwLock<Node>>>);
+
+    /// Construye un runtime con el DOM enlazado y devuelve tambien los
+    /// `<script>` del documento, para llamar a `run_scripts_within` con un
+    /// tope de bucles y de tiempo fijados por el test.
+    fn runtime_and_scripts(html: &str) -> PageUnderTest {
+        let dom = HtmlParser::parse(html);
+        let mut runtime = JsRuntime::new();
+        runtime.bind_dom(dom.clone()).expect("bind_dom");
+        let scripts = Node::find_all_by_tag(&dom, "script");
+        (dom, runtime, scripts)
+    }
+
+    /// Tarea 1.1 del plan: una pagina con un bucle infinito se carga igual,
+    /// el script se reporta como fallido y el siguiente corre. El tope de
+    /// vueltas se baja para que el test no dependa de la velocidad del build
+    /// (con el valor real, 10 millones, un build de depuracion en Windows
+    /// pasaba de los 5 s). Que el valor real se aplica a los dos
+    /// constructores lo comprueba `engine_js::runtime::tests`.
     #[test]
     fn a_runaway_script_fails_and_the_rest_of_the_page_still_loads() {
-        let dom = HtmlParser::parse(
+        let (dom, mut runtime, scripts) = runtime_and_scripts(
             r#"<html><body><p id="antes">antes</p><script>while (true) {}</script><script>document.getElementById('antes').textContent = 'sigue vivo';</script><p id="despues">despues</p></body></html>"#,
         );
-        let started = std::time::Instant::now();
-        let results = execute_inline_scripts(&dom, &HashMap::new());
-        assert!(started.elapsed() < std::time::Duration::from_secs(30), "el bucle infinito debe cortarse, tardo {:?}", started.elapsed());
+        runtime.context.runtime_limits_mut().set_loop_iteration_limit(50_000);
+
+        let results = run_scripts_within(&mut runtime, &scripts, &HashMap::new(), true, std::time::Duration::from_secs(600));
 
         assert_eq!(results.len(), 2);
         assert!(results[0].is_err(), "el bucle infinito debe reportarse como fallo: {:?}", results[0]);
         assert!(results[1].is_ok(), "el script siguiente debe correr: {:?}", results[1]);
         assert_eq!(Node::text_content(&Node::find_by_id(&dom, "antes").unwrap()), "sigue vivo");
         assert!(Node::find_by_id(&dom, "despues").is_some(), "el resto del documento sigue ahi");
+    }
+
+    /// El tope de tiempo total: con el tiempo agotado se omiten los scripts
+    /// que faltan en vez de seguir. Con tope cero es determinista (nada corre);
+    /// con uno holgado corren todos.
+    #[test]
+    fn the_script_time_budget_skips_the_remaining_scripts_once_spent() {
+        let html = r#"<html><body><p id="a">a</p><script>document.getElementById('a').textContent = 'uno';</script><script>document.getElementById('a').textContent = 'dos';</script></body></html>"#;
+
+        let (dom, mut runtime, scripts) = runtime_and_scripts(html);
+        let agotado = run_scripts_within(&mut runtime, &scripts, &HashMap::new(), true, std::time::Duration::ZERO);
+        assert!(agotado.is_empty(), "con el tiempo ya agotado no debe correr ninguno: {agotado:?}");
+        assert_eq!(Node::text_content(&Node::find_by_id(&dom, "a").unwrap()), "a");
+
+        let (dom, mut runtime, scripts) = runtime_and_scripts(html);
+        let holgado = run_scripts_within(&mut runtime, &scripts, &HashMap::new(), true, std::time::Duration::from_secs(600));
+        assert_eq!(holgado.len(), 2);
+        assert_eq!(Node::text_content(&Node::find_by_id(&dom, "a").unwrap()), "dos");
     }
 
     #[test]
