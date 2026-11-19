@@ -161,6 +161,11 @@ python3 scripts/dev/engine_driver.py http://127.0.0.1:9001/wiki/Navegador_web --
 
 ## Fase 0 — Una sola versión del código
 
+> **Estado (19-nov):** el trabajo va apilado sobre el PR #1 en la rama
+> `plan/fase-0-1-sobre-pr1` ([PR #3](https://github.com/charlessonamericantrading/navegador/pull/3),
+> borrador, apunta al PR #1). **No se ha fusionado nada en `main`**: las
+> tareas 0.1, 0.2 y 0.3 quedan pendientes hasta que Charlesson lo decida.
+
 ### [ ] 0.1 Fusionar el PR #1 en `main`
 
 - **Quién:** Charlesson, o Sonnet si se le pide expresamente.
@@ -178,7 +183,7 @@ No toca el producto. Comprobado: no tiene conflictos con el PR #1.
 - Mover `plan.md` a `docs/plans/plan-maestro-2026-09-21.md` y dejar una
   línea en su cabecera: "Congelado. El plan vigente es `PLAN_SONNET.md`".
 
-### [ ] 0.4 Banco de páginas visibles
+### [x] 0.4 Banco de páginas visibles
 
 - **Hacer:** script `scripts/dev/bench-all` que pase `engine_driver.py`
   por los dos fixtures y por cuatro páginas reales (Wikipedia, Hacker
@@ -187,19 +192,27 @@ No toca el producto. Comprobado: no tiene conflictos con el PR #1.
   Las páginas de terceros **no se suben al repo**: se descargan a una
   carpeta ignorada por git.
 - **Verificar:** la tabla reproduce los números de la columna "PR #1".
+- **Hecho (PR #3):** `scripts/dev/bench_all.py`. Carga las páginas en vivo
+  (con `--mirror` en la nube) en lugar de guardarlas, así no hay nada de
+  terceros que ignorar. `--strict` aplica los objetivos de la Fase 1.
 
-### [ ] 0.5 Un test que falla fuera de Windows
+### [x] 0.5 Un test que falla fuera de Windows
 
 `desktop/tests/engine-protocol.test.js`, caso "lo que el parser de URL no
 normaliza se rechaza": en Linux `app://./..%5C..%5Csecreto` no se
 rechaza. En el CI pasa. Decidir si es un fallo real de la validación o
 un test que solo vale para Windows, y dejarlo explícito.
 
+- **Hecho (PR #3):** en Linux no era una fuga (la ruta se quedaba dentro
+  de la carpeta), pero la regla cambiaba con el sistema. `resolveAppPath`
+  rechaza ahora barra invertida y letra de unidad en todos. Test: 35 bien
+  y 1 fallo → 36 bien y 0 fallos.
+
 ---
 
 ## Fase 1 — Que nunca se cuelgue y sea rápido
 
-### [ ] 1.1 Límites al JavaScript
+### [x] 1.1 Límites al JavaScript
 
 - **Comprobado:** una página con `<script>while(true){}</script>` cuelga
   el motor para siempre. No responde a nada más.
@@ -208,6 +221,9 @@ un test que solo vale para Windows, y dejarlo explícito.
   tope de tiempo total de scripts por página.
 - **Verificar:** test nuevo con ese bucle: el motor responde en menos de
   5 s y pinta el resto de la página.
+- **Hecho (PR #3):** límite de 10 millones de vueltas por llamada y tope
+  de 5 s de scripts por página. Antes: 15 s sin responder. Después:
+  **0,18 s**. Suite: 935 bien, 0 fallos; clippy limpio.
 
 ### [ ] 1.2 Red con límites
 
