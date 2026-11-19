@@ -236,7 +236,7 @@ un test que solo vale para Windows, y dejarlo explícito.
   falló en el CI de Windows por un test dependiente de la velocidad;
   corregido (reglas 10 y 11).
 
-### [ ] 1.2 Red con límites
+### [x] 1.2 Red con límites
 
 - **Comprobado en código:** `NetworkEngine::fetch`
   (`engine/crates/net/src/http_client.rs`) no tiene ningún timeout: un
@@ -249,6 +249,28 @@ un test que solo vale para Windows, y dejarlo explícito.
   `Accept` correcto por tipo.
 - **Verificar:** test con un servidor local que nunca responde a una
   imagen: la página se pinta en menos de 10 s.
+- **Hecho (PR #3):** conexión 10 s; petición entera 20 s (también para
+  `fetch`/XHR de las páginas); 8 s por subrecurso y **10 s en total para
+  los subrecursos, contados desde que llega el documento** (lo ya
+  descargado se conserva). Antes: una página con recursos mudos no
+  terminaba (45 s sin respuesta). Después: **10,0 s** con el estado
+  completo. 943 tests bien, clippy limpio. Por tanto una navegación puede
+  tardar hasta lo que tarde el documento (máx. 20 s) más 10 s.
+- **No hecho:** `User-Agent` de navegador real y `Accept` por tipo. No se
+  puede comprobar en la nube (el motor no sale a internet y el espejo
+  cambia el agente). Pasa a la 1.2b.
+
+### [ ] 1.2b `User-Agent` y `Accept` (necesita un PC con internet)
+
+- **Hipótesis, sin comprobar:** algunos sitios sirven otra página o
+  bloquean a un agente desconocido (`NextGenWebEngine/0.1.0`). Hoy todas
+  las peticiones llevan `Accept: text/html,...`, también las imágenes.
+- **Hacer:** primero medir. En un PC con internet, cargar Google,
+  Wikipedia, DuckDuckGo y Hacker News con el agente actual y con uno
+  compatible, y comparar el HTML recibido y la captura. Solo cambiarlo si
+  la diferencia es visible. Si se cambia, `navigator.userAgent` de JS debe
+  dar el mismo valor.
+- **Verificar:** capturas antes y después de las cuatro páginas.
 
 ### [ ] 1.3 Interfaz que no se desincroniza
 
