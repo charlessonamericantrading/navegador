@@ -78,9 +78,29 @@ impl Default for JsRuntime {
     }
 }
 
+/// Iteraciones de bucle que un script puede acumular en UNA llamada antes de
+/// que Boa lance un error (tarea 1.1 del plan). Sin tope, `while(true){}` -
+/// o cualquier bucle con un fallo - dejaba el motor colgado para siempre y
+/// con el la interfaz entera: el proceso es de un solo hilo.
+///
+/// Boa cuenta por marco de llamada, no por bucle: cada llamada a una funcion
+/// empieza de cero, asi que un codigo legitimo que trocea su trabajo no se
+/// ve afectado. 10 millones es holgado para cualquier arranque de pagina
+/// (un bundle recorre cientos de elementos, no millones) y a la velocidad
+/// del interprete se agota en una fraccion de segundo, no en minutos.
+pub const MAX_LOOP_ITERATIONS: u64 = 10_000_000;
+
+/// Aplica los limites de ejecucion a un `Context` recien construido. La
+/// recursion y la pila ya vienen acotadas por Boa (512 llamadas anidadas);
+/// aqui solo se acota lo que por defecto es ilimitado.
+fn limit_runaway_scripts(context: &mut Context) {
+    context.runtime_limits_mut().set_loop_iteration_limit(MAX_LOOP_ITERATIONS);
+}
+
 impl JsRuntime {
     pub fn new() -> Self {
         let mut context = Context::default();
+        limit_runaway_scripts(&mut context);
         let _ = AsyncEventLoop::register_microtasks(&mut context);
         Self { context, document_bindings: None, pending_window_opens: None, pending_history_ops: None, pending_navigations: None, mutation_observers: None, timers: None, module_loader: None }
     }
@@ -108,6 +128,7 @@ impl JsRuntime {
                 return Self::new();
             }
         };
+        limit_runaway_scripts(&mut context);
         let _ = AsyncEventLoop::register_microtasks(&mut context);
         Self { context, document_bindings: None, pending_window_opens: None, pending_history_ops: None, pending_navigations: None, mutation_observers: None, timers: None, module_loader: Some(loader) }
     }
@@ -517,6 +538,55 @@ impl JsRuntime {
 mod tests {
     use super::*;
     use engine_dom::HtmlParser;
+
+    /// Tarea 1.1 del plan: ambos constructores aplican el limite de bucles.
+    /// Si uno lo olvidara, las paginas con modulos ES (`with_modules`) serian
+    /// las unicas capaces de colgar el motor.
+    #[test]
+    fn both_constructors_apply_the_loop_iteration_limit() {
+        let classic = JsRuntime::new();
+        assert_eq!(classic.context.runtime_limits().loop_iteration_limit(), MAX_LOOP_ITERATIONS);
+        let with_modules = JsRuntime::with_modules("https://ejemplo.test/");
+        assert_eq!(with_modules.context.runtime_limits().loop_iteration_limit(), MAX_LOOP_ITERATIONS);
+    }
+
+    /// Un bucle infinito termina con un error en vez de colgar, y el runtime
+    /// sigue sirviendo despues: la pagina se pinta con lo que haya y los
+    /// listeners ya registrados siguen funcionando. Se baja el tope para que
+    /// el test no dependa de la velocidad del build de depuracion.
+    #[test]
+    fn an_infinite_loop_ends_with_an_error_and_leaves_the_runtime_usable() {
+        let mut runtime = JsRuntime::new();
+        runtime.context.runtime_limits_mut().set_loop_iteration_limit(50_000);
+
+        let started = std::time::Instant::now();
+        let error = runtime.eval("while (true) {}").expect_err("un bucle infinito debe fallar, no colgar");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "tardo {:?}", started.elapsed());
+        assert!(error.to_string().to_lowercase().contains("loop"), "el motivo deberia nombrar el bucle: {error}");
+
+        assert_eq!(runtime.eval("1 + 1").expect("el runtime debe seguir usable"), "2");
+    }
+
+    /// El limite no debe afectar a codigo legitimo: un bucle de cien mil
+    /// vueltas (mas que cualquier arranque de pagina real) corre entero.
+    #[test]
+    fn a_long_but_finite_loop_still_runs_to_completion() {
+        let mut runtime = JsRuntime::new();
+        let result = runtime.eval("var n = 0; for (var i = 0; i < 100000; i++) { n += 1; } n").expect("no deberia cortarse");
+        assert_eq!(result, "100000");
+    }
+
+    /// El conteo es por llamada de funcion: trocear el trabajo en llamadas
+    /// no acumula contra el limite.
+    #[test]
+    fn the_loop_count_restarts_in_every_function_call() {
+        let mut runtime = JsRuntime::new();
+        runtime.context.runtime_limits_mut().set_loop_iteration_limit(1_000);
+        let result = runtime
+            .eval("function trozo() { var n = 0; for (var i = 0; i < 800; i++) { n += 1; } return n; } var total = 0; for (var k = 0; k < 20; k++) { total += trozo(); } total")
+            .expect("20 llamadas de 800 vueltas no acumulan");
+        assert_eq!(result, "16000");
+    }
 
     /// Regresion del bug de bucle de eventos encontrado al construir la
     /// Fase 9 (ver `drain_jobs`): disparar un evento desde Rust - lo que

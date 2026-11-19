@@ -344,9 +344,19 @@ fn run_scripts(runtime: &mut JsRuntime, scripts: &[Arc<RwLock<Node>>], external_
     //    ejecutar nada: no hay un "cuando llegue" que respetar. Es una
     //    aproximacion declarada, y la que menos codigo rompe - lo que `async`
     //    promete es "no bloqueo el parseo", no un orden concreto.
+    let inicio = std::time::Instant::now();
     let mut resultados = Vec::new();
     for orden in [Orden::Clasico, Orden::Diferido, Orden::Asincrono] {
         for script in clasificados.iter().filter(|s| s.orden == orden) {
+            // Tope de tiempo total de scripts por pagina (tarea 1.1). El limite
+            // de bucles de Boa acota cada script; esto acota la SUMA, para que
+            // una pagina con muchos scripts lentos no deje al usuario esperando
+            // minutos antes de ver nada. Los que quedan se omiten y la pagina
+            // se pinta con lo que ya corrio, que es mejor que no pintarla.
+            if inicio.elapsed() > SCRIPT_TIME_BUDGET {
+                tracing::warn!("[js] tope de {SCRIPT_TIME_BUDGET:?} de scripts por pagina agotado: se omiten los que faltan");
+                return resultados;
+            }
             if let Some(r) = ejecutar_script(runtime, script, external_scripts, allow_inline) {
                 resultados.push(r);
             }
@@ -354,6 +364,10 @@ fn run_scripts(runtime: &mut JsRuntime, scripts: &[Arc<RwLock<Node>>], external_
     }
     resultados
 }
+
+/// Tiempo total que los `<script>` de una pagina pueden gastar durante la
+/// carga antes de omitir el resto (tarea 1.1 del plan).
+const SCRIPT_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Cuando le toca correr a un `<script>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,6 +553,26 @@ mod tests {
         let results = execute_inline_scripts(&dom, &external);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].as_deref(), Ok("40"));
+    }
+
+    /// Tarea 1.1 del plan, de punta a punta con el limite POR DEFECTO: una
+    /// pagina con un bucle infinito en un script se carga igual, el script
+    /// se reporta como fallido y el siguiente corre con normalidad. Antes el
+    /// motor no volvia nunca de la primera evaluacion.
+    #[test]
+    fn a_runaway_script_fails_and_the_rest_of_the_page_still_loads() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><p id="antes">antes</p><script>while (true) {}</script><script>document.getElementById('antes').textContent = 'sigue vivo';</script><p id="despues">despues</p></body></html>"#,
+        );
+        let started = std::time::Instant::now();
+        let results = execute_inline_scripts(&dom, &HashMap::new());
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "el bucle infinito debe cortarse, tardo {:?}", started.elapsed());
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_err(), "el bucle infinito debe reportarse como fallo: {:?}", results[0]);
+        assert!(results[1].is_ok(), "el script siguiente debe correr: {:?}", results[1]);
+        assert_eq!(Node::text_content(&Node::find_by_id(&dom, "antes").unwrap()), "sigue vivo");
+        assert!(Node::find_by_id(&dom, "despues").is_some(), "el resto del documento sigue ahi");
     }
 
     #[test]
