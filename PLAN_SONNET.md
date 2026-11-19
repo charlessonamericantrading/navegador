@@ -135,6 +135,15 @@ con el producto roto a la vista.
 8. **No leas `engine/ARCHITECTURE.md` entero** (más de 5.000 líneas).
    Busca con grep la parte que necesites.
 9. **Al terminar una tarea**, marca su casilla `[x]` en este archivo.
+10. **Los tests no dependen de la velocidad ni del reloj.** El CI del motor
+    corre en Windows con build de depuración, que es 3 a 10 veces más lento
+    que tu máquina. Un test que tarda 5 s en Linux falla ahí (pasó con la
+    tarea 1.1). Fija los límites por parámetro, no por tiempo.
+11. **Antes de subir**, ejecuta lo mismo que el CI, en `engine/`:
+    `cargo test --workspace --locked`,
+    `cargo clippy --workspace --all-targets --locked -- -D warnings` y
+    `cargo run -p engine-core --bin wpt_runner --locked -- tests/wpt-style`.
+    En `desktop/` y `frontend/`: `npm test` y `npm run lint`.
 
 **Aviso de entorno.** En una sesión en la nube el motor no tiene salida
 directa a internet: cualquier `https://` falla con `client error (Connect)`.
@@ -223,7 +232,9 @@ un test que solo vale para Windows, y dejarlo explícito.
   5 s y pinta el resto de la página.
 - **Hecho (PR #3):** límite de 10 millones de vueltas por llamada y tope
   de 5 s de scripts por página. Antes: 15 s sin responder. Después:
-  **0,18 s**. Suite: 935 bien, 0 fallos; clippy limpio.
+  **0,18 s**. Suite: 936 bien, 0 fallos; clippy limpio. El primer intento
+  falló en el CI de Windows por un test dependiente de la velocidad;
+  corregido (reglas 10 y 11).
 
 ### [ ] 1.2 Red con límites
 
