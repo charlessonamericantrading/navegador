@@ -232,6 +232,12 @@ struct EngineServer {
     /// Empieza en 1 para que el `0` de `Tab::document_id` signifique
     /// inequivocamente "todavia no se ha cargado nada aqui".
     next_document_id: u64,
+    /// Cuanto se espera a UN subrecurso (hoja, script, imagen) antes de
+    /// omitirlo. Por defecto `SUBRESOURCE_TIMEOUT`; los tests lo bajan.
+    subresource_timeout: std::time::Duration,
+    /// Tiempo TOTAL que se dedica a los subrecursos de una pagina, contado
+    /// desde que llega el documento. Por defecto `SUBRESOURCE_BUDGET`.
+    subresource_budget: std::time::Duration,
 }
 
 impl EngineServer {
@@ -253,6 +259,8 @@ impl EngineServer {
             active_tab: 0,
             next_tab_id: 1,
             next_document_id: 1,
+            subresource_timeout: Self::SUBRESOURCE_TIMEOUT,
+            subresource_budget: Self::SUBRESOURCE_BUDGET,
         }
     }
 
@@ -563,12 +571,17 @@ impl EngineServer {
 
         let (n_css, n_js) = (stylesheet_hrefs.len(), script_srcs.len());
 
+        // Un unico tope compartido por hojas, scripts e imagenes, por ese
+        // orden: lo que condiciona el aspecto va primero y, si el tiempo se
+        // acaba, son las imagenes lo que se sacrifica.
+        let deadline = tokio::time::Instant::now() + self.subresource_budget;
+
         let t = std::time::Instant::now();
-        let external_css = self.fetch_external_stylesheets(stylesheet_hrefs, &page_url).await;
+        let external_css = self.fetch_external_stylesheets(stylesheet_hrefs, &page_url, deadline).await;
         tracing::info!("[tiempo] {n_css} hoja(s) de estilo en {:?} ({} bytes de CSS)", t.elapsed(), external_css.len());
 
         let t = std::time::Instant::now();
-        let external_scripts = self.fetch_external_scripts(script_srcs, &page_url).await;
+        let external_scripts = self.fetch_external_scripts(script_srcs, &page_url, deadline).await;
         tracing::info!("[tiempo] {n_js} script(s) externos en {:?}", t.elapsed());
 
         // `background-image`/`background: url(...)` (Fase 40) - las URLs se
@@ -587,7 +600,7 @@ impl EngineServer {
         let n_img = image_srcs.len();
 
         let t = std::time::Instant::now();
-        let images = self.fetch_images(image_srcs, &page_url).await;
+        let images = self.fetch_images(image_srcs, &page_url, deadline).await;
         tracing::info!("[tiempo] {n_img} imagen(es) en {:?} ({} decodificadas)", t.elapsed(), images.len());
 
         let t = std::time::Instant::now();
@@ -1006,6 +1019,20 @@ impl EngineServer {
     /// solo en recorrerlas una a una.
     const MAX_CONCURRENT_SUBRESOURCES: usize = 6;
 
+    /// Cuanto se espera a UN subrecurso antes de omitirlo (tarea 1.2 del
+    /// plan). Un navegador real tambien se rinde con un recurso lento y
+    /// pinta la pagina sin el. Antes no habia limite: una sola imagen cuyo
+    /// servidor aceptaba la conexion y no contestaba dejaba la navegacion
+    /// esperando para siempre.
+    const SUBRESOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+    /// Tiempo TOTAL para todos los subrecursos de una pagina, desde que llega
+    /// el documento (tarea 1.2 del plan). Sin esto, 160 imagenes lentas a 8 s
+    /// cada una y 6 a la vez sumaban mas de 3 minutos. Pasado el tope se
+    /// pinta con lo que haya llegado: lo ya descargado se conserva y a lo que
+    /// falta ni siquiera se le pide.
+    const SUBRESOURCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
     /// Descarga en PARALELO (acotado, ver `MAX_CONCURRENT_SUBRESOURCES`)
     /// una lista de referencias crudas (`href`/`src` tal como aparecen en
     /// el HTML), resolviendolas antes contra `page_url` - la URL final tras
@@ -1027,6 +1054,7 @@ impl EngineServer {
         refs: Vec<String>,
         page_url: &url::Url,
         kind: &'static str,
+        deadline: tokio::time::Instant,
     ) -> Vec<(String, engine_net::NetworkResponse)> {
         use futures_util::stream::StreamExt;
 
@@ -1050,9 +1078,22 @@ impl EngineServer {
                         return None;
                     }
                 };
-                match self.broker.fetch(&request).await {
-                    Ok(response) if response.is_success() => Some((raw, response)),
-                    Ok(response) => {
+                // Tope de ESTA peticion: su propio tiempo, sin pasar nunca del
+                // tope compartido de toda la pagina. Si el tope compartido ya
+                // se agoto, ni se le pide: no hace falta abrir una conexion
+                // para abandonarla al instante.
+                let limit = (tokio::time::Instant::now() + self.subresource_timeout).min(deadline);
+                if limit <= tokio::time::Instant::now() {
+                    tracing::debug!("[server] tiempo para subrecursos agotado, no se pide {absolute}");
+                    return None;
+                }
+                match tokio::time::timeout_at(limit, self.broker.fetch(&request)).await {
+                    Err(_elapsed) => {
+                        tracing::warn!("[server] {absolute} no respondio a tiempo, se omite");
+                        None
+                    }
+                    Ok(Ok(response)) if response.is_success() => Some((raw, response)),
+                    Ok(Ok(response)) => {
                         tracing::warn!(
                             "[server] {absolute} respondio {} {}, se omite",
                             response.status_code,
@@ -1060,7 +1101,7 @@ impl EngineServer {
                         );
                         None
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         tracing::warn!("[server] no se pudo descargar {absolute}: {error}");
                         None
                     }
@@ -1084,11 +1125,11 @@ impl EngineServer {
     /// vez de abortar la carga entera de la pagina - igual que un
     /// navegador real, que sigue mostrando la pagina con el resto de sus
     /// estilos aunque una hoja concreta no cargue.
-    async fn fetch_external_stylesheets(&self, hrefs: Vec<String>, page_url: &url::Url) -> String {
+    async fn fetch_external_stylesheets(&self, hrefs: Vec<String>, page_url: &url::Url, deadline: tokio::time::Instant) -> String {
         let mut combined = String::new();
         // El orden que devuelve `fetch_subresources` es el del documento,
         // no el de llegada - imprescindible aqui (ver su doc-comment).
-        for (_href, response) in self.fetch_subresources(hrefs, page_url, "<link rel=stylesheet>").await {
+        for (_href, response) in self.fetch_subresources(hrefs, page_url, "<link rel=stylesheet>", deadline).await {
             combined.push_str(&response.text());
             combined.push('\n');
         }
@@ -1107,9 +1148,9 @@ impl EngineServer {
     ///
     /// Mismo criterio que las hojas de estilo: un script que falla al
     /// descargarse se omite con un aviso, no aborta la pagina entera.
-    async fn fetch_external_scripts(&self, srcs: Vec<String>, page_url: &url::Url) -> HashMap<String, String> {
+    async fn fetch_external_scripts(&self, srcs: Vec<String>, page_url: &url::Url, deadline: tokio::time::Instant) -> HashMap<String, String> {
         let mut fetched = HashMap::new();
-        for (src, response) in self.fetch_subresources(srcs, page_url, "<script src>").await {
+        for (src, response) in self.fetch_subresources(srcs, page_url, "<script src>", deadline).await {
             fetched.insert(src, response.text());
         }
         fetched
@@ -1124,9 +1165,9 @@ impl EngineServer {
     /// el `src` SIN resolver - lo unico que `engine-layout`/`engine-gfx`
     /// ven al recorrer las cajas (`BoxType::Image`), igual que
     /// `external_scripts`.
-    async fn fetch_images(&self, srcs: Vec<String>, page_url: &url::Url) -> ImageMap {
+    async fn fetch_images(&self, srcs: Vec<String>, page_url: &url::Url, deadline: tokio::time::Instant) -> ImageMap {
         let mut fetched = ImageMap::new();
-        for (src, response) in self.fetch_subresources(srcs, page_url, "<img src>").await {
+        for (src, response) in self.fetch_subresources(srcs, page_url, "<img src>", deadline).await {
             // La DECODIFICACION sigue siendo secuencial a proposito: es
             // trabajo de CPU, no de red, y paralelizarla necesitaria sacarla
             // a un pool aparte. Lo que dominaba el tiempo era la espera de
@@ -3572,5 +3613,111 @@ mod tests {
         assert!(json2.contains("\"type\":\"accessibility_tree\""));
         assert!(json2.contains("(button) \\\"Guardar\\\""));
         assert!(json2.contains("(input) \\\"Tu nombre\\\""));
+    }
+
+    // ---- Tarea 1.2 del plan: tiempos limite de los subrecursos -------------
+
+    /// Servidor local: `/` y `/rapido.css` contestan al instante; cualquier
+    /// otra ruta acepta la conexion, lee la peticion y no contesta nunca (el
+    /// caso que antes dejaba la navegacion esperando para siempre). Devuelve
+    /// el origen y un contador de las peticiones que ha recibido.
+    fn server_with_slow_subresources() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    let mut buffer = [0u8; 4096];
+                    let read = stream.read(&mut buffer).unwrap_or(0);
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let (body, kind) = match path.as_str() {
+                        "/" => ("<html><head><title>rapida</title><link rel=\"stylesheet\" href=\"/rapido.css\"><link rel=\"stylesheet\" href=\"/lento.css\"></head><body><p>hola</p><img src=\"/lento1.png\"><img src=\"/lento2.png\"></body></html>", "text/html"),
+                        "/rapido.css" => ("h1 { color: #cc0000; }", "text/css"),
+                        _ => {
+                            std::thread::sleep(std::time::Duration::from_secs(60));
+                            return;
+                        }
+                    };
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    fn server_with_budget(timeout_ms: u64, budget_ms: u64) -> EngineServer {
+        // En memoria: estos tests no deben tocar las cookies ni el
+        // almacenamiento del perfil real.
+        let mut server = EngineServer::with_broker(engine_net::LocalBroker::in_memory().shared(), "local");
+        server.subresource_timeout = std::time::Duration::from_millis(timeout_ms);
+        server.subresource_budget = std::time::Duration::from_millis(budget_ms);
+        server
+    }
+
+    /// Una pagina cuyos recursos secundarios no contestan se carga igual: el
+    /// documento llega, los recursos lentos se omiten y se devuelve el estado.
+    /// Antes la navegacion esperaba para siempre. Los topes se bajan para no
+    /// esperar 8 y 10 s; el margen de 10 s del assert es contra maquinas
+    /// lentas, no el valor que se prueba.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_whose_subresources_never_answer_still_loads() {
+        let (origin, _hits) = server_with_slow_subresources();
+        let mut server = server_with_budget(300, 600);
+
+        let started = std::time::Instant::now();
+        let response = server.navigate(None, format!("{origin}/"), true).await;
+
+        assert!(matches!(response, EngineResponse::State { .. }), "debe devolver el estado, no un error: {response:?}");
+        assert!(server.active_tab().current_page.is_some(), "la pagina debe quedar cargada");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "tardo {:?}", started.elapsed());
+    }
+
+    /// Lo que llego a tiempo se conserva: la hoja rapida entra aunque la
+    /// lenta no conteste. El tope por recurso es de 2 s, no de 300 ms: la
+    /// hoja rapida tiene que llegar DENTRO de el, y en un build de depuracion
+    /// lento (el CI corre en Windows) 300 ms no es un margen fiable. Cuesta
+    /// 2 s de test, que es lo que tarda en rendirse la hoja lenta.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_arrived_in_time_is_kept_when_the_rest_times_out() {
+        let (origin, _hits) = server_with_slow_subresources();
+        let server = server_with_budget(2_000, 10_000);
+        let page_url = url::Url::parse(&format!("{origin}/")).unwrap();
+        let deadline = tokio::time::Instant::now() + server.subresource_budget;
+
+        let started = std::time::Instant::now();
+        let css = server.fetch_external_stylesheets(vec!["/lento.css".to_string(), "/rapido.css".to_string()], &page_url, deadline).await;
+
+        assert!(css.contains("color: #cc0000"), "la hoja rapida debe conservarse: {css:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "tardo {:?}", started.elapsed());
+    }
+
+    /// El tope compartido es de toda la pagina: con el tiempo ya agotado no se
+    /// hace ni una peticion mas (no se abre una conexion para abandonarla).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn once_the_shared_budget_is_spent_no_further_requests_are_made() {
+        let (origin, hits) = server_with_slow_subresources();
+        let server = server_with_budget(300, 0);
+        let page_url = url::Url::parse(&format!("{origin}/")).unwrap();
+        let deadline = tokio::time::Instant::now() + server.subresource_budget;
+
+        let css = server.fetch_external_stylesheets(vec!["/rapido.css".to_string()], &page_url, deadline).await;
+
+        assert!(css.is_empty(), "con el tiempo agotado no debe descargarse nada: {css:?}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "no debe llegar ninguna peticion al servidor");
+    }
+
+    /// Los valores por defecto son los del plan: no cambian por accidente.
+    #[test]
+    fn the_default_subresource_limits_are_the_ones_in_the_plan() {
+        assert_eq!(EngineServer::SUBRESOURCE_TIMEOUT, std::time::Duration::from_secs(8));
+        assert_eq!(EngineServer::SUBRESOURCE_BUDGET, std::time::Duration::from_secs(10));
     }
 }
