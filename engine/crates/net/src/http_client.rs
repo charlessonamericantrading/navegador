@@ -11,6 +11,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use hyper_rustls::HttpsConnector;
 use std::sync::Mutex;
+use std::time::Duration;
 
 #[derive(Error, Debug)]
 pub enum NetworkError {
@@ -28,6 +29,12 @@ pub enum NetworkError {
     TooManyRedirects(u8),
     #[error("failed to decompress response body ({0}): {1}")]
     Decompress(String, String),
+    /// El servidor no termino de contestar a tiempo (tarea 1.2 del plan):
+    /// no conecto, no mando las cabeceras o no acabo de mandar el cuerpo.
+    /// Es un error distinto de `Http` a proposito: quien llama puede decidir
+    /// que un recurso lento se omite sin tratarlo como una pagina rota.
+    #[error("la peticion a {url} no termino en {after:?}")]
+    Timeout { url: String, after: Duration },
     /// La respuesta llego bien pero el origen que la pidio no puede LEERLA
     /// (Fase 20, ver `crate::cors`). Es un error distinto de un fallo de
     /// red a proposito: la peticion si se hizo, el servidor si contesto, y
@@ -82,6 +89,18 @@ fn decompress_body(body: &[u8], content_encoding: Option<&str>) -> Result<Vec<u8
         _ => Ok(body.to_vec()),
     }
 }
+
+/// Cuanto se espera a que se abra la conexion TCP (tarea 1.2 del plan). Un
+/// servidor caido o una direccion que descarta paquetes en silencio dejaba
+/// antes la peticion esperando hasta el limite del sistema operativo, que
+/// puede ser de minutos.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cuanto dura como maximo una peticion ENTERA - conexion, cabeceras, cuerpo
+/// y todas las redirecciones que siga (tarea 1.2 del plan). Es el techo de
+/// seguridad; quien descarga subrecursos aplica uno mas corto
+/// (`core::server`).
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Limite de saltos de redireccion en una sola cadena antes de rendirse -
 /// mismo valor que usa el fetch spec de WHATWG (`redirect count` maximo),
@@ -147,6 +166,9 @@ pub struct NetworkEngine {
     /// (`header_for` purga caducadas de paso), asi que no habria lecturas
     /// concurrentes reales que ganar.
     cookies: Mutex<CookieStore>,
+    /// Techo de duracion de una peticion entera. Por defecto `REQUEST_TIMEOUT`;
+    /// los tests lo bajan con `with_request_timeout` para no esperar 20 s.
+    request_timeout: Duration,
 }
 
 /// rustls 0.23 exige un CryptoProvider de proceso instalado explicitamente
@@ -188,13 +210,39 @@ impl NetworkEngine {
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
 
+        // El conector TCP se construye aparte para poder ponerle el tiempo
+        // maximo de conexion; `https_or_http` exige que no imponga solo http.
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+        http.set_connect_timeout(Some(CONNECT_TIMEOUT));
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
             .enable_http1()
-            .build();
+            .wrap_connector(http);
         let client = Client::builder(TokioExecutor::new()).build(https);
-        Self { client, cookies: Mutex::new(cookies) }
+        Self { client, cookies: Mutex::new(cookies), request_timeout: REQUEST_TIMEOUT }
+    }
+
+    /// Cambia el techo de duracion de una peticion entera (por defecto
+    /// `REQUEST_TIMEOUT`). Existe para los tests.
+    #[must_use]
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
+    /// Hace la peticion con todas las politicas de abajo (redirecciones,
+    /// cookies, CORS) y con un techo de tiempo: si no ha terminado cuando se
+    /// agota `request_timeout`, se abandona y se devuelve `Timeout` (tarea 1.2
+    /// del plan). Antes un servidor que aceptaba la conexion y no contestaba
+    /// dejaba la peticion - y con ella la pagina entera - esperando para
+    /// siempre.
+    pub async fn fetch(&self, req: &NetworkRequest) -> Result<NetworkResponse, NetworkError> {
+        match tokio::time::timeout(self.request_timeout, self.fetch_without_deadline(req)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(NetworkError::Timeout { url: req.url.to_string(), after: self.request_timeout }),
+        }
     }
 
     /// Sigue redirecciones 301/302/303/307/308 de verdad en vez de devolver
@@ -209,7 +257,7 @@ impl NetworkEngine {
     /// comportamiento de facto que fetch/XHR estandarizaron despues). 307
     /// y 308 preservan metodo y cuerpo exactos, que es su unica razon de
     /// existir frente a 301/302.
-    pub async fn fetch(&self, req: &NetworkRequest) -> Result<NetworkResponse, NetworkError> {
+    async fn fetch_without_deadline(&self, req: &NetworkRequest) -> Result<NetworkResponse, NetworkError> {
         // Politica de mismo origen (Fase 20). Solo se aplica a peticiones
         // que trae un origen adjunto, es decir las que inicio un script
         // (`fetch`/XHR) - la navegacion y los subrecursos pasan de largo,
@@ -607,5 +655,67 @@ mod tests {
         let engine = NetworkEngine::new();
         engine.set_cookie_from_js("a=1", "no-es-una-url");
         assert_eq!(engine.cookie_header_for_js("tampoco-una-url"), "");
+    }
+
+    /// Servidor local para los tests de tiempo. `contesta` decide que hace con
+    /// cada conexion: `true` responde `ok` enseguida, `false` acepta, lee la
+    /// peticion y se queda callado (el caso que antes colgaba la pagina).
+    /// Devuelve la URL de su raiz. Vive en un hilo normal para no depender del
+    /// ejecutor de Tokio que se esta probando.
+    fn local_server(contesta: bool) -> String {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                std::thread::spawn(move || {
+                    let mut buffer = [0u8; 4096];
+                    let _ = stream.read(&mut buffer);
+                    if contesta {
+                        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+                    } else {
+                        std::thread::sleep(Duration::from_secs(60));
+                    }
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    /// Tarea 1.2 del plan: un servidor que acepta la conexion y no contesta
+    /// termina con `Timeout` en vez de dejar la peticion esperando. El techo
+    /// se baja a 300 ms para que el test no dure 20 s; el limite de 10 s del
+    /// assert es solo un margen enorme contra maquinas lentas, no el valor
+    /// que se prueba.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_that_never_answers_ends_with_a_timeout_error() {
+        let url = local_server(false);
+        let engine = NetworkEngine::new().with_request_timeout(Duration::from_millis(300));
+
+        let started = std::time::Instant::now();
+        let error = engine.fetch(&NetworkRequest::new(&url).unwrap()).await.expect_err("sin respuesta debe fallar, no esperar");
+
+        assert!(matches!(error, NetworkError::Timeout { .. }), "el error debe ser Timeout: {error:?}");
+        assert!(error.to_string().contains("127.0.0.1"), "el mensaje debe decir a que URL: {error}");
+        assert!(started.elapsed() < Duration::from_secs(10), "tardo {:?}", started.elapsed());
+    }
+
+    /// El conector nuevo (con tiempo maximo de conexion) y el techo no deben
+    /// afectar a una peticion normal: responde 200 con su cuerpo.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_normal_request_is_not_affected_by_the_timeouts() {
+        let url = local_server(true);
+        let response = NetworkEngine::new().fetch(&NetworkRequest::new(&url).unwrap()).await.expect("una peticion normal debe funcionar");
+        assert_eq!(response.status_code, 200);
+        assert_eq!(response.text(), "ok");
+    }
+
+    /// Los valores por defecto son los del plan: no cambian por accidente.
+    #[test]
+    fn the_default_limits_are_the_ones_in_the_plan() {
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(20));
+        assert_eq!(NetworkEngine::new().request_timeout, REQUEST_TIMEOUT);
     }
 }
