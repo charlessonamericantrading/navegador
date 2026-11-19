@@ -152,6 +152,12 @@ function resolveAppPath(baseDir, requestUrl) {
   }
   if (pathname.includes('\0')) return null;
   const relativa = pathname.replace(/^\/+/, '') || 'index.html';
+  // Ni la barra invertida ni una letra de unidad aparecen en las rutas que
+  // genera el empaquetador. En Windows serían un escape (`..\..\x`, `C:/x`),
+  // pero en Linux y macOS `path.resolve` los toma por un nombre de fichero
+  // cualquiera y la ruta se quedaría dentro. Se rechazan en todos los
+  // sistemas para que la regla no cambie con la plataforma.
+  if (relativa.includes('\\') || /^[a-zA-Z]:/.test(relativa)) return null;
   const raiz = path.resolve(baseDir);
   const destino = path.resolve(raiz, relativa);
   const desdeRaiz = path.relative(raiz, destino);
