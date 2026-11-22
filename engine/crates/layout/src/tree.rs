@@ -3828,6 +3828,74 @@ impl LayoutTreeBuilder {
     /// Coloca UN nodo inline-level (hoja de texto, o elemento inline cuyos
     /// hijos se recorren recursivamente con el MISMO cursor compartido) -
     /// ver `flow_inline_run` para la logica de ajuste de linea.
+    /// `display: inline-block` con `width` o `height` explicitos (tarea 2.3).
+    fn is_sized_inline_block(computed_style: &HashMap<String, String>) -> bool {
+        computed_style.get("display").map(String::as_str) == Some("inline-block")
+            && (computed_style.contains_key("width") || computed_style.contains_key("height"))
+    }
+
+    /// Coloca un `inline-block` con tamaño explicito como una caja atomica en
+    /// la linea: respeta `width`/`height`, `padding`, `border` y `margin`, salta
+    /// de linea si no cabe, y su contenido se reparte dentro de SU ancho (no del
+    /// de la linea). Antes un `<span style="display:inline-block;width:100px;
+    /// height:30px">` vacio medía 0x0 y no se pintaba.
+    ///
+    /// Simplificaciones: se alinea por arriba de la linea (no por la linea de
+    /// base) y `box-sizing` se trata siempre como `content-box`.
+    #[allow(clippy::too_many_arguments)]
+    fn place_sized_inline_block(node: &mut LayoutBox, origin_x: f32, inner_width: f32, text_line_height: f32, line_extent: &mut f32, cursor_x: &mut f32, cursor_y: &mut f32, font_set: Option<&FontSet>, images: &ImageMap) {
+        let padding = resolve_padding(&node.computed_style, inner_width);
+        let border = resolve_border_width(&node.computed_style);
+        let margin = resolve_margin(&node.computed_style, inner_width);
+        let explicit_width = node.computed_style.get("width").and_then(|v| parse_css_length_relative(v, inner_width));
+        let explicit_height = node.computed_style.get("height").and_then(|v| parse_css_length(v));
+        let horizontal_extras = padding.left + padding.right + border.left + border.right;
+        let vertical_extras = padding.top + padding.bottom + border.top + border.bottom;
+
+        // Salto de linea previo: solo si el ancho se conoce de antemano y no
+        // cabe en lo que queda de la linea (que ya tiene algo).
+        if let Some(width) = explicit_width {
+            let remaining = origin_x + inner_width - *cursor_x;
+            if width + horizontal_extras + margin.left + margin.right > remaining && *cursor_x > origin_x {
+                *cursor_y += *line_extent;
+                *cursor_x = origin_x;
+                *line_extent = text_line_height;
+            }
+        }
+
+        let box_x = *cursor_x + margin.left;
+        let box_y = *cursor_y + margin.top;
+        let content_x = box_x + border.left + padding.left;
+        let content_y = box_y + border.top + padding.top;
+        let available = (origin_x + inner_width - content_x - padding.right - border.right - margin.right).max(0.0);
+        let content_limit = explicit_width.unwrap_or(available);
+
+        // Los hijos se reparten en un contexto de linea propio: su ancho es el
+        // de esta caja, no el de la linea que la contiene.
+        let (mut child_x, mut child_y, mut child_extent) = (content_x, content_y, text_line_height);
+        for child in &mut node.children {
+            Self::place_inline_node(child, content_x, content_limit, text_line_height, &mut child_extent, &mut child_x, &mut child_y, font_set, images);
+        }
+        let natural_width = node
+            .children
+            .iter()
+            .filter(|c| c.dimensions.width > 0.0)
+            .map(|c| c.dimensions.x + c.dimensions.width - content_x)
+            .fold(0.0_f32, f32::max);
+        let natural_height = if node.children.is_empty() { 0.0 } else { (child_y - content_y) + child_extent };
+        let width = explicit_width.unwrap_or(natural_width);
+        let height = explicit_height.unwrap_or(natural_height);
+
+        node.dimensions = Rect { x: box_x, y: box_y, width: width + horizontal_extras, height: height + vertical_extras };
+        node.box_dimensions.content = Rect { x: content_x, y: content_y, width, height };
+        node.box_dimensions.padding = padding;
+        node.box_dimensions.border = border;
+        node.box_dimensions.margin = margin;
+
+        *cursor_x = box_x + node.dimensions.width + margin.right;
+        *line_extent = line_extent.max(margin.top + node.dimensions.height + margin.bottom);
+    }
+
     fn place_inline_node(node: &mut LayoutBox, origin_x: f32, inner_width: f32, text_line_height: f32, line_extent: &mut f32, cursor_x: &mut f32, cursor_y: &mut f32, font_set: Option<&FontSet>, images: &ImageMap) {
         // Mismo criterio que en `flow_block_children`: `position: absolute`/
         // `fixed` (Fase 3.3) no consume espacio ni avanza el cursor de la
@@ -3916,6 +3984,13 @@ impl LayoutTreeBuilder {
                 }
             }
             BoxType::Inline => {
+                // `display: inline-block` con `width`/`height` (tarea 2.3): una
+                // caja atomica del tamaño pedido, no el recorrido de hijos de
+                // un elemento inline normal (que ignora ambos).
+                if Self::is_sized_inline_block(&node.computed_style) {
+                    Self::place_sized_inline_block(node, origin_x, inner_width, text_line_height, line_extent, cursor_x, cursor_y, font_set, images);
+                    return;
+                }
                 // `padding`/`border` de elementos inline (span/a/b/button...)
                 // SI se resuelven: el spec real solo les da efecto HORIZONTAL
                 // sobre el flujo (empujan donde arrancan/terminan los hijos
@@ -3946,10 +4021,21 @@ impl LayoutTreeBuilder {
                 // fragmentos rectangulares, no uno) - simplificacion
                 // declarada, suficiente para pintar/hit-testear el caso
                 // comun.
+                // Si el contenido se partio en varias lineas, el cursor acaba a la
+                // izquierda de donde empezo y `cursor_x - start_x` salia negativo
+                // (se quedaba en 0: un enlace largo no se podia clicar). El
+                // rectangulo es la union de lo que contiene.
+                let (mut left, mut right) = (start_x, *cursor_x);
+                for child in &node.children {
+                    if child.dimensions.width > 0.0 {
+                        left = left.min(child.dimensions.x);
+                        right = right.max(child.dimensions.x + child.dimensions.width);
+                    }
+                }
                 node.dimensions = Rect {
-                    x: start_x,
+                    x: left,
                     y: start_y - padding.top - border.top,
-                    width: (*cursor_x - start_x).max(0.0),
+                    width: (right - left).max(0.0),
                     height: (*cursor_y - start_y) + *line_extent + padding.top + padding.bottom + border.top + border.bottom,
                 };
             }
@@ -4918,6 +5004,72 @@ mod tests {
 
         assert_eq!(a_box.dimensions.y, b_box.dimensions.y, "ambos deberian compartir la misma linea (misma y), no apilarse");
         assert!(a_box.dimensions.width < 100.0, "deberia encogerse a su contenido ('a'), no llenar los 800px del contenedor");
+    }
+
+    /// Tarea 2.3 (caso 13 del fixture): tres cuadrados `inline-block` de
+    /// 100x30 con margen, vacios, en una misma fila. Antes medían 0x0.
+    #[test]
+    fn empty_inline_blocks_with_explicit_size_keep_their_size_and_share_a_line() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="fila"><span id="a"></span><span id="b"></span><span id="c"></span></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse(
+            "body { margin: 0px; } span { display: inline-block; width: 100px; height: 30px; margin-right: 10px; background: #cc0000; }",
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("existe")).expect("tiene caja");
+        let (a, b, c) = (caja("a"), caja("b"), caja("c"));
+
+        assert_eq!((a.dimensions.width, a.dimensions.height), (100.0, 30.0));
+        assert_eq!((b.dimensions.width, b.dimensions.height), (100.0, 30.0));
+        assert_eq!(b.dimensions.x, a.dimensions.x + 110.0, "100 de ancho + 10 de margen");
+        assert_eq!(c.dimensions.x, b.dimensions.x + 110.0);
+        assert_eq!(a.dimensions.y, c.dimensions.y, "los tres en la misma linea");
+    }
+
+    #[test]
+    fn a_sized_inline_block_that_does_not_fit_wraps_to_the_next_line() {
+        let dom = HtmlParser::parse(r#"<html><body><span id="a"></span><span id="b"></span><span id="c"></span></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } span { display: inline-block; width: 100px; height: 30px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 250.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("existe")).expect("tiene caja");
+        let (a, b, c) = (caja("a"), caja("b"), caja("c"));
+
+        assert_eq!(a.dimensions.y, b.dimensions.y);
+        assert!(c.dimensions.y >= a.dimensions.y + 30.0, "el tercero no cabe en 250px y baja a otra linea ({} vs {})", c.dimensions.y, a.dimensions.y);
+        assert_eq!(c.dimensions.x, 0.0, "y empieza a la izquierda");
+    }
+
+    /// El texto de un `inline-block` con ancho explicito se reparte dentro de
+    /// ese ancho, y el alto automatico lo da el contenido.
+    #[test]
+    fn a_sized_inline_block_wraps_its_text_inside_its_own_width() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><span id="s">una frase bastante larga que no cabe en cien pixeles de ancho</span></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } span { display: inline-block; width: 100px; }");
+        let font_set = FontSet::load_default_sans_serif();
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        let s = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "s").expect("existe")).expect("tiene caja");
+
+        assert_eq!(s.dimensions.width, 100.0);
+        assert!(s.dimensions.height > 40.0, "varias lineas dentro de 100px de ancho: {}", s.dimensions.height);
+    }
+
+    /// Verificacion "de paso" de la tarea 2.3: un enlace cuyo texto ocupa varias
+    /// lineas informaba ancho 0 y no se podia clicar.
+    #[test]
+    fn an_inline_link_that_wraps_over_several_lines_still_has_a_clickable_box() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="width:150px"><a id="enlace" href="/x">un enlace con un texto lo bastante largo para ocupar varias lineas</a></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let font_set = FontSet::load_default_sans_serif();
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        let enlace = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "enlace").expect("existe")).expect("tiene caja");
+
+        assert!(enlace.dimensions.width > 0.0, "ancho 0 = imposible de clicar: {:?}", enlace.dimensions);
+        assert!(enlace.dimensions.height > 30.0, "ocupa varias lineas: {:?}", enlace.dimensions);
     }
 
     /// El reverso: `display:block` sobre una etiqueta naturalmente inline

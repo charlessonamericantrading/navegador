@@ -115,6 +115,13 @@ pub fn resolve_style(dom_node: &Arc<RwLock<Node>>, stylesheet: &StyleSheet, view
     // despues, sin importar especificidad (ver doc-comment del modulo).
     apply_matching_rules(&mut computed, user_agent_stylesheet(), dom_node, viewport_width);
 
+    // Atributos de presentacion (`bgcolor`, `width`, `cellpadding`...): CSS de
+    // especificidad cero que cae entre el agente de usuario y el autor (tarea
+    // 2.8). Cualquier regla de la pagina los vence.
+    for (property, value) in crate::presentational::presentational_hints(dom_node) {
+        computed.insert(property, value);
+    }
+
     // Origen 2: autor de la pagina - sobrescribe cualquier declaracion de
     // agente de usuario para la misma propiedad.
     apply_matching_rules(&mut computed, stylesheet, dom_node, viewport_width);
@@ -158,6 +165,73 @@ mod tests {
 
         let computed = resolve_style(&p, &stylesheet, 1280.0);
         assert_eq!(computed.get("color").map(String::as_str), Some("#ff0000"));
+    }
+
+    fn style_of(html: &str, tag: &str, css: &str) -> HashMap<String, String> {
+        let dom = HtmlParser::parse(html);
+        let stylesheet = Parser::parse(css);
+        resolve_style(&find_first_element(&dom, tag), &stylesheet, 1280.0)
+    }
+
+    /// Tarea 2.8: los atributos HTML de presentacion cuentan como CSS.
+    #[test]
+    fn presentational_attributes_become_css() {
+        let table = style_of(
+            r##"<html><body><table width="85%" bgcolor="#f6f6ef" border="2" cellspacing="3"><tr><td>x</td></tr></table></body></html>"##,
+            "table",
+            "",
+        );
+        assert_eq!(table.get("width").map(String::as_str), Some("85%"));
+        assert_eq!(table.get("background-color").map(String::as_str), Some("#f6f6ef"));
+        assert_eq!(table.get("border").map(String::as_str), Some("2px solid #808080"));
+        assert_eq!(table.get("border-spacing").map(String::as_str), Some("3px"));
+
+        let td = style_of(r##"<html><body><table cellpadding="5" border="1"><tr><td bgcolor="ff6600" width="40">x</td></tr></table></body></html>"##, "td", "");
+        assert_eq!(td.get("background-color").map(String::as_str), Some("#ff6600"), "bgcolor sin almohadilla");
+        assert_eq!(td.get("width").map(String::as_str), Some("40px"), "un numero suelto son pixeles");
+        assert_eq!(td.get("padding-left").map(String::as_str), Some("5px"), "cellpadding de la tabla, en cada lado");
+        assert_eq!(td.get("padding-top").map(String::as_str), Some("5px"));
+        assert_eq!(td.get("border").map(String::as_str), Some("1px solid #808080"), "las celdas heredan el borde de la tabla");
+    }
+
+    /// El CSS de la pagina siempre gana a un atributo de presentacion.
+    #[test]
+    fn author_css_beats_presentational_attributes() {
+        let table = style_of(
+            r##"<html><body><table width="85%" bgcolor="#f6f6ef"><tr><td>x</td></tr></table></body></html>"##,
+            "table",
+            "table { width: 300px; background-color: #000000; }",
+        );
+        assert_eq!(table.get("width").map(String::as_str), Some("300px"));
+        assert_eq!(table.get("background-color").map(String::as_str), Some("#000000"));
+    }
+
+    #[test]
+    fn presentational_attributes_beat_the_user_agent_sheet() {
+        let td = style_of(r##"<html><body><table cellpadding="0"><tr><td>x</td></tr></table></body></html>"##, "td", "");
+        assert_eq!(td.get("padding-left").map(String::as_str), Some("0px"), "cellpadding=0 gana a la regla de padding de td del agente de usuario");
+    }
+
+    #[test]
+    fn align_and_center_and_font_attributes() {
+        let p = style_of(r##"<html><body><p align="center">x</p></body></html>"##, "p", "");
+        assert_eq!(p.get("text-align").map(String::as_str), Some("center"));
+
+        let table = style_of(r##"<html><body><center><table><tr><td>x</td></tr></table></center></body></html>"##, "table", "");
+        assert_eq!(table.get("margin-left").map(String::as_str), Some("auto"), "una tabla dentro de <center> se centra");
+        assert_eq!(table.get("margin-right").map(String::as_str), Some("auto"));
+
+        let font = style_of(r##"<html><body><font color="#828282" size="1">x</font></body></html>"##, "font", "");
+        assert_eq!(font.get("color").map(String::as_str), Some("#828282"));
+        assert_eq!(font.get("font-size").map(String::as_str), Some("10px"));
+    }
+
+    #[test]
+    fn nonsense_attribute_values_are_ignored() {
+        let table = style_of(r##"<html><body><table width="abc" bgcolor="zz!!" border="x"><tr><td>x</td></tr></table></body></html>"##, "table", "");
+        assert_eq!(table.get("width"), None);
+        assert_eq!(table.get("background-color"), None);
+        assert_eq!(table.get("border"), None);
     }
 
     #[test]
