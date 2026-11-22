@@ -13,6 +13,13 @@ use engine_layout::{ImageMap, LayoutBox};
 use engine_text::FontSet;
 use tiny_skia::{Color, Pixmap};
 
+/// Color del lienzo cuando la pagina no declara fondo en `<html>` ni en
+/// `<body>`: blanco, igual que cualquier navegador. Antes era gris 245, asi
+/// que una pagina sin fondo propio (Google, Hacker News fuera de su tabla)
+/// se veia sobre un gris que no existe en el original. Compartido con la
+/// ventana nativa para que las dos superficies no vuelvan a discrepar.
+pub const DEFAULT_CANVAS_COLOR: [u8; 4] = [255, 255, 255, 255];
+
 pub fn render_layout_to_png(
     layout_root: &LayoutBox,
     font_set: Option<&FontSet>,
@@ -29,7 +36,10 @@ pub fn render_layout_to_png(
     let canvas_color = engine_layout::canvas_background(layout_root)
         .and_then(|value| crate::display_list::parse_css_color(&value))
         .map(|[r, g, b, a]| Color::from_rgba8(r, g, b, a))
-        .unwrap_or_else(|| Color::from_rgba8(245, 245, 245, 255));
+        .unwrap_or_else(|| {
+            let [r, g, b, a] = DEFAULT_CANVAS_COLOR;
+            Color::from_rgba8(r, g, b, a)
+        });
     pixmap.fill(canvas_color);
 
     let display_list = DisplayList::build(layout_root, images);
@@ -117,6 +127,21 @@ mod tests {
             render(&solo_visibles, 0.0),
             "una caja que asoma por el borde inferior TIENE que pintarse: si esto pasa, el descarte se esta comiendo pixeles visibles"
         );
+    }
+
+    /// Tarea 2.9 del plan: sin fondo declarado, el lienzo es blanco (255), no
+    /// el gris 245 de antes.
+    #[test]
+    fn a_page_without_a_background_is_painted_on_a_white_canvas() {
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.dimensions.width = 40.0;
+        root.dimensions.height = 30.0;
+        let png = render_layout_to_png(&root, None, &engine_layout::ImageMap::new(), 40, 30, 0.0).expect("PNG should encode");
+        let pixmap = Pixmap::decode_png(&png).expect("el PNG generado debe poder leerse");
+        for (x, y) in [(0, 0), (39, 29), (20, 15)] {
+            let pixel = pixmap.pixel(x, y).expect("pixel dentro del lienzo");
+            assert_eq!((pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()), (255, 255, 255, 255), "pixel ({x}, {y})");
+        }
     }
 
     #[test]
