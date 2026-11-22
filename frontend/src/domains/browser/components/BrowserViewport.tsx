@@ -28,13 +28,17 @@ interface BrowserViewportProps {
   screenshot: string;
   url: string;
   elements: InteractiveElement[];
+  /// Cuánto se ha desplazado el documento. `elements[].rect` es del
+  /// documento y los clics del usuario son del viewport (la captura): sin
+  /// restarlo, tras un scroll se buscaba el campo en el sitio equivocado.
+  scrollOffsetY: number;
   /// Fase 39: el motor descargo la pagina sin error, pero venia sin
   /// contenido visible y con `<script>` que lo habrian generado. Se pinta
   /// un aviso encima en vez de dejar el area en blanco sin explicacion.
   requiresJavascript: boolean;
   onManualNavigate: (url: string) => void;
   onManualClick: (x: number, y: number) => void;
-  onManualType: (x: number, y: number, text: string) => void;
+  onManualType: (elementId: number, text: string) => void;
   onManualResize: (width: number, height: number) => void;
   onManualScroll: (dy: number) => void;
   loading: boolean;
@@ -59,6 +63,7 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   screenshot,
   url,
   elements,
+  scrollOffsetY,
   requiresJavascript,
   onManualNavigate,
   onManualClick,
@@ -80,8 +85,10 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
 }) => {
   const [addressInput, setAddressInput] = useState(url || 'https://www.google.com');
   const [inputTextPopup, setInputTextPopup] = useState<{
+    /// Posición en coordenadas del DOCUMENTO (se resta el scroll al pintar).
     mx: number;
     my: number;
+    elementId: number;
     text: string;
     placeholder: string;
   } | null>(null);
@@ -253,13 +260,15 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
     const mappedX = Math.round(clickX * scaleX);
     const mappedY = Math.round(clickY * scaleY);
 
+    // `elements` está en coordenadas del documento; el clic, en las de la captura.
+    const documentY = mappedY + scrollOffsetY;
     const clickedInputEl = elements.find(el => {
       const { x, y, width, height } = el.rect;
       const isInside = (
         mappedX >= x &&
         mappedX <= x + width &&
-        mappedY >= y &&
-        mappedY <= y + height
+        documentY >= y &&
+        documentY <= y + height
       );
       return isInside && (el.tag_name === 'input' || el.tag_name === 'textarea');
     });
@@ -268,7 +277,8 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
       setInputTextPopup({
         mx: clickedInputEl.rect.x + clickedInputEl.rect.width / 2,
         my: clickedInputEl.rect.y + clickedInputEl.rect.height / 2,
-        text: '',
+        elementId: clickedInputEl.id,
+        text: clickedInputEl.attributes.value ?? '',
         placeholder: clickedInputEl.attributes.placeholder || 'Escribe texto...'
       });
     } else {
@@ -298,7 +308,7 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   const handlePopupSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (inputTextPopup) {
-      onManualType(inputTextPopup.mx, inputTextPopup.my, inputTextPopup.text);
+      onManualType(inputTextPopup.elementId, inputTextPopup.text);
       setInputTextPopup(null);
     }
   };
@@ -458,7 +468,7 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
             )}
 
             {inputTextPopup && (() => {
-              const { left, top } = toStagePx(inputTextPopup.mx, inputTextPopup.my);
+              const { left, top } = toStagePx(inputTextPopup.mx, inputTextPopup.my - scrollOffsetY);
               return (
               <form
                 onSubmit={handlePopupSubmit}

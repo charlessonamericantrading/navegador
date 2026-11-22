@@ -367,6 +367,28 @@ pub fn centro_de(estado: &Value, etiqueta: &str) -> (f64, f64) {
     )
 }
 
+/// Todo el texto visible de la pagina, leido del arbol de accesibilidad.
+///
+/// `elements` solo trae lo interactivo y visible (tarea 3.3 del plan): ya no
+/// sirve para comprobar que un texto llego a la pagina, como hacian estos
+/// tests cuando `elements` incluia hasta `<body>` con todo su texto.
+pub fn texto_visible(motor: &mut Motor) -> String {
+    fn recoger(nodo: &Value, salida: &mut String) {
+        if let Some(nombre) = nodo["name"].as_str() {
+            salida.push_str(nombre);
+            salida.push('\n');
+        }
+        for hijo in nodo["children"].as_array().into_iter().flatten() {
+            recoger(hijo, salida);
+        }
+    }
+    let arbol = motor.pedir(serde_json::json!({"type": "get_accessibility_tree", "id": "texto-visible"}));
+    assert_eq!(arbol["type"], "accessibility_tree", "no se pudo leer el arbol: {arbol}");
+    let mut texto = String::new();
+    recoger(&arbol["tree"]["root"], &mut texto);
+    texto
+}
+
 pub fn a_snake_case(nombre: &str) -> String {
     let mut salida = String::new();
     for (i, c) in nombre.chars().enumerate() {

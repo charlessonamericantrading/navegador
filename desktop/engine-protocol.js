@@ -56,6 +56,10 @@ const ESQUEMA = {
   scroll: { dx: campo.integer(...I32), dy: campo.integer(...I32) },
   type_text: { x: campo.finite(), y: campo.finite(), text: campo.string(MAX_TEXT), press_enter: campo.bool() },
   press_key: { key: campo.string(MAX_KEY) },
+  // Por id de la lista `elements`: el motor desplaza el elemento a la vista y
+  // calcula el punto, que es lo único fiable tras un scroll (tarea 3.1).
+  click_element: { element_id: campo.integer(...U32) },
+  type_into_element: { element_id: campo.integer(...U32), text: campo.string(MAX_TEXT), replace: campo.bool(), press_enter: campo.bool() },
   back: {},
   forward: {},
   new_tab: { url: campo.optionalString(MAX_URL) },

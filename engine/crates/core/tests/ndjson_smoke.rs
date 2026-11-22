@@ -268,6 +268,50 @@ fn click_type_text_y_press_key_son_aceptados_sobre_la_pagina() {
     assert_correlacionada(&r, "k1", "state");
 }
 
+/// Tarea 3.1: `click_element` y `type_into_element` actuan por el `id` de la
+/// lista `elements`, sin coordenadas, y funcionan igual con la pagina
+/// desplazada (el motor sabe donde esta el scroll; la interfaz no tiene por
+/// que saberlo).
+#[test]
+fn click_element_y_type_into_element_actuan_por_id_de_la_lista() {
+    let servidor = TestServer::nuevo(PAGINA);
+    let mut motor = Motor::arrancar();
+
+    let estado = motor.pedir(json!({"type": "navigate", "id": "n", "url": servidor.url("/")}));
+    let id_de = |etiqueta: &str| elemento_por_etiqueta(&estado, etiqueta)["id"].as_u64().unwrap();
+    let (boton, campo) = (id_de("button"), id_de("input"));
+
+    let r = motor.pedir(json!({"type": "click_element", "id": "c1", "element_id": boton}));
+    assert_correlacionada(&r, "c1", "state");
+
+    let r = motor.pedir(json!({
+        "type": "type_into_element", "id": "t1",
+        "element_id": campo, "text": "hola", "replace": true, "press_enter": false
+    }));
+    assert_correlacionada(&r, "t1", "state");
+    let r = motor.pedir(json!({
+        "type": "type_into_element", "id": "t2",
+        "element_id": campo, "text": "adios", "replace": true, "press_enter": false
+    }));
+    assert_correlacionada(&r, "t2", "state");
+
+    let escrito = motor.pedir(json!({"type": "get_state", "id": "s1"}));
+    assert_eq!(
+        elemento_por_etiqueta(&escrito, "input")["attributes"]["value"], "adios",
+        "con `replace` el segundo texto sustituye al primero"
+    );
+
+    // Un id que no existe es un error explicito, no un clic en otro sitio.
+    let r = motor.pedir(json!({"type": "click_element", "id": "c2", "element_id": 9999}));
+    assert_correlacionada(&r, "c2", "error");
+    // Escribir en algo que no es un campo, tambien.
+    let r = motor.pedir(json!({
+        "type": "type_into_element", "id": "t3",
+        "element_id": boton, "text": "x", "replace": false, "press_enter": false
+    }));
+    assert_correlacionada(&r, "t3", "error");
+}
+
 #[test]
 fn type_text_sobre_algo_que_no_es_un_campo_da_error_explicito() {
     let servidor = TestServer::nuevo(PAGINA);
@@ -478,6 +522,8 @@ fn todas_las_variantes_del_protocolo_estan_cubiertas() {
         "scroll",
         "type_text",
         "press_key",
+        "click_element",
+        "type_into_element",
         "back",
         "forward",
         "new_tab",

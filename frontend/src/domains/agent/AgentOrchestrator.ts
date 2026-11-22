@@ -71,8 +71,15 @@ export interface BrowserInterface {
   getElements: () => Promise<InteractiveElement[]>;
   getAccessibilityPrompt?: () => Promise<string>;
   navigate: (url: string) => Promise<void>;
-  click: (x: number, y: number) => Promise<void>;
-  typeText: (x: number, y: number, text: string) => Promise<void>;
+  /**
+   * Por `id` de la lista de elementos, no por coordenadas: las `rect` de la
+   * lista son del documento y el clic necesita las del viewport, que solo el
+   * motor conoce tras un scroll (tarea 3.1 del plan). El motor desplaza el
+   * elemento a la vista antes de actuar.
+   */
+  clickElement: (elementId: number) => Promise<void>;
+  /** Sustituye el valor del campo por `text` (no envía el formulario). */
+  typeIntoElement: (elementId: number, text: string) => Promise<void>;
   pressKey: (key: string) => Promise<void>;
 }
 
@@ -247,7 +254,6 @@ export class AgentOrchestrator {
    */
   private async executeAction(step: AgentStepResult, elements: InteractiveElement[]): Promise<ActionOutcome> {
     const fallo = (message: string): ActionOutcome => ({ message, finished: false, failed: true, answer: '' });
-    const centro = (el: InteractiveElement) => [Math.round(el.rect.x + el.rect.width / 2), Math.round(el.rect.y + el.rect.height / 2)] as const;
 
     try {
       switch (step.action) {
@@ -259,16 +265,14 @@ export class AgentOrchestrator {
         case 'click': {
           const el = elements.find((e) => e.id === step.target_id);
           if (!el) return fallo(`Elemento [${step.target_id}] no encontrado`);
-          const [x, y] = centro(el);
-          await this.browser.click(x, y);
+          await this.browser.clickElement(el.id);
           return { message: `Haciendo clic en [${el.id}] ${el.tag_name} '${el.text}'`, finished: false, failed: false, answer: '' };
         }
         case 'type': {
           const el = elements.find((e) => e.id === step.target_id);
           if (!el) return fallo(`Campo de entrada [${step.target_id}] no encontrado`);
-          const [x, y] = centro(el);
           const text = step.text || '';
-          await this.browser.typeText(x, y, text);
+          await this.browser.typeIntoElement(el.id, text);
           return { message: `Escribiendo '${text}' en [${el.id}] ${el.tag_name}`, finished: false, failed: false, answer: '' };
         }
         case 'press': {

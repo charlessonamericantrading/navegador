@@ -78,10 +78,31 @@ def serve_fixtures():
     return server.server_address[1]
 
 
+def accessible_texts(engine, timeout):
+    """Texto de cada nodo del arbol de accesibilidad, en orden de documento.
+
+    `elements` (la lista de la respuesta `state`) solo trae lo interactivo
+    desde la tarea 3.3; para leer el texto de una pagina hay que mirar el
+    arbol de accesibilidad.
+    """
+    response = engine.request(timeout, type="get_accessibility_tree")
+    texts = []
+
+    def walk(node):
+        if node.get("name"):
+            texts.append(node["name"])
+        for child in node.get("children", []):
+            walk(child)
+
+    if response.get("type") == "accessibility_tree":
+        walk(response["tree"]["root"])
+    return texts
+
+
 def brief(response):
     keys = ("type", "seconds", "bytes", "url", "title", "message")
     out = {k: response[k] for k in keys if k in response}
-    if "elements" in response:
+    if response.get("elements") is not None:
         out["elements"] = len(response["elements"])
     return out
 
@@ -118,9 +139,11 @@ def main():
                 f.write(base64.b64decode(nav["screenshot"]))
             print("captura      ", args.out)
         if args.texts:
-            for element in nav["elements"]:
-                if element["tag_name"] == "p":
-                    print("   ", element["text"][:140])
+            seen = set()
+            for text in accessible_texts(engine, args.timeout):
+                if text not in seen:
+                    seen.add(text)
+                    print("   ", text[:140])
         steps = [
             ("scroll       ", dict(type="scroll", dx=0, dy=600)),
             ("click vacio  ", dict(type="click", x=2, y=2)),

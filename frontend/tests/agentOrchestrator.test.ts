@@ -36,8 +36,8 @@ function navegadorFalso(url = 'https://google.com/', elementos: InteractiveEleme
     getTitle: async () => 'Google',
     getElements: async () => elementos,
     navigate: async (u) => { acciones.push(`navigate ${u}`); },
-    click: async (x, y) => { acciones.push(`click ${x},${y}`); },
-    typeText: async (_x, _y, text) => { acciones.push(`type ${text}`); },
+    clickElement: async (id) => { acciones.push(`click [${id}]`); },
+    typeIntoElement: async (id, text) => { acciones.push(`type [${id}] ${text}`); },
     pressKey: async (key) => { acciones.push(`press ${key}`); },
   };
   return { browser, acciones };
@@ -127,18 +127,18 @@ test('escribir y enviar son pasos distintos', async () => {
 
   await agente.runStep('busca gatos', 'simulation'); // navegar a Google
   await agente.runStep('busca gatos', 'simulation'); // escribir la consulta
-  assert.deepEqual(acciones.slice(1), ['type gatos'], 'escribir no debe pulsar Enter por su cuenta');
+  assert.deepEqual(acciones.slice(1), ['type [1] gatos'], 'escribir no debe pulsar Enter por su cuenta');
 
   const envio = await agente.runStep('busca gatos', 'simulation');
   assert.equal(envio.action, 'press');
-  assert.deepEqual(acciones.slice(1), ['type gatos', 'press Enter']);
+  assert.deepEqual(acciones.slice(1), ['type [1] gatos', 'press Enter']);
 });
 
 // --- Fallos que antes se daban por éxito (H15) ---
 
 test('un error del motor es un paso fallido, no el fin de la tarea, y el modelo lo ve', async () => {
   const { browser } = navegadorFalso();
-  browser.click = async () => { throw new BrowserActionError('element_not_found'); };
+  browser.clickElement = async () => { throw new BrowserActionError('element_not_found'); };
   const { modelo, prompts } = modeloQueResponde(JSON.stringify({ thought: 't', action: 'click', target_id: 1 }));
   const agente = new AgentOrchestrator(browser, modelo);
 
@@ -149,6 +149,19 @@ test('un error del motor es un paso fallido, no el fin de la tarea, y el modelo 
 
   await agente.runStep('objetivo', 'gemini');
   assert.match(prompts[1], /FALLÓ: Error al ejecutar acción: element_not_found/, 'el siguiente prompt tiene que contar el fallo');
+});
+
+test('clic y escritura del agente van por id de elemento, no por coordenadas (tarea 3.1)', async () => {
+  const { browser, acciones } = navegadorFalso();
+  const { modelo } = modeloQueResponde(
+    JSON.stringify({ thought: 't', action: 'click', target_id: 1 }),
+    JSON.stringify({ thought: 't', action: 'type', target_id: 1, text: 'hola' }),
+  );
+  const agente = new AgentOrchestrator(browser, modelo);
+
+  await agente.runStep('objetivo', 'gemini');
+  await agente.runStep('objetivo', 'gemini');
+  assert.deepEqual(acciones, ['click [1]', 'type [1] hola']);
 });
 
 test('una acción desconocida falla sin tocar el navegador', async () => {

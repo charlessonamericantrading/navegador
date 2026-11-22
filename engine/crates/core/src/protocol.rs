@@ -48,6 +48,27 @@ pub enum EngineRequest {
         id: Option<String>,
         key: String,
     },
+    /// Clic en un elemento de la lista `elements` por su `id` (tarea 3.1 del
+    /// plan). Las coordenadas de `elements[].rect` son del DOCUMENTO, y
+    /// `click` espera coordenadas de VIEWPORT: tras un scroll no coinciden.
+    /// Con esta peticion el motor desplaza el elemento a la vista y calcula
+    /// el punto exacto, que es la unica forma fiable de clicar lo que se ve.
+    ClickElement {
+        id: Option<String>,
+        element_id: u32,
+    },
+    /// Escribe en un elemento de la lista `elements` por su `id` (tarea 3.1).
+    /// `replace` borra antes el valor actual (rellenar un formulario no debe
+    /// concatenar al texto que ya hubiera).
+    TypeIntoElement {
+        id: Option<String>,
+        element_id: u32,
+        text: String,
+        #[serde(default)]
+        replace: bool,
+        #[serde(default)]
+        press_enter: bool,
+    },
     /// Historial atras/adelante (Fase 4.4) - sin parametros propios: la URL
     /// a la que ir ya se conoce del historial que `EngineServer` mantiene
     /// internamente (ver `server::EngineServer::back`/`forward`), igual
@@ -104,6 +125,8 @@ impl EngineRequest {
             | Self::Scroll { id, .. }
             | Self::TypeText { id, .. }
             | Self::PressKey { id, .. }
+            | Self::ClickElement { id, .. }
+            | Self::TypeIntoElement { id, .. }
             | Self::Back { id }
             | Self::Forward { id }
             | Self::NewTab { id, .. }

@@ -16,6 +16,20 @@ test('acepta las peticiones reales de la interfaz y devuelve una copia limpia', 
   assert.deepEqual(validateEngineRequest({ type: 'list_tabs' }), { type: 'list_tabs' });
 });
 
+test('acepta click_element y type_into_element, y descarta lo que sobra', () => {
+  assert.deepEqual(validateEngineRequest({ type: 'click_element', element_id: 7 }), { type: 'click_element', element_id: 7 });
+  assert.deepEqual(
+    validateEngineRequest({ type: 'type_into_element', element_id: 3, text: 'hola', replace: true, press_enter: false }),
+    { type: 'type_into_element', element_id: 3, text: 'hola', replace: true, press_enter: false },
+  );
+  assert.throws(() => validateEngineRequest({ type: 'click_element', element_id: -1 }), /entero/);
+  assert.throws(() => validateEngineRequest({ type: 'click_element', element_id: 1.5 }), /entero/);
+  assert.throws(() => validateEngineRequest({ type: 'click_element' }), /entero/);
+  assert.throws(() => validateEngineRequest({ type: 'click_element', element_id: 1, x: 5 }), /campo no permitido/);
+  assert.throws(() => validateEngineRequest({ type: 'type_into_element', element_id: 1, text: 'a', replace: 'si', press_enter: false }), /booleano/);
+  assert.throws(() => validateEngineRequest({ type: 'type_into_element', element_id: 1, text: 'x'.repeat(100_001), replace: false, press_enter: false }), /supera/);
+});
+
 test('el id del renderer se descarta: lo pone el proceso principal', () => {
   assert.deepEqual(validateEngineRequest({ type: 'ping', id: 'suplantado' }), { type: 'ping' });
 });

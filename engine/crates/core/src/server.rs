@@ -430,6 +430,21 @@ impl EngineServer {
                 press_enter,
             } => (self.type_text(id, x, y, text, press_enter).await, false),
             EngineRequest::PressKey { id, key } => (self.press_key(id, key).await, false),
+            EngineRequest::ClickElement { element_id, .. } => match self.locate_element(element_id) {
+                Ok((x, y)) => (self.click(id, x, y).await, false),
+                Err(message) => (Self::error(id, message), false),
+            },
+            EngineRequest::TypeIntoElement { element_id, text, replace, press_enter, .. } => {
+                match self.locate_element(element_id) {
+                    Ok((x, y)) => {
+                        if replace {
+                            self.clear_control_value_at(x, y);
+                        }
+                        (self.type_text(id, x, y, text, press_enter).await, false)
+                    }
+                    Err(message) => (Self::error(id, message), false),
+                }
+            }
             EngineRequest::Back { .. } => (self.back(id).await, false),
             EngineRequest::Forward { .. } => (self.forward(id).await, false),
             EngineRequest::NewTab { url, .. } => (self.open_new_tab(id, url).await, false),
@@ -1434,6 +1449,63 @@ impl EngineServer {
         self.state_response(id)
     }
 
+    /// Resuelve un `id` de la lista `elements` al punto donde clicarlo, en
+    /// coordenadas de VIEWPORT (las que esperan `click` y `type_text`), y
+    /// desplaza la pagina si ese punto queda fuera de la ventana (tarea 3.1).
+    ///
+    /// El `id` es la posicion en la lista que se calcula AHORA mismo con la
+    /// misma funcion que la respuesta de `state`: si la pagina cambio desde
+    /// que se pidio el estado, el `id` puede apuntar a otro elemento, igual
+    /// que le pasaria a un humano que clica sobre una captura antigua. Por
+    /// eso quien actua debe pedir el estado antes de cada acción.
+    fn locate_element(&mut self, element_id: u32) -> Result<(f32, f32), String> {
+        let viewport_height = self.height as f32;
+        let tab = self.active_tab_mut();
+        let Some(page) = &tab.current_page else {
+            return Err("no hay ninguna página cargada".to_string());
+        };
+        let targets = collect_interactive_targets(&page.page.layout_root);
+        let Some((element, _)) = targets.get(element_id as usize) else {
+            return Err(format!(
+                "el elemento [{element_id}] no existe: la página tiene {} elementos interactivos; pide el estado de nuevo",
+                targets.len()
+            ));
+        };
+        let rect = &element.rect;
+        // Un elemento mas alto que la ventana se apunta por su parte
+        // superior visible, no por su centro (que podria quedar fuera).
+        let point_x = rect.x + rect.width / 2.0;
+        let point_y = if rect.height > viewport_height {
+            rect.y + viewport_height / 2.0
+        } else {
+            rect.y + rect.height / 2.0
+        };
+        let mut offset = tab.scroll_offset_y;
+        if point_y < offset || point_y >= offset + viewport_height {
+            let content_extent = page.page.layout_root.content_extent();
+            offset = clamp_scroll_offset(point_y - viewport_height / 2.0, content_extent, viewport_height);
+            page.publish_scroll_offset(offset);
+            tab.scroll_offset_y = offset;
+        }
+        Ok((point_x, point_y - offset))
+    }
+
+    /// `replace` de `type_into_element`: vacia el `value` del control de texto
+    /// que hay en ese punto del viewport. Si no es un control de texto no
+    /// toca nada; `type_text` ya devuelve el error adecuado.
+    fn clear_control_value_at(&mut self, x: f32, y: f32) {
+        let scroll_offset_y = self.active_tab().scroll_offset_y;
+        let Some(page) = &self.active_tab().current_page else { return };
+        let Some(node) = page.page.layout_root.hit_test(x, y + scroll_offset_y) else { return };
+        if !is_text_control(&node) {
+            return;
+        }
+        let mut node_guard = node.write().unwrap();
+        if let NodeType::Element { attributes, .. } = &mut node_guard.node_type {
+            attributes.insert("value".to_string(), String::new());
+        }
+    }
+
     /// `key` es el mismo string que `KeyboardEvent.key` real (`"Backspace"`,
     /// `"a"`, `"Enter"`...) - se usa TANTO para poblar `event.key` (via
     /// `dispatch_keyboard_event`, Fase 4.1) COMO para decidir si hay una
@@ -2365,9 +2437,69 @@ async fn write_response(
 }
 
 fn collect_interactive_elements(layout_root: &engine_layout::LayoutBox) -> Vec<InteractiveElement> {
-    let mut elements = Vec::new();
-    collect_elements_recursive(layout_root, &mut elements);
-    elements
+    collect_interactive_targets(layout_root).into_iter().map(|(element, _)| element).collect()
+}
+
+/// Tope de la lista `elements` (tarea 3.3). Antes se devolvia TODO elemento
+/// de la pagina (miles en una web real: 4,8 MB de JSON en Wikipedia) y el
+/// agente se ahogaba. Quien necesite mas, puede desplazar la pagina.
+const MAX_INTERACTIVE_ELEMENTS: usize = 500;
+/// El texto de cada elemento se recorta: un menu entero dentro de un `<nav>`
+/// no ayuda a decidir donde clicar.
+const MAX_ELEMENT_TEXT_CHARS: usize = 120;
+
+/// Roles ARIA que convierten cualquier etiqueta en algo con lo que se puede
+/// interactuar.
+const INTERACTIVE_ROLES: &[&str] = &[
+    "button", "link", "textbox", "searchbox", "combobox", "checkbox", "radio", "switch", "tab",
+    "menuitem", "menuitemcheckbox", "menuitemradio", "option", "slider", "spinbutton", "listbox",
+];
+
+/// ¿Se puede interactuar con este elemento? Es la definicion de la lista
+/// `elements` (tarea 3.3): enlaces con destino, controles de formulario y
+/// lo que la propia pagina declara como accionable (`role`, `onclick`,
+/// `tabindex`, `contenteditable`). Un `<div>` o un `<p>` sin nada de eso no
+/// es un objetivo: su texto ya viaja en el de su ancestro interactivo y en
+/// la captura.
+fn is_interactive_element(tag_name: &str, attributes: &HashMap<String, String>) -> bool {
+    match tag_name {
+        "a" => return attributes.contains_key("href"),
+        "button" | "select" | "textarea" | "summary" => return true,
+        "input" => return attributes.get("type").map(|kind| !kind.eq_ignore_ascii_case("hidden")).unwrap_or(true),
+        _ => {}
+    }
+    if attributes.get("role").is_some_and(|role| INTERACTIVE_ROLES.contains(&role.trim().to_ascii_lowercase().as_str())) {
+        return true;
+    }
+    if attributes.contains_key("onclick") {
+        return true;
+    }
+    if attributes.get("contenteditable").is_some_and(|value| !value.eq_ignore_ascii_case("false")) {
+        return true;
+    }
+    // `tabindex="-1"` hace el elemento enfocable solo por codigo, no por el
+    // usuario: no es un objetivo.
+    attributes.get("tabindex").and_then(|value| value.trim().parse::<i32>().ok()).is_some_and(|index| index >= 0)
+}
+
+/// Un elemento sin area no se ve ni se puede clicar. Excepcion: un enlace de
+/// anchura cero con altura (su contenido es un icono o un elemento vacio que
+/// el motor aun no sabe medir) sigue siendo un destino de navegacion util.
+fn is_visible_target(tag_name: &str, rect: &ElementRect) -> bool {
+    rect.height > 0.0 && (rect.width > 0.0 || tag_name == "a")
+}
+
+/// La lista de elementos interactivos y visibles, cada uno con su nodo del
+/// DOM. El `id` de cada elemento es su posicion en esta lista: tanto
+/// `state` como `click_element`/`type_into_element` la recalculan con esta
+/// misma funcion, asi que coinciden mientras la pagina no cambie.
+fn collect_interactive_targets(
+    layout_root: &engine_layout::LayoutBox,
+) -> Vec<(InteractiveElement, std::sync::Arc<std::sync::RwLock<Node>>)> {
+    let mut targets = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    collect_targets_recursive(layout_root, &mut targets, &mut seen);
+    targets
 }
 
 /// El texto VISIBLE de un elemento para la lista `elements` del protocolo
@@ -2439,49 +2571,69 @@ fn collect_visible_text_recursive(layout_box: &LayoutBox, out: &mut String) {
     }
 }
 
-fn collect_elements_recursive(
+fn collect_targets_recursive(
     layout_box: &engine_layout::LayoutBox,
-    elements: &mut Vec<InteractiveElement>,
+    targets: &mut Vec<(InteractiveElement, std::sync::Arc<std::sync::RwLock<Node>>)>,
+    seen: &mut std::collections::HashSet<usize>,
 ) {
+    if targets.len() >= MAX_INTERACTIVE_ELEMENTS {
+        return;
+    }
     if let Some(node) = &layout_box.dom_node {
         let node_guard = node.read().unwrap();
-        if let NodeType::Element {
-            tag_name,
-            attributes,
-        } = &node_guard.node_type
-        {
-            let id = elements.len() as u32;
-            let selector = attributes
-                .get("id")
-                .map(|value| format!("#{value}"))
-                .unwrap_or_else(|| tag_name.clone());
-            elements.push(InteractiveElement {
-                id,
-                tag_name: tag_name.clone(),
-                text: collect_visible_text(layout_box),
-                rect: ElementRect {
-                    x: layout_box.dimensions.x,
-                    y: layout_box.dimensions.y,
-                    width: layout_box.dimensions.width,
-                    height: layout_box.dimensions.height,
-                },
-                selector,
-                attributes: ElementAttributes {
-                    id: attributes.get("id").cloned(),
-                    name: attributes.get("name").cloned(),
-                    placeholder: attributes.get("placeholder").cloned(),
-                    element_type: attributes.get("type").cloned(),
-                    role: attributes.get("role").cloned(),
-                    href: attributes.get("href").cloned(),
-                    value: attributes.get("value").cloned(),
-                    checked: attributes.contains_key("checked"),
-                },
-            });
+        if let NodeType::Element { tag_name, attributes } = &node_guard.node_type {
+            let rect = ElementRect {
+                x: layout_box.dimensions.x,
+                y: layout_box.dimensions.y,
+                width: layout_box.dimensions.width,
+                height: layout_box.dimensions.height,
+            };
+            // Un mismo nodo puede tener varias cajas (anonimas, fragmentos):
+            // se lista una sola vez, la primera.
+            let is_new = seen.insert(std::sync::Arc::as_ptr(node) as usize);
+            if is_new && is_interactive_element(tag_name, attributes) && is_visible_target(tag_name, &rect) {
+                let selector = attributes
+                    .get("id")
+                    .map(|value| format!("#{value}"))
+                    .unwrap_or_else(|| tag_name.clone());
+                targets.push((
+                    InteractiveElement {
+                        id: targets.len() as u32,
+                        tag_name: tag_name.clone(),
+                        text: short_label(&collect_visible_text(layout_box)),
+                        rect,
+                        selector,
+                        attributes: ElementAttributes {
+                            id: attributes.get("id").cloned(),
+                            name: attributes.get("name").cloned(),
+                            placeholder: attributes.get("placeholder").cloned(),
+                            element_type: attributes.get("type").cloned(),
+                            role: attributes.get("role").cloned(),
+                            href: attributes.get("href").cloned(),
+                            value: attributes.get("value").cloned(),
+                            checked: attributes.contains_key("checked"),
+                        },
+                    },
+                    node.clone(),
+                ));
+            }
         }
     }
     for child in &layout_box.children {
-        collect_elements_recursive(child, elements);
+        collect_targets_recursive(child, targets, seen);
     }
+}
+
+/// Texto de un elemento para la lista: espacios colapsados (el layout
+/// conserva los de entre etiquetas) y recortado.
+fn short_label(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAX_ELEMENT_TEXT_CHARS {
+        return collapsed;
+    }
+    let mut shortened: String = collapsed.chars().take(MAX_ELEMENT_TEXT_CHARS).collect();
+    shortened.push('…');
+    shortened
 }
 
 #[cfg(test)]
@@ -2716,6 +2868,174 @@ mod tests {
             focused_node: None,
         });
         server
+    }
+
+    fn server_from_html(html: &str) -> EngineServer {
+        let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+        let mut server = EngineServer::new();
+        let tab = server.active_tab_mut();
+        tab.current_page = Some(LoadedPage {
+            url: "http://ejemplo.test/".to_string(),
+            title: String::new(),
+            page,
+            runtime,
+            font_set: None,
+            images: ImageMap::new(),
+            focused_node: None,
+        });
+        server
+    }
+
+    async fn state_elements(server: &mut EngineServer) -> Vec<InteractiveElement> {
+        let (state, _) = server.handle(EngineRequest::GetState { id: None }).await;
+        let EngineResponse::State { elements, .. } = state else { panic!("get_state debe devolver un State") };
+        elements.expect("get_state trae la lista de elementos")
+    }
+
+    /// Tarea 3.3: `elements` solo trae lo accionable y visible. Antes traia
+    /// cada etiqueta de la pagina (4,8 MB en Wikipedia).
+    #[tokio::test]
+    async fn elements_lists_only_visible_interactive_targets() {
+        let mut server = server_from_html(
+            "<html><body>\
+             <p>texto suelto</p><div>otro bloque</div>\
+             <a href=\"/a\">enlace</a><a name=\"ancla\">sin destino</a>\
+             <button>Pulsar</button><input type=\"hidden\" name=\"h\"><input type=\"text\" name=\"q\">\
+             <select><option>uno</option></select><textarea></textarea>\
+             <div onclick=\"1\">accionable</div><div role=\"button\">rol</div>\
+             <div tabindex=\"0\">enfocable</div><div tabindex=\"-1\">solo por codigo</div>\
+             <div style=\"display:none\"><button>oculto</button></div>\
+             <div tabindex=\"0\"></div>\
+             <a href=\"/vacio\"></a>\
+             </body></html>",
+        );
+        let elements = state_elements(&mut server).await;
+        let tags: Vec<_> = elements.iter().map(|e| (e.tag_name.as_str(), e.text.as_str())).collect();
+        assert_eq!(
+            tags,
+            vec![
+                ("a", "enlace"),
+                ("button", "Pulsar"),
+                ("input", ""),
+                ("select", "uno"),
+                ("textarea", ""),
+                ("div", "accionable"),
+                ("div", "rol"),
+                ("div", "enfocable"),
+                // El <div tabindex> vacio (alto 0) no esta; el enlace vacio si:
+                // sin ancho pero con alto sigue siendo un destino de navegacion.
+                ("a", ""),
+            ],
+            "solo elementos interactivos y visibles, en orden de documento"
+        );
+        let ids: Vec<u32> = elements.iter().map(|e| e.id).collect();
+        assert_eq!(ids, (0..elements.len() as u32).collect::<Vec<_>>(), "los ids son la posicion en la lista");
+    }
+
+    #[tokio::test]
+    async fn element_text_is_collapsed_and_truncated() {
+        let largo = "palabra ".repeat(60);
+        let mut server = server_from_html(&format!("<html><body><a href=\"/x\">  uno \n\n   dos </a><a href=\"/y\">{largo}</a></body></html>"));
+        let elements = state_elements(&mut server).await;
+        assert_eq!(elements[0].text, "uno dos", "espacios colapsados");
+        assert!(elements[1].text.chars().count() <= MAX_ELEMENT_TEXT_CHARS + 1, "recortado: {}", elements[1].text.chars().count());
+        assert!(elements[1].text.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn the_element_list_is_capped() {
+        let botones = "<button>b</button>".repeat(MAX_INTERACTIVE_ELEMENTS + 50);
+        let mut server = server_from_html(&format!("<html><body>{botones}</body></html>"));
+        assert_eq!(state_elements(&mut server).await.len(), MAX_INTERACTIVE_ELEMENTS);
+    }
+
+    const TALL_PAGE_WITH_FORM: &str = "<html><body><div style=\"height:3000px\">relleno</div>\
+        <button id=\"abajo\">Abajo</button>\
+        <input id=\"campo\" type=\"text\" value=\"viejo\">\
+        <div style=\"height:1000px\">mas relleno</div>\
+        <script>var pulsado = false; document.getElementById('abajo').addEventListener('click', function() { pulsado = true; });</script>\
+        </body></html>";
+
+    fn element_id(elements: &[InteractiveElement], dom_id: &str) -> u32 {
+        elements.iter().find(|e| e.attributes.id.as_deref() == Some(dom_id)).unwrap_or_else(|| panic!("no hay #{dom_id}")).id
+    }
+
+    /// Tarea 3.1: antes, clicar por las coordenadas de `elements[].rect`
+    /// (del DOCUMENTO) fallaba en cuanto la pagina estaba desplazada, porque
+    /// `click` espera coordenadas de VIEWPORT. `click_element` lo resuelve
+    /// dentro del motor, que es quien sabe donde esta el scroll.
+    #[tokio::test]
+    async fn click_element_scrolls_the_target_into_view_and_clicks_it() {
+        let mut server = server_from_html(TALL_PAGE_WITH_FORM);
+        let elements = state_elements(&mut server).await;
+        let boton = element_id(&elements, "abajo");
+        assert_eq!(server.active_tab().scroll_offset_y, 0.0);
+
+        let (response, _) = server.handle(EngineRequest::ClickElement { id: Some("c".to_string()), element_id: boton }).await;
+        let EngineResponse::State { scroll_offset_y, .. } = response else { panic!("click_element debe devolver un State: {response:?}") };
+        assert!(scroll_offset_y > 2000.0, "el boton estaba a 3000 px: la pagina debio desplazarse ({scroll_offset_y})");
+        let runtime = &mut server.active_tab_mut().current_page.as_mut().expect("pagina").runtime;
+        assert_eq!(runtime.eval("pulsado").unwrap(), "true", "el listener de click del boton se ejecuto");
+    }
+
+    #[tokio::test]
+    async fn click_element_also_works_when_the_page_is_already_scrolled_somewhere_else() {
+        let mut server = server_from_html(TALL_PAGE_WITH_FORM);
+        let elements = state_elements(&mut server).await;
+        let boton = element_id(&elements, "abajo");
+        server.handle(EngineRequest::Scroll { id: None, dx: 0, dy: 1200 }).await;
+        server.handle(EngineRequest::ClickElement { id: None, element_id: boton }).await;
+        let runtime = &mut server.active_tab_mut().current_page.as_mut().expect("pagina").runtime;
+        assert_eq!(runtime.eval("pulsado").unwrap(), "true");
+    }
+
+    #[tokio::test]
+    async fn type_into_element_appends_by_default_and_replaces_on_request() {
+        let mut server = server_from_html(TALL_PAGE_WITH_FORM);
+        let elements = state_elements(&mut server).await;
+        let campo = element_id(&elements, "campo");
+        let valor = |server: &mut EngineServer| {
+            let page = &server.active_tab().current_page.as_ref().expect("pagina").page;
+            let campo = Node::find_by_id(&page.dom_root, "campo").expect("el campo existe");
+            let guard = campo.read().unwrap();
+            match &guard.node_type {
+                NodeType::Element { attributes, .. } => attributes.get("value").cloned().unwrap_or_default(),
+                _ => String::new(),
+            }
+        };
+
+        let (response, _) = server
+            .handle(EngineRequest::TypeIntoElement { id: None, element_id: campo, text: "+nuevo".to_string(), replace: false, press_enter: false })
+            .await;
+        assert!(matches!(response, EngineResponse::State { .. }), "{response:?}");
+        assert_eq!(valor(&mut server), "viejo+nuevo", "sin replace se añade al final");
+        assert!(server.active_tab().scroll_offset_y > 2000.0, "y la pagina se desplazo hasta el campo");
+
+        server
+            .handle(EngineRequest::TypeIntoElement { id: None, element_id: campo, text: "limpio".to_string(), replace: true, press_enter: false })
+            .await;
+        assert_eq!(valor(&mut server), "limpio", "con replace se sustituye el valor");
+    }
+
+    #[tokio::test]
+    async fn type_into_a_non_text_element_is_a_clear_error() {
+        let mut server = server_from_html(TALL_PAGE_WITH_FORM);
+        let elements = state_elements(&mut server).await;
+        let boton = element_id(&elements, "abajo");
+        let (response, _) = server
+            .handle(EngineRequest::TypeIntoElement { id: None, element_id: boton, text: "x".to_string(), replace: true, press_enter: false })
+            .await;
+        let EngineResponse::Error { message, .. } = response else { panic!("debe ser un error") };
+        assert!(message.contains("control de texto"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_element_id_is_an_error_not_a_click_somewhere_else() {
+        let mut server = server_from_html(TALL_PAGE_WITH_FORM);
+        let (response, _) = server.handle(EngineRequest::ClickElement { id: Some("c".to_string()), element_id: 999 }).await;
+        let EngineResponse::Error { message, .. } = response else { panic!("debe ser un error") };
+        assert!(message.contains("[999]") && message.contains("pide el estado"), "{message}");
+        assert_eq!(server.active_tab().scroll_offset_y, 0.0, "y no se movio nada");
     }
 
     /// El punto real de esta tarea: un `document.addEventListener('scroll',

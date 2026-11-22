@@ -75,8 +75,12 @@ def through_mirror(url, ports):
     return urllib.parse.urlunsplit(("http", f"127.0.0.1:{ports[parts.netloc]}", parts.path, parts.query, ""))
 
 
-def count_js_ok(elements):
-    return sum(1 for e in elements if e["tag_name"] == "p" and JS_OK.match(e["text"].strip()))
+def count_js_ok(engine, timeout):
+    """Cuantas de las 12 comprobaciones del fixture JS terminaron en OK. El
+    texto se lee del arbol de accesibilidad: `elements` ya solo trae lo
+    interactivo y los <p> del fixture no lo son."""
+    oks = {text.strip()[0] for text in driver.accessible_texts(engine, timeout) if JS_OK.match(text.strip())}
+    return len(oks)
 
 
 def measure(engine_path, url, timeout, out_png=None, count_js=False):
@@ -96,7 +100,7 @@ def measure(engine_path, url, timeout, out_png=None, count_js=False):
             with open(out_png, "wb") as f:
                 f.write(base64.b64decode(nav["screenshot"]))
         if count_js:
-            note = f"js {count_js_ok(nav['elements'])}/{JS_CHECKS}"
+            note = f"js {count_js_ok(engine, timeout)}/{JS_CHECKS}"
         steps = (
             ("scroll", dict(type="scroll", dx=0, dy=600)),
             ("clic", dict(type="click", x=2, y=2)),

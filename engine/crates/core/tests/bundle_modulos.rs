@@ -29,7 +29,7 @@
 
 mod common;
 
-use common::{Motor, TestServer};
+use common::{texto_visible, Motor, TestServer};
 use serde_json::json;
 
 /// `index.html` como lo emite un bundler: cáscara vacía más el módulo.
@@ -98,10 +98,10 @@ fn un_bundle_con_modulos_se_ejecuta_y_pinta_su_contenido() {
     // como modulo (antes era un error de sintaxis en su primer `import`), el
     // `<link rel="modulepreload">` se descargo, el `import` lo encontro, y las
     // mutaciones del DOM llegaron al arbol de layout.
-    let texto = serde_json::to_string(&estado).unwrap();
+    let texto = texto_visible(&mut motor);
     assert!(
         texto.contains("Hola desde el bundle"),
-        "el modulo no llego a pintar su contenido. Estado: {}",
+        "el modulo no llego a pintar su contenido. Texto: {}",
         &texto[..texto.len().min(1200)]
     );
     assert!(
@@ -152,7 +152,8 @@ fn el_modulo_raiz_puede_manipular_el_dom_como_un_script_clasico() {
     let mut motor = Motor::arrancar();
 
     let estado = motor.pedir(json!({"type": "navigate", "id": "m", "url": servidor.url("/")}));
-    let texto = serde_json::to_string(&estado).unwrap();
+    assert_eq!(estado["type"], "state", "la navegacion fallo: {estado}");
+    let texto = texto_visible(&mut motor);
     assert!(
         texto.contains("escrito por el modulo"),
         "el modulo no vio el mismo document que el resto de la pagina"
@@ -177,7 +178,8 @@ fn un_modulo_en_linea_tambien_se_ejecuta_como_modulo() {
     let mut motor = Motor::arrancar();
 
     let estado = motor.pedir(json!({"type": "navigate", "id": "i", "url": servidor.url("/")}));
-    let texto = serde_json::to_string(&estado).unwrap();
+    assert_eq!(estado["type"], "state", "la navegacion fallo: {estado}");
+    let texto = texto_visible(&mut motor);
     assert!(
         texto.contains("es modulo"),
         "un <script type=\"module\"> en linea no se evaluo como modulo"
@@ -204,7 +206,8 @@ fn nomodule_se_omite_cuando_el_motor_ejecuta_modulos() {
     let mut motor = Motor::arrancar();
 
     let estado = motor.pedir(json!({"type": "navigate", "id": "n", "url": servidor.url("/")}));
-    let texto = serde_json::to_string(&estado).unwrap();
+    assert_eq!(estado["type"], "state", "la navegacion fallo: {estado}");
+    let texto = texto_visible(&mut motor);
     assert!(
         texto.contains("moderno"),
         "deberia haber ganado el modulo: {}",
@@ -261,7 +264,8 @@ fn defer_corre_despues_que_un_script_clasico_aunque_venga_antes_en_el_documento(
     let mut motor = Motor::arrancar();
 
     let estado = motor.pedir(json!({"type": "navigate", "id": "d", "url": servidor.url("/")}));
-    let texto = serde_json::to_string(&estado).unwrap();
+    assert_eq!(estado["type"], "state", "la navegacion fallo: {estado}");
+    let texto = texto_visible(&mut motor);
     assert!(
         texto.contains("primero fue pronto"),
         "el `defer` no espero al script clasico: {}",

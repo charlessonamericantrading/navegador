@@ -39,6 +39,9 @@ function App() {
   // contenido lo genera JavaScript que todavia no se ejecuta. Sin esto la
   // pantalla se quedaba en blanco sin un solo mensaje.
   const [requiresJavascript, setRequiresJavascript] = useState(false);
+  // Desplazamiento vertical del documento. Las `rect` de `elements` son del
+  // DOCUMENTO; para saber dónde están en la captura hay que restarlo.
+  const [scrollOffsetY, setScrollOffsetY] = useState(0);
   const [loading, setLoading] = useState(false);
   // Historial y pestañas: el motor los soporta desde hace tiempo y los
   // reporta en cada `state` (`can_go_back`/`can_go_forward`/`tab_id`),
@@ -108,6 +111,7 @@ function App() {
     // reemplazan cuando llegan.
     if (data.elements !== undefined) setElements(data.elements);
     if (data.requires_javascript !== undefined) setRequiresJavascript(Boolean(data.requires_javascript));
+    if (typeof data.scroll_offset_y === 'number') setScrollOffsetY(data.scroll_offset_y);
     setCanGoBack(Boolean(data.can_go_back));
     setCanGoForward(Boolean(data.can_go_forward));
     if (typeof data.tab_id === 'number') setActiveTabId(data.tab_id);
@@ -417,9 +421,12 @@ function App() {
     sendCommand({ type: 'click', x, y });
   };
 
-  const handleManualType = (x: number, y: number, text: string) => {
+  // Por id de elemento: el motor sabe dónde está el scroll y desplaza el campo
+  // a la vista (tarea 3.1). `replace`: la ventana emergente parte del valor
+  // actual del campo, así que lo que se envía es el valor final.
+  const handleManualType = (elementId: number, text: string) => {
     if (loading) return;
-    sendCommand({ type: 'type_text', x, y, text, press_enter: true });
+    sendCommand({ type: 'type_into_element', element_id: elementId, text, replace: true, press_enter: true });
   };
 
   const handleManualScroll = (dy: number) => {
@@ -455,15 +462,15 @@ function App() {
       await runEngineCommand({ type: 'navigate', url });
       refreshTabs();
     },
-    click: async (x: number, y: number) => {
-      await runEngineCommand({ type: 'click', x, y });
+    clickElement: async (elementId: number) => {
+      await runEngineCommand({ type: 'click_element', element_id: elementId });
     },
     // Rellenar no envía (plan H17): enviar es `pressKey('Enter')`, un paso
     // aparte que el agente tiene que decidir. La escritura manual
     // (`handleManualType`) sigue enviando: la dispara el propio usuario al
     // confirmar la ventana emergente de texto del viewport.
-    typeText: async (x: number, y: number, text: string) => {
-      await runEngineCommand({ type: 'type_text', x, y, text, press_enter: false });
+    typeIntoElement: async (elementId: number, text: string) => {
+      await runEngineCommand({ type: 'type_into_element', element_id: elementId, text, replace: true, press_enter: false });
     },
     pressKey: async (key: string) => {
       await runEngineCommand({ type: 'press_key', key });
@@ -522,6 +529,7 @@ function App() {
           screenshot={screenshot}
           url={browserUrl}
           elements={elements}
+          scrollOffsetY={scrollOffsetY}
           requiresJavascript={requiresJavascript}
           onManualNavigate={handleManualNavigate}
           onManualClick={handleManualClick}
