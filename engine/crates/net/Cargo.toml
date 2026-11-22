@@ -24,6 +24,10 @@ brotli.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
+# Decodificacion de texto segun el charset (tarea 1.6 del plan): ISO-8859-1,
+# Windows-1252, Shift_JIS, GBK, KOI8-R... Es la misma biblioteca que usa Firefox;
+# cada codificacion heredada tiene sus propios casos borde y no se reimplementa.
+encoding_rs = "0.8"
 psl.workspace = true
 # Tokens del canal del broker (ADR 0001, etapa 2): aleatoriedad del sistema.
 # La misma version que ya compila `ring` (rustls), no entra codigo nuevo.
