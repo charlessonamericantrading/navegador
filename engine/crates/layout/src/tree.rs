@@ -2455,7 +2455,17 @@ impl LayoutTreeBuilder {
                 // cualquier RACHA de espacios en blanco a uno solo, sin
                 // quitar los bordes por completo.
                 let collapsed = collapse_whitespace(content);
-                if !collapsed.trim().is_empty() {
+                // Un texto SOLO en blanco entre dos elementos en linea
+                // (`<b>a</b> <i>b</i>`) es el espacio que separa las palabras
+                // (tarea 2.2 del plan). Antes se descartaba siempre y
+                // "negrita cursiva enlace" salia pegado. Solo se conserva
+                // cuando de verdad separa algo; ver `keeps_inter_element_space`.
+                let keep = if collapsed.trim().is_empty() {
+                    !collapsed.is_empty() && Self::keeps_inter_element_space(parent_layout_box)
+                } else {
+                    true
+                };
+                if keep {
                     let mut text_box = LayoutBox::new(BoxType::Text(collapsed));
                     text_box.computed_style = inherited.clone();
                     parent_layout_box.children.push(text_box);
@@ -3492,6 +3502,26 @@ impl LayoutTreeBuilder {
         matches!(b.box_type, BoxType::Text(_) | BoxType::Inline | BoxType::Image(_) | BoxType::Replaced)
     }
 
+    /// Si un texto SOLO en blanco que viene despues de lo ya construido en
+    /// `parent` debe conservarse como un espacio (tarea 2.2 del plan).
+    ///
+    /// Sí cuando lo que lo precede es un elemento o texto en linea: es el
+    /// espacio entre palabras. No cuando es el primer hijo, o lo precede un
+    /// bloque (el espacio de `</div>\n<div>` no genera nada), ni dentro de
+    /// un contenedor flex/grid/tabla, donde el espacio en blanco entre hijos
+    /// nunca se pinta y no debe convertirse en un elemento anonimo.
+    ///
+    /// El espacio de principio y de fin de linea se descarta despues, al
+    /// colocar la racha (`place_inline_node` le da ancho cero).
+    fn keeps_inter_element_space(parent: &LayoutBox) -> bool {
+        let display = parent.computed_style.get("display").map(|v| v.trim().to_ascii_lowercase());
+        let lays_children_out_itself = matches!(
+            display.as_deref(),
+            Some("flex" | "inline-flex" | "grid" | "inline-grid" | "table" | "table-row" | "table-row-group" | "table-header-group" | "table-footer-group" | "table-column" | "table-column-group")
+        );
+        !lays_children_out_itself && parent.children.last().is_some_and(Self::is_inline_level)
+    }
+
     /// Coloca una RACHA de hijos inline-level (`BoxType::Text`/
     /// `BoxType::Inline` consecutivos, ya sea texto suelto o elementos como
     /// `span`/`a`/`b`/`i`) fluyendo horizontalmente en lineas reales, en vez
@@ -3551,6 +3581,14 @@ impl LayoutTreeBuilder {
         let mut line_extent = text_line_height;
         for node in nodes.iter_mut() {
             Self::place_inline_node(node, origin_x, inner_width, text_line_height, &mut line_extent, &mut cursor_x, &mut cursor_y, font_set, images);
+        }
+        // El espacio al final de la racha (`<b>x</b> ` antes de un bloque o del
+        // cierre del padre) no debe contar: desplazaria el centrado.
+        for node in nodes.iter_mut().rev() {
+            match &node.box_type {
+                BoxType::Text(content) if content.trim().is_empty() => node.dimensions.width = 0.0,
+                _ => break,
+            }
         }
         if text_align != TextAlign::Left {
             Self::apply_text_align(nodes, origin_x, inner_width, text_align);
@@ -3694,6 +3732,22 @@ impl LayoutTreeBuilder {
                     // del motor sin fuente real.
                     None => content.len() as f32 * 8.0,
                 };
+
+                // Un espacio entre elementos en linea (tarea 2.2): ocupa su ancho
+                // solo si esta en medio de una linea y cabe. Al principio de una
+                // linea o al final no ocupa nada, y nunca provoca un salto: en
+                // CSS los espacios en los bordes de una linea desaparecen.
+                if content.trim().is_empty() {
+                    let space_width = match font {
+                        Some(f) => engine_text::measure_text(f, " ", font_size).width,
+                        None => content.len() as f32 * 8.0,
+                    };
+                    let fits = *cursor_x > origin_x && space_width <= origin_x + inner_width - *cursor_x;
+                    let width = if fits { space_width } else { 0.0 };
+                    node.dimensions = Rect { x: *cursor_x, y: *cursor_y, width, height: text_line_height };
+                    *cursor_x += width;
+                    return;
+                }
 
                 let mut remaining = origin_x + inner_width - *cursor_x;
                 if natural_width > remaining && *cursor_x > origin_x {
@@ -5986,6 +6040,55 @@ mod tests {
 
         assert_eq!(caja.dimensions.x, 0.0);
         assert_eq!(caja.box_dimensions.margin.left, 0.0);
+    }
+
+    /// Tarea 2.2 del plan: el espacio entre elementos en linea se conserva.
+    /// Sin fuente la anchura de un espacio es 8 px (la aproximacion del motor),
+    /// asi que el hueco entre `<b>` e `<i>` debe ser exactamente 8.
+    #[test]
+    fn a_space_between_two_inline_elements_is_kept() {
+        let dom = HtmlParser::parse(r##"<html><body style="margin:0"><p id="p" style="margin:0">Texto <b id="b">negrita</b> <i id="i">cursiva</i> <a id="a" href="#">enlace</a> fin</p></body></html>"##);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let (b, i, a) = (box_of(&root, &dom, "b"), box_of(&root, &dom, "i"), box_of(&root, &dom, "a"));
+
+        assert_eq!(i.dimensions.x - (b.dimensions.x + b.dimensions.width), 8.0, "hueco entre <b> e <i>");
+        assert_eq!(a.dimensions.x - (i.dimensions.x + i.dimensions.width), 8.0, "hueco entre <i> y <a>");
+    }
+
+    /// Los espacios de los bordes de una racha no ocupan nada: ni al principio
+    /// ni al final del parrafo.
+    #[test]
+    fn whitespace_at_the_edges_of_an_inline_run_takes_no_room() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><p id="p" style="margin:0">   <b id="b">x</b>   </p></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let (p, b) = (box_of(&root, &dom, "p"), box_of(&root, &dom, "b"));
+
+        assert_eq!(b.dimensions.x, p.dimensions.x, "el espacio inicial no empuja el contenido");
+        let trailing = p.children.last().expect("el parrafo tiene hijos");
+        assert!(matches!(&trailing.box_type, BoxType::Text(t) if t.trim().is_empty()), "el espacio final se conserva como caja");
+        assert_eq!(trailing.dimensions.width, 0.0, "pero sin ancho");
+    }
+
+    /// El espacio en blanco entre bloques no genera cajas (el salto de linea
+    /// entre `</div>` y `<div>` es lo mas comun de cualquier HTML).
+    #[test]
+    fn whitespace_between_block_siblings_creates_no_boxes() {
+        let dom = HtmlParser::parse("<html><body id=\"cuerpo\"><div>uno</div>\n   <div>dos</div>\n</body></html>");
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let body = box_of(&root, &dom, "cuerpo");
+
+        assert_eq!(body.children.len(), 2, "solo los dos <div>, sin cajas de espacio: {:?}", body.children.iter().map(|c| &c.box_type).collect::<Vec<_>>());
+    }
+
+    /// Dentro de un contenedor flex el espacio entre hijos no es un elemento
+    /// anonimo: el contenedor tiene exactamente sus dos hijos.
+    #[test]
+    fn whitespace_inside_a_flex_container_creates_no_anonymous_item() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="f" style="display:flex"><span>a</span> <span>b</span> </div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let flex = box_of(&root, &dom, "f");
+
+        assert_eq!(flex.children.len(), 2, "{:?}", flex.children.iter().map(|c| &c.box_type).collect::<Vec<_>>());
     }
 
     #[test]
