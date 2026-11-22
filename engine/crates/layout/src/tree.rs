@@ -1136,6 +1136,27 @@ fn resolve_block_width(computed_style: &HashMap<String, String>, auto_width: f32
     resolve_block_width_with_reference(computed_style, auto_width, auto_width)
 }
 
+/// Resuelve `line-height` a pixeles (tarea 2.6 del plan). `None` cuando es
+/// `normal` o no se entiende: quien llama usa entonces la altura natural de
+/// la fuente, que es lo que hacia el motor siempre.
+///
+/// Un numero sin unidad (`1.5`) es un multiplicador del tamaño de fuente DE
+/// ESA CAJA; un porcentaje tambien se mide sobre su propio tamaño de fuente;
+/// los `em` ya llegan en pixeles desde la cascada.
+fn resolve_line_height(raw: &str, font_size: f32) -> Option<f32> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("normal") || trimmed.is_empty() {
+        return None;
+    }
+    if let Some(percent) = trimmed.strip_suffix('%') {
+        return percent.trim().parse::<f32>().ok().filter(|n| *n >= 0.0).map(|n| n / 100.0 * font_size);
+    }
+    if let Ok(multiplier) = trimmed.parse::<f32>() {
+        return (multiplier >= 0.0).then_some(multiplier * font_size);
+    }
+    parse_css_length(trimmed)
+}
+
 /// `auto_width` es el ancho que se usa cuando `width` es `auto` (lo que
 /// queda del contenedor tras los margenes); `percent_reference` es contra lo
 /// que se resuelven los porcentajes de `width`, `min-width`, `max-width` y
@@ -2524,6 +2545,16 @@ impl LayoutTreeBuilder {
                 if keep {
                     let mut text_box = LayoutBox::new(BoxType::Text(collapsed));
                     text_box.computed_style = inherited.clone();
+                    // `line-height` heredado en `em` (`1.5em`) llega crudo: las
+                    // hojas de texto no pasan por la conversion de unidades de
+                    // arriba, asi que se resuelve aqui con SU tamaño de fuente
+                    // (tarea 2.6). Un numero sin unidad (`1.5`) se deja como esta.
+                    if let Some(raw) = text_box.computed_style.get("line-height").cloned() {
+                        let font_px = text_box.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
+                        if let Some(resolved) = resolve_relative_units(&raw, font_px, viewport) {
+                            text_box.computed_style.insert("line-height".to_string(), resolved);
+                        }
+                    }
                     parent_layout_box.children.push(text_box);
                 }
             }
@@ -3616,7 +3647,7 @@ impl LayoutTreeBuilder {
         INLINE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
-        let text_line_height = match font_set {
+        let natural_line_height = match font_set {
             Some(set) => {
                 let (font_size, bold, italic) = Self::first_leaf_font_info(nodes).unwrap_or((INITIAL_FONT_SIZE, false, false));
                 match set.pick(bold, italic) {
@@ -3626,6 +3657,13 @@ impl LayoutTreeBuilder {
             }
             None => LINE_HEIGHT_FALLBACK,
         };
+        // `line-height` declarado (tarea 2.6): sustituye a la altura natural de
+        // la fuente y se deja resuelto en las hojas para el pintado.
+        let declared_line_height = Self::first_leaf_line_height(nodes);
+        let text_line_height = declared_line_height.unwrap_or(natural_line_height);
+        if let Some(height) = declared_line_height {
+            Self::set_run_line_height(nodes, height);
+        }
 
         let mut cursor_x = origin_x;
         let mut cursor_y = start_y;
@@ -3747,6 +3785,44 @@ impl LayoutTreeBuilder {
             }
         }
         None
+    }
+
+    /// El `line-height` declarado de la primera hoja de texto de la racha, ya
+    /// en pixeles (tarea 2.6). Mismo criterio de "la primera hoja manda" que
+    /// `first_leaf_font_info`: una racha usa una altura de linea uniforme.
+    fn first_leaf_line_height(nodes: &[LayoutBox]) -> Option<f32> {
+        for node in nodes {
+            match &node.box_type {
+                BoxType::Text(_) => {
+                    let font_size = node.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
+                    return node.computed_style.get("line-height").and_then(|v| resolve_line_height(v, font_size));
+                }
+                BoxType::Inline => {
+                    if let Some(height) = Self::first_leaf_line_height(&node.children) {
+                        return Some(height);
+                    }
+                }
+                BoxType::Block | BoxType::Image(_) | BoxType::Replaced => {}
+            }
+        }
+        None
+    }
+
+    /// Deja en cada hoja de texto de la racha su `line-height` YA resuelto en
+    /// pixeles, en la clave aparte `line-height-px` (la `line-height` original,
+    /// que es heredable y puede ser un numero, no se toca). Quien pinta lo lee
+    /// de ahi para repartir las lineas de un texto que se parte con el mismo
+    /// interlineado que reservo el layout.
+    fn set_run_line_height(nodes: &mut [LayoutBox], line_height: f32) {
+        for node in nodes {
+            match &node.box_type {
+                BoxType::Text(_) => {
+                    node.computed_style.insert("line-height-px".to_string(), format!("{line_height}px"));
+                }
+                BoxType::Inline => Self::set_run_line_height(&mut node.children, line_height),
+                BoxType::Block | BoxType::Image(_) | BoxType::Replaced => {}
+            }
+        }
     }
 
     /// Coloca UN nodo inline-level (hoja de texto, o elemento inline cuyos
@@ -6184,6 +6260,39 @@ mod tests {
         assert_eq!(a.box_dimensions.margin.left, 105.0, "10% de 1000 mas 5px");
         assert_eq!(a.dimensions.x, 105.0);
         assert_eq!(a.dimensions.width, 980.0, "el 100% es el contenedor entero (1000), no lo que queda tras el margen");
+    }
+
+    /// Tarea 2.6 del plan: `line-height` fija la altura de la linea. Sin fuente
+    /// la altura natural es 22 px (la aproximacion del motor), asi que cualquier
+    /// otro valor demuestra que se aplico.
+    #[test]
+    fn line_height_sets_the_height_of_a_line_of_text() {
+        let alto = |estilo: &str| {
+            let dom = HtmlParser::parse(&format!(r#"<html><body style="margin:0"><p id="p" style="margin:0; font-size: 20px; {estilo}">Texto</p></body></html>"#));
+            let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+            box_of(&root, &dom, "p").dimensions.height
+        };
+
+        assert_eq!(alto("line-height: 40px"), 40.0, "en pixeles");
+        assert_eq!(alto("line-height: 2"), 40.0, "multiplicador sin unidad: 2 x 20px");
+        assert_eq!(alto("line-height: 150%"), 30.0, "porcentaje del tamaño de fuente");
+        assert_eq!(alto("line-height: 1.5em"), 30.0, "em, ya convertido a pixeles por la cascada");
+        assert_eq!(alto("line-height: normal"), 22.0, "normal: la altura natural");
+        assert_eq!(alto(""), 22.0, "sin declarar: la altura natural");
+    }
+
+    /// `line-height` se hereda, y las hojas de texto quedan con el valor ya
+    /// resuelto en pixeles para que el pintado reparta las lineas igual.
+    #[test]
+    fn line_height_is_inherited_and_left_resolved_on_the_text_leaves() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div style="line-height: 30px"><p id="p" style="margin:0">x</p></div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let p = box_of(&root, &dom, "p");
+
+        assert_eq!(p.dimensions.height, 30.0, "el <p> hereda el line-height del <div>");
+        let hoja = p.children.first().expect("el <p> tiene su texto");
+        assert_eq!(hoja.computed_style.get("line-height-px").map(String::as_str), Some("30px"));
+        assert_eq!(hoja.computed_style.get("line-height").map(String::as_str), Some("30px"), "el valor heredado original sigue ahi");
     }
 
     #[test]

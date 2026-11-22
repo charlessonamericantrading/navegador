@@ -77,8 +77,8 @@ pub fn paint_display_list(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: 
                     fill_shape(pixmap, rect, *radius, &paint_of(*color), scroll_offset_y, current_mask.as_ref());
                 }
             }
-            DisplayItem::Text { rect, text, color, font_size, bold, italic, underline, text_align } => {
-                paint_text(pixmap, rect, text, *color, *font_size, *bold, *italic, *underline, *text_align, font_set, scroll_offset_y, current_mask.as_ref());
+            DisplayItem::Text { rect, text, color, font_size, bold, italic, underline, text_align, line_height } => {
+                paint_text(pixmap, rect, text, *color, *font_size, *bold, *italic, *underline, *text_align, *line_height, font_set, scroll_offset_y, current_mask.as_ref());
             }
             DisplayItem::Border { rect, width: border_width, color, radius } => {
                 paint_border(pixmap, rect, *border_width, *color, *radius, scroll_offset_y, current_mask.as_ref());
@@ -390,6 +390,7 @@ fn paint_text(
     italic: bool,
     underline: bool,
     text_align: TextAlign,
+    line_height: Option<f32>,
     font_set: Option<&FontSet>,
     scroll_offset_y: f32,
     mask: Option<&Mask>,
@@ -404,9 +405,14 @@ fn paint_text(
             // lineas que se pinta aqui coincide con el que se reservo alli
             // por construccion, no por coincidencia.
             let lines = wrap_text(font, text, font_size, rect.width);
-            let line_height = engine_text::line_height(font, font_size);
+            let natural_height = engine_text::line_height(font, font_size);
+            // Con un `line-height` mayor (o menor) que el natural, cada linea
+            // avanza ese tanto y el texto se centra verticalmente dentro de
+            // ella: la mitad de la diferencia va arriba ("half-leading").
+            let line_height = line_height.unwrap_or(natural_height);
+            let half_leading = (line_height - natural_height) / 2.0;
             for (index, line) in lines.iter().enumerate() {
-                let line_y = screen_y + index as f32 * line_height;
+                let line_y = screen_y + index as f32 * line_height + half_leading;
                 // `text-align` (Fase 31) DENTRO de una caja que envuelve
                 // varias lineas por si sola - el unico caso que
                 // `engine-layout` deja sin resolver (ver el aviso de
@@ -791,6 +797,7 @@ mod tests {
                 italic: false,
                 underline,
                 text_align: TextAlign::Left,
+                line_height: None,
             }];
             paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
             pixmap
@@ -824,6 +831,7 @@ mod tests {
             italic: false,
             underline: true,
             text_align: TextAlign::Left,
+            line_height: None,
         }];
         paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
         assert!(pixmap.pixels().iter().all(|p| p.alpha() == 0), "una linea en blanco no deberia pintar nada, ni siquiera un subrayado");
@@ -854,6 +862,7 @@ mod tests {
                 italic: false,
                 underline: false,
                 text_align,
+                line_height: None,
             }];
             paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
             let width = pixmap.width();

@@ -36,7 +36,9 @@ pub enum DisplayItem {
     /// `resolve_text_align` mas abajo) - el resto de `text-align` ya lo
     /// resolvio `engine-layout` desplazando la caja entera antes de
     /// llegar aqui.
-    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool, underline: bool, text_align: TextAlign },
+    /// `line_height` (tarea 2.6): la altura de linea en pixeles que el layout
+    /// resolvio desde `line-height`; `None` usa la altura natural de la fuente.
+    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool, underline: bool, text_align: TextAlign, line_height: Option<f32> },
     /// `rect` es el border-box COMPLETO (`layout_box.dimensions`, que ya
     /// incluye el propio border - ver `engine_layout::tree::
     /// flow_block_children`); quien pinta esto (`engine-gfx/src/paint.rs`)
@@ -132,7 +134,35 @@ impl DisplayList {
         list
     }
 
+    /// Envoltorio de `build_items_inner` que aplica `opacity` (tarea 2.6 del
+    /// plan): lo que emitio la caja y todo su subarbol queda con el alfa
+    /// multiplicado por la opacidad. Al envolver cada nivel, las opacidades
+    /// anidadas se multiplican solas (0.5 dentro de 0.5 = 0.25).
+    ///
+    /// Aproximacion declarada: es la opacidad de CADA elemento sumada, no la
+    /// del grupo compuesto (un hijo opaco encima de un padre translucido deja
+    /// ver el fondo del padre a traves, a diferencia del spec). Las imagenes no
+    /// se atenuan (sus items no llevan alfa) y el subarbol con `z-index`, que
+    /// se pinta aparte, tampoco.
     fn build_items(
+        layout_box: &LayoutBox,
+        target: &mut Vec<DisplayItem>,
+        images: &ImageMap,
+        z_layers: &mut Vec<(i32, Vec<DisplayItem>)>,
+        active_clips: &[Rect],
+    ) {
+        let opacity = parse_css_opacity(&layout_box.computed_style);
+        if opacity >= 1.0 {
+            return Self::build_items_inner(layout_box, target, images, z_layers, active_clips);
+        }
+        let start = target.len();
+        Self::build_items_inner(layout_box, target, images, z_layers, active_clips);
+        for item in &mut target[start..] {
+            scale_item_alpha(item, opacity);
+        }
+    }
+
+    fn build_items_inner(
         layout_box: &LayoutBox,
         target: &mut Vec<DisplayItem>,
         images: &ImageMap,
@@ -238,6 +268,7 @@ impl DisplayList {
                         italic: false,
                         underline: false,
                         text_align: if replaced.centered { TextAlign::Center } else { TextAlign::Left },
+                        line_height: None,
                     });
                 }
 
@@ -265,6 +296,10 @@ impl DisplayList {
                     italic: resolve_font_style_is_italic(&layout_box.computed_style),
                     underline: resolve_text_decoration_is_underline(&layout_box.computed_style),
                     text_align: resolve_text_align(&layout_box.computed_style),
+                    // El layout deja en `line-height-px` el valor ya resuelto
+                    // cuando el autor declaro `line-height`; sin el, altura
+                    // natural de la fuente.
+                    line_height: layout_box.computed_style.get("line-height-px").and_then(|v| parse_css_length(v)),
                 });
             }
             BoxType::Image(src) => {
@@ -991,6 +1026,28 @@ fn parse_css_border_radius(computed_style: &HashMap<String, String>) -> Option<f
     None
 }
 
+/// `opacity` (tarea 2.6 del plan): un numero de 0 a 1 o un porcentaje, acotado
+/// a ese rango. Ausente o invalido: 1 (opaco, el valor inicial).
+fn parse_css_opacity(computed_style: &HashMap<String, String>) -> f32 {
+    let Some(raw) = computed_style.get("opacity") else { return 1.0 };
+    let raw = raw.trim();
+    let value = match raw.strip_suffix('%') {
+        Some(percent) => percent.trim().parse::<f32>().ok().map(|n| n / 100.0),
+        None => raw.parse::<f32>().ok(),
+    };
+    value.map(|v| v.clamp(0.0, 1.0)).unwrap_or(1.0)
+}
+
+/// Multiplica el alfa del color de un item por `factor`. Los items sin color
+/// (imagenes, recortes) no se tocan.
+fn scale_item_alpha(item: &mut DisplayItem, factor: f32) {
+    let scale = |color: &mut [u8; 4]| color[3] = (color[3] as f32 * factor).round() as u8;
+    match item {
+        DisplayItem::SolidRect { color, .. } | DisplayItem::Text { color, .. } | DisplayItem::Border { color, .. } | DisplayItem::Shadow { color, .. } => scale(color),
+        _ => {}
+    }
+}
+
 /// `box-shadow: <offset-x> <offset-y> [<blur-radius>] <color>` (Fase 3.5,
 /// blur real desde entonces) - `offset-x`/`offset-y` aceptan negativos (a
 /// diferencia de `parse_css_length`, que rechaza negativos porque un
@@ -1044,6 +1101,70 @@ fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tarea 2.6 del plan: `opacity` multiplica el alfa de la caja y de todo su
+    /// subarbol, y las opacidades anidadas se multiplican.
+    #[test]
+    fn opacity_scales_the_alpha_of_the_box_and_its_descendants() {
+        let construir = |opacidad_padre: Option<&str>, opacidad_hijo: Option<&str>| {
+            let mut padre = LayoutBox::new(BoxType::Block);
+            padre.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+            padre.computed_style.insert("background-color".to_string(), "#000000".to_string());
+            if let Some(o) = opacidad_padre {
+                padre.computed_style.insert("opacity".to_string(), o.to_string());
+            }
+            let mut hijo = LayoutBox::new(BoxType::Block);
+            hijo.dimensions = Rect { x: 10.0, y: 10.0, width: 20.0, height: 20.0 };
+            hijo.computed_style.insert("background-color".to_string(), "#ff0000".to_string());
+            if let Some(o) = opacidad_hijo {
+                hijo.computed_style.insert("opacity".to_string(), o.to_string());
+            }
+            padre.children.push(hijo);
+            DisplayList::build(&padre, &ImageMap::new())
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    DisplayItem::SolidRect { color, .. } => Some(color[3]),
+                    _ => None,
+                })
+                .collect::<Vec<u8>>()
+        };
+
+        assert_eq!(construir(None, None), vec![255, 255], "sin opacity no cambia nada");
+        assert_eq!(construir(Some("0.5"), None), vec![128, 128], "el padre translucido atenua tambien a su hijo");
+        assert_eq!(construir(Some("0.5"), Some("0.5")), vec![128, 64], "las opacidades anidadas se multiplican");
+        assert_eq!(construir(Some("30%"), None), vec![77, 77], "tambien en porcentaje");
+        assert_eq!(construir(Some("0"), None), vec![0, 0], "opacity 0: invisible");
+        assert_eq!(construir(Some("7"), None), vec![255, 255], "fuera de rango se acota a 1");
+        assert_eq!(construir(Some("nada"), None), vec![255, 255], "un valor invalido es opaco");
+    }
+
+    /// Tarea 2.6 del plan: el `line-height` que el layout dejo resuelto en la
+    /// hoja de texto llega al item de pintado; sin el, es `None` (altura
+    /// natural de la fuente).
+    #[test]
+    fn a_text_leaf_carries_its_resolved_line_height_into_the_display_list() {
+        let altura = |estilo: Option<&str>| {
+            let mut root = LayoutBox::new(BoxType::Block);
+            root.dimensions.width = 200.0;
+            root.dimensions.height = 100.0;
+            let mut hoja = LayoutBox::new(BoxType::Text("hola".to_string()));
+            hoja.dimensions = Rect { x: 0.0, y: 0.0, width: 40.0, height: 40.0 };
+            if let Some(valor) = estilo {
+                hoja.computed_style.insert("line-height-px".to_string(), valor.to_string());
+            }
+            root.children.push(hoja);
+            let lista = DisplayList::build(&root, &ImageMap::new());
+            lista.items.iter().find_map(|item| match item {
+                DisplayItem::Text { line_height, .. } => Some(*line_height),
+                _ => None,
+            })
+        };
+
+        assert_eq!(altura(Some("40px")), Some(Some(40.0)));
+        assert_eq!(altura(None), Some(None), "sin line-height: altura natural");
+        assert_eq!(altura(Some("1.5")), Some(None), "un valor que no es una longitud: altura natural");
+    }
 
     /// Tarea 2.5 del plan: un `rgba(...)` con espacios dentro de `box-shadow`
     /// se reconoce como color. Antes el valor se partia por esos espacios, el
