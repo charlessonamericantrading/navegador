@@ -90,6 +90,117 @@ impl SystemFont {
     }
 }
 
+/// La familia de letra que el motor sabe distinguir (tarea 2.7 del plan): las
+/// tres genericas de CSS. Un `font-family` real es una lista de nombres
+/// (`Georgia, "Times New Roman", serif`); el motor no carga fuentes web ni
+/// nombres concretos, asi que cada nombre conocido se reduce a su familia
+/// generica y la lista se resuelve por el primero que se reconoce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontFamily {
+    #[default]
+    SansSerif,
+    Serif,
+    Monospace,
+}
+
+impl FontFamily {
+    /// Reduce un valor de `font-family` a una de las tres familias: el primer
+    /// nombre de la lista que se reconoce manda; si ninguno se reconoce
+    /// (`"Noto Sans JP"`), sans-serif, que es lo que hacia el motor siempre.
+    pub fn from_css(value: &str) -> Self {
+        for name in value.split(',') {
+            let name = name.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_ascii_lowercase();
+            if let Some(family) = Self::from_name(&name) {
+                return family;
+            }
+        }
+        Self::SansSerif
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        const SERIF: &[&str] = &[
+            "serif", "georgia", "times", "times new roman", "garamond", "palatino", "palatino linotype", "book antiqua", "cambria", "baskerville",
+            "liberation serif", "dejavu serif", "noto serif", "charter", "didot", "bookman",
+        ];
+        const MONOSPACE: &[&str] = &[
+            "monospace", "courier", "courier new", "consolas", "menlo", "monaco", "lucida console", "ui-monospace", "sfmono-regular", "sf mono",
+            "source code pro", "fira code", "fira mono", "jetbrains mono", "dejavu sans mono", "liberation mono", "roboto mono", "cascadia code",
+            "cascadia mono", "andale mono", "noto sans mono",
+        ];
+        const SANS: &[&str] = &[
+            "sans-serif", "arial", "helvetica", "helvetica neue", "verdana", "tahoma", "segoe ui", "system-ui", "-apple-system", "blinkmacsystemfont",
+            "roboto", "inter", "open sans", "lucida grande", "trebuchet ms", "liberation sans", "dejavu sans", "noto sans", "ubuntu", "calibri",
+        ];
+        if SERIF.contains(&name) {
+            Some(Self::Serif)
+        } else if MONOSPACE.contains(&name) {
+            Some(Self::Monospace)
+        } else if SANS.contains(&name) {
+            Some(Self::SansSerif)
+        } else {
+            None
+        }
+    }
+
+    /// Nombres concretos a probar, por orden, antes de caer en la generica de
+    /// `fontdb` (que en Linux casi nunca existe). Los de Windows y macOS
+    /// primero porque es donde se usa el producto.
+    fn preferred_names(self) -> &'static [&'static str] {
+        match self {
+            Self::SansSerif => &[],
+            Self::Serif => &["Georgia", "Times New Roman", "Liberation Serif", "DejaVu Serif", "FreeSerif", "Noto Serif"],
+            Self::Monospace => &["Consolas", "Courier New", "Menlo", "Liberation Mono", "DejaVu Sans Mono", "FreeMono", "Noto Sans Mono"],
+        }
+    }
+
+    fn generic(self) -> fontdb::Family<'static> {
+        match self {
+            Self::SansSerif => fontdb::Family::SansSerif,
+            Self::Serif => fontdb::Family::Serif,
+            Self::Monospace => fontdb::Family::Monospace,
+        }
+    }
+}
+
+/// Las cuatro variantes de peso/estilo de UNA familia.
+#[derive(Debug, Clone, Default)]
+pub struct FontFaces {
+    pub regular: Option<SystemFont>,
+    pub bold: Option<SystemFont>,
+    pub italic: Option<SystemFont>,
+    pub bold_italic: Option<SystemFont>,
+}
+
+impl FontFaces {
+    pub fn pick(&self, bold: bool, italic: bool) -> Option<&SystemFont> {
+        match (bold, italic) {
+            (true, true) => self.bold_italic.as_ref(),
+            (true, false) => self.bold.as_ref(),
+            (false, true) => self.italic.as_ref(),
+            (false, false) => self.regular.as_ref(),
+        }
+    }
+
+    /// Carga las cuatro variantes de `family` con UN solo escaneo de las
+    /// fuentes del sistema (`db` ya lo hizo). Una familia que el sistema no
+    /// tiene queda vacia: `FontSet::pick_family` cae entonces en sans-serif.
+    fn load(db: &fontdb::Database, family: FontFamily) -> Self {
+        let load = |bold: bool, italic: bool| -> Option<SystemFont> {
+            let mut families: Vec<fontdb::Family<'_>> = family.preferred_names().iter().map(|name| fontdb::Family::Name(name)).collect();
+            families.push(family.generic());
+            let query = fontdb::Query {
+                families: &families,
+                weight: if bold { fontdb::Weight::BOLD } else { fontdb::Weight::NORMAL },
+                style: if italic { fontdb::Style::Italic } else { fontdb::Style::Normal },
+                ..fontdb::Query::default()
+            };
+            let id = db.query(&query)?;
+            db.with_face_data(id, |data, face_index| SystemFont { bytes: data.to_vec(), face_index, id: next_font_id() })
+        };
+        Self { regular: load(false, false), bold: load(true, false), italic: load(false, true), bold_italic: load(true, true) }
+    }
+}
+
 /// Las 4 combinaciones reales de peso/estilo que el motor distingue hoy
 /// (negrita binaria, cursiva binaria - ver `resolve_font_weight_is_bold`/
 /// `resolve_font_style_is_italic` en `engine-layout::tree`, que deciden que
@@ -100,12 +211,16 @@ impl SystemFont {
 /// vez y se pasaba a ambos en vez de que cada uno cargara la suya (ver el
 /// doc-comment de `NativeEngineWindow::run` en `engine-gfx/src/window.rs`):
 /// medir con una fuente y pintar con otra podria desalinear cajas y glifos.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FontSet {
     pub regular: Option<SystemFont>,
     pub bold: Option<SystemFont>,
     pub italic: Option<SystemFont>,
     pub bold_italic: Option<SystemFont>,
+    /// Serifa y monoespaciada (tarea 2.7). Vacias si el sistema no tiene
+    /// ninguna: `pick_family` cae entonces en las de arriba (sans-serif).
+    pub serif: FontFaces,
+    pub monospace: FontFaces,
 }
 
 /// Cache de proceso (Fase 5, hallazgo real de rendimiento) de la unica
@@ -139,11 +254,21 @@ impl FontSet {
     }
 
     fn load_default_sans_serif_uncached() -> Self {
+        // UN solo escaneo de las fuentes del sistema para las 12 caras (3
+        // familias x 4 variantes): antes eran 4 escaneos solo para sans-serif.
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let sans = FontFaces::load(&db, FontFamily::SansSerif);
+        // Sin ninguna sans-serif cae a la primera fuente del sistema, igual
+        // que hacia `SystemFont::load_default_sans_serif_variant`.
+        let fallback = |bold: bool, italic: bool, found: Option<SystemFont>| found.or_else(|| SystemFont::load_default_sans_serif_variant(bold, italic));
         Self {
-            regular: SystemFont::load_default_sans_serif_variant(false, false),
-            bold: SystemFont::load_default_sans_serif_variant(true, false),
-            italic: SystemFont::load_default_sans_serif_variant(false, true),
-            bold_italic: SystemFont::load_default_sans_serif_variant(true, true),
+            regular: fallback(false, false, sans.regular),
+            bold: fallback(true, false, sans.bold),
+            italic: fallback(false, true, sans.italic),
+            bold_italic: fallback(true, true, sans.bold_italic),
+            serif: FontFaces::load(&db, FontFamily::Serif),
+            monospace: FontFaces::load(&db, FontFamily::Monospace),
         }
     }
 
@@ -159,6 +284,18 @@ impl FontSet {
             (false, true) => self.italic.as_ref(),
             (false, false) => self.regular.as_ref(),
         }
+    }
+
+    /// Como `pick`, pero de la familia pedida (tarea 2.7). Si el sistema no
+    /// tiene esa familia (o esa variante), se usa la sans-serif: es mejor
+    /// texto legible en otra letra que ningun texto.
+    pub fn pick_family(&self, family: FontFamily, bold: bool, italic: bool) -> Option<&SystemFont> {
+        let faces = match family {
+            FontFamily::SansSerif => return self.pick(bold, italic),
+            FontFamily::Serif => &self.serif,
+            FontFamily::Monospace => &self.monospace,
+        };
+        faces.pick(bold, italic).or_else(|| faces.pick(false, false)).or_else(|| self.pick(bold, italic))
     }
 }
 
@@ -185,13 +322,14 @@ mod tests {
             bold: SystemFont::load_default_sans_serif_variant(true, false),
             italic: SystemFont::load_default_sans_serif_variant(false, true),
             bold_italic: SystemFont::load_default_sans_serif_variant(true, true),
+            ..FontSet::default()
         };
         assert!(set.pick(false, false).is_some(), "la variante regular deberia estar disponible, se acaba de cargar");
     }
 
     #[test]
     fn font_set_pick_is_none_for_every_combination_when_nothing_was_loaded() {
-        let empty = FontSet { regular: None, bold: None, italic: None, bold_italic: None };
+        let empty = FontSet::default();
         assert!(empty.pick(false, false).is_none());
         assert!(empty.pick(true, false).is_none());
         assert!(empty.pick(false, true).is_none());
@@ -227,5 +365,55 @@ mod tests {
         let Some(first) = FontSet::load_default_sans_serif().regular else { return };
         let Some(second) = FontSet::load_default_sans_serif().regular else { return };
         assert_eq!(first.bytes, second.bytes, "el cache deberia devolver siempre la misma fuente");
+    }
+
+    #[test]
+    fn font_family_reduces_a_css_list_to_the_first_known_name() {
+        assert_eq!(FontFamily::from_css("Georgia, serif"), FontFamily::Serif);
+        assert_eq!(FontFamily::from_css("\"Times New Roman\", Times, serif"), FontFamily::Serif);
+        assert_eq!(FontFamily::from_css("monospace"), FontFamily::Monospace);
+        assert_eq!(FontFamily::from_css("'Courier New', monospace"), FontFamily::Monospace);
+        assert_eq!(FontFamily::from_css("ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"), FontFamily::Monospace);
+        assert_eq!(FontFamily::from_css("-apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif"), FontFamily::SansSerif);
+        // El primero conocido manda: una serif concreta antes de la generica sans.
+        assert_eq!(FontFamily::from_css("Charter, Arial"), FontFamily::Serif);
+        // Nombres desconocidos se saltan; si no se reconoce ninguno, sans-serif.
+        assert_eq!(FontFamily::from_css("MiFuenteWeb, Georgia"), FontFamily::Serif);
+        assert_eq!(FontFamily::from_css("MiFuenteWeb"), FontFamily::SansSerif);
+        assert_eq!(FontFamily::from_css(""), FontFamily::SansSerif);
+    }
+
+    #[test]
+    fn pick_family_falls_back_to_sans_serif_when_the_family_is_missing() {
+        let Some(regular) = SystemFont::load_default_sans_serif() else { return };
+        let only_sans = FontSet { regular: Some(regular), ..FontSet::default() };
+        assert!(only_sans.pick_family(FontFamily::Serif, false, false).is_some(), "sin serifa instalada se usa la sans-serif");
+        assert_eq!(
+            only_sans.pick_family(FontFamily::Monospace, true, true).is_some(),
+            only_sans.pick(true, true).is_some(),
+            "una variante que ni la sans-serif tiene sigue sin existir: mismo comportamiento de siempre"
+        );
+        assert_eq!(
+            only_sans.pick_family(FontFamily::Monospace, false, false).map(|f| f.cache_id()),
+            only_sans.pick(false, false).map(|f| f.cache_id()),
+            "y es exactamente la misma cara"
+        );
+    }
+
+    /// En una maquina con fuentes serif y monoespaciadas, son caras distintas
+    /// de la sans-serif y medir la misma frase da anchos distintos (la
+    /// monoespaciada ancha siempre mas en las 'i'). Si la maquina no las tiene,
+    /// no hay nada que probar.
+    #[test]
+    fn serif_and_monospace_are_really_different_faces_when_installed() {
+        let set = FontSet::load_default_sans_serif();
+        let (Some(sans), Some(mono)) = (set.pick(false, false), set.monospace.regular.as_ref()) else { return };
+        assert_ne!(sans.cache_id(), mono.cache_id());
+        let sans_width = crate::shape::text_width(sans, "iiiiiiiiii", 24.0);
+        let mono_width = crate::shape::text_width(mono, "iiiiiiiiii", 24.0);
+        assert!(mono_width > sans_width * 1.3, "monoespaciada ({mono_width}) deberia ser mas ancha que sans ({sans_width}) en una 'i'");
+        if let Some(serif) = set.serif.regular.as_ref() {
+            assert_ne!(serif.cache_id(), sans.cache_id());
+        }
     }
 }

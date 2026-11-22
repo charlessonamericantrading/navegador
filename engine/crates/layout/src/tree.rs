@@ -491,6 +491,13 @@ fn parse_css_offset_relative(value: &str, reference_size: f32) -> Option<f32> {
 /// `relative` NO cuenta como fuera de flujo (sigue reservando su espacio
 /// normal, solo se desplaza visualmente despues - ver
 /// `apply_relative_offset`); `static` (el valor inicial real) tampoco.
+/// La familia de letra de una caja (tarea 2.7): serifa, monoespaciada o
+/// sans-serif, la de siempre. `font-family` ya se hereda hasta las hojas de
+/// texto (`INHERITABLE_PROPERTIES`).
+fn resolve_font_family(computed_style: &HashMap<String, String>) -> engine_text::FontFamily {
+    computed_style.get("font-family").map(|value| engine_text::FontFamily::from_css(value)).unwrap_or_default()
+}
+
 fn is_out_of_flow(computed_style: &HashMap<String, String>) -> bool {
     matches!(computed_style.get("position").map(String::as_str), Some("absolute") | Some("fixed"))
 }
@@ -656,7 +663,7 @@ fn list_marker_text(computed_style: &HashMap<String, String>, ordinal: u32, orde
 fn place_list_marker(child: &mut LayoutBox, ordinal: u32, ordered: bool, font_set: Option<&FontSet>) {
     let text = list_marker_text(&child.computed_style, ordinal, ordered);
     let font_size = child.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
-    let natural_width = match font_set.and_then(|set| set.pick(false, false)) {
+    let natural_width = match font_set.and_then(|set| set.pick_family(resolve_font_family(&child.computed_style), false, false)) {
         Some(f) => engine_text::wrapped_line_width(f, &text, font_size),
         None => text.chars().count() as f32 * 8.0,
     };
@@ -1827,7 +1834,7 @@ fn measure_intrinsic_width_uncached(child: &mut LayoutBox, mode: IntrinsicWidth,
             let font_size = child.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
             let bold = resolve_font_weight_is_bold(&child.computed_style);
             let italic = resolve_font_style_is_italic(&child.computed_style);
-            let font = font_set.and_then(|s| s.pick(bold, italic));
+            let font = font_set.and_then(|s| s.pick_family(resolve_font_family(&child.computed_style), bold, italic));
             let text_w = match font {
                 // `Min`: la caja mas estrecha en la que este texto cabe sin
                 // desbordar es la de su palabra mas larga - por debajo de eso
@@ -3649,8 +3656,8 @@ impl LayoutTreeBuilder {
 
         let natural_line_height = match font_set {
             Some(set) => {
-                let (font_size, bold, italic) = Self::first_leaf_font_info(nodes).unwrap_or((INITIAL_FONT_SIZE, false, false));
-                match set.pick(bold, italic) {
+                let (font_size, bold, italic, family) = Self::first_leaf_font_info(nodes).unwrap_or((INITIAL_FONT_SIZE, false, false, engine_text::FontFamily::default()));
+                match set.pick_family(family, bold, italic) {
                     Some(f) => engine_text::line_height(f, font_size),
                     None => LINE_HEIGHT_FALLBACK,
                 }
@@ -3763,7 +3770,7 @@ impl LayoutTreeBuilder {
     /// `<i>`...) - la base para el `line_height` COMPARTIDO de toda la
     /// racha (ver `flow_inline_run`). `None` si la racha no tiene ninguna
     /// hoja de texto real (p.ej. un `<span></span>` vacio suelto).
-    fn first_leaf_font_info(nodes: &[LayoutBox]) -> Option<(f32, bool, bool)> {
+    fn first_leaf_font_info(nodes: &[LayoutBox]) -> Option<(f32, bool, bool, engine_text::FontFamily)> {
         for node in nodes {
             match &node.box_type {
                 BoxType::Text(_) => {
@@ -3774,7 +3781,7 @@ impl LayoutTreeBuilder {
                         .unwrap_or(INITIAL_FONT_SIZE);
                     let bold = resolve_font_weight_is_bold(&node.computed_style);
                     let italic = resolve_font_style_is_italic(&node.computed_style);
-                    return Some((font_size, bold, italic));
+                    return Some((font_size, bold, italic, resolve_font_family(&node.computed_style)));
                 }
                 BoxType::Inline => {
                     if let Some(info) = Self::first_leaf_font_info(&node.children) {
@@ -3920,7 +3927,7 @@ impl LayoutTreeBuilder {
                 // pintar seleccionen exactamente la misma cara de fuente.
                 let bold = resolve_font_weight_is_bold(&node.computed_style);
                 let italic = resolve_font_style_is_italic(&node.computed_style);
-                let font = font_set.and_then(|set| set.pick(bold, italic));
+                let font = font_set.and_then(|set| set.pick_family(resolve_font_family(&node.computed_style), bold, italic));
 
                 let natural_width = match font {
                     // `wrapped_line_width` y no `measure_text`: tiene que ser
@@ -5070,6 +5077,28 @@ mod tests {
 
         assert!(enlace.dimensions.width > 0.0, "ancho 0 = imposible de clicar: {:?}", enlace.dimensions);
         assert!(enlace.dimensions.height > 30.0, "ocupa varias lineas: {:?}", enlace.dimensions);
+    }
+
+    /// Tarea 2.7: `font-family` elige la cara con la que se MIDE el texto. La
+    /// monoespaciada ensancha una frase de 'i' (la sans-serif las hace
+    /// estrechas). Sin fuente monoespaciada en el sistema, no hay nada que
+    /// probar.
+    #[test]
+    fn a_monospace_font_family_changes_the_measured_width_of_text() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.monospace.regular.is_none() {
+            return;
+        }
+        let width_of = |css: &str| {
+            let dom = HtmlParser::parse(r#"<html><body><p id="p">iiiiiiiiiiiiiiii</p></body></html>"#);
+            let stylesheet = CssParser::parse(&format!("body {{ margin: 0px; }} p {{ margin: 0px; {css} }}"));
+            let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+            find_text_box(&root, "iiiiiiiiiiiiiiii").expect("caja de texto").dimensions.width
+        };
+        let sans = width_of("");
+        let mono = width_of("font-family: monospace;");
+        assert!(mono > sans * 1.3, "monoespaciada ({mono}) deberia ser bastante mas ancha que sans-serif ({sans})");
+        assert_eq!(width_of("font-family: Arial, sans-serif;"), sans, "una sans-serif conocida es la de siempre");
     }
 
     /// El reverso: `display:block` sobre una etiqueta naturalmente inline

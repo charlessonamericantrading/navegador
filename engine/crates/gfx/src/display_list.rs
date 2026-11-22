@@ -1,5 +1,6 @@
 use engine_image::DecodedImage;
 use engine_layout::{ImageMap, LayoutBox, BoxType, Rect};
+use engine_text::FontFamily;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -38,7 +39,7 @@ pub enum DisplayItem {
     /// llegar aqui.
     /// `line_height` (tarea 2.6): la altura de linea en pixeles que el layout
     /// resolvio desde `line-height`; `None` usa la altura natural de la fuente.
-    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool, underline: bool, text_align: TextAlign, line_height: Option<f32> },
+    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool, underline: bool, text_align: TextAlign, line_height: Option<f32>, font_family: FontFamily },
     /// `rect` es el border-box COMPLETO (`layout_box.dimensions`, que ya
     /// incluye el propio border - ver `engine_layout::tree::
     /// flow_block_children`); quien pinta esto (`engine-gfx/src/paint.rs`)
@@ -269,6 +270,7 @@ impl DisplayList {
                         underline: false,
                         text_align: if replaced.centered { TextAlign::Center } else { TextAlign::Left },
                         line_height: None,
+                        font_family: FontFamily::SansSerif,
                     });
                 }
 
@@ -300,6 +302,7 @@ impl DisplayList {
                     // cuando el autor declaro `line-height`; sin el, altura
                     // natural de la fuente.
                     line_height: layout_box.computed_style.get("line-height-px").and_then(|v| parse_css_length(v)),
+                    font_family: layout_box.computed_style.get("font-family").map(|v| FontFamily::from_css(v)).unwrap_or_default(),
                 });
             }
             BoxType::Image(src) => {
@@ -1405,6 +1408,31 @@ mod tests {
             list.items.iter().any(|item| matches!(item, DisplayItem::Text { text, .. } if text == "hola")),
             "deberia pintar el value resuelto como texto real"
         );
+    }
+
+    /// Tarea 2.7: el item de texto lleva la familia de letra que pidio la
+    /// pagina, para pintar con la misma cara con la que el layout midio.
+    #[test]
+    fn a_text_item_carries_the_font_family_of_its_box() {
+        let family_of = |font_family: Option<&str>| {
+            let mut text = LayoutBox::new(BoxType::Text("hola".to_string()));
+            text.dimensions = Rect { x: 0.0, y: 0.0, width: 40.0, height: 20.0 };
+            if let Some(value) = font_family {
+                text.computed_style.insert("font-family".to_string(), value.to_string());
+            }
+            let list = DisplayList::build(&text, &ImageMap::new());
+            list.items
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Text { font_family, .. } => Some(*font_family),
+                    _ => None,
+                })
+                .expect("un item de texto")
+        };
+        assert_eq!(family_of(Some("Georgia, 'Times New Roman', serif")), FontFamily::Serif);
+        assert_eq!(family_of(Some("ui-monospace, Menlo, monospace")), FontFamily::Monospace);
+        assert_eq!(family_of(Some("Arial, sans-serif")), FontFamily::SansSerif);
+        assert_eq!(family_of(None), FontFamily::SansSerif, "sin font-family, la de siempre");
     }
 
     /// Fase 40, el punto real de `background-image`: una caja con la

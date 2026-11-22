@@ -11,7 +11,7 @@
 use crate::display_list::{DisplayItem, TextAlign};
 use crate::image_paint::{paint_background_image, paint_image};
 use engine_layout::Rect;
-use engine_text::{baseline_offset, measure_text, shape_text, underline_metrics, wrap_text, FontSet, SystemFont};
+use engine_text::{baseline_offset, measure_text, shape_text, underline_metrics, wrap_text, FontFamily, FontSet, SystemFont};
 use tiny_skia::{FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Rect as SkiaRect, Stroke, Transform};
 
 /// Pinta cada `DisplayItem` de `items`, EN ORDEN, sobre `pixmap`.
@@ -77,8 +77,8 @@ pub fn paint_display_list(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: 
                     fill_shape(pixmap, rect, *radius, &paint_of(*color), scroll_offset_y, current_mask.as_ref());
                 }
             }
-            DisplayItem::Text { rect, text, color, font_size, bold, italic, underline, text_align, line_height } => {
-                paint_text(pixmap, rect, text, *color, *font_size, *bold, *italic, *underline, *text_align, *line_height, font_set, scroll_offset_y, current_mask.as_ref());
+            DisplayItem::Text { rect, text, color, font_size, bold, italic, underline, text_align, line_height, font_family } => {
+                paint_text(pixmap, rect, text, *color, *font_size, *bold, *italic, *font_family, *underline, *text_align, *line_height, font_set, scroll_offset_y, current_mask.as_ref());
             }
             DisplayItem::Border { rect, width: border_width, color, radius } => {
                 paint_border(pixmap, rect, *border_width, *color, *radius, scroll_offset_y, current_mask.as_ref());
@@ -388,6 +388,7 @@ fn paint_text(
     font_size: f32,
     bold: bool,
     italic: bool,
+    font_family: FontFamily,
     underline: bool,
     text_align: TextAlign,
     line_height: Option<f32>,
@@ -398,7 +399,7 @@ fn paint_text(
     let paint = paint_of(color);
     let screen_y = rect.y - scroll_offset_y;
 
-    match font_set.and_then(|set| set.pick(bold, italic)) {
+    match font_set.and_then(|set| set.pick_family(font_family, bold, italic)) {
         Some(font) => {
             // Mismo `wrap_text` que ya uso el layout para reservar el alto
             // de esta caja (mismo font_size, mismo ancho) - el numero de
@@ -798,6 +799,7 @@ mod tests {
                 underline,
                 text_align: TextAlign::Left,
                 line_height: None,
+                font_family: FontFamily::SansSerif,
             }];
             paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
             pixmap
@@ -832,6 +834,7 @@ mod tests {
             underline: true,
             text_align: TextAlign::Left,
             line_height: None,
+            font_family: FontFamily::SansSerif,
         }];
         paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
         assert!(pixmap.pixels().iter().all(|p| p.alpha() == 0), "una linea en blanco no deberia pintar nada, ni siquiera un subrayado");
@@ -863,6 +866,7 @@ mod tests {
                 underline: false,
                 text_align,
                 line_height: None,
+                font_family: FontFamily::SansSerif,
             }];
             paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
             let width = pixmap.width();
