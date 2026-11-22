@@ -377,43 +377,50 @@ impl EngineServer {
                     page.publish_scroll_offset(scrolled);
                     tab.scroll_offset_y = scrolled;
 
-                    // Evento `scroll` real: el desplazamiento de arriba YA
-                    // era real (`getBoundingClientRect` ya lo reflejaba),
-                    // lo que faltaba era que un listener JS se enterara. Se
-                    // dispara sobre `<html>` (`documentElement`), NO sobre
-                    // `dom_root` directo - mismo objetivo exacto que ya usa
-                    // `fire_popstate`, y no por casualidad: `window.
-                    // addEventListener` (el shim de `register_history`, ver
-                    // su aviso) delega precisamente en `documentElement`,
-                    // asi que dispararlo ahi es lo unico que hace que
-                    // `window.addEventListener('scroll', ...)` tambien se
-                    // entere. `document.addEventListener('scroll', ...)`
-                    // SIGUE funcionando igual: `documentElement.parent` es
-                    // `dom_root`, y la fase de burbuja del dispatch camina
-                    // por los ancestros reales hasta llegar ahi.
-                    // `None` (documento sin ningun elemento raiz - un DOM
-                    // malformado que HTML5 parsing en la practica nunca
-                    // produce) se salta el evento sin tratarlo como error:
-                    // no hay a quien dispararselo, no que la propia
-                    // operacion de scroll haya fallado.
-                    if let Some(html) = Node::document_element(&page.page.dom_root) {
-                        if let Err(error) = page.runtime.dispatch_event(&html, "scroll") {
-                            return (Self::error(id, format!("scroll_event_error: {error}")), false);
+                    // Solo si ALGUIEN escucha `scroll` (tarea 1.5/1.4 del plan): sin
+                    // listeners el evento no puede cambiar nada, y rehacer el
+                    // layout entero en cada paso de scroll era lo que tardaba
+                    // (0,66 s en Wikipedia). El desplazamiento ya esta
+                    // publicado arriba.
+                    if page.runtime.has_event_listener("scroll") {
+                        // Evento `scroll` real: el desplazamiento de arriba YA
+                        // era real (`getBoundingClientRect` ya lo reflejaba),
+                        // lo que faltaba era que un listener JS se enterara. Se
+                        // dispara sobre `<html>` (`documentElement`), NO sobre
+                        // `dom_root` directo - mismo objetivo exacto que ya usa
+                        // `fire_popstate`, y no por casualidad: `window.
+                        // addEventListener` (el shim de `register_history`, ver
+                        // su aviso) delega precisamente en `documentElement`,
+                        // asi que dispararlo ahi es lo unico que hace que
+                        // `window.addEventListener('scroll', ...)` tambien se
+                        // entere. `document.addEventListener('scroll', ...)`
+                        // SIGUE funcionando igual: `documentElement.parent` es
+                        // `dom_root`, y la fase de burbuja del dispatch camina
+                        // por los ancestros reales hasta llegar ahi.
+                        // `None` (documento sin ningun elemento raiz - un DOM
+                        // malformado que HTML5 parsing en la practica nunca
+                        // produce) se salta el evento sin tratarlo como error:
+                        // no hay a quien dispararselo, no que la propia
+                        // operacion de scroll haya fallado.
+                        if let Some(html) = Node::document_element(&page.page.dom_root) {
+                            if let Err(error) = page.runtime.dispatch_event(&html, "scroll") {
+                                return (Self::error(id, format!("scroll_event_error: {error}")), false);
+                            }
                         }
+                        // Un listener de scroll puede mutar el DOM (el patron
+                        // real de "infinite scroll": cargar mas contenido al
+                        // acercarse al final) - mismo criterio que `click`/
+                        // `press_key`: relayout despues de dispatchear, y
+                        // reajustar/republicar el scroll contra el arbol
+                        // fresco (pudo haber crecido o encogido).
+                        page.relayout(w as f32, h as f32);
+                        let content_extent = page.page.layout_root.content_extent();
+                        let scrolled = clamp_scroll_offset(tab.scroll_offset_y, content_extent, h as f32);
+                        page.publish_scroll_offset(scrolled);
+                        tab.scroll_offset_y = scrolled;
                     }
-                    // Un listener de scroll puede mutar el DOM (el patron
-                    // real de "infinite scroll": cargar mas contenido al
-                    // acercarse al final) - mismo criterio que `click`/
-                    // `press_key`: relayout despues de dispatchear, y
-                    // reajustar/republicar el scroll contra el arbol
-                    // fresco (pudo haber crecido o encogido).
-                    page.relayout(w as f32, h as f32);
-                    let content_extent = page.page.layout_root.content_extent();
-                    let scrolled = clamp_scroll_offset(tab.scroll_offset_y, content_extent, h as f32);
-                    page.publish_scroll_offset(scrolled);
-                    tab.scroll_offset_y = scrolled;
                 }
-                (self.state_response(id), false)
+                (self.scroll_state_response(id), false)
             }
             EngineRequest::TypeText {
                 id,
@@ -1554,6 +1561,18 @@ impl EngineServer {
     }
 
     fn state_response(&self, id: Option<String>) -> EngineResponse {
+        self.state_snapshot(id, true)
+    }
+
+    /// El estado tras un `scroll`: igual que `state_response` pero sin los
+    /// elementos ni `requires_javascript`, que un desplazamiento no cambia
+    /// (tarea 1.5 del plan). Evita reenviar y recalcular lo que mas pesa.
+    fn scroll_state_response(&self, id: Option<String>) -> EngineResponse {
+        self.state_snapshot(id, false)
+    }
+
+    /// `with_page_details`: incluir `elements` y `requires_javascript`.
+    fn state_snapshot(&self, id: Option<String>, with_page_details: bool) -> EngineResponse {
         let tab = self.active_tab();
         // Fase 4.4: `can_go_back`/`can_go_forward` se calculan siempre
         // igual, tanto con pagina cargada como sin ella (`history_index`
@@ -1572,10 +1591,10 @@ impl EngineServer {
                 url: String::new(),
                 title: String::new(),
                 screenshot: String::new(),
-                elements: Vec::new(),
+                elements: with_page_details.then(Vec::new),
                 // Sin pagina cargada no hay nada que diagnosticar: el
                 // frontend pinta su pagina de inicio, no un aviso.
-                requires_javascript: false,
+                requires_javascript: with_page_details.then_some(false),
                 can_go_back,
                 can_go_forward,
             };
@@ -1601,11 +1620,8 @@ impl EngineServer {
             url: page.url.clone(),
             title: page.current_title(),
             screenshot,
-            elements: collect_interactive_elements(&page.page.layout_root),
-            requires_javascript: page_content_requires_javascript(
-                &page.page.dom_root,
-                &page.page.layout_root,
-            ),
+            elements: with_page_details.then(|| collect_interactive_elements(&page.page.layout_root)),
+            requires_javascript: with_page_details.then(|| page_content_requires_javascript(&page.page.dom_root, &page.page.layout_root)),
             can_go_back,
             can_go_forward,
         }
@@ -2716,6 +2732,48 @@ mod tests {
 
         let runtime = &mut server.active_tab_mut().current_page.as_mut().expect("deberia haber pagina").runtime;
         assert_eq!(runtime.eval("vistoScroll").unwrap(), "true", "el listener 'scroll' de document deberia haberse disparado");
+    }
+
+    /// Tarea 1.5 del plan: la respuesta a un `scroll` no reenvia `elements` ni
+    /// `requires_javascript` (un desplazamiento no los cambia y pesaban tanto
+    /// como la captura), pero `get_state` sigue trayendolos.
+    #[tokio::test]
+    async fn a_scroll_response_omits_the_page_details_but_get_state_keeps_them() {
+        let mut server = server_with_scrollable_page_and_script("");
+
+        let (scroll, _) = server.handle(EngineRequest::Scroll { id: Some("s".to_string()), dx: 0, dy: 100 }).await;
+        let EngineResponse::State { elements, requires_javascript, scroll_offset_y, screenshot, .. } = &scroll else { panic!("scroll debe devolver un State: {scroll:?}") };
+        assert!(elements.is_none(), "el scroll no reenvia los elementos");
+        assert!(requires_javascript.is_none(), "ni requires_javascript");
+        assert_eq!(*scroll_offset_y, 100.0, "pero si el desplazamiento");
+        assert!(!screenshot.is_empty(), "y la captura");
+        let json = serde_json::to_string(&scroll).unwrap();
+        assert!(!json.contains("\"elements\"") && !json.contains("requires_javascript"), "los campos ni aparecen en el JSON: {}", &json[..json.len().min(200)]);
+
+        let (state, _) = server.handle(EngineRequest::GetState { id: Some("g".to_string()) }).await;
+        let EngineResponse::State { elements, requires_javascript, .. } = &state else { panic!("get_state debe devolver un State") };
+        assert!(elements.is_some() && requires_javascript.is_some(), "get_state si trae todo");
+    }
+
+    /// Tarea 1.5/1.4: sin nadie escuchando `scroll` no se rehace el layout (era
+    /// lo que hacia tardar 0,66 s cada paso en Wikipedia); con un listener si,
+    /// porque podria haber cambiado el DOM. Se distingue cambiando el DOM
+    /// desde fuera justo antes del scroll: el layout solo se entera si hubo
+    /// relayout.
+    #[tokio::test]
+    async fn scroll_rebuilds_the_layout_only_when_someone_listens_for_it() {
+        let extent_after_scroll = |con_listener: bool| async move {
+            let script = if con_listener { "document.addEventListener('scroll', function() {});" } else { "" };
+            let mut server = server_with_scrollable_page_and_script(script);
+            let page = server.active_tab_mut().current_page.as_mut().expect("pagina");
+            assert!(page.page.layout_root.content_extent() >= 4000.0, "la pagina mide 4000 px");
+            page.runtime.eval("document.body.setAttribute('style', 'height:100px')").expect("mutar el DOM");
+            server.handle(EngineRequest::Scroll { id: None, dx: 0, dy: 10 }).await;
+            server.active_tab().current_page.as_ref().expect("pagina").page.layout_root.content_extent()
+        };
+
+        assert!(extent_after_scroll(false).await >= 4000.0, "sin listeners no se rehace el layout: sigue el anterior");
+        assert!(extent_after_scroll(true).await < 4000.0, "con un listener de scroll si se rehace");
     }
 
     /// Un listener de `scroll` puede mutar el DOM (el patron real de

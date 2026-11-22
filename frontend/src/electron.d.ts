@@ -13,7 +13,9 @@ export interface EngineStateEvent {
   url?: string;
   title?: string;
   screenshot?: string;
+  /** Ausente en la respuesta a un `scroll`: sin cambios (tarea 1.5). */
   elements?: InteractiveElement[];
+  /** Ausente en la respuesta a un `scroll`: sin cambios (tarea 1.5). */
   requires_javascript?: boolean;
   can_go_back?: boolean;
   can_go_forward?: boolean;

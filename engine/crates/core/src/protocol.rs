@@ -156,7 +156,13 @@ pub enum EngineResponse {
         url: String,
         title: String,
         screenshot: String,
-        elements: Vec<InteractiveElement>,
+        /// Los elementos interactivos de la pagina. `None` (el campo no se
+        /// envia) significa "no han cambiado desde el estado anterior": lo usa
+        /// `scroll`, que solo mueve el desplazamiento - las coordenadas de los
+        /// elementos son del documento, no de la ventana, asi que no cambian
+        /// - y reenviarlos pesaba tanto como la propia captura (tarea 1.5).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        elements: Option<Vec<InteractiveElement>>,
         /// Fase 39: la pagina se descargo SIN error de red pero no tiene
         /// nada visible que pintar, y trae `<script>` que podrian haberlo
         /// generado. Es el caso de la inmensa mayoria de webs modernas
@@ -167,7 +173,9 @@ pub enum EngineResponse {
         /// existe para que el frontend pueda DECIRLO en vez de callar.
         /// NO es una promesa de que la pagina funcionaria con mas JS: es
         /// una descripcion de lo que se observo (vacia + con scripts).
-        requires_javascript: bool,
+        /// `None` (no se envia) = sin cambios, igual que `elements`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        requires_javascript: Option<bool>,
         /// Historial atras/adelante (Fase 4.4) - si hay una entrada real a
         /// la que ir con `back`/`forward` en este momento, para que el
         /// frontend pueda habilitar/deshabilitar sus botones sin tener que

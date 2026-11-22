@@ -297,6 +297,13 @@ pub struct DocumentBindings {
     scroll_offsets: ScrollOffsets,
 }
 
+impl DocumentBindings {
+    /// Si algun nodo tiene un listener de `event_type` (en cualquier fase).
+    pub fn has_listener(&self, event_type: &str) -> bool {
+        self.listeners.lock().is_ok_and(|map| map.values().any(|list| list.iter().any(|(kind, _, _)| kind == event_type)))
+    }
+}
+
 /// Ver `DocumentBindings::scroll_offsets`.
 pub type ScrollOffsets = Arc<Mutex<HashMap<usize, (f32, f32)>>>;
 

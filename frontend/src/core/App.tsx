@@ -102,8 +102,12 @@ function App() {
   const applyEngineState = useCallback((data: EngineStateEvent) => {
     setScreenshot(data.screenshot || '');
     setBrowserUrl(data.url || '');
-    setElements(data.elements || []);
-    setRequiresJavascript(Boolean(data.requires_javascript));
+    // `elements` y `requires_javascript` pueden no venir (la respuesta a un
+    // `scroll` los omite: un desplazamiento no los cambia, y las coordenadas
+    // de los elementos son del documento). Ausente = sin cambios; solo se
+    // reemplazan cuando llegan.
+    if (data.elements !== undefined) setElements(data.elements);
+    if (data.requires_javascript !== undefined) setRequiresJavascript(Boolean(data.requires_javascript));
     setCanGoBack(Boolean(data.can_go_back));
     setCanGoForward(Boolean(data.can_go_forward));
     if (typeof data.tab_id === 'number') setActiveTabId(data.tab_id);

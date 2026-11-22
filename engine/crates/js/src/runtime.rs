@@ -428,6 +428,14 @@ impl JsRuntime {
     ///
     /// Devuelve si algun listener llamo `event.preventDefault()` (Fase
     /// 4.2) - ver el doc-comment de `DomBindings::dispatch_event`.
+    /// Si algun nodo del documento tiene un listener registrado para
+    /// `event_type` (tarea 1.5/1.4 del plan). Permite al servidor saltarse el
+    /// despacho de un evento, y el relayout que lo sigue, cuando nadie lo
+    /// escucha: `scroll` ocurre decenas de veces por segundo.
+    pub fn has_event_listener(&self, event_type: &str) -> bool {
+        self.document_bindings.as_ref().is_some_and(|bindings| bindings.has_listener(event_type))
+    }
+
     pub fn dispatch_event(&mut self, node: &Arc<RwLock<Node>>, event_type: &str) -> Result<bool, JsError> {
         let Some(registry) = self.document_bindings.clone() else { return Ok(false) };
         let result = DomBindings::dispatch_event(&registry, node, event_type, &mut self.context).map_err(|e| JsError::Execution(e.to_string()));
