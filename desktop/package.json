@@ -9,7 +9,7 @@
     "start": "electron .",
     "pack": "electron-builder --dir",
     "dist": "electron-builder",
-    "test": "node --test tests/ai.test.js tests/engine-protocol.test.js tests/engine-supervisor.test.js tests/engine-broker.test.js",
+    "test": "node --test tests/ai.test.js tests/engine-protocol.test.js tests/engine-supervisor.test.js tests/engine-broker.test.js tests/packaging.test.js",
     "smoke": "node scripts/smoke-packaged.mjs"
   },
   "devDependencies": {
@@ -27,6 +27,7 @@
       "preload.js",
       "ai-credentials.js",
       "ai-provider.js",
+      "ai-settings.js",
       "engine-protocol.js",
       "engine-broker.js",
       "package.json"
