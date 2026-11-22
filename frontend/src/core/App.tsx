@@ -520,6 +520,18 @@ function App() {
     },
     pressKey: async (key: string) => {
       await runEngineCommand({ type: 'press_key', key });
+    },
+    scroll: async (dy: number) => {
+      await runEngineCommand({ type: 'scroll', dx: 0, dy });
+    },
+    goBack: async () => {
+      await runEngineCommand({ type: 'back' });
+      refreshTabs();
+    },
+    getPageText: async () => {
+      if (!window.electronAPI?.sendEngineRequest) return '';
+      const res = await window.electronAPI.sendEngineRequest({ type: 'get_page_text' });
+      return res.type === 'page_text' && typeof res.text === 'string' ? res.text : '';
     }
   }), [runEngineCommand, refreshTabs]);
 

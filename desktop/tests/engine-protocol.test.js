@@ -15,6 +15,7 @@ test('acepta las peticiones reales de la interfaz y devuelve una copia limpia', 
   assert.deepEqual(validateEngineRequest({ type: 'new_tab' }), { type: 'new_tab' });
   assert.deepEqual(validateEngineRequest({ type: 'list_tabs' }), { type: 'list_tabs' });
   assert.deepEqual(validateEngineRequest({ type: 'stop' }), { type: 'stop' });
+  assert.deepEqual(validateEngineRequest({ type: 'get_page_text' }), { type: 'get_page_text' });
 });
 
 test('acepta click_element y type_into_element, y descarta lo que sobra', () => {

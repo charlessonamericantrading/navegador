@@ -237,6 +237,20 @@ fn un_navigate_nuevo_sustituye_al_que_sigue_cargando() {
     drop(mudo);
 }
 
+/// Tarea 3.4: `get_page_text` devuelve el texto legible de la pagina (lo que
+/// `elements`, que solo trae lo accionable, no puede dar).
+#[test]
+fn get_page_text_devuelve_el_texto_legible_de_la_pagina() {
+    let servidor = TestServer::nuevo(PAGINA);
+    let mut motor = Motor::arrancar();
+    motor.pedir(json!({"type": "navigate", "id": "n", "url": servidor.url("/")}));
+
+    let r = motor.pedir(json!({"type": "get_page_text", "id": "t1"}));
+    assert_correlacionada(&r, "t1", "page_text");
+    assert_eq!(r["truncated"], false);
+    assert!(!r["text"].as_str().unwrap().trim().is_empty(), "la pagina de humo tiene texto: {r}");
+}
+
 #[test]
 fn navigate_a_un_esquema_no_permitido_da_error_y_no_navega() {
     let mut motor = Motor::arrancar();
@@ -589,6 +603,7 @@ fn todas_las_variantes_del_protocolo_estan_cubiertas() {
         "switch_tab",
         "list_tabs",
         "get_accessibility_tree",
+        "get_page_text",
         "shutdown",
     ]
     .iter()

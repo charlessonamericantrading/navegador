@@ -119,6 +119,12 @@ pub enum EngineRequest {
     GetAccessibilityTree {
         id: Option<String>,
     },
+    /// El texto visible de la pagina, en orden de lectura y con saltos de linea
+    /// entre bloques (tarea 3.4). `elements` solo trae lo accionable; para
+    /// contestar "¿que dice la primera frase?" el agente necesita leer el resto.
+    GetPageText {
+        id: Option<String>,
+    },
     Shutdown {
         id: Option<String>,
     },
@@ -145,6 +151,7 @@ impl EngineRequest {
             | Self::SwitchTab { id, .. }
             | Self::ListTabs { id }
             | Self::GetAccessibilityTree { id }
+            | Self::GetPageText { id }
             | Self::Shutdown { id } => id.as_deref(),
         }
     }
@@ -235,6 +242,16 @@ pub enum EngineResponse {
         title: String,
         tree: engine_ai::AccessibilityTree,
         prompt: String,
+    },
+    /// Respuesta a `GetPageText` (tarea 3.4). `truncated` avisa de que la pagina
+    /// tenia mas texto del que cabe.
+    PageText {
+        id: Option<String>,
+        tab_id: u32,
+        url: String,
+        title: String,
+        text: String,
+        truncated: bool,
     },
     Ok {
         id: Option<String>,

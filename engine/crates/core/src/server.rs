@@ -461,6 +461,7 @@ impl EngineServer {
             EngineRequest::SwitchTab { tab_id, .. } => (self.switch_tab(id, tab_id), false),
             EngineRequest::ListTabs { .. } => (self.list_tabs(id), false),
             EngineRequest::GetAccessibilityTree { .. } => (self.accessibility_tree_response(id), false),
+            EngineRequest::GetPageText { .. } => (self.page_text_response(id), false),
             EngineRequest::Shutdown { .. } => (
                 EngineResponse::Ok {
                     id,
@@ -1735,6 +1736,18 @@ impl EngineServer {
     }
 
     /// Construye y devuelve el árbol semántico accesible (AOM) de la página activa (Fase 5.2).
+    fn page_text_response(&self, id: Option<String>) -> EngineResponse {
+        let tab = self.active_tab();
+        let Some(page) = &tab.current_page else {
+            return Self::error(id, "no hay ninguna página cargada".to_string());
+        };
+        // El contenido principal primero: en Wikipedia el menu lateral por si
+        // solo llena el tope antes de llegar al articulo.
+        let root = find_main_content(&page.page.layout_root).unwrap_or(&page.page.layout_root);
+        let (text, truncated) = collect_readable_text(root, MAX_PAGE_TEXT_CHARS);
+        EngineResponse::PageText { id, tab_id: tab.id, url: page.url.clone(), title: page.current_title(), text, truncated }
+    }
+
     fn accessibility_tree_response(&self, id: Option<String>) -> EngineResponse {
         let tab = self.active_tab();
         let Some(page) = &tab.current_page else {
@@ -2658,6 +2671,81 @@ fn page_content_requires_javascript(
     !Node::find_all_by_tag(dom_root, "script").is_empty()
 }
 
+/// Tope del texto que devuelve `get_page_text`: lo que cabe holgado en el
+/// prompt de un modelo junto a la lista de elementos.
+const MAX_PAGE_TEXT_CHARS: usize = 12_000;
+
+/// La caja del contenido principal de la pagina (`<main>` o `role="main"`; en su
+/// defecto, el primer `<article>`), si existe y tiene texto de verdad. Lo que
+/// queda fuera (menus, cabeceras, pies) es justo lo que no responde a nada.
+fn find_main_content(root: &LayoutBox) -> Option<&LayoutBox> {
+    fn matches_main(layout_box: &LayoutBox, article: bool) -> bool {
+        let Some(node) = &layout_box.dom_node else { return false };
+        let guard = node.read().unwrap();
+        let NodeType::Element { tag_name, attributes } = &guard.node_type else { return false };
+        if article {
+            tag_name == "article"
+        } else {
+            tag_name == "main" || attributes.get("role").is_some_and(|role| role.eq_ignore_ascii_case("main"))
+        }
+    }
+    fn first(layout_box: &LayoutBox, article: bool) -> Option<&LayoutBox> {
+        if matches_main(layout_box, article) {
+            return Some(layout_box);
+        }
+        layout_box.children.iter().find_map(|child| first(child, article))
+    }
+    // Con texto de sobra para ser el contenido y no un `<main>` vacio de cascara.
+    const MIN_MAIN_CHARS: usize = 200;
+    [false, true]
+        .into_iter()
+        .filter_map(|article| first(root, article))
+        .find(|candidate| collect_visible_text(candidate).trim().chars().count() >= MIN_MAIN_CHARS)
+}
+
+/// El texto visible de la pagina para leerlo: espacios colapsados y un salto de
+/// linea entre bloques (parrafos, filas, items de lista). `bool`: si se cortó
+/// por llegar al tope. A diferencia de `collect_visible_text` (que pega las
+/// hojas sin separador, suficiente para el `text` de un elemento), esto tiene
+/// que poder leerse.
+fn collect_readable_text(layout_box: &LayoutBox, max_chars: usize) -> (String, bool) {
+    fn visit(layout_box: &LayoutBox, out: &mut String, max_chars: usize) -> bool {
+        if out.chars().count() >= max_chars {
+            return true;
+        }
+        let is_block = matches!(layout_box.box_type, BoxType::Block) && layout_box.dom_node.is_some();
+        if is_block && !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if let BoxType::Text(content) = &layout_box.box_type {
+            let words = content.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !words.is_empty() {
+                if !out.is_empty() && !out.ends_with('\n') && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                out.push_str(&words);
+            }
+        }
+        for child in &layout_box.children {
+            if visit(child, out, max_chars) {
+                return true;
+            }
+        }
+        if is_block && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        false
+    }
+    let mut out = String::new();
+    // Un solo nodo de texto enorme se añade entero antes de poder comprobar el
+    // tope, de ahi que tambien se mire el tamaño al terminar.
+    let truncated = visit(layout_box, &mut out, max_chars) || out.chars().count() > max_chars;
+    if truncated {
+        out = out.chars().take(max_chars).collect();
+    }
+    (out.trim().to_string(), truncated)
+}
+
 fn collect_visible_text(layout_box: &LayoutBox) -> String {
     let mut text = String::new();
     collect_visible_text_recursive(layout_box, &mut text);
@@ -3138,6 +3226,54 @@ mod tests {
         let (state, _) = server.handle(EngineRequest::GetState { id: None }).await;
         let EngineResponse::State { elements, .. } = state else { panic!("get_state debe devolver un State") };
         elements.expect("get_state trae la lista de elementos")
+    }
+
+    /// Tarea 3.4: el texto de la pagina, legible: bloques en lineas distintas,
+    /// espacios colapsados, sin el codigo de los scripts.
+    #[tokio::test]
+    async fn get_page_text_returns_readable_text_with_line_breaks_between_blocks() {
+        let mut server = server_from_html(
+            "<html><head><style>p { color: red }</style></head><body><h1>Titulo</h1>\
+             <p>Primera   frase <b>con negrita</b> y mas.</p><p>Segunda.</p>\
+             <ul><li>uno</li><li>dos</li></ul><script>var oculto = 1;</script></body></html>",
+        );
+        let (response, _) = server.handle(EngineRequest::GetPageText { id: Some("t".to_string()) }).await;
+        let EngineResponse::PageText { text, truncated, .. } = response else { panic!("debia ser PageText: {response:?}") };
+        assert!(!truncated);
+        assert_eq!(text, "Titulo\nPrimera frase con negrita y mas.\nSegunda.\n• uno\n• dos", "los items de lista conservan su viñeta");
+    }
+
+    /// Wikipedia: el menu lateral llena el tope antes de llegar al articulo. Con
+    /// un `<main>` con texto de verdad, solo se lee ese.
+    #[tokio::test]
+    async fn get_page_text_prefers_the_main_content_over_menus() {
+        let articulo = "Un navegador web es un programa que permite ver la informacion que contiene una pagina web. ".repeat(4);
+        let mut server = server_from_html(&format!(
+            "<html><body><nav><a href=\"/a\">Menu principal</a><a href=\"/b\">Portada</a></nav><main><h1>Navegador web</h1><p>{articulo}</p></main><footer>Pie de pagina</footer></body></html>"
+        ));
+        let (response, _) = server.handle(EngineRequest::GetPageText { id: None }).await;
+        let EngineResponse::PageText { text, .. } = response else { panic!("debia ser PageText") };
+        assert!(text.starts_with("Navegador web\nUn navegador web es un programa"), "{text}");
+        assert!(!text.contains("Menu principal") && !text.contains("Pie de pagina"), "sin menus ni pie: {text}");
+    }
+
+    /// Un `<main>` casi vacio (cascara de una web que pinta con JS) no sustituye a la pagina.
+    #[tokio::test]
+    async fn get_page_text_ignores_an_empty_main_shell() {
+        let mut server = server_from_html("<html><body><p>Texto fuera del main.</p><main><p>hola</p></main></body></html>");
+        let (response, _) = server.handle(EngineRequest::GetPageText { id: None }).await;
+        let EngineResponse::PageText { text, .. } = response else { panic!("debia ser PageText") };
+        assert!(text.contains("Texto fuera del main."), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_page_text_is_capped_and_says_so() {
+        let largo = "palabra ".repeat(5000);
+        let mut server = server_from_html(&format!("<html><body><p>{largo}</p></body></html>"));
+        let (response, _) = server.handle(EngineRequest::GetPageText { id: None }).await;
+        let EngineResponse::PageText { text, truncated, .. } = response else { panic!("debia ser PageText") };
+        assert!(truncated, "la pagina tiene 40.000 caracteres");
+        assert!(text.chars().count() <= MAX_PAGE_TEXT_CHARS);
     }
 
     /// Tarea 3.3: `elements` solo trae lo accionable y visible. Antes traia

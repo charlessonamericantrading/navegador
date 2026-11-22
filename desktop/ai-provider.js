@@ -5,7 +5,15 @@
 // Cada petición lleva un `requestId` del renderer para poder cancelarla: el
 // botón «Detener» del agente aborta la petición HTTP, no solo deja de esperarla.
 
-const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+const { DEFAULT_GEMINI_MODEL, isValidModelName } = require('./ai-settings');
+
+const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+
+/** El nombre del modelo ya se validó al guardarlo; aquí se vuelve a comprobar porque acaba en una URL. */
+function geminiUrl(model) {
+  if (!isValidModelName(model)) throw new Error(`nombre de modelo no válido: ${String(model).slice(0, 40)}`);
+  return `${GEMINI_BASE}/${model}:generateContent`;
+}
 const MAX_PROMPT_CHARS = 200_000;
 
 /** Quita la clave de cualquier texto que vaya a salir del proceso principal. */
@@ -14,7 +22,7 @@ function redact(text, key) {
   return key ? value.split(key).join('[clave oculta]') : value;
 }
 
-function createGeminiProvider({ getKey, fetch }) {
+function createGeminiProvider({ getKey, fetch, getModel = () => DEFAULT_GEMINI_MODEL }) {
   const inFlight = new Map();
 
   async function generate(requestId, prompt) {
@@ -30,7 +38,7 @@ function createGeminiProvider({ getKey, fetch }) {
     inFlight.set(requestId, controller);
     try {
       // La clave va en cabecera, no en la URL: una URL acaba en logs y trazas.
-      const response = await fetch(GEMINI_URL, {
+      const response = await fetch(geminiUrl(getModel()), {
         method: 'POST',
         signal: controller.signal,
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
@@ -60,4 +68,4 @@ function createGeminiProvider({ getKey, fetch }) {
   return { generate, cancel };
 }
 
-module.exports = { createGeminiProvider, redact, GEMINI_URL };
+module.exports = { createGeminiProvider, redact, geminiUrl };

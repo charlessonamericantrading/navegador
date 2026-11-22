@@ -14,6 +14,7 @@ import {
   BrowserActionError,
   MAX_CONSECUTIVE_FAILURES,
   shouldStopAfterFailures,
+  AGENT_SCROLL_PIXELS,
   type BrowserInterface,
   type InteractiveElement,
   type ModelProvider,
@@ -39,6 +40,9 @@ function navegadorFalso(url = 'https://google.com/', elementos: InteractiveEleme
     clickElement: async (id) => { acciones.push(`click [${id}]`); },
     typeIntoElement: async (id, text) => { acciones.push(`type [${id}] ${text}`); },
     pressKey: async (key) => { acciones.push(`press ${key}`); },
+    scroll: async (dy) => { acciones.push(`scroll ${dy}`); },
+    goBack: async () => { acciones.push('back'); },
+    getPageText: async () => 'La primera frase del artículo.',
   };
   return { browser, acciones };
 }
@@ -215,4 +219,50 @@ test('la política detiene al segundo fallo seguido', () => {
   assert.equal(MAX_CONSECUTIVE_FAILURES, 2);
   assert.equal(shouldStopAfterFailures(1), false);
   assert.equal(shouldStopAfterFailures(2), true);
+});
+
+// --- Acciones nuevas y texto de la página (tarea 3.4) ---
+
+test('el agente puede desplazar la página y volver atrás', async () => {
+  const { browser, acciones } = navegadorFalso();
+  const { modelo } = modeloQueResponde(
+    JSON.stringify({ thought: 't', action: 'scroll', direction: 'down' }),
+    JSON.stringify({ thought: 't', action: 'scroll', direction: 'up' }),
+    JSON.stringify({ thought: 't', action: 'back' }),
+  );
+  const agente = new AgentOrchestrator(browser, modelo);
+
+  for (let i = 0; i < 3; i++) {
+    const paso = await agente.runStep('objetivo', 'gemini');
+    assert.equal(paso.failed, false, paso.execution_msg);
+  }
+  assert.deepEqual(acciones, [`scroll ${AGENT_SCROLL_PIXELS}`, `scroll -${AGENT_SCROLL_PIXELS}`, 'back']);
+});
+
+test('una dirección de scroll desconocida es un paso fallido, no un scroll', async () => {
+  const { browser, acciones } = navegadorFalso();
+  const { modelo } = modeloQueResponde(JSON.stringify({ thought: 't', action: 'scroll', direction: 'sideways' }));
+
+  const paso = await new AgentOrchestrator(browser, modelo).runStep('objetivo', 'gemini');
+  assert.equal(paso.failed, true);
+  assert.deepEqual(acciones, []);
+});
+
+test('el prompt lleva el texto de la página y los ids de la lista de elementos', async () => {
+  const { browser } = navegadorFalso();
+  const { modelo, prompts } = modeloQueResponde(JSON.stringify({ thought: 't', action: 'finish', answer: 'ok' }));
+
+  await new AgentOrchestrator(browser, modelo).runStep('lee la primera frase', 'gemini');
+  assert.match(prompts[0], /La primera frase del artículo\./, 'el agente puede leer la página para contestar');
+  assert.match(prompts[0], /\[1\] input "Buscar"/, 'y los ids son los de `elements`');
+});
+
+test('sin texto de página el agente sigue funcionando', async () => {
+  const { browser } = navegadorFalso();
+  browser.getPageText = async () => { throw new Error('motor ocupado'); };
+  const { modelo, prompts } = modeloQueResponde(JSON.stringify({ thought: 't', action: 'finish', answer: 'ok' }));
+
+  const paso = await new AgentOrchestrator(browser, modelo).runStep('objetivo', 'gemini');
+  assert.equal(paso.failed, false);
+  assert.match(prompts[0], /\(no disponible\)/);
 });

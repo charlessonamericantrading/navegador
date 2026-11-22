@@ -8,7 +8,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createCredentialStore } = require('../ai-credentials');
-const { createGeminiProvider, redact } = require('../ai-provider');
+const { createGeminiProvider, redact, geminiUrl } = require('../ai-provider');
+const { createModelSettings, isValidModelName, DEFAULT_GEMINI_MODEL } = require('../ai-settings');
 
 /** `safeStorage` falso: "cifra" invirtiendo, suficiente para ver que no va en claro. */
 function safeStorageFalso({ disponible = true, backend } = {}) {
@@ -137,4 +138,76 @@ test('valida lo que llega por IPC', async () => {
 
 test('redact oculta todas las apariciones', () => {
   assert.equal(redact(`a ${CLAVE} b ${CLAVE}`, CLAVE), 'a [clave oculta] b [clave oculta]');
+});
+
+// --- Modelo configurable (tarea 3.4) ---
+
+test('el modelo por defecto no es el retirado y va en la URL de la petición', async () => {
+  assert.ok(!DEFAULT_GEMINI_MODEL.includes('2.0'), 'gemini-2.0-flash se retiró el 1-jun-2026');
+  const { fetch, llamadas } = fetchFalso(RESPUESTA_OK);
+  const provider = createGeminiProvider({ getKey: () => CLAVE, fetch });
+
+  await provider.generate('r1', 'prompt');
+  assert.equal(llamadas[0].url, `https://generativelanguage.googleapis.com/v1beta/models/${DEFAULT_GEMINI_MODEL}:generateContent`);
+});
+
+test('el proveedor usa el modelo que se le configura, y lo relee en cada petición', async () => {
+  const { fetch, llamadas } = fetchFalso(RESPUESTA_OK);
+  let modelo = 'gemini-3.1-flash-lite';
+  const provider = createGeminiProvider({ getKey: () => CLAVE, getModel: () => modelo, fetch });
+
+  await provider.generate('r1', 'a');
+  modelo = 'gemini-3.8-flash';
+  await provider.generate('r2', 'b');
+  assert.match(llamadas[0].url, /models\/gemini-3\.1-flash-lite:generateContent$/);
+  assert.match(llamadas[1].url, /models\/gemini-3\.8-flash:generateContent$/);
+});
+
+test('un nombre de modelo que no es un nombre no puede cambiar el destino de la petición', async () => {
+  for (const malo of ['', 'x', 'GEMINI', 'gemini/../../v1/otra', 'gemini?key=1', 'gemini:otra', 'gemini 3', 'a'.repeat(80), null, 7]) {
+    assert.equal(isValidModelName(malo), false, String(malo));
+    assert.throws(() => geminiUrl(malo), /no válido/);
+  }
+  assert.equal(isValidModelName('gemini-3.5-flash'), true);
+
+  const { fetch, llamadas } = fetchFalso(RESPUESTA_OK);
+  const provider = createGeminiProvider({ getKey: () => CLAVE, getModel: () => '../../evil', fetch });
+  await assert.rejects(provider.generate('r1', 'prompt'), /no válido/);
+  assert.equal(llamadas.length, 0, 'ni se llama al proveedor');
+});
+
+function ajustes(t, env = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-set-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'ai-settings.json');
+  return { settings: createModelSettings({ filePath, fs, env }), filePath };
+}
+
+test('el ajuste del modelo se guarda, se lee y se restablece', (t) => {
+  const { settings } = ajustes(t);
+  assert.deepEqual(settings.info(), { model: DEFAULT_GEMINI_MODEL, defaultModel: DEFAULT_GEMINI_MODEL });
+
+  assert.equal(settings.set('  gemini-3.8-flash  ').model, 'gemini-3.8-flash');
+  assert.equal(settings.get(), 'gemini-3.8-flash');
+
+  assert.equal(settings.reset().model, DEFAULT_GEMINI_MODEL);
+  assert.equal(settings.reset().model, DEFAULT_GEMINI_MODEL, 'restablecer sin nada guardado no falla');
+});
+
+test('guardar un nombre no válido se rechaza y no toca lo guardado', (t) => {
+  const { settings } = ajustes(t);
+  settings.set('gemini-3.8-flash');
+  assert.throws(() => settings.set('mal nombre'), /no válido/);
+  assert.equal(settings.get(), 'gemini-3.8-flash');
+});
+
+test('la variable de entorno manda sobre el ajuste guardado, y un fichero estropeado no rompe nada', (t) => {
+  const { settings, filePath } = ajustes(t, { NAVEGADOR_GEMINI_MODEL: 'gemini-3.1-flash-lite' });
+  settings.set('gemini-3.8-flash');
+  assert.equal(settings.get(), 'gemini-3.1-flash-lite');
+
+  const { settings: otro, filePath: otraRuta } = ajustes(t);
+  fs.writeFileSync(otraRuta, '{esto no es json', 'utf8');
+  assert.equal(otro.get(), DEFAULT_GEMINI_MODEL);
+  assert.ok(filePath);
 });

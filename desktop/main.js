@@ -5,6 +5,7 @@ const child_process = require('child_process');
 const { autoUpdater } = require('electron-updater');
 const { createCredentialStore } = require('./ai-credentials');
 const { createGeminiProvider } = require('./ai-provider');
+const { createModelSettings } = require('./ai-settings');
 const { validateEngineRequest, createLineSplitter, resolveAppPath } = require('./engine-protocol');
 const { createBrokerClient, rendererEnv, usesRemoteBroker } = require('./engine-broker');
 const { pathToFileURL } = require('url');
@@ -500,7 +501,8 @@ function ai() {
       fs,
       platform: process.platform,
     });
-    aiServices = { credentials, provider: createGeminiProvider({ getKey: () => credentials.get(), fetch: net.fetch }) };
+    const model = createModelSettings({ filePath: path.join(app.getPath('userData'), 'ai-settings.json'), fs, env: process.env });
+    aiServices = { credentials, model, provider: createGeminiProvider({ getKey: () => credentials.get(), getModel: () => model.get(), fetch: net.fetch }) };
   }
   return aiServices;
 }
@@ -522,6 +524,9 @@ handleTrusted('engine:request', (payload) => sendEngineRequest(validateEngineReq
 handleTrusted('ai:credentials:status', () => ai().credentials.status());
 handleTrusted('ai:credentials:set', (key) => ai().credentials.set(key));
 handleTrusted('ai:credentials:clear', () => ai().credentials.clear());
+handleTrusted('ai:model:get', () => ai().model.info());
+handleTrusted('ai:model:set', (name) => ai().model.set(name));
+handleTrusted('ai:model:reset', () => ai().model.reset());
 handleTrusted('ai:generate', (requestId, prompt) => ai().provider.generate(requestId, prompt));
 handleTrusted('ai:cancel', (requestId) => ai().provider.cancel(requestId));
 

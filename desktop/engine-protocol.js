@@ -69,6 +69,8 @@ const ESQUEMA = {
   switch_tab: { tab_id: campo.integer(...U32) },
   list_tabs: {},
   get_accessibility_tree: {},
+  // Texto legible de la página, para que el agente pueda leer lo que `elements` (solo lo accionable) no trae.
+  get_page_text: {},
 };
 
 /**

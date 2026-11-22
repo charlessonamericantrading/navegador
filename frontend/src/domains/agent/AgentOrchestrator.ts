@@ -26,8 +26,10 @@ export interface InteractiveElement {
 
 export interface AgentStepResult {
   thought: string;
-  action: 'navigate' | 'click' | 'type' | 'press' | 'finish' | string;
+  action: 'navigate' | 'click' | 'type' | 'press' | 'scroll' | 'back' | 'finish' | string;
   target_id?: number;
+  /** Para `scroll`: hacia dónde. */
+  direction?: 'down' | 'up' | string;
   text?: string;
   key?: string;
   url?: string;
@@ -69,7 +71,8 @@ export interface BrowserInterface {
   getUrl: () => Promise<string>;
   getTitle: () => Promise<string>;
   getElements: () => Promise<InteractiveElement[]>;
-  getAccessibilityPrompt?: () => Promise<string>;
+  /** El texto legible de la página (lo que `getElements`, solo lo accionable, no trae). */
+  getPageText?: () => Promise<string>;
   navigate: (url: string) => Promise<void>;
   /**
    * Por `id` de la lista de elementos, no por coordenadas: las `rect` de la
@@ -81,7 +84,13 @@ export interface BrowserInterface {
   /** Sustituye el valor del campo por `text` (no envía el formulario). */
   typeIntoElement: (elementId: number, text: string) => Promise<void>;
   pressKey: (key: string) => Promise<void>;
+  /** Desplaza la página `dy` píxeles (positivo = hacia abajo). */
+  scroll: (dy: number) => Promise<void>;
+  goBack: () => Promise<void>;
 }
+
+/** Lo que baja o sube `scroll`: una pantalla casi entera. */
+export const AGENT_SCROLL_PIXELS = 600;
 
 /**
  * El usuario detuvo la ejecución. Se lanza en vez de devolver un paso para
@@ -195,16 +204,19 @@ export class AgentOrchestrator {
     const elements = await this.browser.getElements();
     throwIfCancelled(signal);
 
-    let domText = '';
-    if (this.browser.getAccessibilityPrompt) {
+    // Los ids del prompt son los de `elements`, los mismos que entienden
+    // `click_element`/`type_into_element`: una sola lista, sin tabla de
+    // equivalencias (el árbol de accesibilidad numeraba aparte y no coincidía).
+    const domText = getSimplifiedDomText(elements);
+    // El texto de la página es opcional: sin él el agente sigue pudiendo actuar,
+    // pero no leer la respuesta.
+    let pageText = '';
+    if (this.browser.getPageText) {
       try {
-        domText = await this.browser.getAccessibilityPrompt();
+        pageText = await this.browser.getPageText();
       } catch {
-        domText = getSimplifiedDomText(elements);
+        pageText = '';
       }
-    }
-    if (!domText) {
-      domText = getSimplifiedDomText(elements);
     }
 
     throwIfCancelled(signal);
@@ -213,7 +225,7 @@ export class AgentOrchestrator {
     if (mode === 'simulation') {
       stepResult = await this.runSimulatedStep(goal, url, title, elements, signal);
     } else {
-      stepResult = await this.runGeminiStep(goal, url, title, domText, signal);
+      stepResult = await this.runGeminiStep(goal, url, title, domText, pageText, signal);
     }
     // La respuesta del modelo puede llegar después de pulsar «Detener»: no
     // se ejecuta.
@@ -279,6 +291,16 @@ export class AgentOrchestrator {
           if (!step.key) return fallo('Acción press sin tecla');
           await this.browser.pressKey(step.key);
           return { message: `Presionando tecla '${step.key}'`, finished: false, failed: false, answer: '' };
+        }
+        case 'scroll': {
+          const up = step.direction === 'up';
+          if (!up && step.direction !== undefined && step.direction !== 'down') return fallo(`scroll con dirección desconocida: ${JSON.stringify(step.direction)}`);
+          await this.browser.scroll(up ? -AGENT_SCROLL_PIXELS : AGENT_SCROLL_PIXELS);
+          return { message: up ? 'Desplazando la página hacia arriba' : 'Desplazando la página hacia abajo', finished: false, failed: false, answer: '' };
+        }
+        case 'back': {
+          await this.browser.goBack();
+          return { message: 'Volviendo a la página anterior', finished: false, failed: false, answer: '' };
         }
         case 'finish':
           return { message: 'Objetivo completado', finished: true, failed: false, answer: step.answer || 'He terminado la tarea.' };
@@ -389,7 +411,7 @@ export class AgentOrchestrator {
     };
   }
 
-  private async runGeminiStep(goal: string, url: string, title: string, domText: string, signal?: AbortSignal): Promise<AgentStepResult> {
+  private async runGeminiStep(goal: string, url: string, title: string, domText: string, pageText: string, signal?: AbortSignal): Promise<AgentStepResult> {
     if (!this.model) {
       return modelError('La IA remota solo está disponible en la aplicación de escritorio.');
     }
@@ -402,9 +424,13 @@ REGLAS DE ACCIÓN:
 2. "click": {"action": "click", "target_id": <ID_NUMÉRICO>}
 3. "type": {"action": "type", "target_id": <ID_NUMÉRICO>, "text": "texto"} (solo escribe; NO envía el formulario)
 4. "press": {"action": "press", "key": "Enter"} (para enviar lo escrito, como paso aparte)
-5. "finish": {"action": "finish", "answer": "respuesta final"}
+5. "scroll": {"action": "scroll", "direction": "down" | "up"} (desplaza una pantalla; clic y type ya llevan el elemento a la vista por sí solos)
+6. "back": {"action": "back"} (vuelve a la página anterior)
+7. "finish": {"action": "finish", "answer": "respuesta final"}
 
-RESPONDE EXCLUSIVAMENTE CON UN OBJETO JSON con las claves: thought, action, target_id, text, key, url, answer.`;
+Usa "finish" en cuanto el texto de la página te permita contestar el objetivo, y pon la respuesta en "answer".
+
+RESPONDE EXCLUSIVAMENTE CON UN OBJETO JSON con las claves: thought, action, target_id, text, key, url, direction, answer.`;
 
     const userPrompt = `OBJETIVO: ${goal}
 ESTADO ACTUAL:
@@ -412,7 +438,10 @@ ESTADO ACTUAL:
 - Título: ${title}
 - Pasos previos: ${JSON.stringify(this.history.map((h) => ({ thought: h.thought, action: h.action })))}
 
-ELEMENTOS INTERACTIVOS DISPONIBLES:
+TEXTO DE LA PÁGINA (lo que se lee):
+${pageText || '(no disponible)'}
+
+ELEMENTOS INTERACTIVOS DISPONIBLES (usa su número en target_id):
 ${domText}
 
 Decide el siguiente paso y responde en JSON.`;

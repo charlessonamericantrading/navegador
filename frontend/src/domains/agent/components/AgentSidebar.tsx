@@ -20,6 +20,10 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
   // entregarlo al proceso principal.
   const [credentialStatus, setCredentialStatus] = useState<AiCredentialStatus | null>(null);
   const [keyDraft, setKeyDraft] = useState('');
+  // Modelo de IA (tarea 3.4): el retirado `gemini-2.0-flash` estaba escrito en
+  // el código; ahora es un ajuste que se cambia aquí sin publicar versión.
+  const [modelInfo, setModelInfo] = useState<AiModelInfo | null>(null);
+  const [modelDraft, setModelDraft] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [currentStep, setCurrentStep] = useState(0);
@@ -66,6 +70,37 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
         console.error('No se pudo consultar la clave de IA:', err instanceof Error ? err.message : err);
       });
   }, []);
+
+  useEffect(() => {
+    window.electronAPI?.ai
+      ?.getModel()
+      .then((info) => {
+        setModelInfo(info);
+        setModelDraft(info.model);
+      })
+      .catch((err) => console.error('No se pudo leer el modelo de IA:', err instanceof Error ? err.message : err));
+  }, []);
+
+  const handleSaveModel = async () => {
+    const ai = window.electronAPI?.ai;
+    if (!ai || !modelDraft.trim()) return;
+    try {
+      const info = await ai.setModel(modelDraft);
+      setModelInfo(info);
+      setModelDraft(info.model);
+      setStatusMessage(`Modelo de IA: ${info.model}`);
+    } catch (err) {
+      setStatusMessage(`No se pudo guardar el modelo: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const handleResetModel = async () => {
+    const ai = window.electronAPI?.ai;
+    if (!ai) return;
+    const info = await ai.resetModel();
+    setModelInfo(info);
+    setModelDraft(info.model);
+  };
 
   const handleSaveKey = async () => {
     const ai = window.electronAPI?.ai;
@@ -217,7 +252,7 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
               className="settings-select"
             >
               <option value="simulation">⚡ Simulación Rápida (Sin API Key)</option>
-              <option value="gemini">🧠 Gemini 2.0 Flash (Real AI)</option>
+              <option value="gemini">🧠 Gemini (IA real)</option>
             </select>
           </label>
 
@@ -225,6 +260,32 @@ export const AgentSidebar: React.FC<AgentSidebarProps> = ({ isOpen, onClose, bro
             <small className="settings-hint">
               El modo Gemini solo está disponible en la aplicación de escritorio: la clave se guarda en su proceso principal, no en la página.
             </small>
+          )}
+
+          {mode === 'gemini' && window.electronAPI?.ai && (
+            <label className="settings-label" style={{ marginTop: '8px' }}>
+              <span>Modelo de Gemini:</span>
+              <input
+                type="text"
+                value={modelDraft}
+                onChange={(e) => setModelDraft(e.target.value)}
+                placeholder={modelInfo?.defaultModel ?? 'gemini-3.5-flash'}
+                className="settings-input"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <div className="agent-controls" style={{ marginTop: '6px' }}>
+                <button type="button" className="btn btn-primary" onClick={handleSaveModel} disabled={!modelDraft.trim() || modelDraft.trim() === modelInfo?.model}>
+                  Guardar modelo
+                </button>
+                <button type="button" className="btn btn-secondary" onClick={handleResetModel} disabled={!modelInfo || modelInfo.model === modelInfo.defaultModel}>
+                  Restablecer
+                </button>
+              </div>
+              <small className="settings-hint">
+                Google retira modelos con el tiempo; si la IA da error de modelo, pon aquí el actual (lista oficial: ai.google.dev/gemini-api/docs/models).
+              </small>
+            </label>
           )}
 
           {mode === 'gemini' && window.electronAPI?.ai && (

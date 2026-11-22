@@ -39,7 +39,14 @@ export interface EngineOtherResponse {
   id?: string | null;
 }
 
-export type EngineResponse = EngineStateEvent | EngineTabsResponse | EngineErrorResponse | EngineOtherResponse;
+export interface EnginePageTextResponse {
+  type: 'page_text';
+  id?: string | null;
+  text: string;
+  truncated: boolean;
+}
+
+export type EngineResponse = EngineStateEvent | EngineTabsResponse | EngineErrorResponse | EnginePageTextResponse | EngineOtherResponse;
 
 /** Lo que valida `desktop/engine-protocol.js`; aqui basta con la forma. */
 export type EngineRequestPayload = { type: string } & Record<string, unknown>;
@@ -63,6 +70,12 @@ declare global {
     secureStorage: boolean;
   }
 
+  /** Modelo de IA en uso y el de fábrica (tarea 3.4). */
+  interface AiModelInfo {
+    model: string;
+    defaultModel: string;
+  }
+
   interface Window {
     electronAPI?: {
       isElectron: boolean;
@@ -77,6 +90,9 @@ declare global {
         credentialStatus: () => Promise<AiCredentialStatus>;
         setGeminiKey: (key: string) => Promise<AiCredentialStatus>;
         clearGeminiKey: () => Promise<AiCredentialStatus>;
+        getModel: () => Promise<AiModelInfo>;
+        setModel: (name: string) => Promise<AiModelInfo>;
+        resetModel: () => Promise<AiModelInfo>;
         generate: (requestId: string, prompt: string) => Promise<string>;
         cancel: (requestId: string) => Promise<void>;
       };
