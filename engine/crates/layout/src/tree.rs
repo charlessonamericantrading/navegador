@@ -207,11 +207,21 @@ fn absolute_length_to_px(token: &str, font_px: f32, viewport: (f32, f32)) -> Opt
 /// `None` si aparece algo que no se puede resolver aqui (un porcentaje, una
 /// `var()` sin sustituir, una funcion desconocida): entonces la declaracion
 /// se deja tal cual, que es mejor que inventarse un numero.
-fn eval_calc(expr: &str, font_px: f32, viewport: (f32, f32)) -> Option<f32> {
-    // Tokenizado: numeros-con-unidad, operadores y parentesis. Un `-` solo
-    // es operador si va rodeado de espacios o sigue a otro operador; en CSS
-    // `10px -5px` son dos valores y `10px-5px` no es valido, asi que exigir
-    // el espacio es lo correcto y ademas evita partir "e-5" de un numero.
+fn eval_calc(expr: &str, font_px: f32, viewport: (f32, f32), percent_base: Option<f32>) -> Option<f32> {
+    let tokens = tokenize_calc(expr);
+    let mut pos = 0usize;
+    let valor = eval_suma(&tokens, &mut pos, font_px, viewport, percent_base)?;
+    if pos != tokens.len() {
+        return None;
+    }
+    Some(valor)
+}
+
+/// Tokenizado de un `calc()`: numeros-con-unidad, operadores y parentesis. Un
+/// `-` solo es operador si va rodeado de espacios o sigue a otro operador; en
+/// CSS `10px -5px` son dos valores y `10px-5px` no es valido, asi que exigir
+/// el espacio es lo correcto y ademas evita partir "e-5" de un numero.
+fn tokenize_calc(expr: &str) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
     let mut actual = String::new();
     let mut anterior_es_valor = false;
@@ -251,32 +261,26 @@ fn eval_calc(expr: &str, font_px: f32, viewport: (f32, f32)) -> Option<f32> {
     if !actual.trim().is_empty() {
         tokens.push(actual.trim().to_string());
     }
-
-    let mut pos = 0usize;
-    let valor = eval_suma(&tokens, &mut pos, font_px, viewport)?;
-    if pos != tokens.len() {
-        return None;
-    }
-    Some(valor)
+    tokens
 }
 
-fn eval_suma(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f32, f32)) -> Option<f32> {
-    let mut acc = eval_producto(tokens, pos, font_px, viewport)?;
+fn eval_suma(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f32, f32), percent_base: Option<f32>) -> Option<f32> {
+    let mut acc = eval_producto(tokens, pos, font_px, viewport, percent_base)?;
     while *pos < tokens.len() && (tokens[*pos] == "+" || tokens[*pos] == "-") {
         let op = tokens[*pos].clone();
         *pos += 1;
-        let derecha = eval_producto(tokens, pos, font_px, viewport)?;
+        let derecha = eval_producto(tokens, pos, font_px, viewport, percent_base)?;
         acc = if op == "+" { acc + derecha } else { acc - derecha };
     }
     Some(acc)
 }
 
-fn eval_producto(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f32, f32)) -> Option<f32> {
-    let mut acc = eval_atomo(tokens, pos, font_px, viewport)?;
+fn eval_producto(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f32, f32), percent_base: Option<f32>) -> Option<f32> {
+    let mut acc = eval_atomo(tokens, pos, font_px, viewport, percent_base)?;
     while *pos < tokens.len() && (tokens[*pos] == "*" || tokens[*pos] == "/") {
         let op = tokens[*pos].clone();
         *pos += 1;
-        let derecha = eval_atomo(tokens, pos, font_px, viewport)?;
+        let derecha = eval_atomo(tokens, pos, font_px, viewport, percent_base)?;
         if op == "*" {
             acc *= derecha;
         } else {
@@ -289,11 +293,11 @@ fn eval_producto(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f3
     Some(acc)
 }
 
-fn eval_atomo(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f32, f32)) -> Option<f32> {
+fn eval_atomo(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f32, f32), percent_base: Option<f32>) -> Option<f32> {
     let token = tokens.get(*pos)?.clone();
     if token == "(" {
         *pos += 1;
-        let dentro = eval_suma(tokens, pos, font_px, viewport)?;
+        let dentro = eval_suma(tokens, pos, font_px, viewport, percent_base)?;
         if tokens.get(*pos)? != ")" {
             return None;
         }
@@ -304,8 +308,35 @@ fn eval_atomo(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f32, 
     if let Some(px) = absolute_length_to_px(&token, font_px, viewport) {
         return Some(px);
     }
+    // Un porcentaje solo se puede evaluar si se conoce el bloque contenedor
+    // (`percent_base`): en la cascada no se conoce y el calc se deja para la
+    // maquetacion (ver `rewrite_calc_keeping_percent`).
+    if let Some(porcentaje) = token.strip_suffix('%') {
+        return porcentaje.trim().parse::<f32>().ok().and_then(|n| percent_base.map(|base| n / 100.0 * base));
+    }
     // Un numero puro (el factor de un `* 2`).
     token.parse::<f32>().ok()
+}
+
+/// Reescribe un `calc()` con porcentajes dejando en PIXELES todo lo demas
+/// (tarea 2.4 del plan): `calc(100% - 2em)` -> `calc(100% - 32px)`. Asi, en
+/// la maquetacion, donde ya se conoce el bloque contenedor, solo quedan
+/// porcentajes y pixeles y `parse_css_length_relative` puede resolverlo sin
+/// saber del tamaño de fuente. `None` si hay algo que no se entiende.
+fn rewrite_calc_keeping_percent(expr: &str, font_px: f32, viewport: (f32, f32)) -> Option<String> {
+    let mut salida = Vec::new();
+    for token in tokenize_calc(expr) {
+        if matches!(token.as_str(), "(" | ")" | "+" | "-" | "*" | "/") || token.ends_with('%') {
+            salida.push(token);
+        } else if let Some(px) = absolute_length_to_px(&token, font_px, viewport) {
+            salida.push(format!("{px}px"));
+        } else if token.parse::<f32>().is_ok() {
+            salida.push(token);
+        } else {
+            return None;
+        }
+    }
+    Some(format!("calc({})", salida.join(" ")))
 }
 
 /// Reescribe un valor de propiedad dejando en PIXELES todo lo que se pueda
@@ -323,11 +354,20 @@ fn resolve_relative_units(value: &str, font_px: f32, viewport: (f32, f32)) -> Op
     for token in dividir_en_tokens(value) {
         let bajo = token.to_ascii_lowercase();
         if let Some(interior) = bajo.strip_prefix("calc(").and_then(|r| r.strip_suffix(')')) {
-            match eval_calc(interior, font_px, viewport) {
+            match eval_calc(interior, font_px, viewport, None) {
                 Some(px) => {
                     salida.push(format!("{px}px"));
                     cambiado = true;
                 }
+                // Con porcentajes no se puede evaluar todavia: se dejan en
+                // pixeles las demas unidades y se resuelve al maquetar.
+                None if interior.contains('%') => match rewrite_calc_keeping_percent(interior, font_px, viewport) {
+                    Some(reescrito) => {
+                        salida.push(reescrito);
+                        cambiado = true;
+                    }
+                    None => salida.push(token.to_string()),
+                },
                 None => salida.push(token.to_string()),
             }
             continue;
@@ -898,7 +938,7 @@ fn resolve_auto_margins(
         margin.right = 0.0;
     }
     let available = (containing_width - margin.left - margin.right).max(0.0);
-    let width = resolve_block_width(computed_style, available);
+    let width = resolve_block_width_with_reference(computed_style, available, containing_width);
     let spare = (available - width).max(0.0);
     match (auto_left, auto_right) {
         (true, true) => {
@@ -1019,6 +1059,13 @@ fn is_border_box(computed_style: &HashMap<String, String>) -> bool {
 /// que SI conocen esa referencia.
 fn parse_css_length_relative(value: &str, reference: f32) -> Option<f32> {
     let trimmed = value.trim();
+    // `calc(100% - 200px)` (tarea 2.4 del plan): la cascada ya dejo en pixeles
+    // todo lo que no es un porcentaje, asi que aqui solo falta resolver estos
+    // contra el bloque contenedor.
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(interior) = lower.strip_prefix("calc(").and_then(|r| r.strip_suffix(')')) {
+        return eval_calc(interior, INITIAL_FONT_SIZE, (0.0, 0.0), Some(reference));
+    }
     if let Some(pct) = trimmed.strip_suffix('%') {
         return pct.trim().parse::<f32>().ok().filter(|n| *n >= 0.0).map(|n| n / 100.0 * reference);
     }
@@ -1086,24 +1133,33 @@ fn clamp_height(height: f32, computed_style: &HashMap<String, String>, containin
 }
 
 fn resolve_block_width(computed_style: &HashMap<String, String>, auto_width: f32) -> f32 {
-    let padding = resolve_padding(computed_style, auto_width);
+    resolve_block_width_with_reference(computed_style, auto_width, auto_width)
+}
+
+/// `auto_width` es el ancho que se usa cuando `width` es `auto` (lo que
+/// queda del contenedor tras los margenes); `percent_reference` es contra lo
+/// que se resuelven los porcentajes de `width`, `min-width`, `max-width` y
+/// `padding`: el ancho del bloque contenedor ENTERO, no lo que queda tras los
+/// margenes del propio elemento (tarea 2.4 del plan). Con `margin-left: 10%`
+/// y `width: calc(100% - 20px)` el 100% es el contenedor, no el contenedor
+/// menos el margen.
+fn resolve_block_width_with_reference(computed_style: &HashMap<String, String>, auto_width: f32, percent_reference: f32) -> f32 {
+    let padding = resolve_padding(computed_style, percent_reference);
     let border = resolve_border_width(computed_style);
     let box_model_extra = padding.left + padding.right + border.left + border.right;
     let border_box = is_border_box(computed_style);
 
-    // `auto_width` es el ancho del bloque contenedor, que es exactamente la
-    // referencia contra la que el spec resuelve un `width` en porcentaje.
     let mut width = computed_style
         .get("width")
-        .and_then(|v| parse_css_length_relative(v, auto_width))
+        .and_then(|v| parse_css_length_relative(v, percent_reference))
         .map(|w| if border_box { w } else { w + box_model_extra })
         .unwrap_or(auto_width);
 
-    if let Some(max_w) = computed_style.get("max-width").and_then(|v| parse_css_length_relative(v, auto_width)) {
+    if let Some(max_w) = computed_style.get("max-width").and_then(|v| parse_css_length_relative(v, percent_reference)) {
         let max_limit = if border_box { max_w } else { max_w + box_model_extra };
         width = width.min(max_limit);
     }
-    if let Some(min_w) = computed_style.get("min-width").and_then(|v| parse_css_length_relative(v, auto_width)) {
+    if let Some(min_w) = computed_style.get("min-width").and_then(|v| parse_css_length_relative(v, percent_reference)) {
         let min_limit = if border_box { min_w } else { min_w + box_model_extra };
         width = width.max(min_limit);
     }
@@ -2709,7 +2765,7 @@ impl LayoutTreeBuilder {
             // unico comportamiento antes de esta tarea - ver
             // `resolve_block_width`.
             let auto_width = (eff_inner_width - margin.left - margin.right).max(0.0);
-            child.dimensions.width = centered_width.unwrap_or_else(|| resolve_block_width(&child.computed_style, auto_width));
+            child.dimensions.width = centered_width.unwrap_or_else(|| resolve_block_width_with_reference(&child.computed_style, auto_width, eff_inner_width));
             let child_width = child.dimensions.width;
             // `position: relative` (Fase 3.3): `child` YA ocupo su lugar
             // normal arriba (sigue reservando su espacio de siempre, esto
@@ -6104,6 +6160,30 @@ mod tests {
 
         assert_eq!(caja.computed_style.get("background-color").map(String::as_str), Some("#ff0000"));
         assert_eq!(caja.dimensions.width, 120.0);
+    }
+
+    /// Tarea 2.4 del plan: `calc()` con un porcentaje se resuelve contra el
+    /// bloque contenedor. Antes la caja caia a "ocupar todo el contenedor".
+    #[test]
+    fn calc_with_a_percentage_resolves_against_the_container() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="a" style="width: calc(100% - 200px)">x</div><div id="b" style="width: calc(50% + 2em)">y</div><div id="c" style="width: calc(100px + 50px)">z</div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+
+        assert_eq!(box_of(&root, &dom, "a").dimensions.width, 800.0, "100% - 200px");
+        assert_eq!(box_of(&root, &dom, "b").dimensions.width, 532.0, "50% de 1000 mas 2em de 16px");
+        assert_eq!(box_of(&root, &dom, "c").dimensions.width, 150.0, "un calc solo con pixeles sigue funcionando");
+    }
+
+    #[test]
+    fn calc_with_a_percentage_works_in_a_stylesheet_and_in_margins() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="a">x</div></body></html>"#);
+        let css = "#a { width: calc(100% - 20px); margin-left: calc(10% + 5px); }";
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(css), 1000.0, 600.0, None, &ImageMap::new());
+        let a = box_of(&root, &dom, "a");
+
+        assert_eq!(a.box_dimensions.margin.left, 105.0, "10% de 1000 mas 5px");
+        assert_eq!(a.dimensions.x, 105.0);
+        assert_eq!(a.dimensions.width, 980.0, "el 100% es el contenedor entero (1000), no lo que queda tras el margen");
     }
 
     #[test]
