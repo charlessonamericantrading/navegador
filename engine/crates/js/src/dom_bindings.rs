@@ -689,6 +689,26 @@ impl DomBindings {
             root_capture.clone(),
         );
 
+        // `document.getElementsByTagName(etiqueta)` (tarea 4.1 del plan): una de
+        // las llamadas mas usadas de la web, que faltaba y lanzaba "not a
+        // callable function". Mismo criterio que `getElementsByClassName`:
+        // un Array con la foto del momento, no una coleccion viva. `"*"`
+        // devuelve todos los elementos y la etiqueta no distingue mayusculas.
+        let get_elements_by_tag = NativeFunction::from_copy_closure_with_captures(
+            |_this, args: &[JsValue], capture: &DomRootCapture, context| {
+                let etiqueta = match args.first() {
+                    Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                    None => return Ok(JsArray::new(context)?.into()),
+                };
+                let objetos: Vec<JsValue> = elementos_por_etiqueta(&capture.0, &etiqueta)
+                    .iter()
+                    .map(|n| element_to_js_object(n, &capture.1, context).into())
+                    .collect();
+                Ok(JsArray::from_iter(objetos, context).into())
+            },
+            root_capture.clone(),
+        );
+
         // `document.createDocumentFragment()`. Un fragmento es un contenedor
         // sin representacion propia: se le anaden hijos y al insertarlo se
         // insertan ellos. Aqui se modela como un nodo `Document` suelto - el
@@ -796,6 +816,7 @@ impl DomBindings {
             .accessor(js_string!("title"), Some(title_getter_fn), Some(title_setter_fn), Attribute::all())
             // Fase 45 (tarea C6)
             .function(get_elements_by_class, js_string!("getElementsByClassName"), 1)
+            .function(get_elements_by_tag, js_string!("getElementsByTagName"), 1)
             .function(create_fragment, js_string!("createDocumentFragment"), 0)
             .function(create_comment, js_string!("createComment"), 1)
             .function(has_focus, js_string!("hasFocus"), 0)
@@ -1849,6 +1870,31 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         capture.clone(),
     );
 
+    // `element.getElementsByTagName` / `getElementsByClassName` (tarea 4.1):
+    // solo los DESCENDIENTES, nunca el propio elemento.
+    let get_elements_by_tag_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let etiqueta = match args.first() {
+                Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                None => return Ok(JsArray::from_iter(Vec::new(), context).into()),
+            };
+            let objetos: Vec<JsValue> = elementos_por_etiqueta(&capture.0, &etiqueta).iter().map(|n| element_to_js_object(n, &capture.1, context).into()).collect();
+            Ok(JsArray::from_iter(objetos, context).into())
+        },
+        capture.clone(),
+    );
+    let get_elements_by_class_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args: &[JsValue], capture: &ElementCapture, context| {
+            let clases = match args.first() {
+                Some(v) => v.to_string(context)?.to_std_string_escaped(),
+                None => return Ok(JsArray::from_iter(Vec::new(), context).into()),
+            };
+            let objetos: Vec<JsValue> = elementos_por_clases(&capture.0, &clases).iter().map(|n| element_to_js_object(n, &capture.1, context).into()).collect();
+            Ok(JsArray::from_iter(objetos, context).into())
+        },
+        capture.clone(),
+    );
+
     // `closest(selector)` sube por los ancestros EMPEZANDO POR EL PROPIO
     // elemento, que es lo que dice el spec y lo que hace util al metodo:
     // `e.target.closest('button')` acierta tanto si se pulso el boton como si
@@ -2332,6 +2378,8 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
         .function(matches_fn, js_string!("matches"), 1)
         .function(query_selector_fn, js_string!("querySelector"), 1)
         .function(query_selector_all_fn, js_string!("querySelectorAll"), 1)
+        .function(get_elements_by_tag_fn, js_string!("getElementsByTagName"), 1)
+        .function(get_elements_by_class_fn, js_string!("getElementsByClassName"), 1)
         .function(closest_fn, js_string!("closest"), 1)
         .function(contains_fn, js_string!("contains"), 1)
         .function(remove_fn, js_string!("remove"), 0)
@@ -2836,6 +2884,27 @@ mod tests {
         runtime.bind_dom(dom).expect("bind_dom no deberia fallar en estos tests");
         runtime.eval(script).expect("el script de test deberia ser JS valido");
         runtime.eval(expresion).expect("la expresion de lectura deberia ser JS valido")
+    }
+
+    /// Tarea 4.1 del plan: `getElementsByTagName` en `document` y en elementos.
+    #[test]
+    fn get_elements_by_tag_name_finds_elements_in_document_and_in_a_subtree() {
+        let html = r#"<html><body><div id="a"><p>uno</p><P>dos</P><span><p>tres</p></span></div><p>cuatro</p></body></html>"#;
+        assert_eq!(eval_with_dom(html, "document.getElementsByTagName('p').length"), "4", "en todo el documento");
+        assert_eq!(eval_with_dom(html, "document.getElementsByTagName('P').length"), "4", "sin distinguir mayusculas");
+        assert_eq!(eval_with_dom(html, "document.getElementById('a').getElementsByTagName('p').length"), "3", "solo el subarbol");
+        assert_eq!(eval_with_dom(html, "document.getElementsByTagName('p')[1].textContent"), "\"dos\"", "en orden de documento");
+        assert_eq!(eval_with_dom(html, "document.getElementsByTagName('nada').length"), "0");
+        assert_eq!(eval_with_dom(html, "var a = document.getElementById('a'); a.getElementsByTagName('div').length"), "0", "el propio elemento no cuenta");
+        assert_eq!(eval_with_dom(html, "document.getElementById('a').getElementsByTagName('*').length"), "4", "'*': todos los descendientes (3 <p> + 1 <span>)");
+    }
+
+    #[test]
+    fn element_get_elements_by_class_name_requires_all_the_classes_and_skips_the_element_itself() {
+        let html = r#"<html><body><div id="r" class="x"><p class="x y">1</p><p class="x">2</p><p class="y">3</p></div></body></html>"#;
+        assert_eq!(eval_with_dom(html, "document.getElementById('r').getElementsByClassName('x').length"), "2", "el propio #r tiene la clase x pero no cuenta");
+        assert_eq!(eval_with_dom(html, "document.getElementById('r').getElementsByClassName('x y').length"), "1", "las dos clases a la vez");
+        assert_eq!(eval_with_dom(html, "document.getElementById('r').getElementsByClassName('').length"), "0");
     }
 
     /// `scrollTop`/`scrollLeft` se leen y escriben de verdad, y el valor es
@@ -4839,6 +4908,52 @@ mod tests_fase44 {
 /// busqueda de `boton`. Es el mismo criterio que usa el selector `.boton` de
 /// CSS, y responder distinto entre los dos seria una fuente de fallos sin
 /// diagnostico.
+/// Elementos DESCENDIENTES de `raiz` con esa etiqueta, en orden de documento
+/// (tarea 4.1 del plan). `"*"` los devuelve todos; la etiqueta no distingue
+/// mayusculas (el parser guarda las etiquetas en minusculas). `raiz` no entra
+/// aunque coincida: asi lo manda `getElementsByTagName`.
+fn elementos_por_etiqueta(raiz: &Arc<RwLock<Node>>, etiqueta: &str) -> Vec<Arc<RwLock<Node>>> {
+    fn recolectar(nodo: &Arc<RwLock<Node>>, etiqueta: &str, salida: &mut Vec<Arc<RwLock<Node>>>) {
+        let hijos = {
+            let n = nodo.read().unwrap();
+            if let NodeType::Element { tag_name, .. } = &n.node_type {
+                if etiqueta == "*" || tag_name == etiqueta {
+                    salida.push(nodo.clone());
+                }
+            }
+            n.children.clone()
+        };
+        for hijo in hijos {
+            recolectar(&hijo, etiqueta, salida);
+        }
+    }
+    let etiqueta = etiqueta.trim().to_ascii_lowercase();
+    let mut salida = Vec::new();
+    recolectar(raiz, &etiqueta, &mut salida);
+    salida.retain(|n| !Arc::ptr_eq(n, raiz));
+    salida
+}
+
+/// Descendientes de `raiz` que tienen TODAS las clases de `clases` (separadas
+/// por espacios, como `getElementsByClassName("a b")`). Sin clases: ninguno.
+fn elementos_por_clases(raiz: &Arc<RwLock<Node>>, clases: &str) -> Vec<Arc<RwLock<Node>>> {
+    let pedidas: Vec<&str> = clases.split_whitespace().collect();
+    let Some(primera) = pedidas.first() else { return Vec::new() };
+    let mut candidatos = Vec::new();
+    recolectar_por_clase(raiz, primera, &mut candidatos);
+    candidatos.retain(|n| !Arc::ptr_eq(n, raiz) && {
+        let guard = n.read().unwrap();
+        match &guard.node_type {
+            NodeType::Element { attributes, .. } => {
+                let tiene = attributes.get("class").map(|c| c.split_whitespace().collect::<Vec<_>>()).unwrap_or_default();
+                pedidas.iter().all(|p| tiene.contains(p))
+            }
+            _ => false,
+        }
+    });
+    candidatos
+}
+
 pub(crate) fn recolectar_por_clase(
     nodo: &Arc<RwLock<Node>>,
     clase: &str,

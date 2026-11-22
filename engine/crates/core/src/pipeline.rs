@@ -219,6 +219,25 @@ pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, vi
         tracing::warn!("[js] fallo al disparar DOMContentLoaded: {e}");
     }
 
+    // `load` (tarea 4.2 del plan): despues de DOMContentLoaded, cuando ya estan
+    // descargados los subrecursos - aqui lo estan siempre, porque el servidor
+    // los baja ANTES de construir la pagina. Se dispara sobre `<html>` y no
+    // sobre el documento, igual que `scroll`/`resize`: `window.addEventListener`
+    // delega en `documentElement`, asi que ahi es donde escucha un
+    // `window.addEventListener('load', ...)`. Nunca se disparaba, y media web
+    // arranca desde ahi.
+    if let Some(html) = Node::document_element(&dom_root) {
+        if let Err(e) = runtime.dispatch_event(&html, "load") {
+            tracing::warn!("[js] fallo al disparar load: {e}");
+        }
+    }
+    // `window.onload = function() {...}`: la otra forma, igual de comun. Una
+    // propiedad `onload` no se invoca sola; se llama despues de los listeners,
+    // como el estandar. Una excepcion dentro de ella no debe romper la carga.
+    if let Err(e) = runtime.eval("if (typeof window !== 'undefined' && typeof window.onload === 'function') { window.onload({ type: 'load' }); }") {
+        tracing::warn!("[js] fallo en window.onload: {e}");
+    }
+
     (PageResult { dom_root, stylesheet, layout_root, script_results }, runtime)
 }
 
@@ -440,6 +459,33 @@ mod tests {
     fn find_background_image_urls_ignores_rules_without_one() {
         let urls = find_background_image_urls("div { color: red; background-color: blue; }");
         assert!(urls.is_empty());
+    }
+
+    /// Tarea 4.2 del plan: `load` se dispara tras `DOMContentLoaded`, tanto a
+    /// `window.addEventListener('load', ...)` como a `window.onload = ...`, y
+    /// despues de que hayan corrido todos los scripts. Antes no se disparaba
+    /// nunca.
+    #[test]
+    fn the_load_event_and_window_onload_fire_after_dom_content_loaded() {
+        let html = r#"<html><body><script>
+            var orden = [];
+            document.addEventListener('DOMContentLoaded', function() { orden.push('dcl'); });
+            window.addEventListener('load', function() { orden.push('load'); });
+            window.onload = function() { orden.push('onload'); };
+            orden.push('script');
+        </script></body></html>"#;
+        let (_page, mut runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+
+        assert_eq!(runtime.eval("orden.join(',')").unwrap(), "\"script,dcl,load,onload\"");
+    }
+
+    /// Un `window.onload` que lanza una excepcion no rompe la carga de la pagina.
+    #[test]
+    fn an_error_inside_window_onload_does_not_break_the_page() {
+        let html = r#"<html><body><p id="x">hola</p><script>window.onload = function() { throw new Error('roto'); };</script></body></html>"#;
+        let (page, _runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+
+        assert_eq!(Node::find_all_by_tag(&page.dom_root, "p").len(), 1, "la pagina se construyo igual");
     }
 
     #[test]
