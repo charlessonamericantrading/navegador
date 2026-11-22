@@ -522,7 +522,12 @@ fn parse_declaration_list<'i, 't>(input: &mut Parser<'i, 't>) -> (HashMap<String
         // cascada: asi todo lo que consume un valor CSS (parseo de color,
         // de longitud...) lo recibe limpio, sin tener que saber nada de la
         // cascada. Antes se quedaba pegado y rompia el parseo del valor.
-        let name = name.to_lowercase();
+        // Los nombres de propiedad no distinguen mayusculas, pero los de las
+        // propiedades personalizadas (`--xhUGwc`) SI: `var(--xhUGwc)` solo
+        // encuentra a `--xhUGwc`. Pasarlas a minusculas rompia TODA variable
+        // con mayusculas (Google las nombra todas asi, y casi ningun valor
+        // que dependiera de una se resolvia).
+        let name = if name.starts_with("--") { name } else { name.to_lowercase() };
         let (value, is_important) = split_important(&value);
         if is_important {
             important.insert(name.clone());
@@ -777,6 +782,17 @@ impl CssParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tarea 2.5 del plan: el nombre de una propiedad personalizada conserva
+    /// sus mayusculas (`--xhUGwc`), aunque el de las propiedades normales no.
+    #[test]
+    fn custom_property_names_keep_their_case_but_regular_ones_do_not() {
+        let sheet = CssParser::parse(":root { --xhUGwc: #fff; COLOR: red; }");
+        let declarations = &sheet.rules[0].declarations;
+        assert_eq!(declarations.get("--xhUGwc").map(String::as_str), Some("#fff"), "la variable debe conservar su nombre exacto");
+        assert!(!declarations.contains_key("--xhugwc"), "no debe existir una copia en minusculas");
+        assert_eq!(declarations.get("color").map(String::as_str), Some("red"), "una propiedad normal si se pasa a minusculas");
+    }
 
     /// El punto real de la expansion de shorthand: `background: #ff0000`
     /// (nunca pintado antes, ver ARCHITECTURE.md) deberia dejar TAMBIEN

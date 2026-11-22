@@ -6091,6 +6091,21 @@ mod tests {
         assert_eq!(flex.children.len(), 2, "{:?}", flex.children.iter().map(|c| &c.box_type).collect::<Vec<_>>());
     }
 
+    /// Tarea 2.5 del plan: una variable con mayusculas en su nombre
+    /// (`--xhUGwc`, como las de Google) se resuelve. Antes el parser la pasaba
+    /// a minusculas y `var(--xhUGwc)` no la encontraba: la declaracion se
+    /// descartaba y la caja se quedaba sin fondo.
+    #[test]
+    fn a_var_with_an_uppercase_name_resolves() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="caja">x</div></body></html>"#);
+        let css = ":root { --xhUGwc: #ff0000; --Ancho: 120px; } #caja { background: var(--xhUGwc); width: var(--Ancho); }";
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(css), 1000.0, 600.0, None, &ImageMap::new());
+        let caja = box_of(&root, &dom, "caja");
+
+        assert_eq!(caja.computed_style.get("background-color").map(String::as_str), Some("#ff0000"));
+        assert_eq!(caja.dimensions.width, 120.0);
+    }
+
     #[test]
     fn missing_margin_resolves_to_zero_not_the_old_fixed_gap() {
         // `<div>` hijos, no `<p>`: `<p>` ya tiene margin real por la hoja de
