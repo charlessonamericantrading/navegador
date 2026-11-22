@@ -929,7 +929,7 @@ fn resolve_border_width(computed_style: &HashMap<String, String>) -> EdgeSizes {
     let Some(raw) = computed_style.get("border") else { return EdgeSizes::default() };
     let mut width: Option<f32> = None;
     let mut is_solid = false;
-    for token in raw.split_whitespace() {
+    for token in engine_css::split_css_tokens(raw) {
         if let Some(w) = parse_css_length(token) {
             width = Some(w);
         } else if token.eq_ignore_ascii_case("solid") {

@@ -922,7 +922,7 @@ fn parse_css_border(computed_style: &HashMap<String, String>) -> Option<(f32, [u
     let mut color: Option<[u8; 4]> = None;
     let mut is_solid = false;
 
-    for token in raw.split_whitespace() {
+    for token in engine_layout::split_css_tokens(raw) {
         if let Some(w) = parse_css_length(token) {
             width = Some(w);
         } else if token.eq_ignore_ascii_case("solid") {
@@ -1005,7 +1005,15 @@ fn parse_css_border_radius(computed_style: &HashMap<String, String>) -> Option<f
 /// de la propiedad.
 fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32, f32, [u8; 4], f32)> {
     fn parse_offset(value: &str) -> Option<f32> {
-        let px = value.trim().strip_suffix("px")?;
+        let value = value.trim();
+        // `0` sin unidad es valido en CSS y es la forma habitual de escribir
+        // el desplazamiento nulo (`0 2px 8px ...`). Sin esto se saltaba y todos
+        // los numeros siguientes se corrian una posicion: dx/dy/blur
+        // equivocados.
+        if value == "0" {
+            return Some(0.0);
+        }
+        let px = value.strip_suffix("px")?;
         px.trim().parse::<f32>().ok()
     }
 
@@ -1013,7 +1021,13 @@ fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32
     let mut offsets: Vec<f32> = Vec::new();
     let mut color: Option<[u8; 4]> = None;
 
-    for token in raw.split_whitespace() {
+    // Con varias sombras (`a, b`) se usa la primera EXTERIOR: el motor pinta
+    // una sola, y las `inset` (interiores) no se dibujan, porque pintarlas
+    // como exteriores ensuciaria el borde de la caja con una sombra que el
+    // autor puso dentro.
+    let layer = engine_layout::split_css_commas(raw).into_iter().find(|layer| !engine_layout::split_css_tokens(layer).iter().any(|t| t.eq_ignore_ascii_case("inset")))?;
+
+    for token in engine_layout::split_css_tokens(layer) {
         if let Some(c) = parse_css_color(token) {
             color = Some(c);
         } else if let Some(n) = parse_offset(token) {
@@ -1030,6 +1044,41 @@ fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tarea 2.5 del plan: un `rgba(...)` con espacios dentro de `box-shadow`
+    /// se reconoce como color. Antes el valor se partia por esos espacios, el
+    /// color no se encontraba y la sombra se pintaba en NEGRO OPACO (la caja
+    /// negra de la portada de Google).
+    #[test]
+    fn a_box_shadow_with_a_spaced_rgba_color_keeps_that_color() {
+        let sombra = parse_css_box_shadow(&style_with("box-shadow", "0px 3px 10px 0px rgba(31, 31, 31, 0.08)"));
+        assert_eq!(sombra, Some((0.0, 3.0, [31, 31, 31, 20], 10.0)), "color con alfa 0.08, no negro opaco");
+    }
+
+    #[test]
+    fn with_several_box_shadows_the_first_outer_one_is_used_and_inset_ones_are_skipped() {
+        let varias = parse_css_box_shadow(&style_with("box-shadow", "0 1px 2px #ff0000, 0 4px 8px #00ff00"));
+        assert_eq!(varias, Some((0.0, 1.0, [255, 0, 0, 255], 2.0)));
+
+        let inset_primero = parse_css_box_shadow(&style_with("box-shadow", "inset 0 1px 0 #ffffff, 0 2px 4px #0000ff"));
+        assert_eq!(inset_primero, Some((0.0, 2.0, [0, 0, 255, 255], 4.0)), "la sombra inset no se pinta como exterior");
+
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "inset 0 1px 0 #ffffff")), None, "solo inset: no hay sombra exterior que pintar");
+    }
+
+    /// `0` sin unidad es un desplazamiento valido: `0 2px 8px #000` es dx=0,
+    /// dy=2, blur=8 (antes salia dx=2, dy=8, blur=0).
+    #[test]
+    fn a_unitless_zero_offset_in_a_box_shadow_is_read() {
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "0 2px 8px #000000")), Some((0.0, 2.0, [0, 0, 0, 255], 8.0)));
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "0 0 0 1px #ff0000")), Some((0.0, 0.0, [255, 0, 0, 255], 0.0)));
+    }
+
+    #[test]
+    fn a_border_with_a_spaced_rgba_color_keeps_that_color() {
+        let borde = parse_css_border(&style_with("border", "1px solid rgba(0, 0, 0, 0.3)"));
+        assert_eq!(borde, Some((1.0, [0, 0, 0, 77])), "borde translucido, no negro solido");
+    }
 
     #[test]
     fn parses_named_colors_case_insensitively() {

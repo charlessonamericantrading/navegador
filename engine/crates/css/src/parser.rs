@@ -709,8 +709,8 @@ fn background_color_candidate(value: &str) -> Option<String> {
 
     let lower = trimmed.to_ascii_lowercase();
     let has_image = lower.contains("url(") || lower.contains("gradient(");
-    let has_other_keyword = lower
-        .split_whitespace()
+    let has_other_keyword = split_css_tokens(&lower)
+        .into_iter()
         .any(|token| BACKGROUND_NON_COLOR_KEYWORDS.contains(&token.trim_matches(',')));
 
     if !has_image && !has_other_keyword {
@@ -718,7 +718,81 @@ fn background_color_candidate(value: &str) -> Option<String> {
         return Some(trimmed.to_string());
     }
 
-    trimmed.split_whitespace().find(|token| token.starts_with('#')).map(str::to_string)
+    // Con mas partes en el valor (imagen, posicion, repeticion...) solo se
+    // acepta un color que se pueda IDENTIFICAR sin la tabla de nombres: un
+    // hexadecimal o una funcion de color (`rgba(0, 0, 0, .5)`). Los tokens se
+    // separan respetando los parentesis: antes `rgba(0, 0, 0, .5) no-repeat`
+    // se partia por los espacios de dentro y el color se perdia. Un degradado
+    // es UN token (`linear-gradient(#000, #fff)`) y no es un color: no se
+    // pinta, que es lo honesto mientras el motor no sepa dibujar degradados.
+    split_css_tokens(trimmed).into_iter().find(|token| token.starts_with('#') || is_color_function(token)).map(str::to_string)
+}
+
+/// `rgb(`, `rgba(`, `hsl(` o `hsla(` al principio de un token.
+fn is_color_function(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    ["rgb(", "rgba(", "hsl(", "hsla("].iter().any(|prefix| lower.starts_with(prefix))
+}
+
+/// Parte un valor CSS en tokens separados por espacios en blanco, SIN partir
+/// lo que esta dentro de parentesis ni de comillas (tarea 2.5 del plan).
+///
+/// `str::split_whitespace` parte por los espacios de dentro de
+/// `rgba(31, 31, 31, 0.08)`, de modo que el color deja de ser un token y
+/// quien lo busca no lo encuentra: un `box-shadow` con ese color se pintaba
+/// con el negro por defecto y un `border: 1px solid rgba(0, 0, 0, .1)` con
+/// borde negro solido.
+pub fn split_css_tokens(value: &str) -> Vec<&str> {
+    split_css_top_level(value, |c| c.is_whitespace())
+}
+
+/// Parte un valor CSS en sus elementos separados por comas, respetando
+/// parentesis y comillas: `0 1px 2px rgba(0,0,0,.2), 0 2px 4px #000` son dos
+/// sombras, no cinco trozos.
+pub fn split_css_commas(value: &str) -> Vec<&str> {
+    split_css_top_level(value, |c| c == ',')
+}
+
+fn split_css_top_level(value: &str, is_separator: impl Fn(char) -> bool) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut start: Option<usize> = None;
+    for (index, ch) in value.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                quote = Some(ch);
+                start.get_or_insert(index);
+            }
+            '(' => {
+                depth += 1;
+                start.get_or_insert(index);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                start.get_or_insert(index);
+            }
+            c if depth == 0 && is_separator(c) => {
+                if let Some(begin) = start.take() {
+                    parts.push(value[begin..index].trim());
+                }
+            }
+            _ => {
+                start.get_or_insert(index);
+            }
+        }
+    }
+    if let Some(begin) = start {
+        parts.push(value[begin..].trim());
+    }
+    parts.retain(|part| !part.is_empty());
+    parts
 }
 
 /// Extrae el `url(...)` de un valor `background` (Fase 40) - a diferencia
@@ -782,6 +856,32 @@ impl CssParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tarea 2.5 del plan: un valor con funciones de color no se parte por los
+    /// espacios que lleva dentro.
+    #[test]
+    fn css_tokens_are_not_split_inside_parentheses_or_quotes() {
+        assert_eq!(split_css_tokens("1px solid rgba(0, 0, 0, 0.1)"), vec!["1px", "solid", "rgba(0, 0, 0, 0.1)"]);
+        assert_eq!(split_css_tokens("  #fff   url(\"a b.png\")  no-repeat "), vec!["#fff", "url(\"a b.png\")", "no-repeat"]);
+        assert_eq!(split_css_tokens("calc(100% - 20px) auto"), vec!["calc(100% - 20px)", "auto"]);
+        assert_eq!(split_css_tokens(""), Vec::<&str>::new());
+        assert_eq!(split_css_commas("0 1px 2px rgba(0, 0, 0, .2), 0 2px 4px #000"), vec!["0 1px 2px rgba(0, 0, 0, .2)", "0 2px 4px #000"]);
+    }
+
+    /// `background` con otras partes conserva un color en forma de funcion, y
+    /// un degradado (que el motor no sabe dibujar) no se confunde con un
+    /// color: no se deriva ningun `background-color` de el.
+    #[test]
+    fn the_background_shorthand_keeps_a_color_function_and_ignores_a_gradient() {
+        let con_funcion = CssParser::parse("a { background: rgba(0, 0, 0, .5) no-repeat }");
+        assert_eq!(con_funcion.rules[0].declarations.get("background-color").map(String::as_str), Some("rgba(0, 0, 0, .5)"));
+
+        let con_hex = CssParser::parse("a { background: #fff url(x.png) no-repeat }");
+        assert_eq!(con_hex.rules[0].declarations.get("background-color").map(String::as_str), Some("#fff"));
+
+        let degradado = CssParser::parse("a { background: linear-gradient(#000000, #ffffff) }");
+        assert!(!degradado.rules[0].declarations.contains_key("background-color"), "un degradado no es un color: {:?}", degradado.rules[0].declarations);
+    }
 
     /// Tarea 2.5 del plan: el nombre de una propiedad personalizada conserva
     /// sus mayusculas (`--xhUGwc`), aunque el de las propiedades normales no.
