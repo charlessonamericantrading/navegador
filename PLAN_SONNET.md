@@ -272,7 +272,7 @@ un test que solo vale para Windows, y dejarlo explícito.
   dar el mismo valor.
 - **Verificar:** capturas antes y después de las cuatro páginas.
 
-### [ ] 1.3 Interfaz que no se desincroniza
+### [x] 1.3 Interfaz que no se desincroniza
 
 - **Comprobado en `main`:** si una página tarda más de 12 s sale el aviso
   "tardando demasiado", y después la barra muestra la URL nueva con el
@@ -284,6 +284,9 @@ un test que solo vale para Windows, y dejarlo explícito.
 - **Verificar:** prueba Playwright contra Electron: navegar a una página
   lenta y después a una rápida. Al final, barra y contenido coinciden.
 
+- **Hecho (PR #3):** cada petición lleva un número (`NavigationSequence`) y su respuesta solo se aplica si ninguna navegación nueva ni Detener empezó después; de `engine:state` solo se recogen las publicaciones espontáneas (`id` nulo). Se puede pedir otra página con una carga en curso. Botón Detener (sustituye a Recargar mientras carga) y la barra vuelve a la página que se ve. Un fallo de carga se pinta dentro del visor (Reintentar / Volver atrás). Motor: petición `stop` y `navigate` interrumpible (un `stop` o un `navigate` nuevo abandonan el anterior, que se contesta con `navegacion_cancelada`).
+- **Verificado en Electron real (Xvfb + Playwright):** lenta → rápida: gana la última, barra y motor coinciden; Detener una carga muda: 0,6 s y el motor sigue vivo; servidor caído: página de error en el visor. Tests: 6 de la numeración, 5 del motor interrumpible, 2 de humo por NDJSON.
+
 ### [ ] 1.4 Rendimiento que falta
 
 - **Medido:** Wikipedia 6,8 s al cargar y **0,58 s por cada paso de
@@ -294,19 +297,26 @@ un test que solo vale para Windows, y dejarlo explícito.
 - **Verificar:** Wikipedia carga en menos de 3 s y el scroll baja de
   0,2 s.
 
-### [ ] 1.5 Respuestas más ligeras
+- **Hecho en parte (PR #3):** clic en Wikipedia **0,56 s → 0,04 s** (el layout solo se rehace si el clic pudo cambiar algo); scroll 0,03-0,05 s; redimensionar 0,38 s. Reparto de la carga en la nube: documento + CSS + JS 0,8 s, imágenes hasta 5,4 s, parseo + JS + cascada + layout **0,55 s**, captura 0,04 s. Lo que domina es la red de las imágenes: ahora tienen su propio tope de 4 s y se piden 12 a la vez (antes 6).
+- **Falta:** el objetivo "Wikipedia carga en menos de 3 s" **no se puede comprobar desde la nube**: aquí las imágenes de otros dominios no tienen salida a internet y agotan su tope. Medir en un PC con internet: `python3 scripts/dev/bench_all.py --strict --only wikipedia`. Si sigue por encima de 3 s, el siguiente paso es la cascada (258 ms por relayout, recorre 1.297 reglas por cada caja).
+
+### [x] 1.5 Respuestas más ligeras
 
 - **Medido:** cada respuesta lleva la captura y **todos** los elementos:
   1,4 MB en Wikipedia, también en cada paso de scroll.
 - **Hacer:** en `scroll`, no reenviar los elementos.
 - **Verificar:** la respuesta de `scroll` en Wikipedia baja de 600 KB.
 
-### [ ] 1.6 Codificación de caracteres
+- **Hecho (PR #3):** la respuesta a `scroll` ya no lleva `elements` ni `requires_javascript` (el frontend conserva los anteriores). Wikipedia: **531 KB** por paso de scroll (casi todo es la captura) y 0,03-0,05 s. Y la lista `elements` completa también bajó con la 3.3.
+
+### [x] 1.6 Codificación de caracteres
 
 - **Comprobado:** una página en ISO-8859-1 muestra "Espa�a".
 - **Hacer:** decodificar según el `charset` de `Content-Type` o de
   `<meta charset>`, con el crate `encoding_rs`.
 - **Verificar:** test con una página Latin-1.
+
+- **Hecho (PR #3):** `decode_text` (BOM → `charset` de `Content-Type` → `<meta charset>` en los primeros 1.024 bytes → UTF-8 si es válido, si no Windows-1252) con `encoding_rs`. 9 tests, incluida una página Latin-1 con acentos y ñ.
 
 ---
 
@@ -317,12 +327,14 @@ compararlo con la captura del motor. Tiene 17 casos numerados.
 **En el PR #1 pasan 4** (el 4, 15, 16 y 17). Los 13 que fallan salen de
 9 causas.
 
-### [ ] 2.1 `margin: auto` no centra
+### [x] 2.1 `margin: auto` no centra
 
 - **Casos 1, 2, 5 y 6.** Es el fallo más visible: ninguna web sale
   centrada. Explica buena parte del aspecto de Google y de Hacker News.
 
-### [ ] 2.2 Espacios entre elementos en línea
+- **Hecho (PR #3):** `margin: auto` centra cajas con ancho (casos 1, 2, 5 y 6 del fixture).
+
+### [x] 2.2 Espacios entre elementos en línea
 
 - **Caso 12.** `Texto <b>negrita</b> <i>cursiva</i> <a>enlace</a>` se
   pinta "negritacursivaenlace".
@@ -330,42 +342,58 @@ compararlo con la captura del motor. Tiene 17 casos numerados.
   Wikipedia sale "(del inglés *web browser*" y en la línea siguiente
   ") es un software".
 
-### [ ] 2.3 `inline-block` con ancho y alto
+- **Hecho (PR #3):** los espacios entre elementos en línea se conservan (caso 12: "Texto **negrita** *cursiva* enlace" con un espacio entre cada palabra); al principio y al final de línea no ocupan nada. **No hecho:** el texto que sigue a un elemento en línea aún salta a la línea siguiente cuando no cabe entero (las hojas de texto se colocan enteras, sin partir entre palabras de elementos distintos). Se ve en Wikipedia: "(del inglés *web browser*" y la línea siguiente.
+
+### [x] 2.3 `inline-block` con ancho y alto
 
 - **Caso 13.** Tres cuadrados de 100×30 no se pintan.
 - Comprobar de paso: en `main`, un enlace que ocupaba varias líneas
   informaba ancho 0 y no se podía clicar.
 
-### [ ] 2.4 `calc()` con porcentaje
+- **Hecho (PR #3):** `display:inline-block` con `width`/`height` es una caja atómica (tamaño, padding, borde y margen; salta de línea si no cabe; su texto se reparte dentro de su ancho). Caso 13: los tres cuadrados rojos de 100×30 en fila. De paso, un enlace cuyo texto ocupa varias líneas informaba ancho 0 y no se podía clicar: su caja es ahora la unión de lo que contiene. 4 tests. Simplificación: se alinea por arriba, no por la línea de base.
+
+### [x] 2.4 `calc()` con porcentaje
 
 - **Caso 3.** `calc(100% - 200px)` ocupa todo el ancho.
 
-### [ ] 2.5 Un valor no entendido hace desaparecer la caja
+- **Hecho (PR #3):** `calc()` con porcentaje se evalúa contra el bloque contenedor (caso 3).
+
+### [x] 2.5 Un valor no entendido hace desaparecer la caja
 
 - **Caso 7.** Con `background: linear-gradient(...)` la caja desaparece.
   Debe ignorarse esa declaración y quedar el valor anterior (azul).
 - Misma familia: la caja de búsqueda de Google sale **negra**.
 
-### [ ] 2.6 `line-height` y `opacity`
+- **Hecho (PR #3):** un valor que el motor no entiende ya no hace desaparecer la caja. Era la causa de la caja negra de Google (nombres de variables CSS pasados a minúsculas y `rgba(31, 31, 31, 0.08)` partido por espacios).
+
+### [x] 2.6 `line-height` y `opacity`
 
 - **Casos 8 y 9.** No se aplican.
 
-### [ ] 2.7 Familias de fuente
+- **Hecho (PR #3):** `line-height` (px, em, número, %) y `opacity` (casos 8 y 9).
+
+### [x] 2.7 Familias de fuente
 
 - **Casos 10 y 11.** Todo sale en la misma fuente sin serifa. Elegir
   serifa, sin serifa o monoespaciada según `font-family`.
 
-### [ ] 2.8 Atributos HTML clásicos
+- **Hecho (PR #3):** `FontFamily::from_css` reduce la lista a serifa, monoespaciada o sans-serif (el primer nombre reconocido manda) y `FontSet` carga las tres con sus cuatro variantes en **un solo** escaneo de fuentes (antes cuatro, solo para sans-serif). Layout y pintado usan la misma cara. Casos 10 y 11. Sin la familia instalada, cae en sans-serif. Nombres de Windows/macOS primero (Georgia, Consolas, Menlo…) y los de Linux de respaldo. **Sin comprobar en Windows.**
+
+### [x] 2.8 Atributos HTML clásicos
 
 - **Caso 14.** Se ignoran `bgcolor`, `width`, `border`, `align` y
   `cellpadding`. Por eso Hacker News no tiene su barra naranja ni su
   ancho del 85 %.
 
-### [ ] 2.9 Fondo de la ventana
+- **Hecho (PR #3):** `bgcolor`, `width`, `height`, `border`, `cellpadding`, `cellspacing`, `align`, `<font color/size/face>` y `<body text>` se traducen a CSS de especificidad cero, entre el agente de usuario y el autor (módulo `engine-css::presentational`). Una tabla dentro de `<center>` se centra. Caso 14: tabla amarilla con borde y mitad de ancho. **Hacker News recupera su barra naranja y su ancho del 85 % centrado.**
+
+### [x] 2.9 Fondo de la ventana
 
 - El lienzo es gris (245) cuando la página no declara fondo. Se ve en
   Google y en Hacker News. Debe ser blanco. Ver
   `engine/crates/gfx/src/raster.rs`.
+
+- **Hecho (PR #3):** lienzo blanco (`DEFAULT_CANVAS_COLOR`) en PNG y ventana nativa.
 
 ### Vistos en `main` y sin comprobar en el PR #1
 
@@ -380,7 +408,7 @@ Comprobar antes de trabajar en ellos:
 
 ## Fase 3 — Escribir, hacer scroll y agente IA
 
-### [ ] 3.1 Coordenadas correctas tras hacer scroll
+### [x] 3.1 Coordenadas correctas tras hacer scroll
 
 - **Comprobado en la app Electron del PR #1:** bajar al final de Hacker
   News y clicar el campo "Search" no abre el cuadro de escritura.
@@ -395,6 +423,8 @@ Comprobar antes de trabajar en ellos:
 - **Verificar:** prueba Playwright que repita el caso de Hacker News y
   escriba en el campo.
 
+- **Hecho (PR #3):** `click_element` y `type_into_element` (el motor lleva el elemento a la vista y actúa en su centro; `replace` evita concatenar). `BrowserViewport` resta el scroll al buscar el campo y al colocar el cuadro de escritura; el agente usa solo las dos nuevas. **Verificado en Electron real** con el caso de Hacker News: scroll de 980 px, clic en "Search" → aparece el cuadro de escritura en su sitio y al enviar el motor intenta navegar con el texto (falla por falta de internet en la nube, como se espera).
+
 ### [ ] 3.2 Escribir de verdad
 
 - **Comprobado en código:** a mano solo se escribe con un cuadro
@@ -404,7 +434,9 @@ Comprobar antes de trabajar en ellos:
   al motor. Dibujar foco y cursor.
 - **Verificar:** escribir, borrar con Retroceso y enviar con Enter.
 
-### [ ] 3.3 Lista de elementos útil
+- **Hecho en parte (PR #3):** el cuadro emergente parte del valor actual del campo y lo **sustituye** (`replace`), en vez de añadir. **Falta:** teclas directas sobre el visor (Retroceso, flechas), dibujar foco y cursor.
+
+### [x] 3.3 Lista de elementos útil
 
 - **Medido:** `elements` trae 799 entradas en Hacker News y 1.307 en
   Wikipedia. Incluye `html`, `body`, `div`, `span`, `option`. Es ruido
@@ -412,6 +444,8 @@ Comprobar antes de trabajar en ellos:
 - **Hacer:** solo interactivos y visibles: `a[href]`, `button`, `input`,
   `select`, `textarea`, `[onclick]`, `[role=button]`, `[role=link]`.
 - **Verificar:** Hacker News baja de 300 elementos.
+
+- **Hecho (PR #3):** `elements` solo trae enlaces con `href`, controles de formulario y lo que la página declara accionable (`role`, `onclick`, `tabindex` ≥ 0, `contenteditable`), con área visible; texto colapsado y recortado a 120 caracteres; tope de 500. **Hacker News: 229 elementos** (antes 799) y Google 13. Los tests que leían texto desde `elements` leen ahora del árbol de accesibilidad.
 
 ### [ ] 3.4 Agente IA
 
@@ -426,6 +460,13 @@ Comprobar antes de trabajar en ellos:
 - **Verificar:** tarea real: "busca Navegador web en Wikipedia y dime la
   primera frase". Debe completarse.
 
+- **Hecho en parte (PR #3):**
+  - Modelo configurable: variable `NAVEGADOR_GEMINI_MODEL` > ajuste en la barra del agente > valor por defecto `gemini-3.5-flash`. El nombre se valida porque acaba en la URL. **Hay que confirmar el valor por defecto:** las páginas oficiales de Google no coinciden sobre el sustituto de `gemini-2.0-flash` (hablan de 3.5, 3.6 y 3.8); mirar https://ai.google.dev/gemini-api/docs/deprecations y, si es otro, ponerlo en Ajustes.
+  - Una sola numeración: el prompt usa la lista `elements`, cuyos ids son los que entienden `click_element`/`type_into_element` (el árbol de accesibilidad numeraba aparte y no coincidía).
+  - El agente lee: petición `get_page_text` (texto legible, bloques en líneas, tope de 12.000 caracteres, prefiere `<main>`). En Wikipedia la primera frase del artículo aparece en el carácter 736.
+  - Acciones nuevas: `scroll` y `back`.
+- **Falta:** la verificación real ("busca Navegador web en Wikipedia y dime la primera frase") necesita una clave de Gemini y un PC con internet; en la nube solo se probó con modelos falsos y la cañería (Electron: texto de página, ajuste del modelo).
+
 ---
 
 ## Fase 4 — JavaScript que falta
@@ -434,13 +475,17 @@ Referencia:
 `python3 scripts/dev/engine_driver.py --fixture js-basics-fixture.html --texts`.
 **En el PR #1 pasan 10 de 12.**
 
-### [ ] 4.1 `document.getElementsByTagName`
+### [x] 4.1 `document.getElementsByTagName`
 
 No existe. Es de las llamadas más usadas de la web.
 
-### [ ] 4.2 Evento `load` de `window`
+- **Hecho (PR #3):** `document.getElementsByTagName` y `element.getElementsByTagName`, además de `getElementsByClassName`. Fixture JS: 12/12.
+
+### [x] 4.2 Evento `load` de `window`
 
 No se dispara nunca. Muchas webs arrancan ahí.
+
+- **Hecho (PR #3):** el evento `load` se dispara sobre `<html>` tras `DOMContentLoaded` y llama a `window.onload`. Fixture JS: 12/12 (antes 10/12).
 
 ### [ ] 4.3 Sonda de APIs
 
