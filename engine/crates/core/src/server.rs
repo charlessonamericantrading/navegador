@@ -238,6 +238,10 @@ struct EngineServer {
     /// Tiempo TOTAL que se dedica a los subrecursos de una pagina, contado
     /// desde que llega el documento. Por defecto `SUBRESOURCE_BUDGET`.
     subresource_budget: std::time::Duration,
+    /// Tiempo maximo que se dedica a las IMAGENES, contado desde que
+    /// terminan las hojas y los scripts (tarea 1.4). Por defecto
+    /// `IMAGE_BUDGET`.
+    image_budget: std::time::Duration,
 }
 
 impl EngineServer {
@@ -261,6 +265,7 @@ impl EngineServer {
             next_document_id: 1,
             subresource_timeout: Self::SUBRESOURCE_TIMEOUT,
             subresource_budget: Self::SUBRESOURCE_BUDGET,
+            image_budget: Self::IMAGE_BUDGET,
         }
     }
 
@@ -626,7 +631,7 @@ impl EngineServer {
         let n_img = image_srcs.len();
 
         let t = std::time::Instant::now();
-        let images = self.fetch_images(image_srcs, &page_url, deadline).await;
+        let images = self.fetch_images(image_srcs, &page_url, self.image_deadline(deadline)).await;
         tracing::info!("[tiempo] {n_img} imagen(es) en {:?} ({} decodificadas)", t.elapsed(), images.len());
 
         let t = std::time::Instant::now();
@@ -1043,7 +1048,7 @@ impl EngineServer {
     /// todas las latencias. Medido en vivo: el articulo "Espana" de
     /// Wikipedia trae 161 `<img>` de upload.wikimedia.org y tardaba ~38 s
     /// solo en recorrerlas una a una.
-    const MAX_CONCURRENT_SUBRESOURCES: usize = 6;
+    const MAX_CONCURRENT_SUBRESOURCES: usize = 12;
 
     /// Cuanto se espera a UN subrecurso antes de omitirlo (tarea 1.2 del
     /// plan). Un navegador real tambien se rinde con un recurso lento y
@@ -1058,6 +1063,20 @@ impl EngineServer {
     /// pinta con lo que haya llegado: lo ya descargado se conserva y a lo que
     /// falta ni siquiera se le pide.
     const SUBRESOURCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Las imagenes son lo ultimo que se descarga y lo menos importante para
+    /// poder leer y actuar sobre la pagina: se les da menos tiempo que al
+    /// resto (tarea 1.4 del plan). Una pagina con 150 imagenes en una red
+    /// lenta tardaba 10 s en aparecer; ahora aparece, sin las que no llegaron,
+    /// a los 4 s de empezar con ellas. Las imagenes van en orden de documento,
+    /// asi que lo que se pierde es lo de mas abajo.
+    const IMAGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+    /// Hasta cuando se esperan las imagenes: su propio tope, sin pasar nunca
+    /// del compartido de toda la pagina.
+    fn image_deadline(&self, shared_deadline: tokio::time::Instant) -> tokio::time::Instant {
+        (tokio::time::Instant::now() + self.image_budget).min(shared_deadline)
+    }
 
     /// Descarga en PARALELO (acotado, ver `MAX_CONCURRENT_SUBRESOURCES`)
     /// una lista de referencias crudas (`href`/`src` tal como aparecen en
@@ -1241,6 +1260,10 @@ impl EngineServer {
         let mut submit_control_target: Option<std::sync::Arc<std::sync::RwLock<Node>>> = None;
         let scroll_offset_y = self.active_tab().scroll_offset_y;
         let (width, height) = (self.width, self.height);
+        // Tarea 1.4: el layout solo se rehace si el clic pudo cambiar algo. En
+        // Wikipedia rehacerlo costaba 0,55 s por clic, incluso en una zona
+        // vacia donde no pasa nada.
+        let mut may_have_changed_the_page = false;
         {
             let tab = self.active_tab_mut();
             let Some(page) = &mut tab.current_page else {
@@ -1251,6 +1274,12 @@ impl EngineServer {
                 .layout_root
                 .hit_test(x, y + scroll_offset_y)
             {
+                // Un listener de clic (o de foco/cambio, que este mismo clic
+                // dispara) puede tocar el DOM, y clicar un campo o una casilla
+                // cambia su estado. Sin nada de eso, no hay nada que rehacer.
+                may_have_changed_the_page = page.runtime.has_event_listener("click")
+                    || is_text_control(&node)
+                    || is_checkable_input(&node);
                 if is_text_control(&node) {
                     page.focused_node = Some(node.clone());
                     if let Err(error) = page.runtime.dispatch_event(&node, "focus") {
@@ -1304,6 +1333,7 @@ impl EngineServer {
                         // DOM hecha por este script se vea reflejada en la
                         // captura que devuelve este mismo clic.
                         Some(LinkAction::RunScript(script)) => {
+                            may_have_changed_the_page = true;
                             if let Err(error) = page.runtime.eval(&script) {
                                 // Un error dentro de un `javascript:` NO
                                 // aborta el clic entero (el resto del clic
@@ -1333,7 +1363,9 @@ impl EngineServer {
                         }
                     }
                 }
-                page.relayout(width as f32, height as f32);
+                if may_have_changed_the_page {
+                    page.relayout(width as f32, height as f32);
+                }
                 if let Some(fragment) = fragment_target {
                     scroll_target = fragment_scroll_offset(page, &fragment, height as f32);
                 }
@@ -3313,6 +3345,35 @@ mod tests {
         assert!(extent_after_scroll(true).await < 4000.0, "con un listener de scroll si se rehace");
     }
 
+    /// Tarea 1.4: un clic donde no hay nada que lo escuche ni nada que
+    /// cambiar no rehace el layout (0,55 s en Wikipedia); con un listener de
+    /// clic, o sobre un campo, si. Se distingue cambiando el DOM desde fuera
+    /// justo antes del clic: el layout solo se entera si hubo relayout.
+    #[tokio::test]
+    async fn a_click_rebuilds_the_layout_only_when_it_could_have_changed_something() {
+        let extent_after_click = |html: &'static str| async move {
+            let mut server = server_from_html(html);
+            let page = server.active_tab_mut().current_page.as_mut().expect("pagina");
+            assert!(page.page.layout_root.content_extent() >= 4000.0, "la pagina mide 4000 px");
+            page.runtime.eval("document.body.setAttribute('style', 'height:100px')").expect("mutar el DOM");
+            server.handle(EngineRequest::Click { id: None, x: 5.0, y: 5.0 }).await;
+            server.active_tab().current_page.as_ref().expect("pagina").page.layout_root.content_extent()
+        };
+
+        assert!(
+            extent_after_click("<html><body style=\"height:4000px\"><p>texto</p></body></html>").await >= 4000.0,
+            "sin listeners ni controles no se rehace el layout"
+        );
+        assert!(
+            extent_after_click("<html><body style=\"height:4000px\"><p>texto</p><script>document.addEventListener('click', function() {});</script></body></html>").await < 4000.0,
+            "con un listener de clic si"
+        );
+        assert!(
+            extent_after_click("<html><body style=\"height:4000px;margin:0\"><input style=\"width:300px;height:30px\"></body></html>").await < 4000.0,
+            "clicar un campo si"
+        );
+    }
+
     /// Un listener de `scroll` puede mutar el DOM (el patron real de
     /// "infinite scroll") - ese cambio tiene que verse reflejado, no
     /// perderse hasta la siguiente interaccion.
@@ -4314,5 +4375,22 @@ mod tests {
     fn the_default_subresource_limits_are_the_ones_in_the_plan() {
         assert_eq!(EngineServer::SUBRESOURCE_TIMEOUT, std::time::Duration::from_secs(8));
         assert_eq!(EngineServer::SUBRESOURCE_BUDGET, std::time::Duration::from_secs(10));
+        assert_eq!(EngineServer::IMAGE_BUDGET, std::time::Duration::from_secs(4));
+    }
+
+    /// Tarea 1.4: las imagenes tienen su propio tope, mas corto que el de la
+    /// pagina, y nunca pasan del compartido.
+    #[tokio::test]
+    async fn images_get_a_shorter_deadline_than_the_rest_of_the_page_but_never_a_longer_one() {
+        let server = server_with_budget(1000, 10_000);
+        let now = tokio::time::Instant::now();
+
+        let long_shared = now + std::time::Duration::from_secs(10);
+        let image_deadline = server.image_deadline(long_shared);
+        assert!(image_deadline < long_shared, "con tiempo de sobra, las imagenes se cortan antes");
+        assert!(image_deadline <= now + EngineServer::IMAGE_BUDGET + std::time::Duration::from_millis(50));
+
+        let short_shared = now + std::time::Duration::from_secs(1);
+        assert_eq!(server.image_deadline(short_shared), short_shared, "si al resto casi no le queda tiempo, tampoco a las imagenes");
     }
 }
