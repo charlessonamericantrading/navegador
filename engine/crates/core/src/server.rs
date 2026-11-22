@@ -1260,10 +1260,6 @@ impl EngineServer {
         let mut submit_control_target: Option<std::sync::Arc<std::sync::RwLock<Node>>> = None;
         let scroll_offset_y = self.active_tab().scroll_offset_y;
         let (width, height) = (self.width, self.height);
-        // Tarea 1.4: el layout solo se rehace si el clic pudo cambiar algo. En
-        // Wikipedia rehacerlo costaba 0,55 s por clic, incluso en una zona
-        // vacia donde no pasa nada.
-        let mut may_have_changed_the_page = false;
         {
             let tab = self.active_tab_mut();
             let Some(page) = &mut tab.current_page else {
@@ -1277,7 +1273,10 @@ impl EngineServer {
                 // Un listener de clic (o de foco/cambio, que este mismo clic
                 // dispara) puede tocar el DOM, y clicar un campo o una casilla
                 // cambia su estado. Sin nada de eso, no hay nada que rehacer.
-                may_have_changed_the_page = page.runtime.has_event_listener("click")
+                // Tarea 1.4: el layout solo se rehace si el clic pudo cambiar
+                // algo. En Wikipedia rehacerlo costaba 0,55 s por clic,
+                // incluso en una zona vacia donde no pasa nada.
+                let mut may_have_changed_the_page = page.runtime.has_event_listener("click")
                     || is_text_control(&node)
                     || is_checkable_input(&node);
                 if is_text_control(&node) {
