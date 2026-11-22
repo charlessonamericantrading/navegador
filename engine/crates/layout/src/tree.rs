@@ -862,6 +862,56 @@ fn resolve_margin(computed_style: &HashMap<String, String>, containing_width: f3
     resolve_box_edges(computed_style, "margin", containing_width)
 }
 
+/// Si `margin-left` / `margin-right` valen `auto` (tarea 2.1 del plan). El
+/// parser ya expande `margin: 0 auto` a sus cuatro longhands, asi que basta
+/// con mirarlos; la abreviada se mira solo si es de un unico valor
+/// (`margin: auto`), que es el caso en que no hay longhands. `resolve_margin`
+/// trata `auto` como cero (no es una longitud), por eso hace falta esto
+/// aparte: sin ello ninguna caja con ancho propio se centraba nunca.
+fn auto_horizontal_margins(computed_style: &HashMap<String, String>) -> (bool, bool) {
+    let is_auto = |name: &str| computed_style.get(name).is_some_and(|v| v.trim().eq_ignore_ascii_case("auto"));
+    let shorthand_auto = is_auto("margin");
+    (is_auto("margin-left") || (shorthand_auto && !computed_style.contains_key("margin-left")), is_auto("margin-right") || (shorthand_auto && !computed_style.contains_key("margin-right")))
+}
+
+/// Reparte el espacio sobrante entre los margenes `auto` de un bloque
+/// (CSS 2.1 §10.3.3): con los dos en `auto` la caja se centra, con uno solo
+/// ese margen absorbe todo el sobrante. Devuelve los margenes laterales ya
+/// resueltos y el ancho de la caja.
+///
+/// El ancho se calcula con los margenes `auto` a cero y se compara con lo
+/// que queda libre, asi que tambien cubre `max-width` (el patron mas comun:
+/// `max-width: 1200px; margin: 0 auto`). Si el bloque ocupa todo el ancho,
+/// no sobra nada y los margenes quedan en cero, igual que antes. Si no cabe
+/// (sobrante negativo) tambien: el spec manda poner a cero el margen auto.
+fn resolve_auto_margins(
+    computed_style: &HashMap<String, String>,
+    mut margin: EdgeSizes,
+    auto_left: bool,
+    auto_right: bool,
+    containing_width: f32,
+) -> (EdgeSizes, f32) {
+    if auto_left {
+        margin.left = 0.0;
+    }
+    if auto_right {
+        margin.right = 0.0;
+    }
+    let available = (containing_width - margin.left - margin.right).max(0.0);
+    let width = resolve_block_width(computed_style, available);
+    let spare = (available - width).max(0.0);
+    match (auto_left, auto_right) {
+        (true, true) => {
+            margin.left = spare / 2.0;
+            margin.right = spare / 2.0;
+        }
+        (true, false) => margin.left = spare,
+        (false, true) => margin.right = spare,
+        (false, false) => {}
+    }
+    (margin, width)
+}
+
 /// SOLO el ancho de `border` (forma abreviada `border: <ancho> <estilo>
 /// <color>`, en cualquier orden - igual que el spec real permite) - el
 /// layout solo necesita la geometria para reservar espacio;
@@ -2628,7 +2678,17 @@ impl LayoutTreeBuilder {
             // texto de forma automatica, sin necesitar un caso aparte.
             child.containing_width = eff_inner_width;
             child.containing_height = definite_inner_height;
-            let margin = resolve_margin(&child.computed_style, eff_inner_width);
+            let mut margin = resolve_margin(&child.computed_style, eff_inner_width);
+            // `margin: auto` (tarea 2.1): reparte el espacio sobrante entre
+            // los margenes laterales. El ancho ya sale resuelto de aqui para
+            // no calcularlo dos veces con margenes distintos.
+            let (auto_left, auto_right) = auto_horizontal_margins(&child.computed_style);
+            let mut centered_width = None;
+            if auto_left || auto_right {
+                let (resolved_margin, width) = resolve_auto_margins(&child.computed_style, margin, auto_left, auto_right, eff_inner_width);
+                margin = resolved_margin;
+                centered_width = Some(width);
+            }
             child.box_dimensions.margin = margin;
 
             cursor_y += margin.top;
@@ -2639,7 +2699,7 @@ impl LayoutTreeBuilder {
             // unico comportamiento antes de esta tarea - ver
             // `resolve_block_width`.
             let auto_width = (eff_inner_width - margin.left - margin.right).max(0.0);
-            child.dimensions.width = resolve_block_width(&child.computed_style, auto_width);
+            child.dimensions.width = centered_width.unwrap_or_else(|| resolve_block_width(&child.computed_style, auto_width));
             let child_width = child.dimensions.width;
             // `position: relative` (Fase 3.3): `child` YA ocupo su lugar
             // normal arriba (sigue reservando su espacio de siempre, esto
@@ -5843,6 +5903,89 @@ mod tests {
 
         assert_eq!(child_box.dimensions.x, container_box.dimensions.x + 10.0, "margin-left deberia desplazar el hijo 10px a la derecha");
         assert_eq!(child_box.dimensions.y, container_box.dimensions.y + 10.0, "margin-top deberia desplazar el hijo 10px hacia abajo");
+    }
+
+    /// Caja del `<div id="...">` del documento, para los tests de margin auto.
+    fn box_of(root: &LayoutBox, dom: &Arc<RwLock<Node>>, id: &str) -> LayoutBox {
+        let node = Node::find_by_id(dom, id).unwrap_or_else(|| panic!("{id} deberia existir en el DOM"));
+        find_box_for_dom_node(root, &node).unwrap_or_else(|| panic!("{id} deberia tener caja de layout")).clone()
+    }
+
+    /// Tarea 2.1 del plan: `margin: 0 auto` con ancho propio centra la caja y
+    /// conserva el margen vertical. Es el fallo mas visible del motor:
+    /// ninguna pagina con un contenedor de ancho fijo salia centrada.
+    #[test]
+    fn margin_auto_centers_a_box_with_its_own_width_and_keeps_the_vertical_margin() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="caja" style="width: 300px; height: 40px; margin: 10px auto">x</div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let caja = box_of(&root, &dom, "caja");
+
+        assert_eq!(caja.dimensions.width, 300.0);
+        assert_eq!(caja.dimensions.x, 350.0, "(1000 - 300) / 2");
+        assert_eq!(caja.box_dimensions.margin.left, 350.0);
+        assert_eq!(caja.box_dimensions.margin.right, 350.0);
+        assert_eq!(caja.box_dimensions.margin.top, 10.0, "el margen vertical no se pierde");
+    }
+
+    /// El patron mas comun de la web real: `max-width` + `margin: 0 auto`.
+    #[test]
+    fn margin_auto_centers_a_box_limited_by_max_width() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="caja" style="max-width: 600px; margin: 0 auto">x</div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let caja = box_of(&root, &dom, "caja");
+
+        assert_eq!(caja.dimensions.width, 600.0);
+        assert_eq!(caja.dimensions.x, 200.0);
+    }
+
+    /// Un porcentaje se resuelve contra el contenedor, no contra el ancho que
+    /// queda despues de repartir los margenes (el error tipico al centrar).
+    #[test]
+    fn margin_auto_with_a_percentage_width_is_relative_to_the_container() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="caja" style="width: 50%; margin: 0 auto">x</div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let caja = box_of(&root, &dom, "caja");
+
+        assert_eq!(caja.dimensions.width, 500.0);
+        assert_eq!(caja.dimensions.x, 250.0);
+    }
+
+    /// Con un solo margen `auto`, ese absorbe el sobrante: `margin-left: auto`
+    /// empuja la caja contra el borde derecho; `margin-right: auto` la deja a
+    /// la izquierda.
+    #[test]
+    fn a_single_auto_margin_absorbs_all_the_spare_space() {
+        let dom = HtmlParser::parse(
+            r#"<html><body style="margin:0"><div id="derecha" style="width: 200px; margin-left: auto">x</div><div id="izquierda" style="width: 200px; margin-right: auto">y</div></body></html>"#,
+        );
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+
+        assert_eq!(box_of(&root, &dom, "derecha").dimensions.x, 800.0);
+        assert_eq!(box_of(&root, &dom, "izquierda").dimensions.x, 0.0);
+    }
+
+    /// Sin ancho propio el bloque ocupa todo el contenedor y los margenes
+    /// `auto` valen cero: nada cambia respecto a antes.
+    #[test]
+    fn margin_auto_without_an_own_width_leaves_the_box_full_width() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="caja" style="margin: 0 auto">x</div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let caja = box_of(&root, &dom, "caja");
+
+        assert_eq!(caja.dimensions.width, 1000.0);
+        assert_eq!(caja.dimensions.x, 0.0);
+    }
+
+    /// Una caja mas ancha que su contenedor no se centra con margenes
+    /// negativos: los `auto` valen cero (CSS 2.1 §10.3.3).
+    #[test]
+    fn margin_auto_on_a_box_wider_than_its_container_stays_at_zero() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="caja" style="width: 1500px; margin: 0 auto">x</div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let caja = box_of(&root, &dom, "caja");
+
+        assert_eq!(caja.dimensions.x, 0.0);
+        assert_eq!(caja.box_dimensions.margin.left, 0.0);
     }
 
     #[test]
