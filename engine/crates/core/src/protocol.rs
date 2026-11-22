@@ -69,6 +69,16 @@ pub enum EngineRequest {
         #[serde(default)]
         press_enter: bool,
     },
+    /// Detiene la navegacion en curso (tarea 1.3 del plan). Solo hace algo si
+    /// hay un `navigate` a medias: el motor lo abandona y contesta a ese
+    /// `navigate` con un error `navegacion_cancelada`. Sin nada en curso es un
+    /// no-op. Un `navigate` nuevo mientras otro
+    /// sigue cargando tambien lo cancela: lo ultimo que pide el usuario manda.
+    /// La respuesta a `stop` es siempre `ok` (`stopped`), haya o no algo que
+    /// detener.
+    Stop {
+        id: Option<String>,
+    },
     /// Historial atras/adelante (Fase 4.4) - sin parametros propios: la URL
     /// a la que ir ya se conoce del historial que `EngineServer` mantiene
     /// internamente (ver `server::EngineServer::back`/`forward`), igual
@@ -125,6 +135,7 @@ impl EngineRequest {
             | Self::Scroll { id, .. }
             | Self::TypeText { id, .. }
             | Self::PressKey { id, .. }
+            | Self::Stop { id }
             | Self::ClickElement { id, .. }
             | Self::TypeIntoElement { id, .. }
             | Self::Back { id }

@@ -260,6 +260,14 @@ impl Motor {
         }
     }
 
+    /// Escribe una peticion SIN esperar su respuesta (para probar lo que pasa
+    /// mientras otra sigue en curso). La respuesta se lee despues con `leer`.
+    pub fn enviar(&mut self, peticion: Value) {
+        let linea = serde_json::to_string(&peticion).unwrap();
+        writeln!(self.entrada, "{linea}").expect("no se pudo escribir la peticion");
+        self.entrada.flush().expect("no se pudo vaciar stdin");
+    }
+
     /// Espera el siguiente estado publicado sin peticion (`id: null`).
     pub fn leer_publicacion(&mut self) -> Value {
         loop {

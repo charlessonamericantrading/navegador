@@ -180,6 +180,63 @@ fn navigate_y_get_state_devuelven_la_pagina_real() {
     assert_eq!(s["title"], "Pagina de humo");
 }
 
+/// Tarea 1.3: una pagina que no contesta no deja al motor atrapado. `stop`
+/// abandona la carga al instante (antes habia que esperar al tiempo maximo de
+/// red, con el motor sin leer nada), la respuesta a esa navegacion es un error
+/// claro y el motor sigue sirviendo peticiones.
+#[test]
+fn stop_cancela_una_navegacion_colgada_y_el_motor_sigue_vivo() {
+    // Un servidor que acepta la conexion (el sistema lo hace por si solo) y
+    // nunca contesta: la carga se queda esperando indefinidamente.
+    let mudo = std::net::TcpListener::bind("127.0.0.1:0").expect("puerto libre");
+    let url_muda = format!("http://127.0.0.1:{}/", mudo.local_addr().unwrap().port());
+    let normal = TestServer::nuevo(PAGINA);
+    let mut motor = Motor::arrancar();
+
+    motor.enviar(json!({"type": "navigate", "id": "n1", "url": url_muda}));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let inicio = std::time::Instant::now();
+    motor.enviar(json!({"type": "stop", "id": "s1"}));
+
+    let navegacion = motor.leer();
+    assert_correlacionada(&navegacion, "n1", "error");
+    assert!(
+        navegacion["message"].as_str().unwrap().starts_with("navegacion_cancelada"),
+        "la navegacion cancelada se contesta con su propio error: {navegacion}"
+    );
+    let parada = motor.leer();
+    assert_correlacionada(&parada, "s1", "ok");
+    assert!(inicio.elapsed() < std::time::Duration::from_secs(5), "detener tiene que ser inmediato, tardo {:?}", inicio.elapsed());
+
+    // El motor sigue vivo y carga la siguiente pagina con normalidad.
+    let r = motor.pedir(json!({"type": "ping", "id": "p1"}));
+    assert_correlacionada(&r, "p1", "pong");
+    let r = motor.pedir(json!({"type": "navigate", "id": "n2", "url": normal.url("/")}));
+    assert_correlacionada(&r, "n2", "state");
+    drop(mudo);
+}
+
+/// Un `navigate` nuevo sustituye al que sigue cargando, sin esperar a que
+/// acabe: la ultima peticion del usuario es la que se ve.
+#[test]
+fn un_navigate_nuevo_sustituye_al_que_sigue_cargando() {
+    let mudo = std::net::TcpListener::bind("127.0.0.1:0").expect("puerto libre");
+    let url_muda = format!("http://127.0.0.1:{}/", mudo.local_addr().unwrap().port());
+    let normal = TestServer::nuevo(PAGINA);
+    let mut motor = Motor::arrancar();
+
+    motor.enviar(json!({"type": "navigate", "id": "lento", "url": url_muda}));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    motor.enviar(json!({"type": "navigate", "id": "rapido", "url": normal.url("/")}));
+
+    let primera = motor.leer();
+    assert_correlacionada(&primera, "lento", "error");
+    let segunda = motor.leer();
+    assert_correlacionada(&segunda, "rapido", "state");
+    assert_eq!(segunda["title"], "Pagina de humo", "la pagina que se ve es la ultima pedida");
+    drop(mudo);
+}
+
 #[test]
 fn navigate_a_un_esquema_no_permitido_da_error_y_no_navega() {
     let mut motor = Motor::arrancar();
@@ -524,6 +581,7 @@ fn todas_las_variantes_del_protocolo_estan_cubiertas() {
         "press_key",
         "click_element",
         "type_into_element",
+        "stop",
         "back",
         "forward",
         "new_tab",

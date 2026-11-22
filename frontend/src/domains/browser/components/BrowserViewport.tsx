@@ -42,6 +42,14 @@ interface BrowserViewportProps {
   onManualResize: (width: number, height: number) => void;
   onManualScroll: (dy: number) => void;
   loading: boolean;
+  /// La última navegación que falló: se pinta como una página de error dentro
+  /// del visor, con la dirección que se pidió (tarea 1.3).
+  loadError: { url: string; message: string } | null;
+  /// Sube cuando hay que devolver la barra de direcciones a `url` (al detener
+  /// una carga: la barra no debe quedarse con la página que ya no se carga).
+  addressResetKey: number;
+  onStop: () => void;
+  onRetry: () => void;
   /// Historial y pestañas (el motor ya los soportaba; la interfaz no los
   /// exponia). `canGoBack`/`canGoForward` vienen del propio motor en cada
   /// `state`, asi que los botones reflejan el historial REAL en vez de una
@@ -59,6 +67,19 @@ interface BrowserViewportProps {
   isAgentOpen?: boolean;
 }
 
+/**
+ * Lo que el motor dice (`network_error: ...`, `http_error: 404 ...`) traducido
+ * a una frase para quien no sabe qué es un error de red. El texto original se
+ * muestra debajo, para quien lo necesite.
+ */
+function describeLoadError(message: string): string {
+  if (message.startsWith('http_error')) return 'El servidor ha respondido con un error.';
+  if (message.startsWith('network_error')) return 'No se ha podido conectar con el sitio. Comprueba la dirección y tu conexión.';
+  if (message.startsWith('invalid_url')) return 'La dirección no es válida.';
+  if (message.startsWith('esquema_no_soportado')) return 'Solo se pueden abrir direcciones http y https.';
+  return 'La página no se ha podido abrir.';
+}
+
 export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   screenshot,
   url,
@@ -71,6 +92,10 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   onManualResize,
   onManualScroll,
   loading,
+  loadError,
+  addressResetKey,
+  onStop,
+  onRetry,
   canGoBack,
   canGoForward,
   onBack,
@@ -202,6 +227,14 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
     if (url) setAddressInput(url);
   }
 
+  // Detener una carga: la barra vuelve a la página que se está viendo. Mismo
+  // patrón que arriba (se ajusta durante el render, no en un efecto).
+  const [previousResetKey, setPreviousResetKey] = useState(addressResetKey);
+  if (addressResetKey !== previousResetKey) {
+    setPreviousResetKey(addressResetKey);
+    setAddressInput(url || '');
+  }
+
   useEffect(() => {
     if (inputTextPopup && popupInputRef.current) {
       popupInputRef.current.focus();
@@ -232,7 +265,8 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
 
   const handleNavigateSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (addressInput.trim() && !loading) {
+    // Se puede pedir otra página con una carga en curso: sustituye a la anterior.
+    if (addressInput.trim()) {
       onManualNavigate(resolveAddressTarget(addressInput));
     }
   };
@@ -378,14 +412,25 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
           >
             →
           </button>
-          <button
-            onClick={() => onManualNavigate(url || 'https://www.google.com')}
-            className="btn icon-btn"
-            title="Recargar página"
-            aria-label="Recargar página"
-          >
-            ↻
-          </button>
+          {loading ? (
+            <button
+              onClick={onStop}
+              className="btn icon-btn stop-btn"
+              title="Detener la carga"
+              aria-label="Detener la carga"
+            >
+              ✕
+            </button>
+          ) : (
+            <button
+              onClick={() => onManualNavigate(url || 'https://www.google.com')}
+              className="btn icon-btn"
+              title="Recargar página"
+              aria-label="Recargar página"
+            >
+              ↻
+            </button>
+          )}
           {tabs.length <= 1 && (
             <button onClick={onNewTab} className="btn icon-btn" title="Pestaña nueva" aria-label="Pestaña nueva">
               +
@@ -426,7 +471,28 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
 
       {/* Área Principal de Renderizado / Inicio */}
       <div className="viewport-container" ref={containerRef} onWheel={screenshot ? handleWheel : undefined}>
-        {screenshot ? (
+        {loadError ? (
+          // Página de error dentro del visor (tarea 1.3): lo que pasó, con la
+          // dirección pedida y una salida, en vez de dejar la página anterior
+          // bajo una barra que ya muestra otra.
+          <div className="load-error" role="alert">
+            <span className="load-error-icon" aria-hidden="true">⚠️</span>
+            <h2>No se ha podido cargar la página</h2>
+            <p className="load-error-url">{loadError.url}</p>
+            <p>{describeLoadError(loadError.message)}</p>
+            <p className="load-error-detail">{loadError.message}</p>
+            <div className="load-error-actions">
+              <button type="button" className="btn btn-primary" onClick={onRetry}>
+                Reintentar
+              </button>
+              {canGoBack && (
+                <button type="button" className="btn" onClick={onBack}>
+                  Volver atrás
+                </button>
+              )}
+            </div>
+          </div>
+        ) : screenshot ? (
           <div ref={stageRef} style={{ position: 'relative', width: '100%', height: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
             <img
               ref={imgRef}

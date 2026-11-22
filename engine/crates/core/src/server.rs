@@ -430,6 +430,10 @@ impl EngineServer {
                 press_enter,
             } => (self.type_text(id, x, y, text, press_enter).await, false),
             EngineRequest::PressKey { id, key } => (self.press_key(id, key).await, false),
+            // Llega aqui solo cuando no hay ninguna navegacion en curso: si la
+            // hubiera, `run_stdio` la abandona antes de llamar a `handle`
+            // (ver `handle_interruptible`).
+            EngineRequest::Stop { .. } => (EngineResponse::Ok { id, message: "stopped" }, false),
             EngineRequest::ClickElement { element_id, .. } => match self.locate_element(element_id) {
                 Ok((x, y)) => (self.click(id, x, y).await, false),
                 Err(message) => (Self::error(id, message), false),
@@ -2272,56 +2276,123 @@ pub async fn run_stdio() -> io::Result<()> {
     // que solo consulta algo) no genera otra publicacion identica.
     let mut last_state: Option<u64> = None;
 
+    // Lineas que llegaron mientras una navegacion estaba en curso y esperan
+    // su turno, en orden (ver `handle_interruptible`).
+    let mut backlog: std::collections::VecDeque<Result<String, RejectedLine>> = std::collections::VecDeque::new();
+
     loop {
-        tokio::select! {
-            line = lines.next_line() => {
-                let line = match line? {
-                    None => break,
-                    Some(Ok(line)) => line,
-                    // Una linea desmedida o que no es UTF-8 se contesta y se
-                    // sigue: antes la primera crecia sin limite y la segunda
-                    // mataba el proceso entero con `InvalidData`.
-                    Some(Err(rejected)) => {
-                        write_response(&mut stdout, EngineResponse::Error { id: None, message: rejected.message() }).await?;
-                        continue;
-                    }
-                };
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                let response = match serde_json::from_str::<EngineRequest>(&line) {
-                    Ok(request) => {
-                        let (response, should_shutdown) = server.handle(request).await;
-                        if let Some(fingerprint) = state_fingerprint(&response) {
-                            last_state = Some(fingerprint);
-                        }
-                        write_response(&mut stdout, response).await?;
-                        if should_shutdown {
-                            break;
-                        }
-                        continue;
-                    }
-                    Err(error) => EngineResponse::Error {
-                        id: None,
-                        message: format!("invalid_request: {error}"),
+        let next = match backlog.pop_front() {
+            Some(queued) => queued,
+            None => {
+                tokio::select! {
+                    line = lines.next_line() => match line? {
+                        None => break,
+                        Some(line) => line,
                     },
-                };
-
-                write_response(&mut stdout, response).await?;
-            }
-            _ = tick.tick() => {
-                let Some(state) = server.tick_active_tab_timers() else { continue };
-                let fingerprint = state_fingerprint(&state);
-                if fingerprint.is_some() && fingerprint != last_state {
-                    last_state = fingerprint;
-                    write_response(&mut stdout, state).await?;
+                    _ = tick.tick() => {
+                        let Some(state) = server.tick_active_tab_timers() else { continue };
+                        let fingerprint = state_fingerprint(&state);
+                        if fingerprint.is_some() && fingerprint != last_state {
+                            last_state = fingerprint;
+                            write_response(&mut stdout, state).await?;
+                        }
+                        continue;
+                    }
                 }
             }
+        };
+        let line = match next {
+            Ok(line) => line,
+            // Una linea desmedida o que no es UTF-8 se contesta y se sigue:
+            // antes la primera crecia sin limite y la segunda mataba el
+            // proceso entero con `InvalidData`.
+            Err(rejected) => {
+                write_response(&mut stdout, EngineResponse::Error { id: None, message: rejected.message() }).await?;
+                continue;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
         }
+
+        let response = match serde_json::from_str::<EngineRequest>(&line) {
+            Ok(request) => {
+                let (response, should_shutdown) = handle_interruptible(&mut server, request, &mut lines, &mut backlog).await?;
+                if let Some(fingerprint) = state_fingerprint(&response) {
+                    last_state = Some(fingerprint);
+                }
+                write_response(&mut stdout, response).await?;
+                if should_shutdown {
+                    break;
+                }
+                continue;
+            }
+            Err(error) => EngineResponse::Error {
+                id: None,
+                message: format!("invalid_request: {error}"),
+            },
+        };
+
+        write_response(&mut stdout, response).await?;
     }
 
     Ok(())
+}
+
+/// Atiende una peticion. Un `navigate` puede tardar decenas de segundos en una
+/// red mala, y mientras tanto el motor no leia nada de la entrada: ni el
+/// usuario podia detenerlo ni una navegacion nueva lo sustituia hasta que el
+/// anterior terminara (tarea 1.3 del plan).
+///
+/// Mientras un `navigate` esta en curso se sigue leyendo la entrada:
+/// - un `stop` o un `navigate` nuevo ABANDONA el en curso (que se contesta con
+///   un error `navegacion_cancelada`, para que quien esperaba su respuesta no
+///   se quede colgado) y la linea se procesa a continuacion;
+/// - cualquier otra linea (un scroll, un `resize`...) espera su turno en
+///   `backlog`, en orden, como si nunca se hubiera adelantado.
+///
+/// Abandonar una navegacion es seguro porque `navigate` no toca el estado del
+/// servidor hasta el final (todo lo anterior es red y calculo): si se cancela
+/// en un `await`, la pagina anterior sigue intacta.
+async fn handle_interruptible<R: AsyncBufRead + Unpin>(
+    server: &mut EngineServer,
+    request: EngineRequest,
+    lines: &mut BoundedLines<R>,
+    backlog: &mut std::collections::VecDeque<Result<String, RejectedLine>>,
+) -> io::Result<(EngineResponse, bool)> {
+    let EngineRequest::Navigate { id: navigate_id, .. } = &request else {
+        return Ok(server.handle(request).await);
+    };
+    let navigate_id = navigate_id.clone();
+    let mut in_flight = std::pin::pin!(server.handle(request));
+    let mut input_open = true;
+    loop {
+        if !input_open {
+            return Ok(in_flight.await);
+        }
+        tokio::select! {
+            result = &mut in_flight => return Ok(result),
+            line = lines.next_line() => match line? {
+                None => input_open = false,
+                Some(next) => {
+                    let interrupts = matches!(
+                        &next,
+                        Ok(text) if matches!(
+                            serde_json::from_str::<EngineRequest>(text),
+                            Ok(EngineRequest::Stop { .. } | EngineRequest::Navigate { .. })
+                        )
+                    );
+                    backlog.push_back(next);
+                    if interrupts {
+                        return Ok((
+                            EngineServer::error(navigate_id, "navegacion_cancelada: la carga se detuvo o se pidio otra pagina".to_string()),
+                            false,
+                        ));
+                    }
+                }
+            },
+        }
+    }
 }
 
 /// Huella de lo que un `State` muestra, sin su `id`: dos estados con la
@@ -2634,6 +2705,152 @@ fn short_label(text: &str) -> String {
     let mut shortened: String = collapsed.chars().take(MAX_ELEMENT_TEXT_CHARS).collect();
     shortened.push('…');
     shortened
+}
+
+#[cfg(test)]
+mod interruptible_navigation_tests {
+    use super::*;
+    use engine_net::broker::BrokerFuture;
+    use engine_net::storage::{QuotaExceeded, StorageKind};
+    use engine_net::{LocalBroker, NetworkError, NetworkResponse, ResourceBroker};
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    /// Broker cuya red tarda `delay` en contestar... y entonces falla. Lo
+    /// justo para tener una navegacion en curso durante un rato controlado,
+    /// sin sockets. El resto de operaciones las delega en un broker de verdad.
+    struct SlowBroker {
+        delay: Duration,
+        inner: LocalBroker,
+    }
+
+    impl SlowBroker {
+        fn shared(delay: Duration) -> SharedBroker {
+            std::sync::Arc::new(Self { delay, inner: LocalBroker::in_memory() })
+        }
+    }
+
+    impl ResourceBroker for SlowBroker {
+        fn fetch<'a>(&'a self, request: &'a NetworkRequest) -> BrokerFuture<'a, Result<NetworkResponse, NetworkError>> {
+            let (delay, url) = (self.delay, request.url.to_string());
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Err(NetworkError::Http(format!("sin red en el test ({url})")))
+            })
+        }
+        fn cookie_header_for_js(&self, page_url: &str) -> String {
+            self.inner.cookie_header_for_js(page_url)
+        }
+        fn set_cookie_from_js(&self, raw: &str, page_url: &str) {
+            self.inner.set_cookie_from_js(raw, page_url);
+        }
+        fn storage_get(&self, kind: StorageKind, origin: &str, key: &str) -> Option<String> {
+            self.inner.storage_get(kind, origin, key)
+        }
+        fn storage_set(&self, kind: StorageKind, origin: &str, key: &str, value: &str) -> Result<(), QuotaExceeded> {
+            self.inner.storage_set(kind, origin, key, value)
+        }
+        fn storage_remove(&self, kind: StorageKind, origin: &str, key: &str) {
+            self.inner.storage_remove(kind, origin, key);
+        }
+        fn storage_clear(&self, kind: StorageKind, origin: &str) {
+            self.inner.storage_clear(kind, origin);
+        }
+        fn storage_length(&self, kind: StorageKind, origin: &str) -> usize {
+            self.inner.storage_length(kind, origin)
+        }
+        fn storage_key(&self, kind: StorageKind, origin: &str, index: usize) -> Option<String> {
+            self.inner.storage_key(kind, origin, index)
+        }
+    }
+
+    fn entrada(texto: &'static str) -> BoundedLines<BufReader<&'static [u8]>> {
+        BoundedLines::new(BufReader::new(texto.as_bytes()), 4096)
+    }
+
+    fn navegar(id: &str) -> EngineRequest {
+        EngineRequest::Navigate { id: Some(id.to_string()), url: "http://lento.test/".to_string() }
+    }
+
+    /// Un `stop` que llega a mitad de la carga la abandona YA: la respuesta a
+    /// la navegacion es `navegacion_cancelada` (no se espera al fallo de la
+    /// red, que aqui tardaria una hora) y el `stop` queda en cola para
+    /// contestarse a continuacion.
+    #[tokio::test]
+    async fn a_stop_abandons_the_navigation_in_flight() {
+        let mut server = EngineServer::with_broker(SlowBroker::shared(Duration::from_secs(3600)), "test");
+        let mut lines = entrada("{\"type\":\"stop\",\"id\":\"s1\"}\n");
+        let mut backlog = VecDeque::new();
+
+        let (response, shutdown) = handle_interruptible(&mut server, navegar("n1"), &mut lines, &mut backlog).await.unwrap();
+
+        assert!(!shutdown);
+        let EngineResponse::Error { id, message } = response else { panic!("debia ser un error: {response:?}") };
+        assert_eq!(id.as_deref(), Some("n1"), "se contesta a la navegacion, no al stop");
+        assert!(message.starts_with("navegacion_cancelada"), "{message}");
+        assert_eq!(backlog.len(), 1, "el stop espera su turno");
+
+        let Ok(EngineRequest::Stop { id }) = serde_json::from_str(backlog[0].as_ref().unwrap()) else { panic!("la linea en cola es el stop") };
+        let (ack, _) = server.handle(EngineRequest::Stop { id: id.clone() }).await;
+        assert!(matches!(ack, EngineResponse::Ok { .. }), "{ack:?}");
+    }
+
+    /// Lo ultimo que pide el usuario manda: un `navigate` nuevo sustituye al
+    /// que sigue cargando, y no hay que esperar a que acabe.
+    #[tokio::test]
+    async fn a_new_navigate_replaces_the_one_in_flight() {
+        let mut server = EngineServer::with_broker(SlowBroker::shared(Duration::from_secs(3600)), "test");
+        let mut lines = entrada("{\"type\":\"navigate\",\"id\":\"n2\",\"url\":\"http://rapido.test/\"}\n");
+        let mut backlog = VecDeque::new();
+
+        let (response, _) = handle_interruptible(&mut server, navegar("n1"), &mut lines, &mut backlog).await.unwrap();
+
+        assert!(matches!(&response, EngineResponse::Error { id, message } if id.as_deref() == Some("n1") && message.starts_with("navegacion_cancelada")), "{response:?}");
+        assert_eq!(backlog.len(), 1, "la navegacion nueva queda para atenderse a continuacion");
+    }
+
+    /// Una linea que no es `stop` ni `navigate` (un scroll, un resize...) NO
+    /// interrumpe: la navegacion termina sola y la linea se atiende despues.
+    #[tokio::test]
+    async fn other_requests_wait_their_turn_without_interrupting() {
+        let mut server = EngineServer::with_broker(SlowBroker::shared(Duration::from_millis(50)), "test");
+        let mut lines = entrada("{\"type\":\"scroll\",\"id\":\"sc\",\"dx\":0,\"dy\":10}\n");
+        let mut backlog = VecDeque::new();
+
+        let (response, _) = handle_interruptible(&mut server, navegar("n1"), &mut lines, &mut backlog).await.unwrap();
+
+        let EngineResponse::Error { message, .. } = response else { panic!("la navegacion debia terminar con su propio error de red") };
+        assert!(message.starts_with("network_error"), "no se cancelo: {message}");
+        assert_eq!(backlog.len(), 1, "el scroll espera en cola, en orden");
+    }
+
+    /// Cerrarse la entrada a mitad de una carga no la corta ni gira en vacio:
+    /// termina la navegacion y el bucle principal vera el final despues.
+    #[tokio::test]
+    async fn a_closed_input_lets_the_navigation_finish() {
+        let mut server = EngineServer::with_broker(SlowBroker::shared(Duration::from_millis(30)), "test");
+        let mut lines = entrada("");
+        let mut backlog = VecDeque::new();
+
+        let (response, _) = handle_interruptible(&mut server, navegar("n1"), &mut lines, &mut backlog).await.unwrap();
+
+        assert!(matches!(&response, EngineResponse::Error { message, .. } if message.starts_with("network_error")), "{response:?}");
+        assert!(backlog.is_empty());
+    }
+
+    /// Cualquier peticion que no sea `navigate` se atiende directamente, sin
+    /// tocar la entrada.
+    #[tokio::test]
+    async fn requests_other_than_navigate_are_handled_directly() {
+        let mut server = EngineServer::with_broker(SlowBroker::shared(Duration::from_secs(3600)), "test");
+        let mut lines = entrada("{\"type\":\"stop\"}\n");
+        let mut backlog = VecDeque::new();
+
+        let (response, _) = handle_interruptible(&mut server, EngineRequest::Ping { id: Some("p".to_string()) }, &mut lines, &mut backlog).await.unwrap();
+
+        assert!(matches!(response, EngineResponse::Pong { .. }), "{response:?}");
+        assert!(backlog.is_empty(), "no leyo la entrada");
+    }
 }
 
 #[cfg(test)]

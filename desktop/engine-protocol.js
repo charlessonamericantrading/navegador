@@ -60,6 +60,8 @@ const ESQUEMA = {
   // calcula el punto, que es lo único fiable tras un scroll (tarea 3.1).
   click_element: { element_id: campo.integer(...U32) },
   type_into_element: { element_id: campo.integer(...U32), text: campo.string(MAX_TEXT), replace: campo.bool(), press_enter: campo.bool() },
+  // Abandona la navegación en curso (tarea 1.3): la interfaz lo pide con el botón Detener.
+  stop: {},
   back: {},
   forward: {},
   new_tab: { url: campo.optionalString(MAX_URL) },

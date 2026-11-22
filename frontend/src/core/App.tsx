@@ -4,6 +4,7 @@ import WelcomeGuide from '../domains/onboarding/components/WelcomeGuide';
 import AgentSidebar from '../domains/agent/components/AgentSidebar';
 import { BrowserActionError, type BrowserInterface } from '../domains/agent/AgentOrchestrator';
 import type { EngineRequestPayload, EngineStateEvent } from '../electron';
+import { NavigationSequence, isCancellationMessage, isNavigationCommand } from './navigationSequence';
 import './App.css';
 
 interface ElementRect {
@@ -43,6 +44,15 @@ function App() {
   // DOCUMENTO; para saber dónde están en la captura hay que restarlo.
   const [scrollOffsetY, setScrollOffsetY] = useState(0);
   const [loading, setLoading] = useState(false);
+  // La última navegación que falló (tarea 1.3). Se pinta dentro del visor, no
+  // solo como aviso flotante: antes la barra mostraba la dirección nueva sobre
+  // el contenido de la página anterior, sin ninguna explicación.
+  const [loadError, setLoadError] = useState<{ url: string; message: string } | null>(null);
+  // Sube cada vez que hay que devolver la barra de direcciones a la página
+  // que se está viendo (al detener una carga).
+  const [addressResetKey, setAddressResetKey] = useState(0);
+  // Numera las navegaciones: una respuesta atrasada no pisa la pantalla.
+  const [navigation] = useState(() => new NavigationSequence());
   // Historial y pestañas: el motor los soporta desde hace tiempo y los
   // reporta en cada `state` (`can_go_back`/`can_go_forward`/`tab_id`),
   // pero la interfaz no los usaba. Se guardan aqui para poder
@@ -127,6 +137,13 @@ function App() {
     setLoading(true);
     window.clearTimeout(loadingTimeoutRef.current);
     loadingTimeoutRef.current = window.setTimeout(() => {
+      if (window.electronAPI?.sendEngineRequest) {
+        // La petición sigue viva: se avisa, pero `loading` se mantiene para
+        // que el botón Detener siga ahí. Si el motor no contesta, el proceso
+        // principal la da por fallida a los 30 s.
+        showToast('La página está tardando en responder. Puedes esperar o pulsar Detener.');
+        return;
+      }
       setLoading(false);
       showToast('La página está tardando demasiado en responder. Puedes intentarlo de nuevo.');
       // La respuesta puede no haber llegado porque la conexión en sí está
@@ -183,6 +200,15 @@ function App() {
     }
   }, []);
 
+  // Peticiones que no muestran «cargando» (scroll, redimensionar): su `state`
+  // se aplica salvo que una navegación o Detener lo haya dejado obsoleto.
+  const sendEngineQuietly = useCallback(async (payload: EngineRequestPayload): Promise<void> => {
+    if (!window.electronAPI?.sendEngineRequest) return;
+    const ticket = navigation.ticket(payload.type);
+    const res = await window.electronAPI.sendEngineRequest(payload);
+    if (res?.type === 'state' && navigation.isCurrent(ticket)) applyEngineState(res);
+  }, [applyEngineState, navigation]);
+
   // Escuchar reinicios/fallos del proceso backend (solo existe en la app de escritorio Electron)
   const [backendIssue, setBackendIssue] = useState<BackendStatusEvent | null>(null);
   useEffect(() => {
@@ -223,15 +249,14 @@ function App() {
       
       const unsubscribe = window.electronAPI.onEngineState((data) => {
         if (data.type === 'state') {
-          applyEngineState(data);
-          endLoading();
-          window.clearTimeout(scrollTimeoutRef.current);
-          scrollBusyRef.current = false;
-          flushScroll();
+          // Solo lo espontáneo (`id` nulo: un temporizador de la página cambió
+          // algo). Las respuestas con `id` las aplica quien hizo la petición,
+          // que es quien sabe si siguen siendo vigentes (tarea 1.3).
+          if (data.id == null) applyEngineState(data);
         } else if (data.type === 'ready') {
           console.log('Motor Rust listo vía IPC.');
           if (lastSizeRef.current) {
-            window.electronAPI?.sendEngineRequest({ type: 'resize', ...lastSizeRef.current }).catch(console.error);
+            sendEngineQuietly({ type: 'resize', ...lastSizeRef.current }).catch(console.error);
           }
         }
       });
@@ -239,13 +264,8 @@ function App() {
       // Solicitar estado inicial o dimensionamiento
       const initialWidth = lastSizeRef.current?.width || 1280;
       const initialHeight = lastSizeRef.current?.height || 720;
-      window.electronAPI.sendEngineRequest({ type: 'resize', width: initialWidth, height: initialHeight })
-        .then((res) => {
-          if (res?.type === 'state') {
-            applyEngineState(res);
-            refreshTabs();
-          }
-        })
+      sendEngineQuietly({ type: 'resize', width: initialWidth, height: initialHeight })
+        .then(() => refreshTabs())
         .catch((err) => console.log('Inicializando motor vía IPC...', err));
 
       return () => {
@@ -332,7 +352,7 @@ function App() {
         wsRef.current.close();
       }
     };
-  }, [applyEngineState, beginLoading, endLoading, flushScroll, refreshTabs, showToast]);
+  }, [applyEngineState, beginLoading, endLoading, flushScroll, refreshTabs, sendEngineQuietly, showToast]);
 
   // Ejecuta un comando y FALLA si el motor no lo confirma (plan H15). Es la
   // unica ruta que usa el agente: un error del motor tiene que llegarle como
@@ -343,20 +363,31 @@ function App() {
   // falla de forma explicita en vez de dar por hecho que funciono.
   const runEngineCommand = useCallback(async (payload: EngineRequestPayload): Promise<void> => {
     if (window.electronAPI?.sendEngineRequest) {
+      const navigates = isNavigationCommand(payload.type);
+      if (navigates) setLoadError(null);
+      const ticket = navigation.ticket(payload.type);
       beginLoading();
       try {
         const res = await window.electronAPI.sendEngineRequest(payload);
+        // Una navegación posterior (o Detener) ya tomó el relevo: esta
+        // respuesta describe una página que ya no interesa y no se aplica. El
+        // `loading` lo terminará la petición vigente, no esta.
+        if (!navigation.isCurrent(ticket)) return;
         if (res?.type === 'error') {
+          if (navigates && !isCancellationMessage(res.message || '')) {
+            const target = typeof payload.url === 'string' ? payload.url : browserUrlRef.current;
+            setLoadError({ url: target, message: res.message || 'Error en acción del motor' });
+          }
           throw new BrowserActionError(res.message || 'Error en acción del motor');
         }
         if (res?.type === 'state') {
           applyEngineState(res);
         }
+        endLoading();
       } catch (err) {
+        if (navigation.isCurrent(ticket)) endLoading();
         if (err instanceof BrowserActionError) throw err;
         throw new BrowserActionError(err instanceof Error ? err.message : 'Error comunicando con el motor nativo');
-      } finally {
-        endLoading();
       }
       return;
     }
@@ -366,7 +397,7 @@ function App() {
       throw new BrowserActionError('El transporte WebSocket no confirma comandos: no se puede verificar la acción.');
     }
     throw new BrowserActionError('No hay conexión con el motor.');
-  }, [applyEngineState, beginLoading, endLoading]);
+  }, [applyEngineState, beginLoading, endLoading, navigation]);
 
   // Eventos manuales del usuario en el navegador: el mismo comando, con el
   // fallo convertido en aviso. Por WebSocket la falta de confirmacion es
@@ -376,6 +407,8 @@ function App() {
       await runEngineCommand(payload);
     } catch (err) {
       if (!window.electronAPI?.sendEngineRequest && wsRef.current?.readyState === WebSocket.OPEN) return;
+      // Una navegación fallida ya se muestra dentro del visor (`loadError`).
+      if (isNavigationCommand(payload.type) && window.electronAPI?.sendEngineRequest) return;
       showToast(err instanceof Error ? err.message : String(err));
     }
   };
@@ -410,10 +443,23 @@ function App() {
     refreshTabs();
   };
 
+  // Se puede pedir otra página con una carga en curso: la última petición
+  // manda (el motor abandona la anterior y la respuesta vieja se ignora).
   const handleManualNavigate = async (url: string) => {
-    if (loading) return;
     await sendCommand({ type: 'navigate', url });
     refreshTabs();
+  };
+
+  // Detener la carga (tarea 1.3): lo que hubiera en vuelo queda obsoleto, el
+  // motor abandona la navegación y la barra vuelve a la página que se ve.
+  const handleStop = () => {
+    navigation.invalidateAll();
+    endLoading();
+    setLoadError(null);
+    setAddressResetKey((key) => key + 1);
+    if (window.electronAPI?.sendEngineRequest) {
+      window.electronAPI.sendEngineRequest({ type: 'stop' }).catch(console.error);
+    }
   };
 
   const handleManualClick = (x: number, y: number) => {
@@ -431,7 +477,7 @@ function App() {
 
   const handleManualScroll = (dy: number) => {
     if (window.electronAPI?.sendEngineRequest) {
-      window.electronAPI.sendEngineRequest({ type: 'scroll', dx: 0, dy }).catch(console.error);
+      sendEngineQuietly({ type: 'scroll', dx: 0, dy }).catch(console.error);
     } else {
       scrollPendingRef.current += dy;
       flushScroll();
@@ -441,7 +487,7 @@ function App() {
   const handleManualResize = (width: number, height: number) => {
     lastSizeRef.current = { width, height };
     if (window.electronAPI?.sendEngineRequest) {
-      window.electronAPI.sendEngineRequest({ type: 'resize', width, height }).catch(console.error);
+      sendEngineQuietly({ type: 'resize', width, height }).catch(console.error);
     } else if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'resize', width, height }));
     }
@@ -537,6 +583,10 @@ function App() {
           onManualResize={handleManualResize}
           onManualScroll={handleManualScroll}
           loading={loading}
+          loadError={loadError}
+          addressResetKey={addressResetKey}
+          onStop={handleStop}
+          onRetry={() => loadError && handleManualNavigate(loadError.url)}
           canGoBack={canGoBack}
           canGoForward={canGoForward}
           onBack={handleBack}
