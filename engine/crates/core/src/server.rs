@@ -12,7 +12,7 @@ use crate::protocol::{
 };
 use base64::Engine as _;
 use engine_dom::{Node, NodeType};
-use engine_gfx::render_layout_to_png;
+use engine_gfx::{focus_overlay, render_layout_to_png_with_overlay};
 use engine_image::decode_image;
 use engine_js::JsRuntime;
 use engine_layout::{BoxType, ImageMap, LayoutBox, LayoutTreeBuilder};
@@ -1290,6 +1290,10 @@ impl EngineServer {
                     if let Err(error) = page.runtime.dispatch_event(&node, "focus") {
                         return Self::error(id, format!("focus_error: {error}"));
                     }
+                } else {
+                    // Clicar fuera de un campo le quita el foco, como en un
+                    // navegador: las teclas ya no van a ningun sitio.
+                    page.focused_node = None;
                 }
                 // `checked` se conmuta ANTES de disparar "click" (Fase 4.1) -
                 // asi es el orden real de un navegador de verdad: la accion
@@ -1573,9 +1577,19 @@ impl EngineServer {
                 return Self::error(id, format!("no hay un control enfocado para la tecla {key}"));
             };
             let node = node.clone();
-            let mutates_value = matches!(key.as_str(), "Backspace" | "Delete") && is_text_control(&node);
+            // Una tecla con caracter (`a`, `ñ`, `5`, ` `) escribe en el campo
+            // enfocado (tarea 3.2): antes solo Retroceso/Supr cambiaban el valor y
+            // el resto de teclas se limitaban a disparar eventos.
+            let mut chars = key.chars();
+            let printable = matches!((chars.next(), chars.next()), (Some(c), None) if !c.is_control());
+            let is_backspace = matches!(key.as_str(), "Backspace" | "Delete");
+            let mutates_value = (is_backspace || printable) && is_text_control(&node);
             if mutates_value {
-                backspace_control_value(&node);
+                if is_backspace {
+                    backspace_control_value(&node);
+                } else {
+                    append_control_value(&node, &key);
+                }
             }
             let mut enter_prevented = false;
             for event_type in ["keydown", "keyup"] {
@@ -1589,7 +1603,16 @@ impl EngineServer {
                 if let Err(error) = page.runtime.dispatch_event(&node, "input") {
                     return Self::error(id, format!("input_error: {error}"));
                 }
-                page.relayout(width as f32, height as f32);
+                // Con la pagina escuchando teclas o `input` pudo cambiar cualquier
+                // cosa: layout entero. Si nadie escucha, el valor solo cambia el
+                // texto del propio campo (su tamaño es fijo), y rehacer el layout
+                // de Wikipedia por cada letra costaba 0,4 s.
+                let page_may_react = ["input", "keydown", "keyup", "change"].iter().any(|event| page.runtime.has_event_listener(event));
+                if page_may_react {
+                    page.relayout(width as f32, height as f32);
+                } else {
+                    refresh_control_text(page, &node);
+                }
             }
             // Enter en un input de texto de una sola linea enfocado
             // (nunca un `<textarea>`, ver el mismo criterio en
@@ -1713,13 +1736,21 @@ impl EngineServer {
             };
         };
 
-        let screenshot = match render_layout_to_png(
+        // Foco: anillo y cursor sobre el control que tiene el teclado (tarea 3.2).
+        let overlay = page
+            .focused_node
+            .as_ref()
+            .and_then(|node| page.page.layout_root.find_box_for_node(node))
+            .map(|focused| focus_overlay(focused, page.font_set.as_ref()))
+            .unwrap_or_default();
+        let screenshot = match render_layout_to_png_with_overlay(
             &page.page.layout_root,
             page.font_set.as_ref(),
-                        &page.images,
+            &page.images,
             self.width,
             self.height,
             tab.scroll_offset_y,
+            &overlay,
         ) {
             Ok(bytes) => base64::engine::general_purpose::STANDARD.encode(bytes),
             Err(error) => return Self::error(id, format!("render_error: {error}")),
@@ -1844,6 +1875,19 @@ fn is_text_control(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> bool {
             Some("checkbox" | "radio" | "button" | "submit" | "reset" | "file")
         ),
         _ => false,
+    }
+}
+
+/// Pone en la caja de `node` el texto que le corresponde segun su `value` actual,
+/// sin rehacer el layout (el tamaño de un campo no depende de lo escrito).
+fn refresh_control_text(page: &mut LoadedPage, node: &std::sync::Arc<std::sync::RwLock<Node>>) {
+    let (tag_name, attributes) = match &node.read().unwrap().node_type {
+        NodeType::Element { tag_name, attributes } => (tag_name.clone(), attributes.clone()),
+        _ => return,
+    };
+    let text = engine_layout::resolve_replaced_text(&tag_name, &attributes, node);
+    if let Some(layout_box) = page.page.layout_root.find_box_for_node_mut(node) {
+        layout_box.replaced_text = text;
     }
 }
 
@@ -3264,6 +3308,113 @@ mod tests {
         let (state, _) = server.handle(EngineRequest::GetState { id: None }).await;
         let EngineResponse::State { elements, .. } = state else { panic!("get_state debe devolver un State") };
         elements.expect("get_state trae la lista de elementos")
+    }
+
+    const PAGE_WITH_FIELD: &str = "<html><body style=\"margin:0\"><input id=\"campo\" type=\"text\" placeholder=\"escribe\" style=\"width:200px;height:30px\"><button id=\"otro\" style=\"width:80px;height:30px\">Otro</button></body></html>";
+
+    fn field_value(server: &EngineServer) -> String {
+        let page = &server.active_tab().current_page.as_ref().expect("pagina").page;
+        let campo = Node::find_by_id(&page.dom_root, "campo").expect("campo");
+        let guard = campo.read().unwrap();
+        match &guard.node_type {
+            NodeType::Element { attributes, .. } => attributes.get("value").cloned().unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    fn field_painted_text(server: &EngineServer) -> Option<String> {
+        let page = &server.active_tab().current_page.as_ref().expect("pagina").page;
+        let campo = Node::find_by_id(&page.dom_root, "campo").expect("campo");
+        page.layout_root.find_box_for_node(&campo).and_then(|b| b.replaced_text.as_ref().map(|r| r.text.clone()))
+    }
+
+    async fn press(server: &mut EngineServer, key: &str) -> EngineResponse {
+        server.handle(EngineRequest::PressKey { id: None, key: key.to_string() }).await.0
+    }
+
+    /// Tarea 3.2: las teclas con caracter escriben en el campo enfocado, Retroceso
+    /// borra, y lo que se ve en el campo (el texto de su caja) va por delante sin
+    /// rehacer el layout.
+    #[tokio::test]
+    async fn typing_keys_writes_into_the_focused_field_and_backspace_erases() {
+        let mut server = server_from_html(PAGE_WITH_FIELD);
+        server.handle(EngineRequest::Click { id: None, x: 20.0, y: 15.0 }).await;
+        for key in ["h", "o", "l", "a", " ", "ñ"] {
+            let r = press(&mut server, key).await;
+            assert!(matches!(r, EngineResponse::State { .. }), "{key}: {r:?}");
+        }
+        assert_eq!(field_value(&server), "hola ñ");
+        assert_eq!(field_painted_text(&server).as_deref(), Some("hola ñ"), "el campo pinta lo escrito");
+
+        press(&mut server, "Backspace").await;
+        press(&mut server, "Backspace").await;
+        assert_eq!(field_value(&server), "hola");
+        assert_eq!(field_painted_text(&server).as_deref(), Some("hola"));
+    }
+
+    /// Las teclas que no son un caracter (flechas, Tab, F5...) no escriben nada.
+    #[tokio::test]
+    async fn named_keys_do_not_write_text() {
+        let mut server = server_from_html(PAGE_WITH_FIELD);
+        server.handle(EngineRequest::Click { id: None, x: 20.0, y: 15.0 }).await;
+        for key in ["ArrowLeft", "Tab", "Shift", "F5", "Escape"] {
+            press(&mut server, key).await;
+        }
+        assert_eq!(field_value(&server), "");
+        assert_eq!(field_painted_text(&server).as_deref(), Some("escribe"), "sigue el placeholder");
+    }
+
+    /// Clicar fuera del campo le quita el foco: las teclas ya no van a ningun sitio.
+    #[tokio::test]
+    async fn clicking_elsewhere_blurs_the_field() {
+        let mut server = server_from_html(PAGE_WITH_FIELD);
+        server.handle(EngineRequest::Click { id: None, x: 20.0, y: 15.0 }).await;
+        press(&mut server, "a").await;
+        server.handle(EngineRequest::Click { id: None, x: 250.0, y: 15.0 }).await;
+        let r = press(&mut server, "b").await;
+        assert!(matches!(&r, EngineResponse::Error { message, .. } if message.contains("no hay un control enfocado")), "{r:?}");
+        assert_eq!(field_value(&server), "a");
+    }
+
+    /// El foco se ve: la captura con el campo enfocado no es la misma que sin foco
+    /// (anillo y cursor), y el cursor se mueve al escribir.
+    #[tokio::test]
+    async fn a_focused_field_is_drawn_with_a_ring_and_a_caret() {
+        let screenshot = |r: EngineResponse| match r {
+            EngineResponse::State { screenshot, .. } => screenshot,
+            other => panic!("{other:?}"),
+        };
+        let mut server = server_from_html(PAGE_WITH_FIELD);
+        let (before, _) = server.handle(EngineRequest::GetState { id: None }).await;
+        let before = screenshot(before);
+        let focused = screenshot(server.handle(EngineRequest::Click { id: None, x: 20.0, y: 15.0 }).await.0);
+        assert_ne!(before, focused, "con el foco, la captura cambia");
+        let typed = screenshot(press(&mut server, "m").await);
+        assert_ne!(focused, typed, "al escribir cambia el texto y se mueve el cursor");
+        // Sin foco otra vez, la captura de antes de escribir no vuelve (el valor sigue).
+        let blurred = screenshot(server.handle(EngineRequest::Click { id: None, x: 250.0, y: 15.0 }).await.0);
+        assert_ne!(blurred, typed, "sin foco desaparece el anillo");
+    }
+
+    /// Con un listener de teclado en la pagina, que pudo cambiar cualquier cosa, si
+    /// se rehace el layout (lo mismo que el clic).
+    #[tokio::test]
+    async fn typing_rebuilds_the_layout_when_the_page_listens_to_keys() {
+        let extent_after_key = |html: &'static str| async move {
+            let mut server = server_from_html(html);
+            server.handle(EngineRequest::Click { id: None, x: 20.0, y: 15.0 }).await;
+            let page = server.active_tab_mut().current_page.as_mut().expect("pagina");
+            assert!(page.page.layout_root.content_extent() >= 3000.0);
+            page.runtime.eval("document.getElementById('relleno').setAttribute('style', 'height:100px')").expect("mutar el DOM");
+            press(&mut server, "a").await;
+            server.active_tab().current_page.as_ref().expect("pagina").page.layout_root.content_extent()
+        };
+        let base = "<html><body style=\"margin:0\"><input id=\"campo\" type=\"text\" style=\"width:200px;height:30px\"><div id=\"relleno\" style=\"height:3000px\"></div>";
+        assert!(extent_after_key(Box::leak(format!("{base}</body></html>").into_boxed_str())).await >= 3000.0, "sin listeners no se rehace");
+        assert!(
+            extent_after_key(Box::leak(format!("{base}<script>document.addEventListener('keydown', function() {{}});</script></body></html>").into_boxed_str())).await < 3000.0,
+            "con un listener de keydown si"
+        );
     }
 
     /// Tarea 3.4: el texto de la pagina, legible: bloques en lineas distintas,

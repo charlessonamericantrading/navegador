@@ -336,6 +336,15 @@ impl LayoutBox {
         self.children.iter().find_map(|child| child.find_box_for_node(node))
     }
 
+    /// Como `find_box_for_node`, pero mutable: para cambiar algo de UNA caja sin
+    /// rehacer todo el layout (el texto de un campo mientras se escribe).
+    pub fn find_box_for_node_mut(&mut self, node: &Arc<RwLock<Node>>) -> Option<&mut LayoutBox> {
+        if self.dom_node.as_ref().is_some_and(|own| Arc::ptr_eq(own, node)) {
+            return Some(self);
+        }
+        self.children.iter_mut().find_map(|child| child.find_box_for_node_mut(node))
+    }
+
     /// El borde inferior real de TODO el contenido, mas alla del viewport
     /// con el que se construyo el arbol: `dimensions.height` de la caja
     /// raiz es siempre el alto del viewport de ENTRADA

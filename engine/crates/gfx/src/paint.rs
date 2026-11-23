@@ -255,6 +255,20 @@ fn fill_shape(pixmap: &mut Pixmap, rect: &Rect, radius: f32, paint: &Paint<'stat
     let Some(sk_rect) = SkiaRect::from_xywh(rect.x, rect.y - scroll_offset_y, rect.width, rect.height) else { return };
     if let Some(path) = rounded_rect_path(sk_rect, radius) {
         pixmap.fill_path(&path, paint, FillRule::Winding, Transform::identity(), mask);
+    } else if sk_rect.width() < 2.0 || sk_rect.height() < 2.0 {
+        // Una franja de 1 px (el cursor de un campo, una linea fina) con
+        // antialias entra en la ruta de "hairline" de tiny-skia, que en debug
+        // aborta con un `debug_assert!` para algunas fracciones de `x`. Se ajusta
+        // a la rejilla de pixeles y se pinta sin antialias: una linea de 1 px
+        // nitida es ademas lo que se quiere ver.
+        let (left, top) = (sk_rect.left().round(), sk_rect.top().round());
+        let right = sk_rect.right().round().max(left + 1.0);
+        let bottom = sk_rect.bottom().round().max(top + 1.0);
+        if let Some(snapped) = SkiaRect::from_ltrb(left, top, right, bottom) {
+            let mut crisp = paint.clone();
+            crisp.anti_alias = false;
+            pixmap.fill_rect(snapped, &crisp, Transform::identity(), mask);
+        }
     } else {
         pixmap.fill_rect(sk_rect, paint, Transform::identity(), mask);
     }
@@ -826,6 +840,22 @@ mod tests {
         let soft = paint_with(20.0);
         assert_eq!(count_partial_alpha(&hard), 0, "sin blur, el borde deberia ser completamente duro");
         assert!(count_partial_alpha(&soft) > 0, "con blur, deberia haber pixeles de borde con alpha intermedio (difuminado real, no una sombra dura)");
+    }
+
+    /// Un rectangulo de 1 px de ancho (el cursor de un campo) con la `x` en
+    /// cualquier fraccion no puede hacer entrar en panico al rasterizador: la
+    /// ruta de "hairline" con antialias de tiny-skia tiene un `debug_assert!`
+    /// que saltaba con algunos anchos (rompia los tests de humo en debug).
+    #[test]
+    fn a_one_pixel_wide_rect_at_any_fractional_x_paints_without_panicking() {
+        for tenth in 0..20 {
+            let x = 10.0 + tenth as f32 / 10.0;
+            for height in [1.0_f32, 17.0, 19.2, 21.0] {
+                let mut pixmap = Pixmap::new(40, 40).unwrap();
+                let items = vec![DisplayItem::SolidRect { rect: Rect { x, y: 5.3, width: 1.0, height }, color: [0, 0, 0, 255], radius: 0.0 }];
+                paint_display_list(&mut pixmap, &items, None, 0.0);
+            }
+        }
     }
 
     /// Tarea 2.7: un degradado horizontal de negro a blanco arranca negro a la

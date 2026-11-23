@@ -988,6 +988,47 @@ fn parse_css_border(computed_style: &HashMap<String, String>) -> Option<(f32, [u
     Some((resolved_width, resolved_color))
 }
 
+/// Color del anillo de foco de un control (azul de navegador).
+const FOCUS_RING_COLOR: [u8; 4] = [26, 115, 232, 255];
+
+/// Lo que se pinta ENCIMA de la pagina para el control con el foco (tarea 3.2):
+/// un anillo azul alrededor de su caja y, en un campo de texto de una linea, el
+/// cursor al final de lo escrito. No es parte de la pagina (no cambia su layout
+/// ni su DOM): se añade a la captura y se tira.
+///
+/// La geometria del cursor repite la del texto del campo (`inset = borde + 3`,
+/// centrado en vertical), que es donde `build_items_inner` lo pinta.
+pub fn focus_overlay(focused: &LayoutBox, font_set: Option<&engine_text::FontSet>) -> Vec<DisplayItem> {
+    let mut items = vec![DisplayItem::Border { rect: focused.dimensions.clone(), width: 2.0, color: FOCUS_RING_COLOR, radius: parse_css_border_radius(&focused.computed_style).unwrap_or(0.0) }];
+
+    let is_text_field = matches!(focused.box_type, BoxType::Replaced) && !focused.replaced_text.as_ref().is_some_and(|r| r.centered);
+    let multiline = focused.dimensions.height > 40.0;
+    if is_text_field && !multiline {
+        let font_size = focused.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
+        let border_width = parse_css_border(&focused.computed_style).map_or(0.0, |(width, _)| width);
+        let inset = border_width + 3.0;
+        // Un campo vacio (con o sin placeholder) lleva el cursor al principio; con
+        // texto, tras la ultima letra.
+        let typed_width = match (&focused.replaced_text, font_set.and_then(|set| set.pick_family(FontFamily::SansSerif, false, false))) {
+            (Some(replaced), Some(font)) if !replaced.is_placeholder => engine_text::text_width(font, &replaced.text, font_size),
+            _ => 0.0,
+        };
+        let line = font_size * 1.2;
+        let max_x = focused.dimensions.x + (focused.dimensions.width - inset).max(0.0);
+        items.push(DisplayItem::SolidRect {
+            rect: Rect {
+                x: (focused.dimensions.x + inset + typed_width).min(max_x),
+                y: focused.dimensions.y + ((focused.dimensions.height - line) / 2.0).max(0.0),
+                width: 1.0,
+                height: line.min(focused.dimensions.height),
+            },
+            color: focused.computed_style.get("color").and_then(|v| parse_css_color(v)).unwrap_or(INITIAL_COLOR),
+            radius: 0.0,
+        });
+    }
+    items
+}
+
 /// Hacia donde apunta un degradado lineal.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GradientDirection {
@@ -1593,6 +1634,36 @@ mod tests {
             list.items.iter().any(|item| matches!(item, DisplayItem::Text { text, .. } if text == "hola")),
             "deberia pintar el value resuelto como texto real"
         );
+    }
+
+    /// Tarea 3.2: el foco de un campo de texto dibuja un anillo y un cursor que se
+    /// desplaza con lo escrito; un boton solo lleva anillo.
+    #[test]
+    fn focus_overlay_draws_a_ring_and_a_caret_that_follows_the_text() {
+        let font_set = engine_text::FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let field = |text: &str, placeholder: bool| {
+            let mut b = LayoutBox::new(BoxType::Replaced);
+            b.dimensions = Rect { x: 10.0, y: 10.0, width: 170.0, height: 21.0 };
+            b.replaced_text = Some(engine_layout::ReplacedText { text: text.to_string(), is_placeholder: placeholder, centered: false });
+            b.computed_style.insert("border".to_string(), "1px solid #767676".to_string());
+            b
+        };
+        let caret_x = |items: &[DisplayItem]| items.iter().find_map(|i| match i { DisplayItem::SolidRect { rect, .. } => Some(rect.x), _ => None }).expect("un cursor");
+
+        let empty = focus_overlay(&field("", true), Some(&font_set));
+        assert!(matches!(empty[0], DisplayItem::Border { .. }), "el anillo");
+        let at_start = caret_x(&empty);
+        assert!((at_start - 14.0).abs() < 0.5, "sin texto, el cursor al principio ({at_start})");
+
+        let typed = focus_overlay(&field("hola", false), Some(&font_set));
+        assert!(caret_x(&typed) > at_start + 15.0, "con texto, tras la ultima letra ({})", caret_x(&typed));
+
+        let mut button = field("Enviar", false);
+        button.replaced_text.as_mut().unwrap().centered = true;
+        assert_eq!(focus_overlay(&button, Some(&font_set)).len(), 1, "un boton solo lleva anillo");
     }
 
     fn gradient(value: &str) -> Gradient {

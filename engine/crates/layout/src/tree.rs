@@ -1402,7 +1402,7 @@ fn override_box_type_from_display(default: &BoxType, display: Option<&str>) -> B
 /// navegador real tampoco pinta el `value` de un checkbox como texto.
 /// `<select>` (Fase 35) resuelve la opcion seleccionada via
 /// `resolve_select_text`.
-fn resolve_replaced_text(tag_name: &str, attributes: &HashMap<String, String>, dom_node: &Arc<RwLock<Node>>) -> Option<ReplacedText> {
+pub fn resolve_replaced_text(tag_name: &str, attributes: &HashMap<String, String>, dom_node: &Arc<RwLock<Node>>) -> Option<ReplacedText> {
     let input_type = attributes.get("type").map(|v| v.to_lowercase()).unwrap_or_default();
     let has_value = |v: &&String| !v.is_empty();
 
@@ -5176,7 +5176,8 @@ mod tests {
         assert!(rest.first_line_indent > 0.0, "la primera linea empieza tras la negrita, no en el margen: {}", rest.first_line_indent);
         assert!((rest.first_line_indent - (bold.dimensions.x + bold.dimensions.width)).abs() < 8.0, "justo a continuacion de la negrita ({} vs {})", rest.first_line_indent, bold.dimensions.x + bold.dimensions.width);
         assert_eq!(rest.dimensions.y, bold.dimensions.y, "arranca en la linea de la negrita");
-        assert!(rest.dimensions.height >= 3.0 * 18.0, "ocupa varias lineas: {}", rest.dimensions.height);
+        let line_height = engine_text::line_height(font_set.pick(false, false).expect("fuente"), 16.0);
+        assert!(rest.dimensions.height >= 3.0 * line_height - 0.5, "ocupa varias lineas: {} (linea {line_height})", rest.dimensions.height);
         // El parrafo mide lo que miden sus lineas: ni una de mas ni una de menos.
         let p = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "p").expect("p")).expect("caja del p");
         assert!(p.dimensions.height <= rest.dimensions.height + 1.0, "{} vs {}", p.dimensions.height, rest.dimensions.height);
@@ -5214,7 +5215,8 @@ mod tests {
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
         let a = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "a").expect("a")).expect("caja del enlace");
         let first = root_text_boxes(&root)[0];
-        let last_line_y = first.dimensions.y + first.dimensions.height - 17.6;
+        let line_height = engine_text::line_height(font_set.pick(false, false).expect("fuente"), 16.0);
+        let last_line_y = first.dimensions.y + first.dimensions.height - line_height;
         assert!((a.dimensions.y - last_line_y).abs() < 1.0, "el enlace va en la ultima linea del texto ({} vs {})", a.dimensions.y, last_line_y);
         assert!(a.dimensions.x > 0.0, "y a continuacion, no al principio de la linea: {}", a.dimensions.x);
     }
@@ -5259,20 +5261,26 @@ mod tests {
     /// flex, remaquetados). La sangria de la primera linea de una pasada no
     /// puede sobrevivir a la siguiente: en Wikipedia dejaba "o complementos."
     /// una linea mas abajo de donde el layout la habia puesto.
+    ///
+    /// Los anchos salen de MEDIR con la fuente de la maquina, no de numeros fijos:
+    /// en Windows las metricas son otras y un ancho a ojo daba otro reparto de
+    /// lineas (el trabajo `test` del CI fallo asi).
     #[test]
     fn the_first_line_indent_of_a_previous_pass_does_not_survive_a_wider_layout() {
         let font_set = FontSet::load_default_sans_serif();
-        if font_set.pick(false, false).is_none() {
-            return;
-        }
-        let mut nodes = vec![
-            LayoutBox::new(BoxType::Text("primero ".to_string())),
-            LayoutBox::new(BoxType::Text("segundo texto bastante largo que se parte en varias lineas al ser estrecho".to_string())),
-        ];
-        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, 120.0, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
+        let Some(font) = font_set.pick(false, false) else { return };
+        let first = "primero ";
+        let second = "segundo texto bastante largo que se parte en varias lineas al ser estrecho";
+        let width_of = |text: &str| engine_text::wrapped_line_width(font, text, 16.0);
+        // Cabe "primero " y la primera palabra de lo siguiente, pero no todo.
+        let narrow = width_of(first) + width_of("segundo") + 4.0;
+        assert!(width_of(second) > narrow);
+
+        let mut nodes = vec![LayoutBox::new(BoxType::Text(first.to_string())), LayoutBox::new(BoxType::Text(second.to_string()))];
+        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, narrow, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
         assert!(nodes[1].first_line_indent > 0.0, "en estrecho se parte tras 'primero'");
 
-        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, 2000.0, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
+        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, width_of(first) + width_of(second) + 50.0, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
         assert_eq!(nodes[1].first_line_indent, 0.0, "en ancho cabe entero: sin sangria heredada");
     }
 
@@ -5282,20 +5290,23 @@ mod tests {
     #[test]
     fn a_leading_space_removed_in_a_narrow_pass_is_back_in_a_wide_one() {
         let font_set = FontSet::load_default_sans_serif();
-        if font_set.pick(false, false).is_none() {
-            return;
-        }
+        let Some(font) = font_set.pick(false, false) else { return };
+        let width_of = |text: &str| engine_text::wrapped_line_width(font, text, 16.0);
         let tail = " o complementos y mas cosas".to_string();
         let mut nodes = vec![
             LayoutBox::new(BoxType::Text("antes de todo esto ".to_string())),
             LayoutBox::new(BoxType::Text("extensiones".to_string())),
             LayoutBox::new(BoxType::Text(tail.clone())),
         ];
-        // Estrecho: el texto de cola no cabe y salta de linea.
-        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, 130.0, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
+        // Estrecho: tras "extensiones" no cabe ni la primera palabra de la cola
+        // (se mide, no se supone), asi que salta de linea y pierde su espacio.
+        let before_tail = width_of("antes de todo esto ") + width_of("extensiones");
+        let narrow = (before_tail + width_of("o") / 2.0).max(width_of("antes de todo esto ")).max(width_of("extensiones") + 1.0);
+        assert!(narrow < before_tail + width_of(" o"), "la cola no cabe");
+        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, narrow, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
         assert!(nodes[2].trimmed_text.is_some() || nodes[2].first_line_indent > 0.0, "en estrecho se parte o se recorta");
         // Ancho: cabe todo en una linea, y el texto conserva su espacio.
-        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, 2000.0, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
+        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, before_tail + width_of(&tail) + 50.0, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
         assert_eq!(nodes[2].trimmed_text, None);
         assert!(matches!(&nodes[2].box_type, BoxType::Text(t) if *t == tail), "el texto original no se toca");
     }

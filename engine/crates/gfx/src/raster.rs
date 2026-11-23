@@ -28,6 +28,21 @@ pub fn render_layout_to_png(
     height: u32,
     scroll_offset_y: f32,
 ) -> Result<Vec<u8>, String> {
+    render_layout_to_png_with_overlay(layout_root, font_set, images, width, height, scroll_offset_y, &[])
+}
+
+/// Como `render_layout_to_png`, con items extra pintados ENCIMA de la pagina
+/// (en coordenadas de documento, como el resto): el foco de un control, por
+/// ejemplo (`display_list::focus_overlay`). No forman parte de la pagina.
+pub fn render_layout_to_png_with_overlay(
+    layout_root: &LayoutBox,
+    font_set: Option<&FontSet>,
+    images: &ImageMap,
+    width: u32,
+    height: u32,
+    scroll_offset_y: f32,
+    overlay: &[crate::display_list::DisplayItem],
+) -> Result<Vec<u8>, String> {
     let mut pixmap = Pixmap::new(width, height)
         .ok_or_else(|| format!("no se pudo crear la superficie de rasterizado {width}x{height}"))?;
     // El fondo del elemento raiz se propaga al lienzo ENTERO (ver
@@ -44,6 +59,9 @@ pub fn render_layout_to_png(
 
     let display_list = DisplayList::build(layout_root, images);
     paint_display_list(&mut pixmap, &display_list.items, font_set, scroll_offset_y);
+    if !overlay.is_empty() {
+        paint_display_list(&mut pixmap, overlay, font_set, scroll_offset_y);
+    }
 
     pixmap
         .encode_png()
