@@ -342,7 +342,7 @@ compararlo con la captura del motor. Tiene 17 casos numerados.
   Wikipedia sale "(del inglés *web browser*" y en la línea siguiente
   ") es un software".
 
-- **Hecho (PR #3):** los espacios entre elementos en línea se conservan (caso 12: "Texto **negrita** *cursiva* enlace" con un espacio entre cada palabra); al principio y al final de línea no ocupan nada. **No hecho:** el texto que sigue a un elemento en línea aún salta a la línea siguiente cuando no cabe entero (las hojas de texto se colocan enteras, sin partir entre palabras de elementos distintos). Se ve en Wikipedia: "(del inglés *web browser*" y la línea siguiente.
+- **Hecho (PR #3):** los espacios entre elementos en línea se conservan (caso 12); al principio y al final de línea no ocupan nada. **Y el texto que sigue a un elemento en línea se parte por palabras** (`wrap_text_from`, con ancho propio para la primera línea): "(del inglés *web browser*" ya no rompe la línea. Tres fallos de colocación corregidos de paso: cada párrafo partido en varias líneas medía una línea de más (88 en vez de 70,4); lo que seguía a un texto largo empezaba en la línea de abajo; y la caja de un enlace que saltaba de línea empezaba una línea más arriba que su texto. Un texto que salta de línea pierde su espacio inicial (guardado aparte, porque la misma caja se coloca varias veces con anchos distintos). Verificado con Wikipedia: los párrafos se leen como en un navegador.
 
 ### [x] 2.3 `inline-block` con ancho y alto
 
@@ -404,6 +404,13 @@ Comprobar antes de trabajar en ellos:
 - Los `<style>` se aplicaban todos antes que los CSS externos, sin
   respetar el orden del documento.
 
+**Comprobados y resueltos (PR #3):** los dos eran reales. Un 404/500 con
+página HTML se muestra ahora (solo es error sin página si el cuerpo no es
+HTML con texto); y `pipeline::assemble_css` coloca cada `<style>` y cada
+hoja externa en su sitio del documento (las externas viajan marcadas con su
+`href`). También salió y se resolvió: **degradados `linear-gradient`** (caso 7
+del fixture, ya se ven los 17 casos).
+
 ---
 
 ## Fase 3 — Escribir, hacer scroll y agente IA
@@ -425,7 +432,7 @@ Comprobar antes de trabajar en ellos:
 
 - **Hecho (PR #3):** `click_element` y `type_into_element` (el motor lleva el elemento a la vista y actúa en su centro; `replace` evita concatenar). `BrowserViewport` resta el scroll al buscar el campo y al colocar el cuadro de escritura; el agente usa solo las dos nuevas. **Verificado en Electron real** con el caso de Hacker News: scroll de 980 px, clic en "Search" → aparece el cuadro de escritura en su sitio y al enviar el motor intenta navegar con el texto (falla por falta de internet en la nube, como se espera).
 
-### [ ] 3.2 Escribir de verdad
+### [x] 3.2 Escribir de verdad
 
 - **Comprobado en código:** a mano solo se escribe con un cuadro
   emergente que **añade** texto y **siempre** pulsa Enter
@@ -434,7 +441,7 @@ Comprobar antes de trabajar en ellos:
   al motor. Dibujar foco y cursor.
 - **Verificar:** escribir, borrar con Retroceso y enviar con Enter.
 
-- **Hecho en parte (PR #3):** el cuadro emergente parte del valor actual del campo y lo **sustituye** (`replace`), en vez de añadir. **Falta:** teclas directas sobre el visor (Retroceso, flechas), dibujar foco y cursor.
+- **Hecho (PR #3):** se escribe con el teclado directamente en el campo y el cuadro emergente desaparece. Clicar un campo de texto le da el teclado (el motor lo enfoca y lo dibuja con anillo azul y cursor); `press_key` con un carácter escribe (acentos, espacio incluidos), Retroceso/Supr borran, Enter envía el formulario (o añade una línea en un `<textarea>`), Escape suelta el campo; clicar fuera o navegar le quita el teclado. Si la página no escucha teclas, solo se repinta el texto del campo (no el layout entero: eran 0,4 s por letra en Wikipedia). **Verificado en Electron real** (Hacker News, campo Search tras bajar al final): "rust" → "rust", Retroceso → "rus", "y" → "rusy". Un fallo real salió de paso: una franja de 1 px con antialias hacía abortar a tiny-skia en debug. **Falta:** selección, flechas, Tab entre campos, copiar y pegar.
 
 ### [x] 3.3 Lista de elementos útil
 
@@ -509,21 +516,27 @@ tarea 0.4. No perseguir el número por sí mismo.
 
 ## Fase 6 — Documentación al día
 
-### [ ] 6.1 README
+### [x] 6.1 README
 
 Reescribirlo con lo que este plan deje verificado. El de `main` se
 contradice (dice a la vez que hay y que no hay canvas, SVG y política de
 mismo origen).
 
-### [ ] 6.2 Estado corto del motor
+- **Hecho (PR #3):** cifras al día (1.052 tests), lo nuevo que funciona, tabla de rendimiento medida y los límites del agente tal como son hoy. Apunta a `engine/ESTADO.md` como punto de entrada. No se reescribió entero: lo que no se pudo comprobar (sandbox, plataformas, sonda de APIs) se deja como estaba.
+
+### [x] 6.2 Estado corto del motor
 
 Crear `engine/ESTADO.md` (máximo 150 líneas): qué funciona, qué no y
 cómo medirlo. `ARCHITECTURE.md` queda como histórico.
 
-### [ ] 6.3 Banco visible en el CI
+- **Hecho (PR #3):** `engine/ESTADO.md` (111 líneas): qué funciona, qué no (con el motivo), cómo medirlo, los números y dónde mirar si algo falla.
+
+### [x] 6.3 Banco visible en el CI
 
 Añadir `bench-all` (tarea 0.4) con los dos fixtures locales a los
 workflows que ya existen en el PR #1.
+
+- **Hecho (PR #3):** job `bench` en `engine.yml` (Linux): compila el motor en release y pasa los dos fixtures por `bench_all.py`. Falla si algo se cuelga o si el fixture de JS baja de 12/12. **Sin comprobar en GitHub todavía:** es la primera vez que ese job corre.
 
 ---
 
