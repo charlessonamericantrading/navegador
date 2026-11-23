@@ -3912,6 +3912,11 @@ impl LayoutTreeBuilder {
         }
         match &node.box_type {
             BoxType::Text(content) => {
+                // La misma caja se coloca varias veces con anchos distintos
+                // (medidas de flex, remaquetados): la sangria de la colocacion
+                // anterior no puede sobrevivir a la siguiente.
+                node.first_line_indent = 0.0;
+                node.trimmed_text = None;
                 let font_size = node
                     .computed_style
                     .get("font-size")
@@ -3944,6 +3949,16 @@ impl LayoutTreeBuilder {
                 // solo si esta en medio de una linea y cabe. Al principio de una
                 // linea o al final no ocupa nada, y nunca provoca un salto: en
                 // CSS los espacios en los bordes de una linea desaparecen.
+                let measure = |text: &str| match font {
+                    Some(f) => engine_text::wrapped_line_width(f, text, font_size),
+                    None => text.len() as f32 * 8.0,
+                };
+                let mut natural_width = natural_width;
+                let mut content: &str = content;
+                // Si el texto salta de linea, el espacio con que empezaba (el que
+                // lo separaba del hermano anterior) deja de existir: se quita del
+                // texto de la caja al terminar.
+                let mut stripped_after_jump: Option<String> = None;
                 if content.trim().is_empty() {
                     let space_width = match font {
                         Some(f) => engine_text::measure_text(f, " ", font_size).width,
@@ -3958,6 +3973,26 @@ impl LayoutTreeBuilder {
 
                 let mut remaining = origin_x + inner_width - *cursor_x;
                 if natural_width > remaining && *cursor_x > origin_x {
+                    // Tarea 2.2b: antes de saltar de linea, se intenta partir el
+                    // texto por palabras. Lo que cabe se queda en lo que resta
+                    // de la linea actual (junto al hermano en linea que ya hay)
+                    // y el resto sigue en las siguientes. Sin esto, todo el
+                    // texto que seguia a un enlace o una cursiva bajaba entero.
+                    if let Some(f) = font {
+                        let indent = *cursor_x - origin_x;
+                        let first_width = inner_width - indent;
+                        let lines = engine_text::wrap_text_from(f, content, font_size, first_width, inner_width);
+                        if lines.len() >= 2 && !lines[0].trim().is_empty() {
+                            let last = lines.last().map(String::as_str).unwrap_or("");
+                            let last_width = engine_text::text_width(f, last, font_size);
+                            node.first_line_indent = indent;
+                            node.dimensions = Rect { x: origin_x, y: *cursor_y, width: inner_width, height: lines.len() as f32 * text_line_height };
+                            *cursor_y += (lines.len() - 1) as f32 * text_line_height;
+                            *cursor_x = origin_x + last_width;
+                            *line_extent = text_line_height;
+                            return;
+                        }
+                    }
                     // No cabe en lo que queda de la linea actual, pero la
                     // linea ya tiene contenido de un hermano anterior: salta
                     // a una linea nueva antes de decidir nada mas. Avanza
@@ -3969,6 +4004,12 @@ impl LayoutTreeBuilder {
                     *cursor_x = origin_x;
                     *line_extent = text_line_height;
                     remaining = inner_width;
+                    let stripped = content.trim_start();
+                    if stripped.len() != content.len() {
+                        content = stripped;
+                        natural_width = measure(content);
+                        stripped_after_jump = Some(content.to_string());
+                    }
                 }
 
                 if natural_width <= remaining {
@@ -3981,14 +4022,24 @@ impl LayoutTreeBuilder {
                     // igual que una caja de texto de bloque de siempre.
                     let lines = match font {
                         Some(f) => engine_text::wrap_text(f, content, font_size, inner_width),
-                        None => vec![content.clone()],
+                        None => vec![content.to_string()],
                     };
                     let consumed_lines = lines.len().max(1) as f32;
                     node.dimensions = Rect { x: origin_x, y: *cursor_y, width: inner_width, height: consumed_lines * text_line_height };
-                    *cursor_y += consumed_lines * text_line_height;
-                    *cursor_x = origin_x;
+                    // El cursor se queda al final de la ULTIMA linea (tarea 2.2b),
+                    // no en el principio de la siguiente: lo que siga en linea (un
+                    // enlace, una cursiva, mas texto) continua ahi. Antes saltaba
+                    // siempre una linea de mas: cada parrafo que se partia en varias
+                    // lineas medía una linea mas de la cuenta, y lo que venia justo
+                    // despues del texto empezaba en la linea de abajo.
+                    *cursor_y += (consumed_lines - 1.0) * text_line_height;
+                    *cursor_x = match (font, lines.last()) {
+                        (Some(f), Some(last)) => origin_x + engine_text::text_width(f, last, font_size),
+                        _ => origin_x,
+                    };
                     *line_extent = text_line_height;
                 }
+                node.trimmed_text = stripped_after_jump;
             }
             BoxType::Inline => {
                 // `display: inline-block` con `width`/`height` (tarea 2.3): una
@@ -4039,11 +4090,15 @@ impl LayoutTreeBuilder {
                         right = right.max(child.dimensions.x + child.dimensions.width);
                     }
                 }
+                // Si el primer hijo salto de linea (el enlace no cabia al final
+                // de la anterior), la caja empieza donde empieza ese hijo y no
+                // una linea mas arriba, donde estaba el cursor antes de saltar.
+                let top = node.children.iter().find(|child| child.dimensions.width > 0.0).map_or(start_y, |child| child.dimensions.y.max(start_y));
                 node.dimensions = Rect {
                     x: left,
-                    y: start_y - padding.top - border.top,
+                    y: top - padding.top - border.top,
                     width: (right - left).max(0.0),
-                    height: (*cursor_y - start_y) + *line_extent + padding.top + padding.bottom + border.top + border.bottom,
+                    height: (*cursor_y - top) + *line_extent + padding.top + padding.bottom + border.top + border.bottom,
                 };
             }
             BoxType::Image(src) => {
@@ -5099,6 +5154,179 @@ mod tests {
         let mono = width_of("font-family: monospace;");
         assert!(mono > sans * 1.3, "monoespaciada ({mono}) deberia ser bastante mas ancha que sans-serif ({sans})");
         assert_eq!(width_of("font-family: Arial, sans-serif;"), sans, "una sans-serif conocida es la de siempre");
+    }
+
+    /// Tarea 2.2b (Wikipedia: "(del inglés *web browser*" y el resto del texto
+    /// en la linea de abajo): el texto que sigue a un elemento en linea se
+    /// parte por palabras y sigue en la MISMA linea, en vez de bajar entero.
+    #[test]
+    fn text_after_an_inline_element_continues_on_the_same_line_and_wraps_by_words() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let largo = "y a continuacion un texto lo bastante largo para llenar varias lineas de este parrafo estrecho";
+        let dom = HtmlParser::parse(&format!(r#"<html><body><p id="p"><b>negrita</b> {largo}</p></body></html>"#));
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; width: 200px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+
+        let bold = find_text_box(&root, "negrita").expect("texto en negrita");
+        let rest = root_text_boxes(&root).into_iter().find(|b| matches!(&b.box_type, BoxType::Text(t) if t.contains("a continuacion"))).expect("el resto del texto");
+
+        assert!(rest.first_line_indent > 0.0, "la primera linea empieza tras la negrita, no en el margen: {}", rest.first_line_indent);
+        assert!((rest.first_line_indent - (bold.dimensions.x + bold.dimensions.width)).abs() < 8.0, "justo a continuacion de la negrita ({} vs {})", rest.first_line_indent, bold.dimensions.x + bold.dimensions.width);
+        assert_eq!(rest.dimensions.y, bold.dimensions.y, "arranca en la linea de la negrita");
+        assert!(rest.dimensions.height >= 3.0 * 18.0, "ocupa varias lineas: {}", rest.dimensions.height);
+        // El parrafo mide lo que miden sus lineas: ni una de mas ni una de menos.
+        let p = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "p").expect("p")).expect("caja del p");
+        assert!(p.dimensions.height <= rest.dimensions.height + 1.0, "{} vs {}", p.dimensions.height, rest.dimensions.height);
+    }
+
+    /// Un parrafo que se parte en varias lineas mide EXACTAMENTE esas lineas. Antes
+    /// medía una de mas (88 en vez de 70,4), y lo que venia despues del texto
+    /// arrancaba en la linea de abajo.
+    #[test]
+    fn a_wrapped_paragraph_is_exactly_as_tall_as_its_lines() {
+        let font_set = FontSet::load_default_sans_serif();
+        let Some(font) = font_set.pick(false, false) else { return };
+        let dom = HtmlParser::parse(r#"<html><body><p id="p">un texto lo bastante largo para llenar varias lineas de este parrafo estrecho de doscientos pixeles de ancho</p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; width: 200px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        let p = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "p").expect("p")).expect("caja del p");
+        let text = root_text_boxes(&root)[0];
+        let lines = engine_text::wrap_text(font, "un texto lo bastante largo para llenar varias lineas de este parrafo estrecho de doscientos pixeles de ancho", 16.0, 200.0).len();
+        assert!(lines >= 3);
+        assert_eq!(text.dimensions.height, lines as f32 * engine_text::line_height(font, 16.0));
+        assert_eq!(p.dimensions.height, text.dimensions.height, "ni una linea de mas");
+    }
+
+    /// Lo que sigue en linea a un texto largo continua tras su ultima linea, no
+    /// en la linea siguiente (Wikipedia: "...introducir una" y el enlace "URL"
+    /// aparte, con un hueco).
+    #[test]
+    fn an_inline_element_after_a_long_text_continues_on_its_last_line() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let dom = HtmlParser::parse(r#"<html><body><p>un texto lo bastante largo para llenar varias lineas de este parrafo estrecho <a id="a" href="/x">URL</a> y mas</p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; width: 200px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        let a = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "a").expect("a")).expect("caja del enlace");
+        let first = root_text_boxes(&root)[0];
+        let last_line_y = first.dimensions.y + first.dimensions.height - 17.6;
+        assert!((a.dimensions.y - last_line_y).abs() < 1.0, "el enlace va en la ultima linea del texto ({} vs {})", a.dimensions.y, last_line_y);
+        assert!(a.dimensions.x > 0.0, "y a continuacion, no al principio de la linea: {}", a.dimensions.x);
+    }
+
+    /// Un enlace que no cabe al final de la linea salta entero a la siguiente: su
+    /// caja (la que se clica) empieza donde esta su texto, no una linea mas arriba.
+    #[test]
+    fn an_inline_element_that_jumps_to_the_next_line_has_its_box_where_its_text_is() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let dom = HtmlParser::parse(r#"<html><body><p>aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll aaaaaaaaaaaaaa <a id="a" href="/x">extensiones</a> y mas.</p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; width: 200px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        let a = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "a").expect("a")).expect("caja del enlace");
+        let text = find_text_box(&root, "extensiones").expect("texto del enlace");
+        assert_eq!(a.dimensions.y, text.dimensions.y, "la caja del enlace y su texto, en la misma linea");
+        assert!(a.dimensions.height < 20.0, "una sola linea: {}", a.dimensions.height);
+    }
+
+    /// El espacio con que empezaba un texto que salta de linea desaparece: no se
+    /// pinta una linea que empiece con un hueco.
+    #[test]
+    fn a_text_that_jumps_to_a_new_line_loses_its_leading_space() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let dom = HtmlParser::parse(r#"<html><body><p>un enlace casi al final de la linea <a href="/x">este de aqui</a> y luego un texto que continua varias lineas despues</p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; width: 200px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        let boxes = root_text_boxes(&root);
+        let tail = boxes.iter().find(|b| matches!(&b.box_type, BoxType::Text(t) if t.contains("luego"))).expect("texto final");
+        if tail.first_line_indent == 0.0 && tail.dimensions.x == 0.0 {
+            let BoxType::Text(text) = &tail.box_type else { unreachable!() };
+            assert!(!text.starts_with(' '), "empieza una linea: sin espacio inicial ({text:?})");
+        }
+    }
+
+    /// La misma caja se coloca varias veces con anchos distintos (medidas de
+    /// flex, remaquetados). La sangria de la primera linea de una pasada no
+    /// puede sobrevivir a la siguiente: en Wikipedia dejaba "o complementos."
+    /// una linea mas abajo de donde el layout la habia puesto.
+    #[test]
+    fn the_first_line_indent_of_a_previous_pass_does_not_survive_a_wider_layout() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let mut nodes = vec![
+            LayoutBox::new(BoxType::Text("primero ".to_string())),
+            LayoutBox::new(BoxType::Text("segundo texto bastante largo que se parte en varias lineas al ser estrecho".to_string())),
+        ];
+        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, 120.0, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
+        assert!(nodes[1].first_line_indent > 0.0, "en estrecho se parte tras 'primero'");
+
+        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, 2000.0, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
+        assert_eq!(nodes[1].first_line_indent, 0.0, "en ancho cabe entero: sin sangria heredada");
+    }
+
+    /// Un texto que salta de linea en una pasada estrecha no pierde su espacio
+    /// inicial para siempre: en una pasada ancha, que no salta, lo conserva.
+    /// (Wikipedia: "extensiones" + "o complementos." salia "extensioneso".)
+    #[test]
+    fn a_leading_space_removed_in_a_narrow_pass_is_back_in_a_wide_one() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let tail = " o complementos y mas cosas".to_string();
+        let mut nodes = vec![
+            LayoutBox::new(BoxType::Text("antes de todo esto ".to_string())),
+            LayoutBox::new(BoxType::Text("extensiones".to_string())),
+            LayoutBox::new(BoxType::Text(tail.clone())),
+        ];
+        // Estrecho: el texto de cola no cabe y salta de linea.
+        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, 130.0, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
+        assert!(nodes[2].trimmed_text.is_some() || nodes[2].first_line_indent > 0.0, "en estrecho se parte o se recorta");
+        // Ancho: cabe todo en una linea, y el texto conserva su espacio.
+        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, 2000.0, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
+        assert_eq!(nodes[2].trimmed_text, None);
+        assert!(matches!(&nodes[2].box_type, BoxType::Text(t) if *t == tail), "el texto original no se toca");
+    }
+
+    fn root_text_boxes(root: &LayoutBox) -> Vec<&LayoutBox> {
+        let mut out = Vec::new();
+        fn walk<'a>(b: &'a LayoutBox, out: &mut Vec<&'a LayoutBox>) {
+            if matches!(b.box_type, BoxType::Text(_)) {
+                out.push(b);
+            }
+            for c in &b.children {
+                walk(c, out);
+            }
+        }
+        walk(root, &mut out);
+        out
+    }
+
+    /// Un texto que ya cabe, o que empieza a principio de linea, no cambia.
+    #[test]
+    fn text_that_fits_or_starts_a_line_has_no_first_line_indent() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let dom = HtmlParser::parse(r#"<html><body><p><b>a</b> corto</p><p>empieza al principio de la linea y es bastante mas largo que el ancho del parrafo</p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; width: 200px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        for b in root_text_boxes(&root) {
+            assert_eq!(b.first_line_indent, 0.0, "{:?}", b.box_type);
+        }
     }
 
     /// El reverso: `display:block` sobre una etiqueta naturalmente inline

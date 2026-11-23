@@ -231,6 +231,20 @@ pub struct LayoutBox {
     /// dejarlo en cero: `resolve_explicit_height` no devuelve nada y la caja
     /// sigue creciendo con su contenido.
     pub(crate) containing_height: f32,
+    /// Solo en cajas de TEXTO que empiezan a mitad de linea y siguen en las
+    /// siguientes (tarea 2.2b): cuanto se desplaza a la derecha su primera
+    /// linea desde `dimensions.x`, porque a su izquierda hay un hermano en
+    /// linea (`un <b>enlace</b> y mas texto`). `0.0` en el resto. Medir
+    /// (`engine-layout`) y pintar (`engine-gfx`) usan este mismo numero con
+    /// `engine_text::wrap_text_from`.
+    pub first_line_indent: f32,
+    /// Solo en cajas de TEXTO que saltaron a una linea nueva con un espacio al
+    /// principio: el texto SIN ese espacio, que es el que se pinta (en CSS los
+    /// espacios del principio de una linea desaparecen). Es una copia aparte y
+    /// no un cambio de `box_type` porque la misma caja se coloca varias veces
+    /// con anchos distintos: si una pasada estrecha le quitara el espacio al
+    /// texto, la pasada ancha ya no lo tendria.
+    pub trimmed_text: Option<String>,
 }
 
 impl LayoutBox {
@@ -249,6 +263,8 @@ impl LayoutBox {
             rowspan: 1,
             containing_width: 0.0,
             containing_height: 0.0,
+            first_line_indent: 0.0,
+            trimmed_text: None,
         }
     }
 

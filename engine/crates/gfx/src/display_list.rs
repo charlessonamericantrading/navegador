@@ -39,7 +39,7 @@ pub enum DisplayItem {
     /// llegar aqui.
     /// `line_height` (tarea 2.6): la altura de linea en pixeles que el layout
     /// resolvio desde `line-height`; `None` usa la altura natural de la fuente.
-    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool, underline: bool, text_align: TextAlign, line_height: Option<f32>, font_family: FontFamily },
+    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool, underline: bool, text_align: TextAlign, line_height: Option<f32>, font_family: FontFamily, first_line_indent: f32 },
     /// `rect` es el border-box COMPLETO (`layout_box.dimensions`, que ya
     /// incluye el propio border - ver `engine_layout::tree::
     /// flow_block_children`); quien pinta esto (`engine-gfx/src/paint.rs`)
@@ -271,6 +271,7 @@ impl DisplayList {
                         text_align: if replaced.centered { TextAlign::Center } else { TextAlign::Left },
                         line_height: None,
                         font_family: FontFamily::SansSerif,
+                        first_line_indent: 0.0,
                     });
                 }
 
@@ -291,7 +292,9 @@ impl DisplayList {
                 let font_size = layout_box.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
                 target.push(DisplayItem::Text {
                     rect: layout_box.dimensions.clone(),
-                    text: content.clone(),
+                    // El texto sin el espacio que quedo al principio de una linea, si
+                    // el layout lo quito (ver `LayoutBox::trimmed_text`).
+                    text: layout_box.trimmed_text.clone().unwrap_or_else(|| content.clone()),
                     color,
                     font_size,
                     bold: resolve_font_weight_is_bold(&layout_box.computed_style),
@@ -303,6 +306,7 @@ impl DisplayList {
                     // natural de la fuente.
                     line_height: layout_box.computed_style.get("line-height-px").and_then(|v| parse_css_length(v)),
                     font_family: layout_box.computed_style.get("font-family").map(|v| FontFamily::from_css(v)).unwrap_or_default(),
+                    first_line_indent: layout_box.first_line_indent,
                 });
             }
             BoxType::Image(src) => {

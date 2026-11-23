@@ -316,6 +316,19 @@ pub fn wrapped_line_width(font: &SystemFont, text: &str, font_size: f32) -> f32 
 }
 
 pub fn wrap_text(font: &SystemFont, text: &str, font_size: f32, max_width: f32) -> Vec<String> {
+    wrap_text_from(font, text, font_size, max_width, max_width)
+}
+
+/// Como `wrap_text`, pero la PRIMERA linea tiene su propio ancho (tarea 2.2b):
+/// un texto que sigue a un elemento en linea (`un <b>enlace</b> y mas texto`)
+/// empieza a mitad de linea, con menos sitio que las siguientes. Quien MIDE
+/// (`engine-layout`) y quien PINTA (`engine-gfx`) llaman a esta misma funcion
+/// con los mismos numeros, para que cuenten las mismas lineas.
+///
+/// Si ni siquiera la primera palabra cabe en `first_max_width` y ese ancho es
+/// menor que `max_width`, la primera linea queda VACIA: es la señal de "aqui no
+/// cabe nada, empieza en la linea siguiente".
+pub fn wrap_text_from(font: &SystemFont, text: &str, font_size: f32, first_max_width: f32, max_width: f32) -> Vec<String> {
     if text.trim().is_empty() {
         return Vec::new();
     }
@@ -353,8 +366,16 @@ pub fn wrap_text(font: &SystemFont, text: &str, font_size: f32, max_width: f32) 
     for word in text.split_whitespace() {
         let word_width = text_width(font, word, font_size);
         let candidate_width = if current_line.is_empty() { word_width } else { current_width + space_width + word_width };
+        // La primera linea puede ser mas estrecha que las demas.
+        let limit = if lines.is_empty() { first_max_width } else { max_width };
 
-        if current_line.is_empty() || candidate_width <= max_width {
+        if current_line.is_empty() && lines.is_empty() && word_width > first_max_width && first_max_width < max_width {
+            // La primera palabra no cabe en lo que queda de la primera linea:
+            // se deja vacia (ver el doc-comment) y la palabra abre la segunda.
+            lines.push(String::new());
+            current_line = word.to_string();
+            current_width = word_width;
+        } else if current_line.is_empty() || candidate_width <= limit {
             if !current_line.is_empty() {
                 current_line.push(' ');
             }
@@ -371,7 +392,9 @@ pub fn wrap_text(font: &SystemFont, text: &str, font_size: f32, max_width: f32) 
     }
 
     if leading_space {
-        if let Some(first) = lines.first_mut() {
+        // En una primera linea vacia (señal de "no cabe aqui") no hay donde
+        // poner el espacio.
+        if let Some(first) = lines.first_mut().filter(|line| !line.is_empty()) {
             first.insert(0, ' ');
         }
     }
@@ -607,6 +630,35 @@ mod tests {
         let rejoined: Vec<&str> = lines.iter().flat_map(|l| l.split_whitespace()).collect();
         let original: Vec<&str> = text.split_whitespace().collect();
         assert_eq!(rejoined, original);
+    }
+
+    /// Tarea 2.2b: una primera linea mas estrecha reparte las palabras entre la
+    /// que queda de linea y las siguientes, sin perder ni reordenar ninguna.
+    #[test]
+    fn wrap_text_from_gives_the_first_line_its_own_narrower_width() {
+        let Some(font) = SystemFont::load_default_sans_serif() else { return };
+        let text = "este es un parrafo bastante largo que deberia necesitar mas de una linea";
+        let first_width = 120.0;
+        let lines = wrap_text_from(&font, text, 16.0, first_width, 400.0);
+
+        assert!(lines.len() >= 2, "{lines:?}");
+        assert!(!lines[0].is_empty(), "la primera palabra cabe en 120px");
+        assert!(measure_text(&font, lines[0].trim(), 16.0).width <= first_width + 0.5, "la primera linea respeta SU ancho: {:?}", lines[0]);
+        let rejoined: Vec<&str> = lines.iter().flat_map(|l| l.split_whitespace()).collect();
+        assert_eq!(rejoined, text.split_whitespace().collect::<Vec<_>>());
+        // Con el mismo ancho en las dos, es exactamente `wrap_text`.
+        assert_eq!(wrap_text_from(&font, text, 16.0, 400.0, 400.0), wrap_text(&font, text, 16.0, 400.0));
+    }
+
+    /// Si ni la primera palabra cabe en lo que queda de la primera linea, esa
+    /// linea queda vacia: la señal de "empieza en la siguiente".
+    #[test]
+    fn wrap_text_from_leaves_the_first_line_empty_when_not_even_one_word_fits() {
+        let Some(font) = SystemFont::load_default_sans_serif() else { return };
+        let lines = wrap_text_from(&font, " gigantesca palabra", 16.0, 5.0, 400.0);
+        assert_eq!(lines.first().map(String::as_str), Some(""), "{lines:?}");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1], "gigantesca palabra", "el espacio inicial no se pega a una linea vacia");
     }
 
     #[test]

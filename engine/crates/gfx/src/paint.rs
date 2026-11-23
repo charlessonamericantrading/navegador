@@ -11,7 +11,7 @@
 use crate::display_list::{DisplayItem, TextAlign};
 use crate::image_paint::{paint_background_image, paint_image};
 use engine_layout::Rect;
-use engine_text::{baseline_offset, measure_text, shape_text, underline_metrics, wrap_text, FontFamily, FontSet, SystemFont};
+use engine_text::{baseline_offset, measure_text, shape_text, underline_metrics, wrap_text_from, FontFamily, FontSet, SystemFont};
 use tiny_skia::{FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Rect as SkiaRect, Stroke, Transform};
 
 /// Pinta cada `DisplayItem` de `items`, EN ORDEN, sobre `pixmap`.
@@ -77,8 +77,8 @@ pub fn paint_display_list(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: 
                     fill_shape(pixmap, rect, *radius, &paint_of(*color), scroll_offset_y, current_mask.as_ref());
                 }
             }
-            DisplayItem::Text { rect, text, color, font_size, bold, italic, underline, text_align, line_height, font_family } => {
-                paint_text(pixmap, rect, text, *color, *font_size, *bold, *italic, *font_family, *underline, *text_align, *line_height, font_set, scroll_offset_y, current_mask.as_ref());
+            DisplayItem::Text { rect, text, color, font_size, bold, italic, underline, text_align, line_height, font_family, first_line_indent } => {
+                paint_text(pixmap, rect, text, *color, *font_size, *bold, *italic, *font_family, *underline, *text_align, *line_height, *first_line_indent, font_set, scroll_offset_y, current_mask.as_ref());
             }
             DisplayItem::Border { rect, width: border_width, color, radius } => {
                 paint_border(pixmap, rect, *border_width, *color, *radius, scroll_offset_y, current_mask.as_ref());
@@ -392,6 +392,7 @@ fn paint_text(
     underline: bool,
     text_align: TextAlign,
     line_height: Option<f32>,
+    first_line_indent: f32,
     font_set: Option<&FontSet>,
     scroll_offset_y: f32,
     mask: Option<&Mask>,
@@ -405,7 +406,9 @@ fn paint_text(
             // de esta caja (mismo font_size, mismo ancho) - el numero de
             // lineas que se pinta aqui coincide con el que se reservo alli
             // por construccion, no por coincidencia.
-            let lines = wrap_text(font, text, font_size, rect.width);
+            // Mismo corte que reservo el layout: la primera linea, si el texto
+            // empezo a mitad de linea, es `first_line_indent` mas estrecha.
+            let lines = wrap_text_from(font, text, font_size, rect.width - first_line_indent, rect.width);
             let natural_height = engine_text::line_height(font, font_size);
             // Con un `line-height` mayor (o menor) que el natural, cada linea
             // avanza ese tanto y el texto se centra verticalmente dentro de
@@ -424,7 +427,7 @@ fn paint_text(
                 // envuelto por separado.
                 let line_width = measure_text(font, line, font_size).width;
                 let line_x = match text_align {
-                    TextAlign::Left => rect.x,
+                    TextAlign::Left => rect.x + if index == 0 { first_line_indent } else { 0.0 },
                     TextAlign::Center => rect.x + ((rect.width - line_width) / 2.0).max(0.0),
                     TextAlign::Right => rect.x + (rect.width - line_width).max(0.0),
                 };
@@ -800,6 +803,7 @@ mod tests {
                 text_align: TextAlign::Left,
                 line_height: None,
                 font_family: FontFamily::SansSerif,
+                first_line_indent: 0.0,
             }];
             paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
             pixmap
@@ -835,6 +839,7 @@ mod tests {
             text_align: TextAlign::Left,
             line_height: None,
             font_family: FontFamily::SansSerif,
+            first_line_indent: 0.0,
         }];
         paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
         assert!(pixmap.pixels().iter().all(|p| p.alpha() == 0), "una linea en blanco no deberia pintar nada, ni siquiera un subrayado");
@@ -867,6 +872,7 @@ mod tests {
                 text_align,
                 line_height: None,
                 font_family: FontFamily::SansSerif,
+                first_line_indent: 0.0,
             }];
             paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
             let width = pixmap.width();
