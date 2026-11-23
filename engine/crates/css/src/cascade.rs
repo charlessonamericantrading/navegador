@@ -139,7 +139,70 @@ pub fn resolve_style(dom_node: &Arc<RwLock<Node>>, stylesheet: &StyleSheet, view
         }
     }
 
+    merge_border_longhands(&mut computed);
     computed
+}
+
+const BORDER_STYLES: &[&str] = &["none", "hidden", "solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset"];
+
+/// Si un token es un ancho de borde (`1px`, `0`, `thin`...) y no un color o un estilo.
+fn is_border_width(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    matches!(lower.as_str(), "thin" | "medium" | "thick") || lower.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// `border-width`, `border-style` y `border-color` por separado se funden en el
+/// `border` que entienden el layout y el pintado (que solo leen esa propiedad).
+/// Es lo habitual en CSS real: `border: 1px solid #a2a9b1; border-color:
+/// transparent` (los botones "silenciosos" de Wikipedia) o `border-style: none`.
+/// Sin esto el motor dibujaba el borde del shorthand y se saltaba el resto.
+///
+/// Los `border-*` por lado (`border-bottom`...) siguen sin soportarse. Un estilo
+/// distinto de `solid` (`dashed`, `dotted`) se dibuja como solido.
+fn merge_border_longhands(computed: &mut HashMap<String, String>) {
+    let (width_longhand, style_longhand, color_longhand) = (computed.get("border-width").cloned(), computed.get("border-style").cloned(), computed.get("border-color").cloned());
+    if width_longhand.is_none() && style_longhand.is_none() && color_longhand.is_none() {
+        return;
+    }
+    let (mut width, mut style, mut color): (Option<String>, Option<String>, Option<String>) = (None, None, None);
+    if let Some(shorthand) = computed.get("border") {
+        for token in crate::parser::split_css_tokens(shorthand) {
+            let lower = token.to_ascii_lowercase();
+            if BORDER_STYLES.contains(&lower.as_str()) {
+                style = Some(lower);
+            } else if is_border_width(token) {
+                width = Some(token.to_string());
+            } else {
+                color = Some(token.to_string());
+            }
+        }
+    }
+    let first = |value: &str| crate::parser::split_css_tokens(value).into_iter().next().map(str::to_string);
+    if let Some(value) = width_longhand.as_deref().and_then(first) {
+        width = Some(value);
+    }
+    if let Some(value) = style_longhand.as_deref().and_then(first) {
+        style = Some(value.to_ascii_lowercase());
+    }
+    if let Some(value) = color_longhand.as_deref().and_then(first) {
+        color = Some(value);
+    }
+    if !style.as_deref().is_some_and(|s| BORDER_STYLES.contains(&s) && s != "none" && s != "hidden") {
+        computed.remove("border");
+        return;
+    }
+    let width = match width.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("thin") => "1px".to_string(),
+        Some("medium") | None => "3px".to_string(),
+        Some("thick") => "5px".to_string(),
+        Some(_) => width.unwrap_or_default(),
+    };
+    let mut value = format!("{width} solid");
+    if let Some(color) = color {
+        value.push(' ');
+        value.push_str(&color);
+    }
+    computed.insert("border".to_string(), value);
 }
 
 #[cfg(test)]
@@ -232,6 +295,22 @@ mod tests {
         assert_eq!(table.get("width"), None);
         assert_eq!(table.get("background-color"), None);
         assert_eq!(table.get("border"), None);
+    }
+
+    /// `border-color: transparent` y compañia se funden con el shorthand: el
+    /// layout y el pintado solo leen `border`.
+    #[test]
+    fn border_longhands_are_merged_into_the_border_the_engine_reads() {
+        let border = |css: &str| style_of("<html><body><a>x</a></body></html>", "a", css).get("border").cloned();
+
+        assert_eq!(border("a { border: 1px solid #a2a9b1; border-color: transparent; }").as_deref(), Some("1px solid transparent"), "el color de la longhand gana");
+        assert_eq!(border("a { border: 1px solid red; border-style: none; }"), None, "border-style: none anula el borde");
+        assert_eq!(border("a { border: 1px solid red; border-width: 0; }").as_deref(), Some("0 solid red"), "ancho 0 se conserva (no ocupa nada)");
+        assert_eq!(border("a { border: 1px solid red; border-width: 4px; }").as_deref(), Some("4px solid red"));
+        assert_eq!(border("a { border-width: 2px; border-style: solid; border-color: rgba(0, 0, 0, .5); }").as_deref(), Some("2px solid rgba(0, 0, 0, .5)"), "solo con longhands");
+        assert_eq!(border("a { border-width: 2px; border-color: red; }"), None, "sin estilo no hay borde (el valor inicial es none)");
+        assert_eq!(border("a { border-style: dashed; }").as_deref(), Some("3px solid"), "ancho medium por defecto; dashed se dibuja solido");
+        assert_eq!(border("a { border: thin solid blue; }").as_deref(), Some("thin solid blue"), "sin longhands no se toca el shorthand");
     }
 
     #[test]
