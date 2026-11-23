@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { isTextEntryElement } from '../textEntry';
 
 interface ElementRect {
   x: number;
@@ -37,8 +38,13 @@ interface BrowserViewportProps {
   /// un aviso encima en vez de dejar el area en blanco sin explicacion.
   requiresJavascript: boolean;
   onManualNavigate: (url: string) => void;
-  onManualClick: (x: number, y: number) => void;
-  onManualType: (elementId: number, text: string) => void;
+  /// `isTextField`: el clic cayó sobre un campo de texto, que desde ese momento
+  /// recibe el teclado (el motor lo enfoca y le dibuja anillo y cursor).
+  onManualClick: (x: number, y: number, isTextField: boolean) => void;
+  /// Una tecla pulsada con el visor enfocado y un campo con el teclado.
+  onManualKey: (key: string) => void;
+  /// Hay un campo de texto con el teclado: las teclas van al motor.
+  typingFocus: boolean;
   onManualResize: (width: number, height: number) => void;
   onManualScroll: (dy: number) => void;
   loading: boolean;
@@ -88,7 +94,8 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   requiresJavascript,
   onManualNavigate,
   onManualClick,
-  onManualType,
+  onManualKey,
+  typingFocus,
   onManualResize,
   onManualScroll,
   loading,
@@ -109,29 +116,8 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   isAgentOpen
 }) => {
   const [addressInput, setAddressInput] = useState(url || 'https://www.google.com');
-  const [inputTextPopup, setInputTextPopup] = useState<{
-    /// Posición en coordenadas del DOCUMENTO (se resta el scroll al pintar).
-    mx: number;
-    my: number;
-    elementId: number;
-    text: string;
-    placeholder: string;
-  } | null>(null);
-
   const containerRef = useRef<HTMLDivElement>(null);
-  const stageRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
-  const popupInputRef = useRef<HTMLInputElement>(null);
-
-  // Rectángulo real (en píxeles, relativo al "stage") que ocupa la imagen del
-  // screenshot dentro de su contenedor. La imagen se ajusta a su caja con
-  // maxWidth/maxHeight y se centra con flexbox, así que salvo que el panel
-  // tenga exactamente proporción 16:9 quedan franjas vacías a los lados o
-  // arriba/abajo. Las insignias/resaltados deben posicionarse relativas a
-  // ESTE rectángulo, no al 100%/100% del contenedor (ver bug de desalineación).
-  // `naturalWidth`/`naturalHeight`: tamano real de la captura. Se guardan aqui
-  // al medir, para que el render no tenga que leer `imgRef.current`.
-  const [imgRect, setImgRect] = useState<{ left: number; top: number; width: number; height: number; naturalWidth: number; naturalHeight: number } | null>(null);
 
   // Informa al backend del tamaño real del contenedor (ver BrowserManager.resize
   // en el backend) - pensado para que, cuando haya un motor de renderizado
@@ -174,50 +160,6 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
     };
   }, [onManualResize]);
 
-  useEffect(() => {
-    const updateImgRect = () => {
-      if (!imgRef.current || !stageRef.current) return;
-      // Antes de que la imagen (data URI) termine de decodificarse, su caja
-      // puede medir 0x0 durante un instante; publicar eso colapsaría todas las
-      // insignias en el mismo punto hasta el próximo recálculo. Se espera a
-      // "complete" y se deja que el onLoad de la imagen dispare la primera
-      // medición válida.
-      if (!imgRef.current.complete || imgRef.current.naturalWidth === 0) return;
-      const imgBox = imgRef.current.getBoundingClientRect();
-      const stageBox = stageRef.current.getBoundingClientRect();
-      setImgRect({
-        left: imgBox.left - stageBox.left,
-        top: imgBox.top - stageBox.top,
-        width: imgBox.width,
-        height: imgBox.height,
-        naturalWidth: imgRef.current.naturalWidth || imgBox.width,
-        naturalHeight: imgRef.current.naturalHeight || imgBox.height
-      });
-    };
-
-    updateImgRect();
-
-    const resizeObserver = new ResizeObserver(updateImgRect);
-    if (imgRef.current) resizeObserver.observe(imgRef.current);
-    window.addEventListener('resize', updateImgRect);
-
-    return () => {
-      resizeObserver.disconnect();
-      window.removeEventListener('resize', updateImgRect);
-    };
-  }, [screenshot]);
-
-  // Convierte una coordenada del modelo (espacio de píxeles real de la
-  // captura recibida, no un tamaño fijo) a píxeles dentro del "stage",
-  // usando el rectángulo real de la imagen.
-  const toStagePx = (mx: number, my: number) => {
-    if (!imgRect) return { left: 0, top: 0 };
-    return {
-      left: imgRect.left + (mx / imgRect.naturalWidth) * imgRect.width,
-      top: imgRect.top + (my / imgRect.naturalHeight) * imgRect.height
-    };
-  };
-
   // Cuando el motor navega (la URL cambia desde fuera), la barra muestra la
   // URL nueva. Se ajusta durante el render comparando con la URL anterior,
   // no en un efecto: el efecto pintaba primero la URL vieja y luego otra vez.
@@ -234,12 +176,6 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
     setPreviousResetKey(addressResetKey);
     setAddressInput(url || '');
   }
-
-  useEffect(() => {
-    if (inputTextPopup && popupInputRef.current) {
-      popupInputRef.current.focus();
-    }
-  }, [inputTextPopup]);
 
   // La barra de direcciones acepta tanto URLs ("wikipedia.org") como
   // busquedas en lenguaje natural ("clima en madrid"), igual que un
@@ -272,11 +208,6 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
   };
 
   const handleImageClick = (e: React.MouseEvent<HTMLImageElement>) => {
-    if (inputTextPopup) {
-      setInputTextPopup(null);
-      return;
-    }
-
     // Evita encolar clics contra una página que ya ha cambiado: cada acción
     // tarda 1-2.5s en el backend (ver browser.py), así que sin esta guarda se
     // podían apilar varios clics que acababan ejecutándose sobre coordenadas
@@ -296,37 +227,32 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
 
     // `elements` está en coordenadas del documento; el clic, en las de la captura.
     const documentY = mappedY + scrollOffsetY;
-    const clickedInputEl = elements.find(el => {
+    const isTextField = elements.some(el => {
       const { x, y, width, height } = el.rect;
-      const isInside = (
-        mappedX >= x &&
-        mappedX <= x + width &&
-        documentY >= y &&
-        documentY <= y + height
-      );
-      return isInside && (el.tag_name === 'input' || el.tag_name === 'textarea');
+      const isInside = mappedX >= x && mappedX <= x + width && documentY >= y && documentY <= y + height;
+      return isInside && isTextEntryElement(el);
     });
 
-    if (clickedInputEl) {
-      setInputTextPopup({
-        mx: clickedInputEl.rect.x + clickedInputEl.rect.width / 2,
-        my: clickedInputEl.rect.y + clickedInputEl.rect.height / 2,
-        elementId: clickedInputEl.id,
-        text: clickedInputEl.attributes.value ?? '',
-        placeholder: clickedInputEl.attributes.placeholder || 'Escribe texto...'
-      });
-    } else {
-      onManualClick(mappedX, mappedY);
-    }
+    onManualClick(mappedX, mappedY, isTextField);
+    // El visor recibe el teclado: sin esto el foco se quedaría en la barra de
+    // direcciones y las teclas no llegarían aquí.
+    containerRef.current?.focus();
+  };
+
+  // Teclado sobre el visor (tarea 3.2): con un campo de texto enfocado, cada
+  // tecla va al motor, que escribe, borra o envía el formulario. Las
+  // combinaciones con Ctrl/Alt/Meta se dejan al sistema (copiar, recargar...).
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!typingFocus || e.ctrlKey || e.altKey || e.metaKey) return;
+    if (e.key === 'Shift' || e.key === 'CapsLock' || e.key === 'Dead' || e.key === 'Process' || e.key === 'Unidentified') return;
+    // Tab y F1-F12 siguen siendo del sistema.
+    if (e.key === 'Tab' || /^F\d+$/.test(e.key)) return;
+    // Espacio y Retroceso harían scroll o navegarían por su cuenta.
+    e.preventDefault();
+    onManualKey(e.key);
   };
 
   const handleWheel = (e: React.WheelEvent) => {
-    // El popup de escritura se posiciona sobre unas coordenadas de la página
-    // que dejan de ser válidas en cuanto ésta se desplaza.
-    if (inputTextPopup) {
-      setInputTextPopup(null);
-    }
-
     // deltaMode indica la unidad de deltaY: 0 = píxeles, 1 = líneas, 2 = páginas.
     // El backend siempre espera píxeles.
     let dy = e.deltaY;
@@ -337,14 +263,6 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
     }
 
     onManualScroll(Math.round(dy));
-  };
-
-  const handlePopupSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (inputTextPopup) {
-      onManualType(inputTextPopup.elementId, inputTextPopup.text);
-      setInputTextPopup(null);
-    }
   };
 
   const quickLinks = [
@@ -470,7 +388,13 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
       </div>
 
       {/* Área Principal de Renderizado / Inicio */}
-      <div className="viewport-container" ref={containerRef} onWheel={screenshot ? handleWheel : undefined}>
+      <div
+        className="viewport-container"
+        ref={containerRef}
+        onWheel={screenshot ? handleWheel : undefined}
+        tabIndex={screenshot ? 0 : undefined}
+        onKeyDown={screenshot ? handleKeyDown : undefined}
+      >
         {loadError ? (
           // Página de error dentro del visor (tarea 1.3): lo que pasó, con la
           // dirección pedida y una salida, en vez de dejar la página anterior
@@ -493,27 +417,13 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
             </div>
           </div>
         ) : screenshot ? (
-          <div ref={stageRef} style={{ position: 'relative', width: '100%', height: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+          <div style={{ position: 'relative', width: '100%', height: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
             <img
               ref={imgRef}
               src={`data:image/png;base64,${screenshot}`}
               alt="Browser Viewport"
               className="screenshot-image"
               onClick={handleImageClick}
-              onLoad={() => {
-                if (imgRef.current && stageRef.current) {
-                  const imgBox = imgRef.current.getBoundingClientRect();
-                  const stageBox = stageRef.current.getBoundingClientRect();
-                  setImgRect({
-                    left: imgBox.left - stageBox.left,
-                    top: imgBox.top - stageBox.top,
-                    width: imgBox.width,
-                    height: imgBox.height,
-                    naturalWidth: imgRef.current.naturalWidth || imgBox.width,
-                    naturalHeight: imgRef.current.naturalHeight || imgBox.height
-                  });
-                }
-              }}
             />
 
             {requiresJavascript && (
@@ -532,29 +442,6 @@ export const BrowserViewport: React.FC<BrowserViewportProps> = ({
                 </div>
               </div>
             )}
-
-            {inputTextPopup && (() => {
-              const { left, top } = toStagePx(inputTextPopup.mx, inputTextPopup.my - scrollOffsetY);
-              return (
-              <form
-                onSubmit={handlePopupSubmit}
-                className="inline-type-popup"
-                style={{ left: `${left}px`, top: `${top}px` }}
-                onClick={(e) => e.stopPropagation()}
-              >
-                <input
-                  ref={popupInputRef}
-                  type="text"
-                  placeholder={inputTextPopup.placeholder}
-                  value={inputTextPopup.text}
-                  onChange={(e) => setInputTextPopup({ ...inputTextPopup, text: e.target.value })}
-                />
-                <button type="submit" className="btn btn-primary" style={{ padding: '8px 14px' }}>
-                  Enviar
-                </button>
-              </form>
-              );
-            })()}
           </div>
         ) : (
           /* PÁGINA DE INICIO / NUEVA PESTAÑA NATIVA (NTP) */

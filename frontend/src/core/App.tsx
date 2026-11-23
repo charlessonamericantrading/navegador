@@ -44,6 +44,9 @@ function App() {
   // DOCUMENTO; para saber dónde están en la captura hay que restarlo.
   const [scrollOffsetY, setScrollOffsetY] = useState(0);
   const [loading, setLoading] = useState(false);
+  // Un campo de texto de la página tiene el teclado: las teclas pulsadas sobre
+  // el visor van al motor (tarea 3.2).
+  const [typingFocus, setTypingFocus] = useState(false);
   // La última navegación que falló (tarea 1.3). Se pinta dentro del visor, no
   // solo como aviso flotante: antes la barra mostraba la dirección nueva sobre
   // el contenido de la página anterior, sin ninguna explicación.
@@ -364,7 +367,10 @@ function App() {
   const runEngineCommand = useCallback(async (payload: EngineRequestPayload): Promise<void> => {
     if (window.electronAPI?.sendEngineRequest) {
       const navigates = isNavigationCommand(payload.type);
-      if (navigates) setLoadError(null);
+      if (navigates) {
+        setLoadError(null);
+        setTypingFocus(false);
+      }
       const ticket = navigation.ticket(payload.type);
       beginLoading();
       try {
@@ -462,17 +468,30 @@ function App() {
     }
   };
 
-  const handleManualClick = (x: number, y: number) => {
+  const handleManualClick = (x: number, y: number, isTextField: boolean) => {
     if (loading) return;
+    // El campo clicado recibe el teclado; clicar en cualquier otro sitio se lo
+    // quita (el motor hace lo mismo con el foco de la pagina).
+    setTypingFocus(isTextField);
     sendCommand({ type: 'click', x, y });
   };
 
-  // Por id de elemento: el motor sabe dónde está el scroll y desplaza el campo
-  // a la vista (tarea 3.1). `replace`: la ventana emergente parte del valor
-  // actual del campo, así que lo que se envía es el valor final.
-  const handleManualType = (elementId: number, text: string) => {
-    if (loading) return;
-    sendCommand({ type: 'type_into_element', element_id: elementId, text, replace: true, press_enter: true });
+  // Teclado sobre el visor (tarea 3.2). Enter puede enviar el formulario y
+  // navegar: va por la ruta normal (con «cargando» y Detener). El resto se
+  // aplica sin molestar; las teclas rápidas se van encolando en el motor, que
+  // las atiende en orden.
+  const handleManualKey = (key: string) => {
+    if (key === 'Escape') {
+      setTypingFocus(false);
+      return;
+    }
+    if (key === 'Enter') {
+      if (loading) return;
+      setTypingFocus(false);
+      sendCommand({ type: 'press_key', key });
+      return;
+    }
+    sendEngineQuietly({ type: 'press_key', key }).catch(console.error);
   };
 
   const handleManualScroll = (dy: number) => {
@@ -591,7 +610,8 @@ function App() {
           requiresJavascript={requiresJavascript}
           onManualNavigate={handleManualNavigate}
           onManualClick={handleManualClick}
-          onManualType={handleManualType}
+          onManualKey={handleManualKey}
+          typingFocus={typingFocus}
           onManualResize={handleManualResize}
           onManualScroll={handleManualScroll}
           loading={loading}
