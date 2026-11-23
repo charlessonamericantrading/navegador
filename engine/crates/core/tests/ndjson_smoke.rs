@@ -251,6 +251,57 @@ fn get_page_text_devuelve_el_texto_legible_de_la_pagina() {
     assert!(!r["text"].as_str().unwrap().trim().is_empty(), "la pagina de humo tiene texto: {r}");
 }
 
+/// Servidor de una respuesta fija con el estado que se pida (la de `TestServer`
+/// siempre es 200 o un 404 vacio).
+fn servidor_con_estado(estado: &'static str, tipo: &'static str, cuerpo: &'static str) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("puerto libre");
+    let url = format!("http://127.0.0.1:{}/", listener.local_addr().unwrap().port());
+    let hilo = std::thread::spawn(move || {
+        if let Ok((mut flujo, _)) = listener.accept() {
+            let mut buffer = [0u8; 2048];
+            let _ = flujo.read(&mut buffer);
+            let respuesta = format!(
+                "HTTP/1.1 {estado}\r\nContent-Type: {tipo}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{cuerpo}",
+                cuerpo.len()
+            );
+            let _ = flujo.write_all(respuesta.as_bytes());
+        }
+    });
+    (url, hilo)
+}
+
+/// La pagina de error HTML de un servidor (un 404 con su mensaje) se muestra,
+/// como en cualquier navegador, en vez de quedarse en un aviso generico.
+#[test]
+fn un_404_con_pagina_html_se_muestra() {
+    let (url, _hilo) = servidor_con_estado(
+        "404 Not Found",
+        "text/html; charset=utf-8",
+        "<html><head><title>No encontrada</title></head><body><h1>Esta pagina no existe</h1><p>Prueba con el buscador.</p></body></html>",
+    );
+    let mut motor = Motor::arrancar();
+    let r = motor.pedir(json!({"type": "navigate", "id": "n", "url": url}));
+    assert_correlacionada(&r, "n", "state");
+    assert_eq!(r["title"], "No encontrada");
+    let texto = common::texto_visible(&mut motor);
+    assert!(texto.contains("Esta pagina no existe"), "{texto}");
+}
+
+/// Un error sin pagina que mostrar (vacio, JSON...) sigue siendo un error claro.
+#[test]
+fn un_500_sin_pagina_sigue_siendo_un_error() {
+    let (url, _hilo) = servidor_con_estado("500 Internal Server Error", "application/json", "{\"error\":\"boom\"}");
+    let mut motor = Motor::arrancar();
+    let r = motor.pedir(json!({"type": "navigate", "id": "n", "url": url}));
+    assert_correlacionada(&r, "n", "error");
+    assert!(r["message"].as_str().unwrap().starts_with("http_error: 500"), "{r}");
+
+    let (url, _hilo) = servidor_con_estado("404 Not Found", "text/html", "<html><body></body></html>");
+    let r = motor.pedir(json!({"type": "navigate", "id": "n2", "url": url}));
+    assert_correlacionada(&r, "n2", "error");
+}
+
 #[test]
 fn navigate_a_un_esquema_no_permitido_da_error_y_no_navega() {
     let mut motor = Motor::arrancar();

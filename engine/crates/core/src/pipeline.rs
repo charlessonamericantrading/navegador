@@ -26,6 +26,120 @@ use std::sync::{Arc, RwLock};
 
 use crate::scripting;
 
+/// Separadores de las hojas externas dentro del CSS que entrega el servidor
+/// (tarea "orden de estilos"): `<inicio><href><fin de href>css<fin>`. Son
+/// caracteres de control que no pueden aparecer en CSS valido, para que
+/// `assemble_css` sepa a que `<link>` pertenece cada hoja y la coloque en su
+/// sitio del documento.
+const SHEET_START: char = '\u{1}';
+const SHEET_HREF_END: char = '\u{2}';
+const SHEET_END: char = '\u{3}';
+
+/// La hoja descargada de `href`, marcada para `assemble_css`. El texto de la
+/// hoja no puede traer los separadores (se quitan): una hoja ajena no debe
+/// poder fingir que es otra.
+pub fn wrap_sheet(href: &str, css: &str) -> String {
+    let clean = |text: &str| text.chars().filter(|c| !matches!(*c, SHEET_START | SHEET_HREF_END | SHEET_END)).collect::<String>();
+    format!("{SHEET_START}{}{SHEET_HREF_END}{}{SHEET_END}\n", clean(href), clean(css))
+}
+
+/// El CSS tal cual, sin marcas (para quien solo lo lee: descubrir imagenes de
+/// fondo, por ejemplo).
+pub fn strip_sheet_markers(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut skipping_href = false;
+    for c in css.chars() {
+        match c {
+            SHEET_START => skipping_href = true,
+            SHEET_HREF_END => skipping_href = false,
+            SHEET_END => {}
+            _ if skipping_href => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Las hojas marcadas de `css` (href, contenido) y el resto sin marcar.
+fn split_marked_sheets(css: &str) -> (Vec<(String, String)>, String) {
+    let mut sheets = Vec::new();
+    let mut unmarked = String::new();
+    let mut rest = css;
+    while let Some(start) = rest.find(SHEET_START) {
+        unmarked.push_str(&rest[..start]);
+        let after = &rest[start + SHEET_START.len_utf8()..];
+        let (Some(href_end), Some(end)) = (after.find(SHEET_HREF_END), after.find(SHEET_END)) else {
+            unmarked.push_str(after);
+            return (sheets, unmarked);
+        };
+        if href_end > end {
+            rest = &after[end + SHEET_END.len_utf8()..];
+            continue;
+        }
+        sheets.push((after[..href_end].to_string(), after[href_end + SHEET_HREF_END.len_utf8()..end].to_string()));
+        rest = &after[end + SHEET_END.len_utf8()..];
+    }
+    unmarked.push_str(rest);
+    (sheets, unmarked)
+}
+
+/// Los `<link rel=stylesheet>` y `<style>` del documento, en orden de documento.
+fn stylesheet_sources(node: &Arc<RwLock<Node>>, out: &mut Vec<Arc<RwLock<Node>>>) {
+    let guard = node.read().unwrap();
+    if let NodeType::Element { tag_name, attributes } = &guard.node_type {
+        let is_source = tag_name == "style"
+            || (tag_name == "link" && attributes.get("rel").is_some_and(|rel| rel.split_whitespace().any(|token| token.eq_ignore_ascii_case("stylesheet"))));
+        if is_source {
+            out.push(node.clone());
+        }
+    }
+    for child in &guard.children {
+        stylesheet_sources(child, out);
+    }
+}
+
+/// El CSS de la pagina en el ORDEN DEL DOCUMENTO (tarea 2 de "vistos en main"):
+/// cada `<style>` y cada hoja externa en el sitio de su etiqueta. Con
+/// especificidad igual gana lo que viene despues, asi que el orden cambia el
+/// aspecto: antes todos los `<style>` iban primero y las hojas externas
+/// despues, y un `<style>` que sobrescribe a un `<link>` anterior perdia.
+///
+/// `external_css` son las hojas marcadas con `wrap_sheet`. Lo que no lleve marca
+/// (CSS suelto que entrega quien llama, como los tests) va al final, como antes.
+pub fn assemble_css(dom_root: &Arc<RwLock<Node>>, external_css: &str, allow_inline_style: bool) -> String {
+    let (mut sheets, unmarked) = split_marked_sheets(external_css);
+    let mut sources = Vec::new();
+    stylesheet_sources(dom_root, &mut sources);
+
+    let mut combined = String::new();
+    for source in &sources {
+        let (is_style, href) = match &source.read().unwrap().node_type {
+            NodeType::Element { tag_name, attributes } => (tag_name == "style", attributes.get("href").cloned()),
+            _ => continue,
+        };
+        if is_style {
+            if allow_inline_style {
+                combined.push_str(&Node::text_content(source));
+                combined.push('\n');
+            }
+        } else if let Some(href) = href {
+            if let Some(position) = sheets.iter().position(|(sheet_href, _)| *sheet_href == href) {
+                let (_, css) = sheets.remove(position);
+                combined.push_str(&css);
+                combined.push('\n');
+            }
+        }
+    }
+    // Hojas que se descargaron pero cuya etiqueta ya no esta (un script la
+    // quito) o no se pudo emparejar: al final, que es donde estaban siempre.
+    for (_, css) in sheets {
+        combined.push_str(&css);
+        combined.push('\n');
+    }
+    combined.push_str(&unmarked);
+    combined
+}
+
 pub struct PageResult {
     /// `dom_root` y `stylesheet` los usa `pipeline.rs` en sus propios tests
     /// para comprobar la estructura del DOM/CSS, y `main.rs` los necesita
@@ -83,12 +197,7 @@ pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f
     let dom_root = HtmlParser::parse(html);
     let script_results = scripting::execute_inline_scripts(&dom_root, external_scripts);
 
-    let mut combined_css = String::new();
-    for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
-        combined_css.push_str(&Node::text_content(style_tag));
-        combined_css.push('\n');
-    }
-    combined_css.push_str(css);
+    let combined_css = assemble_css(&dom_root, css, true);
 
     let stylesheet = CssParser::parse(&combined_css);
     let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
@@ -108,12 +217,7 @@ pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewp
     let dom_root = HtmlParser::parse(html);
     let (script_results, test_results) = scripting::execute_inline_scripts_with_harness(&dom_root, external_scripts, (viewport_width, viewport_height));
 
-    let mut combined_css = String::new();
-    for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
-        combined_css.push_str(&Node::text_content(style_tag));
-        combined_css.push('\n');
-    }
-    combined_css.push_str(css);
+    let combined_css = assemble_css(&dom_root, css, true);
 
     let stylesheet = CssParser::parse(&combined_css);
     let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
@@ -160,14 +264,7 @@ pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, vi
     let (script_results, mut runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network, storage, (viewport_width, viewport_height));
     tracing::info!("[tiempo]   JS {:?} ({} script(s))", t.elapsed(), script_results.len());
 
-    let mut combined_css = String::new();
-    if allow_inline_style {
-        for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
-            combined_css.push_str(&Node::text_content(style_tag));
-            combined_css.push('\n');
-        }
-    }
-    combined_css.push_str(css);
+    let combined_css = assemble_css(&dom_root, css, allow_inline_style);
 
     let t = std::time::Instant::now();
     let stylesheet = CssParser::parse(&combined_css);
@@ -439,6 +536,57 @@ fn extract_url(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Color del primer `<p>` de una pagina construida con esa hoja externa marcada.
+    fn paragraph_color(html: &str, external_css: &str) -> String {
+        let page = build_page(html, external_css, 800.0, 600.0, None, &HashMap::new(), &ImageMap::new());
+        let p = Node::find_all_by_tag(&page.dom_root, "p").into_iter().next().expect("un <p>");
+        engine_css::resolve_style(&p, &page.stylesheet, 800.0).get("color").cloned().unwrap_or_default()
+    }
+
+    /// Un `<style>` que viene DESPUES de un `<link>` gana a igual especificidad
+    /// (antes todos los `<style>` iban primero y la hoja externa siempre ganaba).
+    #[test]
+    fn a_style_after_a_link_overrides_the_external_sheet() {
+        let external = wrap_sheet("tema.css", "p { color: #ff0000; }");
+        let html = r#"<html><head><link rel="stylesheet" href="tema.css"><style>p { color: #0000ff; }</style></head><body><p>x</p></body></html>"#;
+        assert_eq!(paragraph_color(html, &external), "#0000ff");
+    }
+
+    /// Y al reves: un `<style>` anterior al `<link>` pierde ante el.
+    #[test]
+    fn a_style_before_a_link_loses_to_the_external_sheet() {
+        let external = wrap_sheet("tema.css", "p { color: #ff0000; }");
+        let html = r#"<html><head><style>p { color: #0000ff; }</style><link rel="stylesheet" href="tema.css"></head><body><p>x</p></body></html>"#;
+        assert_eq!(paragraph_color(html, &external), "#ff0000");
+    }
+
+    #[test]
+    fn several_links_and_styles_interleave_in_document_order() {
+        let external = format!("{}{}", wrap_sheet("a.css", "p { color: #111111; }"), wrap_sheet("b.css", "p { color: #333333; }"));
+        let html = r#"<html><head><link rel="stylesheet" href="a.css"><style>p { color: #222222; }</style><link rel="stylesheet" href="b.css"></head><body><p>x</p></body></html>"#;
+        assert_eq!(paragraph_color(html, &external), "#333333", "la ultima en el documento");
+        let html = r#"<html><head><link rel="stylesheet" href="b.css"><link rel="stylesheet" href="a.css"><style>p { color: #222222; }</style></head><body><p>x</p></body></html>"#;
+        assert_eq!(paragraph_color(html, &external), "#222222");
+    }
+
+    /// CSS sin marca (el que entregan los tests) sigue yendo al final, como antes,
+    /// y una hoja marcada sin su `<link>` tampoco se pierde.
+    #[test]
+    fn unmarked_css_and_orphan_sheets_still_apply_after_the_documents_styles() {
+        let html = "<html><head><style>p { color: #0000ff; }</style></head><body><p>x</p></body></html>";
+        assert_eq!(paragraph_color(html, "p { color: #ff0000; }"), "#ff0000");
+        assert_eq!(paragraph_color(html, &wrap_sheet("huerfana.css", "p { color: #00ff00; }")), "#00ff00");
+    }
+
+    #[test]
+    fn sheet_markers_do_not_leak_and_a_sheet_cannot_forge_them() {
+        let wrapped = wrap_sheet("a.css", "p { color: red; }\u{3}\u{1}falso\u{2}x");
+        assert_eq!(strip_sheet_markers(&wrapped).trim(), "p { color: red; }falsox");
+        let (sheets, rest) = split_marked_sheets(&wrapped);
+        assert_eq!(sheets.len(), 1, "los separadores de dentro de la hoja se quitaron");
+        assert_eq!(rest.trim(), "");
+    }
 
     #[test]
     fn find_inline_style_css_concatenates_every_style_tag_in_order() {

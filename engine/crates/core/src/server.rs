@@ -536,7 +536,11 @@ impl EngineServer {
             Ok(response) => response,
             Err(error) => return Self::error(id, format!("network_error: {error}")),
         };
-        if !response.is_success() {
+        // Un 404 o un 500 con una pagina HTML se MUESTRA, como hace cualquier
+        // navegador: la pagina de error del servidor dice mas (y a veces ofrece
+        // un buscador o enlaces) que un aviso generico. Solo es un error sin
+        // pagina si el cuerpo no es un documento legible.
+        if !response.is_success() && !is_renderable_error_page(&response) {
             return Self::error(
                 id,
                 format!(
@@ -627,7 +631,7 @@ impl EngineServer {
         let allow_inline_style = csp.allows_inline("style-src");
         let inline_css = if allow_inline_style { find_inline_style_css(&discovery_dom) } else { String::new() };
         let mut image_srcs = find_image_srcs(&discovery_dom);
-        image_srcs.extend(find_background_image_urls(&format!("{inline_css}\n{external_css}")));
+        image_srcs.extend(find_background_image_urls(&format!("{inline_css}\n{}", crate::pipeline::strip_sheet_markers(&external_css))));
         let image_srcs = filter_by_csp(image_srcs, "img-src", &csp, &page_url, &page_origin);
         let n_img = image_srcs.len();
 
@@ -1175,9 +1179,10 @@ impl EngineServer {
         let mut combined = String::new();
         // El orden que devuelve `fetch_subresources` es el del documento,
         // no el de llegada - imprescindible aqui (ver su doc-comment).
-        for (_href, response) in self.fetch_subresources(hrefs, page_url, "<link rel=stylesheet>", deadline).await {
-            combined.push_str(&response.text());
-            combined.push('\n');
+        // Cada hoja va marcada con su `href` crudo para que `pipeline::assemble_css`
+        // la coloque en el sitio de su `<link>`, no al final de todo.
+        for (href, response) in self.fetch_subresources(hrefs, page_url, "<link rel=stylesheet>", deadline).await {
+            combined.push_str(&crate::pipeline::wrap_sheet(&href, &response.text()));
         }
         combined
     }
@@ -2669,6 +2674,39 @@ fn page_content_requires_javascript(
         return false;
     }
     !Node::find_all_by_tag(dom_root, "script").is_empty()
+}
+
+/// ¿Es la respuesta de un error HTTP (4xx/5xx) una pagina que merece mostrarse?
+/// HTML con algo de texto visible: un cuerpo vacio, un JSON o un binario
+/// quedan como `http_error`, que es lo mas util que se puede decir de ellos.
+fn is_renderable_error_page(response: &engine_net::NetworkResponse) -> bool {
+    if response.status_code < 400 {
+        return false;
+    }
+    let is_html = response
+        .headers
+        .get("content-type")
+        .map(|value| value.to_ascii_lowercase())
+        .is_some_and(|value| value.contains("text/html") || value.contains("application/xhtml"));
+    if !is_html {
+        return false;
+    }
+    let html = response.text();
+    let dom = engine_dom::HtmlParser::parse(&html);
+    // Con algo que leer: sin el codigo de scripts y estilos.
+    Node::find_all_by_tag(&dom, "body")
+        .first()
+        .is_some_and(|body| collect_readable_text_of_dom(body).chars().filter(|c| !c.is_whitespace()).count() >= 10)
+}
+
+/// El texto de un nodo del DOM sin descender en `<script>`/`<style>`/`<noscript>`.
+fn collect_readable_text_of_dom(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> String {
+    let guard = node.read().unwrap();
+    match &guard.node_type {
+        NodeType::Text(text) => text.clone(),
+        NodeType::Element { tag_name, .. } if matches!(tag_name.as_str(), "script" | "style" | "noscript" | "template") => String::new(),
+        _ => guard.children.iter().map(collect_readable_text_of_dom).collect::<Vec<_>>().join(" "),
+    }
 }
 
 /// Tope del texto que devuelve `get_page_text`: lo que cabe holgado en el
