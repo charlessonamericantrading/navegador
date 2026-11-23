@@ -1583,10 +1583,15 @@ impl EngineServer {
             let mut chars = key.chars();
             let printable = matches!((chars.next(), chars.next()), (Some(c), None) if !c.is_control());
             let is_backspace = matches!(key.as_str(), "Backspace" | "Delete");
-            let mutates_value = (is_backspace || printable) && is_text_control(&node);
+            // Enter en un `<textarea>` añade una linea; en un campo de una linea
+            // envia el formulario (mas abajo).
+            let is_newline = key == "Enter" && is_textarea(&node);
+            let mutates_value = (is_backspace || printable || is_newline) && is_text_control(&node);
             if mutates_value {
                 if is_backspace {
                     backspace_control_value(&node);
+                } else if is_newline {
+                    append_control_value(&node, "\n");
                 } else {
                     append_control_value(&node, &key);
                 }
@@ -3350,6 +3355,25 @@ mod tests {
         press(&mut server, "Backspace").await;
         assert_eq!(field_value(&server), "hola");
         assert_eq!(field_painted_text(&server).as_deref(), Some("hola"));
+    }
+
+    /// Un `<textarea>` muestra lo que se escribe (el valor va en `value`, y el texto
+    /// de la caja salia del contenido inicial: no se veia nada) y Enter dentro de el
+    /// añade una linea en vez de enviar el formulario.
+    #[tokio::test]
+    async fn typing_in_a_textarea_shows_the_text_and_enter_adds_a_line() {
+        let mut server = server_from_html("<html><body style=\"margin:0\"><form action=\"/envia\"><textarea id=\"campo\" style=\"width:200px;height:60px\"></textarea></form></body></html>");
+        server.handle(EngineRequest::Click { id: None, x: 20.0, y: 15.0 }).await;
+        for key in ["h", "i"] {
+            press(&mut server, key).await;
+        }
+        assert_eq!(field_value(&server), "hi");
+        assert_eq!(field_painted_text(&server).as_deref(), Some("hi"), "el textarea pinta lo escrito");
+
+        let r = press(&mut server, "Enter").await;
+        assert!(matches!(r, EngineResponse::State { .. }), "Enter en un textarea no envia ni falla: {r:?}");
+        press(&mut server, "x").await;
+        assert_eq!(field_value(&server), "hi\nx");
     }
 
     /// Las teclas que no son un caracter (flechas, Tab, F5...) no escriben nada.

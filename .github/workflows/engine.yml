@@ -104,6 +104,28 @@ jobs:
         working-directory: engine
         run: cargo clippy -p engine-net --all-targets --locked -- -D warnings
 
+  # Banco de medidas visibles (tarea 6.3 del plan): compila el motor en release,
+  # lo pasa por los dos fixtures locales (CSS y JavaScript) y falla si alguna
+  # operacion se cuelga (mas de 10 s) o si el fixture de JS deja de sacar sus 12
+  # comprobaciones en OK. Es la parte del banco que no necesita internet; las
+  # paginas reales se miden a mano con `scripts/dev/bench_all.py`.
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache de compilacion
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Compilar el motor (release)
+        working-directory: engine
+        run: cargo build --release --locked -p engine-core --bin engine_server
+      - name: Banco de los fixtures
+        run: python3 scripts/dev/bench_all.py --only fixture-css --only fixture-js
+
   # Auditoria de dependencias (tarea F7 del plan). Va en un job aparte para
   # que un aviso de seguridad recien publicado no oculte un fallo de tests:
   # son dos senales distintas y se leen por separado.

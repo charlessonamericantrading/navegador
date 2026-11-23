@@ -8,9 +8,10 @@ Un navegador de escritorio con un **motor de renderizado propio escrito desde ce
 > sistema operativo. Ver [Qué falta](#qué-falta) antes de usarlo con sitios
 > en los que no confíes.
 >
-> El plan de trabajo completo, con las tareas pendientes priorizadas, está
-> en [`plan.md`](plan.md). El backlog técnico del motor, verificado contra
-> el código, está en [`engine/huecos_sin_resolver.md`](engine/huecos_sin_resolver.md).
+> **Para saber qué funciona hoy y cómo medirlo, empieza por
+> [`engine/ESTADO.md`](engine/ESTADO.md)** (corto y verificado). El plan de
+> trabajo está en [`plan.md`](plan.md) y [`PLAN_SONNET.md`](PLAN_SONNET.md); el
+> backlog técnico, en [`engine/huecos_sin_resolver.md`](engine/huecos_sin_resolver.md).
 
 ---
 
@@ -18,25 +19,28 @@ Un navegador de escritorio con un **motor de renderizado propio escrito desde ce
 
 Todo lo de esta lista está implementado y verificado ejecutando el motor, no
 solo compilándolo. Las cifras salen de correr la suite de tests el
-2026-08-27.
+2026-11-23 (Linux).
 
 | | |
 |---|---|
 | **Motor** | ~25.800 líneas de Rust, 10 crates |
-| **Tests** | 874 pasando, 0 fallando (medido el 2026-09-09) |
+| **Tests** | 1.020 pasando, 0 fallando (medido el 2026-11-23), más 60 tests estilo-WPT |
 | **Red** | HTTP/1.1 + HTTPS real (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies RFC 6265, CORS y CSP |
 | **HTML** | Parseo con `html5ever` (el de Servo), DOM mutable, `<canvas>` 2D context |
-| **CSS** | Cascada con especificidad real, selectores con combinadores (`selectors`, el de Firefox), pseudo-clases, `@media`, `rem`, porcentajes, shorthands (`padding`/`margin` de 1-4 valores, `flex`) |
-| **Layout** | Bloque, inline, `box-sizing: border-box`, flexbox con *intrinsic sizing*, CSS Grid, tablas, `float`, `position` (sticky/relative/absolute) |
+| **CSS** | Cascada con especificidad real y orden de documento, selectores con combinadores (`selectors`, el de Firefox), pseudo-clases, `@media`, variables, `calc()`, `rem`/`em`/`vw`, porcentajes, shorthands, degradados `linear-gradient`, atributos HTML clásicos (`bgcolor`, `width`, `cellpadding`…) |
+| **Layout** | Bloque, texto en línea que se parte por palabras entre elementos, `inline-block` con tamaño, `margin: auto`, `box-sizing: border-box`, flexbox con *intrinsic sizing*, CSS Grid, tablas, `float`, `position` (sticky/relative/absolute) |
 | **JavaScript** | Motor `boa` (sintaxis ES moderna completa: `async`/`await`, clases, spread, `Map`/`Set`, `Promise`), DOM bindings, eventos con burbujeo, `fetch`, `XMLHttpRequest`, `setTimeout`, `requestAnimationFrame`, `localStorage`, `navigator`, Canvas 2D API |
-| **Pintado** | Rasterizado con `tiny-skia`, gráficos vectoriales SVG con `resvg`/`usvg`, fuentes con glifos reales, `border-radius`, sombras |
+| **Pintado** | Rasterizado con `tiny-skia`, gráficos vectoriales SVG con `resvg`/`usvg`, fuentes del sistema con glifos reales (sans-serif, serifa y monoespaciada), `border-radius`, sombras, degradados, lienzo blanco |
 | **IA Nativa** | Crate `engine-ai` con Árbol de Accesibilidad Semántico (AOM) con coordenadas espaciales optimizado para LLMs |
 
 **Lo que se puede hacer con él ahora mismo:** cargar una página real por
-HTTPS, navegar por enlaces, usar el historial, abrir pestañas, rellenar y
-**enviar formularios** (GET y POST), **iniciar sesión** en un sitio con
-autenticación por cookies, e **interactuar con el Agente Copiloto IA**
-autónomo desde la barra lateral.
+HTTPS, navegar por enlaces, usar el historial, abrir pestañas, **escribir con
+el teclado en los campos** (con anillo de foco y cursor) y **enviar
+formularios** (GET y POST), **iniciar sesión** en un sitio con autenticación
+por cookies, detener una carga que se cuelga, e **interactuar con el Agente
+Copiloto IA** autónomo desde la barra lateral. Hacker News y Wikipedia se ven
+como en un navegador (barra naranja, ancho centrado, párrafos con enlaces en
+su sitio).
 
 **Y lo que NO, dicho aquí y no enterrado abajo:** las webs que construyen su
 contenido con JavaScript en el cliente (React, Next, Vue, Shopify) siguen sin
@@ -153,15 +157,23 @@ comercial.
 
 ### Rendimiento
 
-Medido el 2026-08-27 sobre páginas reales y sintéticas. Una página grande
-con mucho CSS (13.000 nodos contra 2.000 reglas) tardaba **69,7 s** y ahora
-tarda **1,8 s**; el artículo "España" de Wikipedia costaba **38,9 s** de CPU
-y ahora **4,0 s**. Las tres causas —selectores reparseados en cada
-comparación, ausencia de prefiltro por selector clave, y subrecursos
-descargados en serie— están documentadas en `ARCHITECTURE.md` (Fase 39).
+Medido el 2026-11-23 en Linux (motor en release, 1280×800). **Que nada se
+cuelgue** es lo que está garantizado: un bucle infinito de JavaScript responde
+en 0,2 s, un servidor que no contesta se abandona (10 s en total para los
+subrecursos, 4 s para las imágenes) y una carga se puede detener o sustituir.
 
-Sigue sin haber caché HTTP ni HTTP/2, así que cada navegación vuelve a
-descargar todos los subrecursos.
+| Página | Carga | Scroll | Clic |
+|---|---|---|---|
+| Hacker News | 1,0–1,3 s | 0,05 s | 0,05 s |
+| Google | 1,3–1,9 s | 0,02 s | 0,01 s |
+| Wikipedia (el motor, sin red) | ~0,55 s | 0,03–0,05 s | 0,04 s |
+
+La carga completa de Wikipedia **no se puede medir desde la nube** (las
+imágenes de otros dominios no salen a internet); en un PC con internet, el
+objetivo es menos de 3 s: `python3 scripts/dev/bench_all.py --strict`. Sigue sin
+haber caché HTTP ni HTTP/2, así que cada navegación vuelve a descargar todos los
+subrecursos. Redimensionar la ventana en una página grande tarda 0,4–0,6 s
+(rehace la cascada entera).
 
 ### Compatibilidad
 
@@ -277,9 +289,18 @@ crudo.
   `safeStorage`, y las llamadas al modelo salen de ahí: la página no vuelve a
   verla (Fase 53). Si el sistema no ofrece cifrado real, dura solo la sesión.
   Por eso el modo Gemini solo funciona en la aplicación de escritorio.
-* Solo Gemini. No hay opción de modelo local ni de otros proveedores.
-* El agente recibe **texto plano** de la página, no el AOM, pese a que el AOM ya
-  existe y el protocolo ya lo expone. Conectarlos es tarea pendiente.
+* Solo Gemini. No hay opción de modelo local ni de otros proveedores. La prueba
+  de punta a punta con la IA real no se ha hecho (necesita una clave).
+* El agente recibe la lista de elementos interactivos (con los mismos números
+  que usan `click_element`/`type_into_element`, así que actúa sobre lo que ve
+  aunque la página esté desplazada) y el **texto legible** de la página
+  (`get_page_text`, que prefiere `<main>` a los menús). Puede hacer clic,
+  escribir, pulsar teclas, hacer scroll y volver atrás. El árbol de
+  accesibilidad (AOM) sigue sin usarse en el prompt: numeraba aparte.
+* El modelo de Gemini es un **ajuste** (variable `NAVEGADOR_GEMINI_MODEL` o el
+  campo del panel del agente), porque Google retira modelos con el tiempo:
+  `gemini-2.0-flash` ya no existe. El valor por defecto (`gemini-3.5-flash`) hay
+  que confirmarlo en la [página oficial](https://ai.google.dev/gemini-api/docs/deprecations).
 * Hay dos implementaciones del agente, una en TypeScript y otra en Python, que
   hacen lo mismo.
 

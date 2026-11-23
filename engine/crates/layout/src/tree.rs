@@ -1448,7 +1448,10 @@ pub fn resolve_replaced_text(tag_name: &str, attributes: &HashMap<String, String
             // es su CONTENIDO DOM (un nodo de texto hijo), no un atributo -
             // por eso hace falta `Node::text_content` en vez de
             // `attributes.get("value")`.
-            let content = Node::text_content(dom_node);
+            // Lo ESCRITO por el usuario (atributo `value`, que es donde el motor lo
+            // guarda; `collect_form_data` lo lee de ahi) manda sobre el contenido
+            // inicial: sin esto, un textarea no mostraba nada de lo que se escribia.
+            let content = attributes.get("value").cloned().unwrap_or_else(|| Node::text_content(dom_node));
             let trimmed = content.trim();
             if !trimmed.is_empty() {
                 Some(ReplacedText { text: trimmed.to_string(), is_placeholder: false, centered: false })

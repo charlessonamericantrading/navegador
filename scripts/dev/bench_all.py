@@ -20,6 +20,10 @@ Limites (segundos):
   por defecto  cualquier operacion <= 10         (que nada se cuelgue)
   --strict     cargar <= 3, clic <= 0.3, scroll <= 0.2, redimensionar <= 1
 
+Ademas, el fixture de JavaScript tiene que sacar sus 12 comprobaciones en OK.
+El CI corre solo los dos fixtures (`--only fixture-css --only fixture-js`): no
+necesitan internet.
+
 Requiere el motor compilado en release (ver cabecera de engine_driver.py) o
 la variable ENGINE apuntando al binario.
 """
@@ -84,15 +88,17 @@ def count_js_ok(engine, timeout):
 
 
 def measure(engine_path, url, timeout, out_png=None, count_js=False):
-    """Una pagina, un motor nuevo. Devuelve ({operacion: segundos|None}, nota)."""
+    """Una pagina, un motor nuevo. Devuelve ({operacion: segundos|None}, nota,
+    comprobaciones de JS que salieron OK o None si no se contaron)."""
     engine = driver.Engine(engine_path)
     times = {op: None for op in OPERATIONS}
     note = ""
+    js_ok = None
     try:
         engine.request(timeout, type="resize", width=1280, height=800)
         nav = engine.request(timeout, type="navigate", url=url)
         if nav.get("type") != "state":
-            return times, f"{nav.get('type')}: {nav.get('message', '')}".strip(": ")
+            return times, f"{nav.get('type')}: {nav.get('message', '')}".strip(": "), js_ok
         times["cargar"] = nav["seconds"]
         if out_png and nav.get("screenshot"):
             import base64
@@ -100,7 +106,8 @@ def measure(engine_path, url, timeout, out_png=None, count_js=False):
             with open(out_png, "wb") as f:
                 f.write(base64.b64decode(nav["screenshot"]))
         if count_js:
-            note = f"js {count_js_ok(engine, timeout)}/{JS_CHECKS}"
+            js_ok = count_js_ok(engine, timeout)
+            note = f"js {js_ok}/{JS_CHECKS}"
         steps = (
             ("scroll", dict(type="scroll", dx=0, dy=600)),
             ("clic", dict(type="click", x=2, y=2)),
@@ -115,7 +122,7 @@ def measure(engine_path, url, timeout, out_png=None, count_js=False):
             times[op] = response["seconds"]
     finally:
         engine.close()
-    return times, note
+    return times, note, js_ok
 
 
 def breaches(times, limits):
@@ -158,8 +165,11 @@ def main():
     rows, failed = [], False
     for name, url, count_js in jobs:
         out_png = os.path.join(args.out_dir, f"{name}.png") if args.out_dir else None
-        times, note = measure(args.engine, url, OPERATION_TIMEOUT, out_png, count_js)
+        times, note, js_ok = measure(args.engine, url, OPERATION_TIMEOUT, out_png, count_js)
         bad = breaches(times, limits)
+        # Una API del fixture de JS que deja de funcionar es un fallo, no una nota.
+        if js_ok is not None and js_ok < JS_CHECKS:
+            bad = bad + ["js"]
         failed = failed or bool(bad)
         rows.append((name, times, note, bad))
 
