@@ -724,7 +724,7 @@ fn background_color_candidate(value: &str) -> Option<String> {
     // separan respetando los parentesis: antes `rgba(0, 0, 0, .5) no-repeat`
     // se partia por los espacios de dentro y el color se perdia. Un degradado
     // es UN token (`linear-gradient(#000, #fff)`) y no es un color: no se
-    // pinta, que es lo honesto mientras el motor no sepa dibujar degradados.
+    // pinta como color; el motor lo dibuja aparte, desde `background-image`.
     split_css_tokens(trimmed).into_iter().find(|token| token.starts_with('#') || is_color_function(token)).map(str::to_string)
 }
 
@@ -804,9 +804,31 @@ fn split_css_top_level(value: &str, is_separator: impl Fn(char) -> bool) -> Vec<
 /// `background-image` longhand (ver `insert_declaration`).
 fn background_image_candidate(value: &str) -> Option<String> {
     let lower = value.to_ascii_lowercase();
-    let start = lower.find("url(")?;
-    let rel_end = value[start..].find(')')?;
-    Some(value[start..start + rel_end + 1].to_string())
+    // La primera imagen del valor (la capa de arriba): un `url(...)` o un
+    // `linear-gradient(...)`. Un degradado lleva parentesis anidados
+    // (`rgba(0, 0, 0, .5)`), asi que se busca el cierre que equilibra.
+    let url = lower.find("url(");
+    let gradient = lower.find("linear-gradient(");
+    let start = match (url, gradient) {
+        (Some(u), Some(g)) => u.min(g),
+        (Some(u), None) => u,
+        (None, Some(g)) => g,
+        (None, None) => return None,
+    };
+    let mut depth = 0usize;
+    for (offset, c) in value[start..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(value[start..start + offset + 1].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 pub struct CssParser;
@@ -881,6 +903,19 @@ mod tests {
 
         let degradado = CssParser::parse("a { background: linear-gradient(#000000, #ffffff) }");
         assert!(!degradado.rules[0].declarations.contains_key("background-color"), "un degradado no es un color: {:?}", degradado.rules[0].declarations);
+    }
+
+    /// Un degradado en el shorthand `background` llega a `background-image` entero,
+    /// con los parentesis anidados de sus colores.
+    #[test]
+    fn the_background_shorthand_keeps_a_whole_gradient_in_background_image() {
+        let hoja = CssParser::parse("a { background: linear-gradient(to right, rgba(0, 0, 0, .5), #fff 80%) no-repeat }");
+        assert_eq!(
+            hoja.rules[0].declarations.get("background-image").map(String::as_str),
+            Some("linear-gradient(to right, rgba(0, 0, 0, .5), #fff 80%)")
+        );
+        let con_url = CssParser::parse("a { background: url(x.png) center, linear-gradient(#000, #fff) }");
+        assert_eq!(con_url.rules[0].declarations.get("background-image").map(String::as_str), Some("url(x.png)"), "la primera capa manda");
     }
 
     /// Tarea 2.5 del plan: el nombre de una propiedad personalizada conserva

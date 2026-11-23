@@ -8,7 +8,7 @@
 //! duplicacion (ver ARCHITECTURE.md). `border-radius`, `box-shadow` y
 //! `overflow: hidden` (Fase 3.5) se añaden aqui, una sola vez.
 
-use crate::display_list::{DisplayItem, TextAlign};
+use crate::display_list::{DisplayItem, Gradient, GradientDirection, StopPosition, TextAlign};
 use crate::image_paint::{paint_background_image, paint_image};
 use engine_layout::Rect;
 use engine_text::{baseline_offset, measure_text, shape_text, underline_metrics, wrap_text_from, FontFamily, FontSet, SystemFont};
@@ -80,6 +80,9 @@ pub fn paint_display_list(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: 
             DisplayItem::Text { rect, text, color, font_size, bold, italic, underline, text_align, line_height, font_family, first_line_indent } => {
                 paint_text(pixmap, rect, text, *color, *font_size, *bold, *italic, *font_family, *underline, *text_align, *line_height, *first_line_indent, font_set, scroll_offset_y, current_mask.as_ref());
             }
+            DisplayItem::Gradient { rect, gradient, radius } => {
+                paint_gradient(pixmap, rect, gradient, *radius, scroll_offset_y, current_mask.as_ref());
+            }
             DisplayItem::Border { rect, width: border_width, color, radius } => {
                 paint_border(pixmap, rect, *border_width, *color, *radius, scroll_offset_y, current_mask.as_ref());
             }
@@ -114,6 +117,7 @@ fn item_rect(item: &DisplayItem) -> Option<&Rect> {
         | DisplayItem::Text { rect, .. }
         | DisplayItem::Border { rect, .. }
         | DisplayItem::Image { rect, .. }
+        | DisplayItem::Gradient { rect, .. }
         | DisplayItem::BackgroundImage { rect, .. } => Some(rect),
     }
 }
@@ -254,6 +258,55 @@ fn fill_shape(pixmap: &mut Pixmap, rect: &Rect, radius: f32, paint: &Paint<'stat
     } else {
         pixmap.fill_rect(sk_rect, paint, Transform::identity(), mask);
     }
+}
+
+/// `linear-gradient` (tarea 2.7): `Shader` lineal de tiny-skia sobre la caja.
+///
+/// La linea del degradado pasa por el centro de la caja con el angulo pedido y
+/// mide lo justo para que las esquinas de salida caigan en el 0 % y el 100 %
+/// (`|w·sen| + |h·cos|`), que es la definicion de CSS.
+fn paint_gradient(pixmap: &mut Pixmap, rect: &Rect, gradient: &Gradient, radius: f32, scroll_offset_y: f32, mask: Option<&Mask>) {
+    use tiny_skia::{Color, GradientStop as SkStop, LinearGradient, Point, SpreadMode};
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let (w, h) = (rect.width, rect.height);
+    let (dx, dy) = match gradient.direction {
+        GradientDirection::Degrees(degrees) => {
+            let radians = degrees.to_radians();
+            (radians.sin(), -radians.cos())
+        }
+        GradientDirection::Corner { sx, sy } => {
+            let (vx, vy) = (sx * h, sy * w);
+            let norm = (vx * vx + vy * vy).sqrt().max(f32::EPSILON);
+            (vx / norm, vy / norm)
+        }
+    };
+    let length = (w * dx).abs() + (h * dy).abs();
+    if length <= 0.0 {
+        return;
+    }
+    let (cx, cy) = (rect.x + w / 2.0, rect.y - scroll_offset_y + h / 2.0);
+    let start = Point::from_xy(cx - dx * length / 2.0, cy - dy * length / 2.0);
+    let end = Point::from_xy(cx + dx * length / 2.0, cy + dy * length / 2.0);
+
+    let mut last = 0.0_f32;
+    let stops: Vec<SkStop> = gradient
+        .stops
+        .iter()
+        .map(|stop| {
+            let fraction = match stop.position {
+                StopPosition::Fraction(f) => f,
+                StopPosition::Pixels(px) => px / length,
+            };
+            // tiny-skia exige posiciones en [0, 1] y no decrecientes.
+            last = fraction.clamp(0.0, 1.0).max(last);
+            SkStop::new(last, Color::from_rgba8(stop.color[0], stop.color[1], stop.color[2], stop.color[3]))
+        })
+        .collect();
+    let Some(shader) = LinearGradient::new(start, end, stops, SpreadMode::Pad, Transform::identity()) else { return };
+    let paint = Paint { shader, anti_alias: true, ..Paint::default() };
+    fill_shape(pixmap, rect, radius, &paint, scroll_offset_y, mask);
 }
 
 /// `box-shadow` con `blur-radius > 0` de verdad difuminado: tiny-skia (a
@@ -773,6 +826,57 @@ mod tests {
         let soft = paint_with(20.0);
         assert_eq!(count_partial_alpha(&hard), 0, "sin blur, el borde deberia ser completamente duro");
         assert!(count_partial_alpha(&soft) > 0, "con blur, deberia haber pixeles de borde con alpha intermedio (difuminado real, no una sombra dura)");
+    }
+
+    /// Tarea 2.7: un degradado horizontal de negro a blanco arranca negro a la
+    /// izquierda y termina blanco a la derecha, con tonos intermedios entre medias
+    /// (no dos bloques de color).
+    #[test]
+    fn a_horizontal_gradient_runs_from_its_first_color_to_its_last() {
+        use crate::display_list::GradientStop;
+        let mut pixmap = Pixmap::new(100, 20).unwrap();
+        let items = vec![DisplayItem::Gradient {
+            rect: Rect { x: 0.0, y: 0.0, width: 100.0, height: 20.0 },
+            gradient: Gradient {
+                direction: GradientDirection::Degrees(90.0),
+                stops: vec![
+                    GradientStop { color: [0, 0, 0, 255], position: StopPosition::Fraction(0.0) },
+                    GradientStop { color: [255, 255, 255, 255], position: StopPosition::Fraction(1.0) },
+                ],
+            },
+            radius: 0.0,
+        }];
+        paint_display_list(&mut pixmap, &items, None, 0.0);
+        let red_at = |x: u32| pixmap.pixel(x, 10).unwrap().red();
+        assert!(red_at(1) < 15, "el extremo izquierdo es casi negro: {}", red_at(1));
+        assert!(red_at(98) > 240, "el derecho, casi blanco: {}", red_at(98));
+        let middle = red_at(50);
+        assert!((110..=145).contains(&middle), "y en medio, un gris intermedio: {middle}");
+        assert!(red_at(25) < middle && middle < red_at(75), "monotono de izquierda a derecha");
+    }
+
+    /// `to bottom` (el valor por defecto) va de arriba a abajo, y las paradas
+    /// con posicion dejan zonas de color solido a los lados.
+    #[test]
+    fn a_vertical_gradient_with_positioned_stops_keeps_solid_bands() {
+        use crate::display_list::GradientStop;
+        let mut pixmap = Pixmap::new(20, 100).unwrap();
+        let items = vec![DisplayItem::Gradient {
+            rect: Rect { x: 0.0, y: 0.0, width: 20.0, height: 100.0 },
+            gradient: Gradient {
+                direction: GradientDirection::Degrees(180.0),
+                stops: vec![
+                    GradientStop { color: [255, 0, 0, 255], position: StopPosition::Fraction(0.3) },
+                    GradientStop { color: [0, 0, 255, 255], position: StopPosition::Fraction(0.7) },
+                ],
+            },
+            radius: 0.0,
+        }];
+        paint_display_list(&mut pixmap, &items, None, 0.0);
+        let top = pixmap.pixel(10, 5).unwrap();
+        let bottom = pixmap.pixel(10, 95).unwrap();
+        assert_eq!((top.red(), top.blue()), (255, 0), "antes del 30 %, rojo solido");
+        assert_eq!((bottom.red(), bottom.blue()), (0, 255), "despues del 70 %, azul solido");
     }
 
     /// La prueba real de `text-decoration: underline` (Fase 29): con una

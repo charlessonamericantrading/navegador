@@ -71,6 +71,10 @@ pub enum DisplayItem {
     /// `Border`, igual que el spec real (una imagen de fondo tapa el color
     /// solido que haya debajo).
     BackgroundImage { rect: Rect, image: Arc<DecodedImage> },
+    /// `background-image: linear-gradient(...)` (tarea 2.7 del plan, caso 7 del
+    /// fixture). Se pinta donde iria el color de fondo, despues de el y antes del
+    /// borde. `radius` mismo criterio que en `SolidRect`.
+    Gradient { rect: Rect, gradient: Gradient, radius: f32 },
     /// `box-shadow` (Fase 3.5) - `rect` YA lleva el desplazamiento
     /// (`offset-x`/`offset-y`) aplicado (ver `parse_css_box_shadow`), asi
     /// que quien pinta esto solo rellena `rect` con `color`, ni sabe que
@@ -209,9 +213,7 @@ impl DisplayList {
                 if let Some(color) = layout_box.computed_style.get("background-color").and_then(|v| parse_css_color(v)) {
                     target.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color, radius });
                 }
-                if let Some(image) = parse_css_background_image(&layout_box.computed_style).and_then(|url| images.get(&url)) {
-                    target.push(DisplayItem::BackgroundImage { rect: layout_box.dimensions.clone(), image: image.clone() });
-                }
+                push_background_image(layout_box, images, radius, target);
                 if let Some((width, color)) = parse_css_border(&layout_box.computed_style) {
                     target.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color, radius });
                 }
@@ -227,9 +229,7 @@ impl DisplayList {
                 if let Some(color) = layout_box.computed_style.get("background-color").and_then(|v| parse_css_color(v)) {
                     target.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color, radius });
                 }
-                if let Some(image) = parse_css_background_image(&layout_box.computed_style).and_then(|url| images.get(&url)) {
-                    target.push(DisplayItem::BackgroundImage { rect: layout_box.dimensions.clone(), image: image.clone() });
-                }
+                push_background_image(layout_box, images, radius, target);
                 let border_width = if let Some((width, color)) = parse_css_border(&layout_box.computed_style) {
                     target.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color, radius });
                     width
@@ -988,6 +988,186 @@ fn parse_css_border(computed_style: &HashMap<String, String>) -> Option<(f32, [u
     Some((resolved_width, resolved_color))
 }
 
+/// Hacia donde apunta un degradado lineal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GradientDirection {
+    /// Angulo CSS: 0deg apunta arriba, 90deg a la derecha (en el sentido del reloj).
+    Degrees(f32),
+    /// `to bottom right`...: hacia una esquina. `sx`/`sy` valen +1 (derecha/abajo)
+    /// o -1 (izquierda/arriba). El angulo depende de la forma de la caja, asi que
+    /// se resuelve al pintar.
+    Corner { sx: f32, sy: f32 },
+}
+
+/// Donde cae una parada de color en la linea del degradado.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StopPosition {
+    /// Fraccion de 0 a 1 de la linea.
+    Fraction(f32),
+    Pixels(f32),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GradientStop {
+    pub color: [u8; 4],
+    pub position: StopPosition,
+}
+
+/// `linear-gradient(...)` ya interpretado: paradas con posicion resuelta (las
+/// que el autor no fijo se reparten por igual) y siempre ordenadas.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gradient {
+    pub direction: GradientDirection,
+    pub stops: Vec<GradientStop>,
+}
+
+/// El fondo de imagen de una caja: un degradado se pinta tal cual; un `url(...)`
+/// solo si su imagen ya esta descargada.
+fn push_background_image(layout_box: &LayoutBox, images: &ImageMap, radius: f32, target: &mut Vec<DisplayItem>) {
+    if let Some(gradient) = layout_box.computed_style.get("background-image").and_then(|v| parse_css_linear_gradient(v)) {
+        target.push(DisplayItem::Gradient { rect: layout_box.dimensions.clone(), gradient, radius });
+        return;
+    }
+    if let Some(image) = parse_css_background_image(&layout_box.computed_style).and_then(|url| images.get(&url)) {
+        target.push(DisplayItem::BackgroundImage { rect: layout_box.dimensions.clone(), image: image.clone() });
+    }
+}
+
+/// `linear-gradient([<angulo> | to <lado>,] <color> [<posicion>], ...)` (tarea
+/// 2.7). `None` si no es un degradado lineal, si tiene menos de dos colores o si
+/// algun color no se entiende: un degradado a medias seria peor que ninguno.
+/// Sin `repeating-` ni parada doble de dos posiciones.
+pub(crate) fn parse_css_linear_gradient(value: &str) -> Option<Gradient> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    let inner = lower.strip_prefix("linear-gradient(").and_then(|rest| rest.strip_suffix(')'))?;
+    // Los colores y posiciones se leen del texto original (los nombres de color
+    // no dependen de mayusculas, pero las URLs si; aqui solo hay colores).
+    let inner = &value[value.len() - inner.len() - 1..value.len() - 1];
+    let parts = engine_layout::split_css_commas(inner);
+    let mut parts = parts.into_iter().map(str::trim).collect::<Vec<_>>();
+
+    let mut direction = GradientDirection::Degrees(180.0);
+    if let Some(first) = parts.first().copied() {
+        let first_lower = first.to_ascii_lowercase();
+        if let Some(sides) = first_lower.strip_prefix("to ") {
+            let (mut sx, mut sy) = (0.0_f32, 0.0_f32);
+            for side in sides.split_whitespace() {
+                match side {
+                    "right" => sx = 1.0,
+                    "left" => sx = -1.0,
+                    "bottom" => sy = 1.0,
+                    "top" => sy = -1.0,
+                    _ => return None,
+                }
+            }
+            direction = match (sx, sy) {
+                (0.0, -1.0) => GradientDirection::Degrees(0.0),
+                (1.0, 0.0) => GradientDirection::Degrees(90.0),
+                (0.0, 1.0) => GradientDirection::Degrees(180.0),
+                (-1.0, 0.0) => GradientDirection::Degrees(270.0),
+                (sx, sy) if sx != 0.0 && sy != 0.0 => GradientDirection::Corner { sx, sy },
+                _ => return None,
+            };
+            parts.remove(0);
+        } else if let Some(degrees) = parse_gradient_angle(&first_lower) {
+            direction = GradientDirection::Degrees(degrees);
+            parts.remove(0);
+        }
+    }
+
+    let mut raw: Vec<([u8; 4], Option<StopPosition>)> = Vec::new();
+    for part in parts {
+        let tokens = engine_layout::split_css_tokens(part);
+        let color_token = tokens.first()?;
+        // Una "pista de color" (`50%` suelto, sin color) no es una parada: se salta.
+        if parse_gradient_position(color_token).is_some() && tokens.len() == 1 {
+            continue;
+        }
+        let color = parse_css_color(color_token)?;
+        let positions: Vec<StopPosition> = tokens[1..].iter().filter_map(|token| parse_gradient_position(token)).collect();
+        if positions.is_empty() {
+            raw.push((color, None));
+        } else {
+            // `red 10% 30%` son dos paradas del mismo color.
+            for position in positions.into_iter().take(2) {
+                raw.push((color, Some(position)));
+            }
+        }
+    }
+    if raw.len() < 2 {
+        return None;
+    }
+
+    // Posiciones que faltan: la primera 0, la ultima 1 y el resto se reparte por
+    // igual entre las paradas con posicion que la rodean. Solo se reparte entre
+    // fracciones; si hay pixeles se tratan aparte al pintar, y aqui las
+    // intermedias sin posicion cuentan desde el extremo anterior conocido.
+    let last_index = raw.len() - 1;
+    if raw[0].1.is_none() {
+        raw[0].1 = Some(StopPosition::Fraction(0.0));
+    }
+    if raw[last_index].1.is_none() {
+        raw[last_index].1 = Some(StopPosition::Fraction(1.0));
+    }
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index].1.is_some() {
+            index += 1;
+            continue;
+        }
+        let run_start = index - 1;
+        let mut run_end = index;
+        while raw[run_end].1.is_none() {
+            run_end += 1;
+        }
+        let (StopPosition::Fraction(from), StopPosition::Fraction(to)) = (raw[run_start].1?, raw[run_end].1?) else {
+            // Mezcla de pixeles y repartos automaticos: no se interpreta.
+            return None;
+        };
+        let missing = (run_end - run_start) as f32;
+        for (step, slot) in raw[run_start + 1..run_end].iter_mut().enumerate() {
+            slot.1 = Some(StopPosition::Fraction(from + (to - from) * (step as f32 + 1.0) / missing));
+        }
+        index = run_end + 1;
+    }
+
+    // Las posiciones no retroceden: una parada nunca queda antes que la anterior.
+    let mut stops = Vec::with_capacity(raw.len());
+    let mut floor = f32::NEG_INFINITY;
+    for (color, position) in raw {
+        let position = match position? {
+            StopPosition::Fraction(f) => StopPosition::Fraction(f.max(floor.min(f32::MAX))),
+            pixels => pixels,
+        };
+        if let StopPosition::Fraction(f) = position {
+            floor = floor.max(f);
+        }
+        stops.push(GradientStop { color, position });
+    }
+    Some(Gradient { direction, stops })
+}
+
+/// `45deg`, `0.25turn`, `1.5708rad`, `100grad` -> grados.
+fn parse_gradient_angle(token: &str) -> Option<f32> {
+    let token = token.trim();
+    for (suffix, to_degrees) in [("deg", 1.0), ("turn", 360.0), ("rad", 180.0 / std::f32::consts::PI), ("grad", 0.9)] {
+        if let Some(number) = token.strip_suffix(suffix) {
+            return number.trim().parse::<f32>().ok().map(|n| n * to_degrees);
+        }
+    }
+    None
+}
+
+/// `30%` o `40px` -> posicion; cualquier otra cosa (un color) no lo es.
+fn parse_gradient_position(token: &str) -> Option<StopPosition> {
+    let token = token.trim();
+    if let Some(percent) = token.strip_suffix('%') {
+        return percent.trim().parse::<f32>().ok().map(|n| StopPosition::Fraction(n / 100.0));
+    }
+    token.strip_suffix("px").and_then(|px| px.trim().parse::<f32>().ok()).map(StopPosition::Pixels)
+}
+
 /// `background-image` (Fase 40) - extrae la URL "desnuda" (sin
 /// `url(...)`/comillas) de la declaracion ya expandida por la cascada
 /// (`engine_css::parser::insert_declaration` ya deja aqui el `url(...)`
@@ -1051,6 +1231,7 @@ fn scale_item_alpha(item: &mut DisplayItem, factor: f32) {
     let scale = |color: &mut [u8; 4]| color[3] = (color[3] as f32 * factor).round() as u8;
     match item {
         DisplayItem::SolidRect { color, .. } | DisplayItem::Text { color, .. } | DisplayItem::Border { color, .. } | DisplayItem::Shadow { color, .. } => scale(color),
+        DisplayItem::Gradient { gradient, .. } => gradient.stops.iter_mut().for_each(|stop| scale(&mut stop.color)),
         _ => {}
     }
 }
@@ -1412,6 +1593,72 @@ mod tests {
             list.items.iter().any(|item| matches!(item, DisplayItem::Text { text, .. } if text == "hola")),
             "deberia pintar el value resuelto como texto real"
         );
+    }
+
+    fn gradient(value: &str) -> Gradient {
+        parse_css_linear_gradient(value).unwrap_or_else(|| panic!("no se interpreto: {value}"))
+    }
+
+    /// Tarea 2.7 (caso 7 del fixture): lo que se entiende de un `linear-gradient`.
+    #[test]
+    fn linear_gradient_directions_stops_and_positions_are_parsed() {
+        let g = gradient("linear-gradient(#000000, #ffffff)");
+        assert_eq!(g.direction, GradientDirection::Degrees(180.0), "por defecto, hacia abajo");
+        assert_eq!(g.stops.len(), 2);
+        assert_eq!(g.stops[0], GradientStop { color: [0, 0, 0, 255], position: StopPosition::Fraction(0.0) });
+        assert_eq!(g.stops[1], GradientStop { color: [255, 255, 255, 255], position: StopPosition::Fraction(1.0) });
+
+        assert_eq!(gradient("linear-gradient(to right, red, blue)").direction, GradientDirection::Degrees(90.0));
+        assert_eq!(gradient("linear-gradient(to top, red, blue)").direction, GradientDirection::Degrees(0.0));
+        assert_eq!(gradient("linear-gradient(to bottom right, red, blue)").direction, GradientDirection::Corner { sx: 1.0, sy: 1.0 });
+        assert_eq!(gradient("linear-gradient(45deg, red, blue)").direction, GradientDirection::Degrees(45.0));
+        assert_eq!(gradient("linear-gradient(0.25turn, red, blue)").direction, GradientDirection::Degrees(90.0));
+    }
+
+    #[test]
+    fn linear_gradient_stop_positions_are_distributed_and_kept_in_order() {
+        // Sin posiciones: reparto por igual.
+        let g = gradient("linear-gradient(#000, #888, #fff)");
+        let fractions: Vec<f32> = g.stops.iter().map(|s| match s.position { StopPosition::Fraction(f) => f, _ => panic!() }).collect();
+        assert_eq!(fractions, vec![0.0, 0.5, 1.0]);
+
+        // Con posiciones explicitas, colores con funcion y pixeles.
+        let g = gradient("linear-gradient(to right, rgba(0, 0, 0, 0.5) 20%, #fff 80%)");
+        assert_eq!(g.stops[0].color, [0, 0, 0, 128]);
+        assert_eq!(g.stops[0].position, StopPosition::Fraction(0.2));
+        assert_eq!(g.stops[1].position, StopPosition::Fraction(0.8));
+        assert_eq!(gradient("linear-gradient(red 10px, blue)").stops[0].position, StopPosition::Pixels(10.0));
+
+        // Una parada no puede quedar antes que la anterior.
+        let g = gradient("linear-gradient(red 60%, blue 20%)");
+        assert_eq!(g.stops[1].position, StopPosition::Fraction(0.6));
+        // `red 10% 30%` son dos paradas.
+        assert_eq!(gradient("linear-gradient(red 10% 30%, blue)").stops.len(), 3);
+    }
+
+    #[test]
+    fn linear_gradient_that_cannot_be_drawn_is_none_rather_than_half_drawn() {
+        for malo in ["linear-gradient(red)", "linear-gradient(to sideways, red, blue)", "linear-gradient(red, currentColor)", "radial-gradient(red, blue)", "url(x.png)", "linear-gradient(#000, #fff"] {
+            assert!(parse_css_linear_gradient(malo).is_none(), "{malo}");
+        }
+    }
+
+    /// El fondo se emite entre el color de fondo y el borde, y solo si hay degradado.
+    #[test]
+    fn a_box_with_a_gradient_emits_it_between_its_background_color_and_its_border() {
+        let mut caja = LayoutBox::new(BoxType::Block);
+        caja.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 40.0 };
+        caja.computed_style.insert("background-color".to_string(), "#ff0000".to_string());
+        caja.computed_style.insert("background-image".to_string(), "linear-gradient(#000, #fff)".to_string());
+        caja.computed_style.insert("border".to_string(), "1px solid #00ff00".to_string());
+        let list = DisplayList::build(&caja, &ImageMap::new());
+        let kinds: Vec<&str> = list.items.iter().map(|i| match i {
+            DisplayItem::SolidRect { .. } => "color",
+            DisplayItem::Gradient { .. } => "degradado",
+            DisplayItem::Border { .. } => "borde",
+            _ => "otro",
+        }).filter(|k| *k != "otro").collect();
+        assert_eq!(kinds, vec!["color", "degradado", "borde"]);
     }
 
     /// Tarea 2.7: el item de texto lleva la familia de letra que pidio la
