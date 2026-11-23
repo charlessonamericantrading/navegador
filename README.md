@@ -24,7 +24,7 @@ solo compilándolo. Las cifras salen de correr la suite de tests el
 | | |
 |---|---|
 | **Motor** | ~25.800 líneas de Rust, 10 crates |
-| **Tests** | 1.020 pasando, 0 fallando (medido el 2026-11-23), más 60 tests estilo-WPT |
+| **Tests** | 1.052 pasando, 0 fallando (medido el 2026-11-23), más 60 tests estilo-WPT |
 | **Red** | HTTP/1.1 + HTTPS real (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies RFC 6265, CORS y CSP |
 | **HTML** | Parseo con `html5ever` (el de Servo), DOM mutable, `<canvas>` 2D context |
 | **CSS** | Cascada con especificidad real y orden de documento, selectores con combinadores (`selectors`, el de Firefox), pseudo-clases, `@media`, variables, `calc()`, `rem`/`em`/`vw`, porcentajes, shorthands, degradados `linear-gradient`, atributos HTML clásicos (`bgcolor`, `width`, `cellpadding`…) |
