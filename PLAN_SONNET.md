@@ -45,7 +45,7 @@ CI en verde y no tiene conflictos. Mientras no se fusione, quien compile
 ### Hallazgo 2 — El plan actual apunta demasiado lejos
 
 El plan maestro del PR #1 (`plan.md`) tiene **44 fases** y su objetivo es
-"superar a Chrome". Buena parte de las últimas fases se fue a broker de
+"superar a los navegadores grandes". Buena parte de las últimas fases se fue a broker de
 procesos, auditorías de dependencias y modelo de amenazas. Es trabajo
 serio, pero **no cambia lo que ves en pantalla**. Lo básico visible sigue
 fallando.
@@ -333,8 +333,8 @@ un test que solo vale para Windows, y dejarlo explícito.
 
 ## Fase 2 — Que las páginas se vean bien
 
-Referencia: abrir `engine/tests/css-basics-fixture.html` en Chrome y
-compararlo con la captura del motor. Tiene 17 casos numerados.
+Referencia: `engine/tests/css-basics-fixture.html` tiene 17 casos numerados;
+cada uno dice en su texto cómo debe verse en la captura del motor.
 **En el PR #1 pasan 4** (el 4, 15, 16 y 17). Los 13 que fallan salen de
 9 causas.
 
@@ -609,7 +609,7 @@ workflows que ya existen en el PR #1.
 No aportan a que una página se vea bien hoy:
 
 - Broker de procesos, sandbox y aislamiento (fases 64–67 del PR #1).
-- WPT oficial, Test262 y comparativas con Chrome.
+- WPT oficial y Test262.
 - Workers, WebGL, audio, vídeo, extensiones, sincronización y móvil.
 
 Se retoman cuando las fases 0 a 3 estén cerradas.
