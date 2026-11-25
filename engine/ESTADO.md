@@ -1,12 +1,13 @@
-# Estado del motor
+# Estado del motor y de la aplicación
 
 Resumen corto y verificado de lo que el motor hace y no hace. Cada afirmación
 sale de ejecutarlo, no de leer el código. `ARCHITECTURE.md` queda como
 histórico: cuenta cómo se llegó aquí, no cómo está hoy.
 
-Última comprobación: 2026-11-23, Linux (nube), motor en release, ventana de
-1280×800. **Windows y macOS no se han vuelto a probar a mano**; en Windows solo
-corre lo que cubre el CI (tests, clippy y la prueba de humo del instalador).
+Última comprobación: 2026-11-25, Linux (nube), motor en release, ventana de
+1280×800 (la ventana real, con ratón y teclado virtuales). **Windows y macOS no
+se han probado a mano con la aplicación nueva**; en Windows solo corre lo que
+cubre el CI (tests y clippy).
 
 ## Cómo medirlo (todo en un comando cada uno)
 
@@ -125,6 +126,9 @@ pantallas con escala (125 %, 200 %) la imagen se amplía (se ve algo borrosa).
 | Algo no se ve | `gfx/src/display_list.rs` (qué se emite) y `gfx/src/paint.rs` (cómo se pinta) |
 | Un estilo no se aplica | `css/src/cascade.rs` y `css/src/presentational.rs` |
 | La página tarda | `RUST_LOG=info` imprime el tiempo de cada fase de `navigate` |
+| La barra, las pestañas o un atajo | `app/src/barra.rs` (el HTML y los iconos) y `app/src/app.rs` (qué hace cada entrada) |
+| Un clic o una tecla que no llega a la página | `app/src/app.rs`, métodos `clic` y `tecla`; la ventana en `app/src/ventana.rs` |
+| El motor se cae o no arranca | `app/src/motor.rs` (procesos motor y broker); `RUST_LOG=info` y la salida de error |
 | Una petición del protocolo | `core/src/protocol.rs` y `core/src/server.rs`; el test de humo exige una prueba por petición |
 | Una API de JS | `js/src/dom_bindings.rs` y la sonda de APIs |
 

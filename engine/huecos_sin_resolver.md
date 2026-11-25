@@ -14,7 +14,13 @@ aquí. Los identificadores entre corchetes remiten a las tareas del plan antiguo
 
 **Última verificación contra el código: 2026-09-09** (actualizado tras la Fase 42). Cada entrada de este fichero
 se comprobó con `grep` sobre `engine/crates/*/src` en esa fecha, no se copió de
-`ARCHITECTURE.md`. Estado de la suite: **874 tests pasando, 0 fallando**, más 60 tests estilo-WPT.
+`ARCHITECTURE.md`.
+
+**Actualización del 2026-11-25** (aplicación 100 % Rust y mejoras del motor): se
+corrigieron las entradas que ese trabajo cerró (2.3, 2.4, 2.7, 2.8, 6 y 8) y se
+añadió la sección 9, la de la aplicación. **El resto sigue como se verificó el
+2026-09-09**: no se ha vuelto a comprobar entrada por entrada. Estado de la
+suite: **1.086 tests pasando, 0 fallando**, más 60 tests estilo-WPT.
 
 ---
 
@@ -207,17 +213,16 @@ adaptador `element.rs` implementa los métodos que necesitan. `:has()` sin verif
 
 ### 2.3 Imágenes de fondo `[plan D2, D3]`
 
-`background-image` solo acepta `url()`. `linear-gradient()` y `radial-gradient()`
-devuelven `None` explícitamente (`display_list.rs:1612` lo prueba). Tampoco hay
+`url()` y **`linear-gradient()`** funcionan (el degradado, desde el 2026-11-25).
+Faltan `radial-gradient()`, `conic-gradient()` y los `repeating-*`, y no hay
 `background-position`, `background-size` con valores explícitos,
-`background-repeat` distinto de `repeat`, ni capas múltiples.
+`background-repeat` distinto de `repeat`, ni capas múltiples (con varias capas
+solo se pinta una).
 
 ### 2.4 `calc()` `[plan D4]`
 
-Sin evaluar. Un valor con paréntesis se deja pasar sin trocear, así que el longhand
-no se genera y **el layout resuelve a cero**. `min()`, `max()`, `clamp()` igual.
-Cerrarlo requiere guardar el AST en `computed_style` y evaluarlo en `layout`, cuando
-ya se conoce el *containing block* — no en el crate `css`.
+`calc()` **funciona** con unidades y porcentajes mezclados (`calc(100% - 200px)`),
+desde el 2026-11-25. `min()`, `max()` y `clamp()` siguen sin verificar.
 
 ### 2.5 Sin implementar `[plan D5, D6, D7, D12]`
 
@@ -235,17 +240,18 @@ display list se ordene solo por orden de árbol `[plan D7]`.
 
 ### 2.7 Tipografía `[plan D9]`
 
-`@font-face` con descarga de fuentes: no existe. `font-family` se parsea y llega al
-layout, pero conviene verificar si `text/` respeta la familia pedida o pinta siempre
-con la misma. Faltan `letter-spacing`, `word-spacing`, `text-transform`,
+`@font-face` con descarga de fuentes: no existe. `font-family` **se respeta en tres
+familias** (sans-serif, serifa y monoespaciada) con las fuentes del sistema; una
+familia que el sistema no tenga sale en sans-serif. Faltan `letter-spacing`, `word-spacing`, `text-transform`,
 `white-space` en sus variantes, `text-overflow: ellipsis`, `word-break`,
 `overflow-wrap`.
 
 ### 2.8 Fondo del lienzo
 
-Cuando `<body>` propaga su fondo al lienzo, sigue pintando el suyo además. Como es
-el mismo color el resultado visible es idéntico; solo se notaría con fondos
-semitransparentes superpuestos. Cosmético, prioridad baja.
+El lienzo es blanco cuando la página no declara fondo (antes era gris). Cuando
+`<body>` propaga su fondo al lienzo, sigue pintando el suyo además. Como es el mismo
+color el resultado visible es idéntico; solo se notaría con fondos semitransparentes
+superpuestos. Cosmético, prioridad baja.
 
 ### 2.9 Rendimiento del layout `[plan D13]`
 
@@ -319,7 +325,7 @@ explícitamente, nunca fingir éxito.
 
 ## 6. Producto y protocolo
 
-- `EngineRequest::SubmitForm` no implementado: devuelve error explícito `[plan C11]`
+- Formularios: el envío GET y POST funciona (Enter en un campo o botón de envío).
 - Selección de texto no implementada `[plan C12]`
 - Sin favicon en `get_state` `[plan E4, I5]`
 - Sin evento de progreso de carga `[plan I5]`
@@ -347,5 +353,28 @@ incluida la del README — es una impresión, no un dato.
 
 ## 8. Plataforma de compilación `[plan J]`
 
-Compilado y probado **solo en Windows**. `winit`/`wgpu` soportan macOS y Linux en
-teoría, pero nunca se ha verificado. Sin versión móvil (decisión: fuera de alcance).
+Antes se compilaba y probaba solo en Windows. **Desde el 2026-11-25 se compila, se
+prueba y se abre la ventana en Linux** (nube, con un servidor gráfico virtual);
+**Windows** solo lo cubre el CI (tests, clippy y el banco), sin prueba a mano con la
+app nueva; **macOS no se ha probado nunca**. Sin versión móvil (decisión: fuera de
+alcance).
+
+---
+
+## 9. La aplicación (`engine/crates/app`) `[plan 5.x]`
+
+Abierto el 2026-11-25. Lo que ya hace está en `ESTADO.md`; esto es lo que falta.
+
+- **Agente IA** `[plan 5.4]`: no hay panel ni bucle en la app nueva.
+- **Instalador y firma** `[plan 5.5]`: solo se compila desde el código.
+- **Pantallas con escala** (125 %, 200 %): la app compone en píxeles CSS y amplía la
+  imagen, así que el texto sale algo borroso. Lo correcto es pintar a la escala real.
+- **Copiar y pegar** (barra de direcciones y campos de la página), selección con
+  ratón y Tab entre campos de la página.
+- **Barra de direcciones:** sin sugerencias, sin historial, sin marcadores.
+- **Pestañas:** no se reordenan ni se arrastran; con muchas, se estrechan hasta 60 px.
+- **Cursor del ratón** (mano sobre enlaces) y **estado al pasar por encima**
+  (`:hover` nunca coincide, ver 2.2): la app no reacciona al mover el ratón.
+- **Descargas, favicon, pantalla completa, imprimir:** no existen.
+- **Capturas de referencia:** las pruebas de extremo a extremo comprueban estado y
+  algunos píxeles, no comparan la imagen entera contra una guardada `[plan 5.7]`.
