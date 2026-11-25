@@ -1,7 +1,7 @@
 # Plan para que el navegador funcione bien
 
 Revisión del 18-nov-2026. Todo lo que dice este documento se comprobó
-**ejecutando** el motor y la app Electron, no leyendo documentación. Los
+**ejecutando** el motor y la app de escritorio antigua, no leyendo documentación. Los
 números son del build `--release`.
 
 Se revisaron las dos líneas de trabajo que existen:
@@ -11,6 +11,17 @@ Se revisaron las dos líneas de trabajo que existen:
   que es el **PR #1, abierto y sin fusionar**.
 
 ---
+
+## Reglas absolutas del proyecto
+
+Antes que todo lo demás (detalle en `AGENTS.md`):
+
+1. La aplicación es **100 % Rust**: motor, ventana, interfaz, agente e instalador.
+2. **Prohibido** usar, instalar, sugerir o nombrar cualquier motor de navegador
+   ajeno, también para pruebas o como "modo de compatibilidad".
+3. **Prohibido** cualquier envoltorio de escritorio basado en tecnología web.
+4. `desktop/`, `frontend/` y `backend/` incumplen estas reglas y se retiran
+   (Fase 5). Lo que este plan hizo en ellos es solo especificación.
 
 ## 1. Resumen (para decidir)
 
@@ -65,7 +76,7 @@ blogs, buscadores simples), con el agente IA funcionando sobre ellas.
 |---|---|
 | ¿Fusionar el PR #1 en `main`? | **Sí, hoy.** Es el paso con más efecto y menos riesgo. |
 | ¿Congelar el plan de 44 fases y seguir este, corto? | **Sí.** Primero que funcione lo que se ve. |
-| ¿Añadir un "modo compatibilidad" con el Chromium que Electron ya trae, para las webs que el motor propio no pueda mostrar? (Fase 5) | **Sí.** Es la única forma de tener un navegador usable a corto plazo. El motor propio sigue por defecto. |
+| ¿Cómo se hace la interfaz 100 % Rust? (Fase 5) | Ver la Fase 5. Cualquier opción que dependa de un motor de navegador ajeno queda **descartada** por las reglas del proyecto (`AGENTS.md`). |
 
 ### Orden y tamaño (estimación, no promesa)
 
@@ -76,7 +87,7 @@ blogs, buscadores simples), con el agente IA funcionando sobre ellas.
 | 2 | Las páginas se ven bien | 5–6 |
 | 3 | Escribir, scroll y agente IA fiables | 3–4 |
 | 4 | JavaScript que falta | 1–2 |
-| 5 | Modo compatibilidad (si lo apruebas) | 2–3 |
+| 5 | Aplicación 100 % Rust: ventana, interfaz y agente | 6–8 |
 | 6 | Documentación al día | 1 |
 
 Con las fases 0 a 3 el producto ya es usable y demostrable.
@@ -281,11 +292,11 @@ un test que solo vale para Windows, y dejarlo explícito.
 - **Hacer:** numerar cada navegación e ignorar cualquier `state` que no
   sea de la última. Mostrar una página de error dentro del visor cuando
   falle la carga, no solo un aviso flotante. Botón "Detener".
-- **Verificar:** prueba Playwright contra Electron: navegar a una página
+- **Verificar:** prueba automática de la interfaz: navegar a una página
   lenta y después a una rápida. Al final, barra y contenido coinciden.
 
 - **Hecho (PR #3):** cada petición lleva un número (`NavigationSequence`) y su respuesta solo se aplica si ninguna navegación nueva ni Detener empezó después; de `engine:state` solo se recogen las publicaciones espontáneas (`id` nulo). Se puede pedir otra página con una carga en curso. Botón Detener (sustituye a Recargar mientras carga) y la barra vuelve a la página que se ve. Un fallo de carga se pinta dentro del visor (Reintentar / Volver atrás). Motor: petición `stop` y `navigate` interrumpible (un `stop` o un `navigate` nuevo abandonan el anterior, que se contesta con `navegacion_cancelada`).
-- **Verificado en Electron real (Xvfb + Playwright):** lenta → rápida: gana la última, barra y motor coinciden; Detener una carga muda: 0,6 s y el motor sigue vivo; servidor caído: página de error en el visor. Tests: 6 de la numeración, 5 del motor interrumpible, 2 de humo por NDJSON.
+- **Verificado en la app de escritorio antigua:** lenta → rápida: gana la última, barra y motor coinciden; Detener una carga muda: 0,6 s y el motor sigue vivo; servidor caído: página de error en el visor. Tests: 6 de la numeración, 5 del motor interrumpible, 2 de humo por NDJSON.
 
 ### [ ] 1.4 Rendimiento que falta
 
@@ -417,7 +428,7 @@ del fixture, ya se ven los 17 casos).
 
 ### [x] 3.1 Coordenadas correctas tras hacer scroll
 
-- **Comprobado en la app Electron del PR #1:** bajar al final de Hacker
+- **Comprobado en la app de escritorio antigua del PR #1:** bajar al final de Hacker
   News y clicar el campo "Search" no abre el cuadro de escritura.
 - **Causa:** `elements[].rect` viene en coordenadas de documento
   (`engine/crates/core/src/server.rs`, `collect_elements_recursive`). El
@@ -427,10 +438,10 @@ del fixture, ya se ven los 17 casos).
   motor hace scroll hasta el elemento y actúa en su centro. El agente usa
   solo estas dos. En `BrowserViewport.tsx` (`handleImageClick`), restar
   `scroll_offset_y` al buscar el campo bajo el clic.
-- **Verificar:** prueba Playwright que repita el caso de Hacker News y
+- **Verificar:** prueba automática que repita el caso de Hacker News y
   escriba en el campo.
 
-- **Hecho (PR #3):** `click_element` y `type_into_element` (el motor lleva el elemento a la vista y actúa en su centro; `replace` evita concatenar). `BrowserViewport` resta el scroll al buscar el campo y al colocar el cuadro de escritura; el agente usa solo las dos nuevas. **Verificado en Electron real** con el caso de Hacker News: scroll de 980 px, clic en "Search" → aparece el cuadro de escritura en su sitio y al enviar el motor intenta navegar con el texto (falla por falta de internet en la nube, como se espera).
+- **Hecho (PR #3):** `click_element` y `type_into_element` (el motor lleva el elemento a la vista y actúa en su centro; `replace` evita concatenar). `BrowserViewport` resta el scroll al buscar el campo y al colocar el cuadro de escritura; el agente usa solo las dos nuevas. **Verificado en la app de escritorio antigua** con el caso de Hacker News: scroll de 980 px, clic en "Search" → aparece el cuadro de escritura en su sitio y al enviar el motor intenta navegar con el texto (falla por falta de internet en la nube, como se espera).
 
 ### [x] 3.2 Escribir de verdad
 
@@ -441,7 +452,7 @@ del fixture, ya se ven los 17 casos).
   al motor. Dibujar foco y cursor.
 - **Verificar:** escribir, borrar con Retroceso y enviar con Enter.
 
-- **Hecho (PR #3):** se escribe con el teclado directamente en el campo y el cuadro emergente desaparece. Clicar un campo de texto le da el teclado (el motor lo enfoca y lo dibuja con anillo azul y cursor); `press_key` con un carácter escribe (acentos, espacio incluidos), Retroceso/Supr borran, Enter envía el formulario (o añade una línea en un `<textarea>`), Escape suelta el campo; clicar fuera o navegar le quita el teclado. Si la página no escucha teclas, solo se repinta el texto del campo (no el layout entero: eran 0,4 s por letra en Wikipedia). **Verificado en Electron real** (Hacker News, campo Search tras bajar al final): "rust" → "rust", Retroceso → "rus", "y" → "rusy". Un fallo real salió de paso: una franja de 1 px con antialias hacía abortar a tiny-skia en debug. **Falta:** selección, flechas, Tab entre campos, copiar y pegar.
+- **Hecho (PR #3):** se escribe con el teclado directamente en el campo y el cuadro emergente desaparece. Clicar un campo de texto le da el teclado (el motor lo enfoca y lo dibuja con anillo azul y cursor); `press_key` con un carácter escribe (acentos, espacio incluidos), Retroceso/Supr borran, Enter envía el formulario (o añade una línea en un `<textarea>`), Escape suelta el campo; clicar fuera o navegar le quita el teclado. Si la página no escucha teclas, solo se repinta el texto del campo (no el layout entero: eran 0,4 s por letra en Wikipedia). **Verificado en la app de escritorio antigua** (Hacker News, campo Search tras bajar al final): "rust" → "rust", Retroceso → "rus", "y" → "rusy". Un fallo real salió de paso: una franja de 1 px con antialias hacía abortar a tiny-skia en debug. **Falta:** selección, flechas, Tab entre campos, copiar y pegar.
 
 ### [x] 3.3 Lista de elementos útil
 
@@ -472,7 +483,7 @@ del fixture, ya se ven los 17 casos).
   - Una sola numeración: el prompt usa la lista `elements`, cuyos ids son los que entienden `click_element`/`type_into_element` (el árbol de accesibilidad numeraba aparte y no coincidía).
   - El agente lee: petición `get_page_text` (texto legible, bloques en líneas, tope de 12.000 caracteres, prefiere `<main>`). En Wikipedia la primera frase del artículo aparece en el carácter 736.
   - Acciones nuevas: `scroll` y `back`.
-- **Falta:** la verificación real ("busca Navegador web en Wikipedia y dime la primera frase") necesita una clave de Gemini y un PC con internet; en la nube solo se probó con modelos falsos y la cañería (Electron: texto de página, ajuste del modelo).
+- **Falta:** la verificación real ("busca Navegador web en Wikipedia y dime la primera frase") necesita una clave de Gemini y un PC con internet; en la nube solo se probó con modelos falsos y la cañería (texto de página y ajuste del modelo).
 
 ---
 
@@ -502,15 +513,62 @@ tarea 0.4. No perseguir el número por sí mismo.
 
 ---
 
-## Fase 5 — Modo compatibilidad (solo si se aprueba)
+## Fase 5 — Aplicación 100 % Rust
 
-- Botón en la barra: "Abrir en modo compatibilidad".
-- Usa un `WebContentsView` de Electron (el Chromium que la app ya
-  incluye) en lugar de la captura del motor propio.
-- Aislado: sin Node, con `contextIsolation` y sesión separada.
-- El agente IA obtiene los elementos con un script inyectado que
-  devuelve el mismo formato que `elements`.
-- El README debe decir con claridad que este modo usa Chromium.
+**Regla del proyecto (`AGENTS.md`):** la aplicación es 100 % Rust y está
+prohibido usar cualquier motor de navegador ajeno o un envoltorio de escritorio
+basado en tecnología web. Hoy la ventana, la barra, las pestañas y el panel del
+agente viven en `desktop/` y `frontend/` (tecnología web) y hay un `backend/` en
+Python: **eso incumple la regla y se retira**. Lo que se hizo ahí en las Fases 1
+y 3 (Detener, escribir con teclado, agente) sirve como especificación: el motor
+ya hace su parte y el comportamiento está probado.
+
+**Punto de partida:** el motor ya es Rust y ya tiene ventana nativa
+(`engine-gfx`, `winit` + `wgpu`; binario de `engine-core`).
+
+### [ ] 5.1 Binario `navegador`
+
+- Ventana nativa con `winit`; el motor dentro del mismo proceso (sin pasar por
+  NDJSON); la captura del motor se pinta en la ventana.
+- **Verificar:** abre Wikipedia y se ve igual que la captura de `engine_driver`.
+
+### [ ] 5.2 Barra del navegador en Rust
+
+- Dirección, atrás/adelante, recargar/Detener, pestañas y página de error.
+- **Decisión pendiente:** dibujarla con una librería de interfaz en Rust
+  (`egui`) o pintarla con el propio motor.
+- **Verificar:** test de Rust que conduce la barra y comprueba el estado.
+
+### [ ] 5.3 Ratón y teclado
+
+- Clic, rueda, teclas al campo enfocado. El motor ya lo hace (`click`,
+  `scroll`, `press_key`); falta llevar los eventos de la ventana.
+
+### [ ] 5.4 Agente IA en Rust
+
+- Llamada al modelo con `hyper` + `rustls` (ya están en el motor), clave en el
+  almacén de credenciales del sistema (crate `keyring`), modelo configurable.
+- Mismo bucle que hoy: `get_page_text`, `elements`, `click_element`,
+  `type_into_element`, `scroll`, `back`. Portar los tests del orquestador.
+
+### [ ] 5.5 Instalador en Rust
+
+- `cargo-wix` (Windows) / `cargo-bundle`. Firma de código igual que hoy.
+
+### [ ] 5.6 Retirar lo antiguo
+
+- Borrar `desktop/`, `frontend/`, `backend/`, sus scripts y su CI.
+- README sin rastro de lo retirado.
+
+### [ ] 5.7 Pruebas de punta a punta sin navegador externo
+
+- Tests de Rust que conducen la aplicación y comprueban capturas del propio
+  motor. Nada de herramientas que dependan de otro navegador.
+
+### [ ] 5.8 (Opcional) Herramientas de medida en Rust
+
+- `bench_all.py`, `engine_driver.py` y `site_mirror.py` son Python. No forman
+  parte de la aplicación, pero pueden pasar a un binario `bench` de Rust.
 
 ---
 
