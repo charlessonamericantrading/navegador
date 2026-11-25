@@ -122,7 +122,7 @@ jobs:
           workspaces: engine
       - name: Compilar el motor y la app (release)
         working-directory: engine
-        run: cargo build --release --locked -p engine-core --bin engine_server -p navegador
+        run: cargo build --release --locked -p engine-core --bin engine_server -p navegador --bin navegador
       - name: Banco de los fixtures
         run: python3 scripts/dev/bench_all.py --only fixture-css --only fixture-js
       # La app entera (broker + motor + barra pintada por el motor) sin
