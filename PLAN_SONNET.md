@@ -20,8 +20,11 @@ Antes que todo lo demás (detalle en `AGENTS.md`):
 2. **Prohibido** usar, instalar, sugerir o nombrar cualquier motor de navegador
    ajeno, también para pruebas o como "modo de compatibilidad".
 3. **Prohibido** cualquier envoltorio de escritorio basado en tecnología web.
-4. `desktop/`, `frontend/` y `backend/` incumplen estas reglas y se retiran
-   (Fase 5). Lo que este plan hizo en ellos es solo especificación.
+4. `desktop/`, `frontend/` y `backend/` incumplían estas reglas y **ya se
+   retiraron** (Fase 5.6, en el PR #3). Lo que este plan hizo en ellos es solo
+   historia y especificación: las tareas de las Fases 0 a 4 que hablan de
+   esas carpetas se hicieron entonces; hoy la aplicación está en
+   `engine/crates/app` (binario `navegador`) y se prueba con Rust.
 
 ## 1. Resumen (para decidir)
 
@@ -41,6 +44,9 @@ CI en verde y no tiene conflictos. Mientras no se fusione, quien compile
 | Prueba de JavaScript básico (12) | 2 bien | 10 bien |
 | Lint del frontend | Roto | En verde |
 | Compilar exige Python | Sí | No |
+
+*(Tabla histórica: describe `main` y el PR #1 cuando se escribió el plan. El
+frontend y el resto de la etapa anterior ya se retiraron.)*
 
 ### Hallazgo 2 — El plan actual apunta demasiado lejos
 
@@ -154,7 +160,9 @@ con el producto roto a la vista.
     `cargo test --workspace --locked`,
     `cargo clippy --workspace --all-targets --locked -- -D warnings` y
     `cargo run -p engine-core --bin wpt_runner --locked -- tests/wpt-style`.
-    En `desktop/` y `frontend/`: `npm test` y `npm run lint`.
+    En la aplicación: `cargo test -p navegador` (ya va dentro del
+    `--workspace` de arriba) y, si tocas la ventana o la barra, una captura
+    con `cargo run --release -p navegador -- --captura v.png <url>`.
 
 **Aviso de entorno.** En una sesión en la nube el motor no tiene salida
 directa a internet: cualquier `https://` falla con `client error (Connect)`.
@@ -190,8 +198,8 @@ python3 scripts/dev/engine_driver.py http://127.0.0.1:9001/wiki/Navegador_web --
 
 - **Quién:** Charlesson, o Sonnet si se le pide expresamente.
 - **Por qué:** todo lo demás de este plan parte de esa rama.
-- **Verificar:** en `main`, `npm run install:all` y `npm start` abren la
-  app y cargan una página.
+- **Verificar:** en `main`, `cd engine && cargo test --workspace --locked`
+  pasa y `python3 scripts/dev/bench_all.py` carga los dos fixtures.
 
 ### [ ] 0.2 Fusionar este PR (plan y herramientas)
 
@@ -218,6 +226,7 @@ No toca el producto. Comprobado: no tiene conflictos con el PR #1.
 
 ### [x] 0.5 Un test que falla fuera de Windows
 
+(Historia: ese test vivía en `desktop/`, ya retirado.)
 `desktop/tests/engine-protocol.test.js`, caso "lo que el parser de URL no
 normaliza se rechaza": en Linux `app://./..%5C..%5Csecreto` no se
 rechaza. En el CI pasa. Decidir si es un fallo real de la validación o
@@ -284,6 +293,11 @@ un test que solo vale para Windows, y dejarlo explícito.
 - **Verificar:** capturas antes y después de las cuatro páginas.
 
 ### [x] 1.3 Interfaz que no se desincroniza
+
+*(Rehecho en Rust en la Fase 5: la app numera sus navegaciones (`nav-N`), solo
+termina la carga cuando contesta la suya, trata `navegacion_cancelada` como
+algo normal y enseña la página de error dentro del visor. Tests en
+`engine/crates/app/src/app.rs`.)*
 
 - **Comprobado en `main`:** si una página tarda más de 12 s sale el aviso
   "tardando demasiado", y después la barra muestra la URL nueva con el
@@ -436,8 +450,8 @@ del fixture, ya se ven los 17 casos).
 - **Hacer:** añadir al protocolo `click_element { element_id }` y
   `type_into_element { element_id, text, replace, press_enter }`. El
   motor hace scroll hasta el elemento y actúa en su centro. El agente usa
-  solo estas dos. En `BrowserViewport.tsx` (`handleImageClick`), restar
-  `scroll_offset_y` al buscar el campo bajo el clic.
+  solo estas dos. Al buscar el campo bajo el clic hay que sumar el scroll
+  a la coordenada de la ventana (`engine/crates/app/src/app.rs` lo hace).
 - **Verificar:** prueba automática que repita el caso de Hacker News y
   escriba en el campo.
 
@@ -465,14 +479,19 @@ del fixture, ya se ven los 17 casos).
 
 - **Hecho (PR #3):** `elements` solo trae enlaces con `href`, controles de formulario y lo que la página declara accionable (`role`, `onclick`, `tabindex` ≥ 0, `contenteditable`), con área visible; texto colapsado y recortado a 120 caracteres; tope de 500. **Hacker News: 229 elementos** (antes 799) y Google 13. Los tests que leían texto desde `elements` leen ahora del árbol de accesibilidad.
 
-### [ ] 3.4 Agente IA
+### [~] 3.4 Agente IA
 
-- **Modelo retirado.** `desktop/ai-provider.js` llama a
+**Esta tarea pasó a la Fase 5.4:** el agente de la etapa anterior se retiró y
+se reescribe en Rust. Lo de abajo es la especificación y lo que el motor ya
+ofrece (`get_page_text`, `click_element`, `type_into_element`, `scroll`,
+`back`).
+
+- **Modelo retirado.** El agente antiguo llamaba a
   `gemini-2.0-flash`, retirado el 1-jun-2026 según varias fuentes.
   Confirmar el sustituto en la página oficial de Google. Hacer el modelo
   configurable en Ajustes.
 - **Árbol de accesibilidad sin conectar.** El motor lo ofrece
-  (`get_accessibility_tree`), pero `App.tsx` no lo pasa al agente. En
+  (`get_accessibility_tree`), pero el agente antiguo no lo pasaba. En
   `main` sus ids no coincidían con los de `elements`: unificarlos.
 - **Faltan acciones.** El agente no puede hacer scroll ni volver atrás.
 - **Verificar:** tarea real: "busca Navegador web en Wikipedia y dime la
@@ -549,6 +568,9 @@ basado en tecnología web. La etapa anterior (`desktop/`, `frontend/`,
 
 ### [ ] 5.4 Agente IA en Rust
 
+- **Es lo siguiente.** Sustituye a la tarea 3.4. La app ya tiene el motor, la
+  barra y las pestañas; falta el panel del agente (también pintado por
+  nuestro motor) y el bucle.
 - Llamada al modelo con `hyper` + `rustls` (ya están en el motor), clave en el
   almacén de credenciales del sistema (crate `keyring`), modelo configurable.
 - Mismo bucle que hoy: `get_page_text`, `elements`, `click_element`,
