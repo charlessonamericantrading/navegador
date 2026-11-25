@@ -517,32 +517,35 @@ tarea 0.4. No perseguir el número por sí mismo.
 
 **Regla del proyecto (`AGENTS.md`):** la aplicación es 100 % Rust y está
 prohibido usar cualquier motor de navegador ajeno o un envoltorio de escritorio
-basado en tecnología web. Hoy la ventana, la barra, las pestañas y el panel del
-agente viven en `desktop/` y `frontend/` (tecnología web) y hay un `backend/` en
-Python: **eso incumple la regla y se retira**. Lo que se hizo ahí en las Fases 1
-y 3 (Detener, escribir con teclado, agente) sirve como especificación: el motor
-ya hace su parte y el comportamiento está probado.
+basado en tecnología web. La etapa anterior (`desktop/`, `frontend/`,
+`backend/`) incumplía la regla y **ya se retiró** (5.6). La aplicación vive en
+`engine/crates/app` (binario `navegador`).
 
-**Punto de partida:** el motor ya es Rust y ya tiene ventana nativa
-(`engine-gfx`, `winit` + `wgpu`; binario de `engine-core`).
+### [x] 5.1 Binario `navegador`
 
-### [ ] 5.1 Binario `navegador`
+- Ventana nativa (`winit` + `softbuffer`). El motor va en otro proceso del
+  mismo ejecutable (`navegador --motor`, NDJSON) y la red en el broker
+  (`navegador --broker`): si una página tumba el motor, la ventana sigue.
+- **Hecho:** abre páginas reales; `navegador --captura v.png <url>` guarda la
+  ventana entera sin pantalla.
 
-- Ventana nativa con `winit`; el motor dentro del mismo proceso (sin pasar por
-  NDJSON); la captura del motor se pinta en la ventana.
-- **Verificar:** abre Wikipedia y se ve igual que la captura de `engine_driver`.
+### [x] 5.2 Barra del navegador en Rust
 
-### [ ] 5.2 Barra del navegador en Rust
+- **Decisión: la pinta nuestro propio motor.** Es HTML/CSS que pasa por el
+  mismo motor que las páginas; los iconos son SVG. Las zonas pulsables salen
+  del layout (`data-accion`).
+- Dirección (con cursor, selección, flechas, Ctrl+A), atrás/adelante,
+  recargar/Detener, pestañas (nueva, cambiar, cerrar), página de inicio y de
+  error con «Reintentar».
+- **Hecho:** 32 tests de Rust conducen la barra y comprueban el estado.
 
-- Dirección, atrás/adelante, recargar/Detener, pestañas y página de error.
-- **Decisión pendiente:** dibujarla con una librería de interfaz en Rust
-  (`egui`) o pintarla con el propio motor.
-- **Verificar:** test de Rust que conduce la barra y comprueba el estado.
+### [x] 5.3 Ratón y teclado
 
-### [ ] 5.3 Ratón y teclado
-
-- Clic, rueda, teclas al campo enfocado. El motor ya lo hace (`click`,
-  `scroll`, `press_key`); falta llevar los eventos de la ventana.
+- Clic, rueda (una sola petición de scroll en vuelo), teclas al campo
+  enfocado, Av Pág/Re Pág/espacio/flechas, atajos (Ctrl+L/T/W/Tab/R, F5,
+  Alt+←/→, Escape). Pantallas con escala: la imagen se amplía (pendiente:
+  pintar a la escala real para que el texto se vea nítido).
+- **Hecho:** probado en una ventana real con ratón y teclado virtuales.
 
 ### [ ] 5.4 Agente IA en Rust
 
@@ -555,15 +558,18 @@ ya hace su parte y el comportamiento está probado.
 
 - `cargo-wix` (Windows) / `cargo-bundle`. Firma de código igual que hoy.
 
-### [ ] 5.6 Retirar lo antiguo
+### [x] 5.6 Retirar lo antiguo
 
-- Borrar `desktop/`, `frontend/`, `backend/`, sus scripts y su CI.
-- README sin rastro de lo retirado.
+- **Hecho:** fuera `desktop/`, `frontend/`, `backend/`, sus scripts y su CI.
+  README y SECURITY reescritos; `instalar`/`iniciar` solo necesitan Rust.
+  Documentos y comentarios dejan de nombrar otros navegadores.
 
-### [ ] 5.7 Pruebas de punta a punta sin navegador externo
+### [~] 5.7 Pruebas de punta a punta sin navegador externo
 
-- Tests de Rust que conducen la aplicación y comprueban capturas del propio
-  motor. Nada de herramientas que dependan de otro navegador.
+- **Hecho:** `engine/crates/app/tests/extremo_a_extremo.rs` conduce la app con
+  el motor real (dirección, enlace, atrás, formulario, pestañas, error) y una
+  prueba de humo en CI guarda la ventana sin pantalla.
+- Falta: comparar capturas contra referencias guardadas.
 
 ### [ ] 5.8 (Opcional) Herramientas de medida en Rust
 

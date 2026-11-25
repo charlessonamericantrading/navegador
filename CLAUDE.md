@@ -16,9 +16,9 @@ se discuten.
 3. **Prohibido usar envoltorios de escritorio basados en tecnología web**
    (aplicaciones de escritorio hechas con HTML/JavaScript que llevan un
    navegador dentro). Ni usarlos, ni instalarlos, ni sugerirlos, ni nombrarlos.
-4. Las carpetas `desktop/`, `frontend/` y `backend/` son de una etapa anterior
-   que **incumple estas reglas** y se van a retirar (ver la Fase 5 de
-   `PLAN_SONNET.md`). No se les añade nada y no se toman como modelo. Si una
+4. Las carpetas `desktop/`, `frontend/` y `backend/` eran de una etapa anterior
+   que **incumplía estas reglas** y se retiraron (Fase 5 de `PLAN_SONNET.md`).
+   No se recuperan del historial de git ni se toman como modelo. Si una
    respuesta tuya se basa en ellas, está mal planteada.
 5. Las pruebas no dependen de ningún navegador externo: se prueba con el propio
    motor (tests de Rust, `scripts/dev/engine_driver.py`, capturas del motor).
@@ -28,6 +28,7 @@ se discuten.
 - `engine/` — el motor, escrito desde cero en Rust (red, HTML, CSS, layout,
   pintado, JavaScript con Boa, árbol de accesibilidad). Estado y cómo medirlo:
   `engine/ESTADO.md`.
-- `engine/crates/gfx` ya tiene una ventana nativa en Rust (`winit` + `wgpu`):
-  es el punto de partida de la aplicación 100 % Rust.
+- `engine/crates/app` — **la aplicación** (binario `navegador`): ventana nativa
+  (`winit` + `softbuffer`), barra y pestañas pintadas por nuestro motor, y el
+  motor en un proceso aparte. Se abre con `cd engine && cargo run --release -p navegador`.
 - Plan de trabajo: `PLAN_SONNET.md`.
