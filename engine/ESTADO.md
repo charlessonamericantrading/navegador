@@ -105,7 +105,7 @@ se miran con el motor y con Chrome: tienen 17 y 12 casos numerados.
    la máquina: el CI corre en Windows y los anchos y alturas cambian. Medir con
    la fuente en el propio test.
 2. Antes de subir: `cargo test --workspace --locked`, `cargo clippy ... -D warnings`
-   y el `wpt_runner`. Si se toca la interfaz: `npm test`, `npm run lint` y
-   `npx tsc -b` en `frontend/`; `npm test` en `desktop/`.
-3. Un fichero nuevo del proceso principal de Electron va en `build.files` de
-   `desktop/package.json` (un test lo comprueba).
+   y el `wpt_runner`. Mientras `desktop/` y `frontend/` sigan en el repositorio,
+   su CI tiene que seguir en verde (pero no se les añade nada).
+3. La aplicación es 100 % Rust (reglas en `AGENTS.md`): nada se añade a
+   `desktop/`, `frontend/` ni `backend/`, que se retiran en la Fase 5 del plan.

@@ -1,5 +1,10 @@
 # Navegador IA
 
+> **Reglas del proyecto: [`AGENTS.md`](AGENTS.md).** La aplicación es 100 %
+> Rust. Las carpetas `desktop/`, `frontend/` y `backend/` son de una etapa
+> anterior que incumple esas reglas y se retiran (Fase 5 de `PLAN_SONNET.md`);
+> lo que este README cuenta de ellas es historia, no el camino a seguir.
+
 Un navegador de escritorio con un **motor de renderizado propio escrito desde cero en Rust** — sin Chromium, sin WebKit, sin Gecko.
 
 > **Estado: en desarrollo, no apto para uso general todavía.**
