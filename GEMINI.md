@@ -28,6 +28,7 @@ se discuten.
 - `engine/` — el motor, escrito desde cero en Rust (red, HTML, CSS, layout,
   pintado, JavaScript con Boa, árbol de accesibilidad). Estado y cómo medirlo:
   `engine/ESTADO.md`.
-- `engine/crates/gfx` ya tiene una ventana nativa en Rust (`winit` + `wgpu`):
-  es el punto de partida de la aplicación 100 % Rust.
+- `engine/crates/app` — **la aplicación** (binario `navegador`): ventana nativa
+  (`winit` + `softbuffer`), barra y pestañas pintadas por nuestro motor, y el
+  motor en un proceso aparte. Se abre con `cd engine && cargo run --release -p navegador`.
 - Plan de trabajo: `PLAN_SONNET.md`.

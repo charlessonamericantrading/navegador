@@ -11,7 +11,7 @@ corre lo que cubre el CI (tests, clippy y la prueba de humo del instalador).
 ## Cómo medirlo (todo en un comando cada uno)
 
 ```bash
-cd engine && cargo test --workspace --locked          # 1.052 tests
+cd engine && cargo test --workspace --locked          # 1.086 tests
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run -p engine-core --bin wpt_runner --locked -- tests/wpt-style   # 60 de 60
 cargo build --release -p engine-core --bin engine_server --bin engine_broker
@@ -21,7 +21,34 @@ python3 scripts/dev/engine_driver.py --fixture css-basics-fixture.html --out css
 ```
 
 Los fixtures (`engine/tests/css-basics-fixture.html` y `js-basics-fixture.html`)
-se miran con el motor y con Chrome: tienen 17 y 12 casos numerados.
+tienen 17 y 12 casos numerados; cada caso dice en su texto cómo debe verse.
+
+## La aplicación (`navegador`, 100 % Rust)
+
+```bash
+cd engine && cargo run --release -p navegador                 # abre la ventana
+cargo run --release -p navegador -- es.wikipedia.org          # con una dirección
+cargo run --release -p navegador -- --captura v.png news.ycombinator.com   # sin ventana: guarda la imagen
+```
+
+- **Ventana** nativa (`winit` + `softbuffer`). El motor corre en otro proceso
+  (`navegador --motor`): si una página lo tumba, la ventana sigue.
+- **La barra la pinta nuestro motor:** pestañas, atrás/adelante, recargar/detener
+  y la barra de direcciones son HTML/CSS que pasa por el mismo motor que las
+  páginas (`engine/crates/app/src/barra.rs`). Los iconos son SVG.
+- **Barra de direcciones:** al pulsar selecciona todo; flechas, Inicio/Fin,
+  Retroceso/Supr, Ctrl+A, Enter y Escape. Lo que no es una dirección se busca.
+- **Atajos:** Ctrl+L (barra), Ctrl+T, Ctrl+W, Ctrl+Tab, Ctrl+R/F5, Alt+←/→,
+  Escape (detener). Rueda, Av Pág/Re Pág, espacio y flechas desplazan.
+- **Páginas propias:** inicio (con accesos) y error (con «Reintentar»),
+  también pintadas por el motor.
+- **Pruebas:** 33 de la lógica y una de extremo a extremo con el motor real
+  (`engine/crates/app/tests/extremo_a_extremo.rs`): escribe una dirección,
+  pulsa un enlace, vuelve atrás, rellena un formulario, abre y cierra una
+  pestaña y comprueba la página de error. Sin ningún navegador externo.
+
+Falta: el panel del agente (5.4), el instalador (5.5), copiar/pegar, y en
+pantallas con escala (125 %, 200 %) la imagen se amplía (se ve algo borrosa).
 
 ## Números
 
@@ -107,5 +134,6 @@ se miran con el motor y con Chrome: tienen 17 y 12 casos numerados.
 2. Antes de subir: `cargo test --workspace --locked`, `cargo clippy ... -D warnings`
    y el `wpt_runner`. Mientras `desktop/` y `frontend/` sigan en el repositorio,
    su CI tiene que seguir en verde (pero no se les añade nada).
-3. La aplicación es 100 % Rust (reglas en `AGENTS.md`): nada se añade a
-   `desktop/`, `frontend/` ni `backend/`, que se retiran en la Fase 5 del plan.
+3. La aplicación es 100 % Rust (reglas en `AGENTS.md`) y vive en
+   `engine/crates/app`. Nada se añade a `desktop/`, `frontend/` ni `backend/`,
+   que se retiran en la Fase 5 del plan.

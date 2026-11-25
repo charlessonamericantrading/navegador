@@ -1,0 +1,30 @@
+[package]
+name = "navegador"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "La aplicación del navegador, 100 % Rust: ventana, barra, pestañas y el motor propio."
+
+[[bin]]
+name = "navegador"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+base64.workspace = true
+url.workspace = true
+engine-core = { path = "../core" }
+engine-dom = { path = "../dom" }
+engine-gfx = { path = "../gfx" }
+engine-layout = { path = "../layout" }
+engine-text = { path = "../text" }
+engine-image = { path = "../image" }
+# Las mismas versiones que ya usa `engine-gfx` para su ventana: no entra
+# ninguna dependencia nueva en el árbol.
+winit = "0.29"
+softbuffer = "0.4"
+tiny-skia = "0.11"
+
+[lints]
+workspace = true

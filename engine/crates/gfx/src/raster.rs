@@ -43,6 +43,23 @@ pub fn render_layout_to_png_with_overlay(
     scroll_offset_y: f32,
     overlay: &[crate::display_list::DisplayItem],
 ) -> Result<Vec<u8>, String> {
+    render_layout_to_pixmap(layout_root, font_set, images, width, height, scroll_offset_y, overlay)?
+        .encode_png()
+        .map_err(|error| format!("no se pudo codificar la captura PNG: {error}"))
+}
+
+/// Pinta la pagina (y `overlay` encima) en un `Pixmap` en memoria, sin
+/// codificar: lo usa la aplicacion `navegador` para pintar su propia barra con
+/// el motor sin pasar por PNG.
+pub fn render_layout_to_pixmap(
+    layout_root: &LayoutBox,
+    font_set: Option<&FontSet>,
+    images: &ImageMap,
+    width: u32,
+    height: u32,
+    scroll_offset_y: f32,
+    overlay: &[crate::display_list::DisplayItem],
+) -> Result<Pixmap, String> {
     let mut pixmap = Pixmap::new(width, height)
         .ok_or_else(|| format!("no se pudo crear la superficie de rasterizado {width}x{height}"))?;
     // El fondo del elemento raiz se propaga al lienzo ENTERO (ver
@@ -63,9 +80,7 @@ pub fn render_layout_to_png_with_overlay(
         paint_display_list(&mut pixmap, overlay, font_set, scroll_offset_y);
     }
 
-    pixmap
-        .encode_png()
-        .map_err(|error| format!("no se pudo codificar la captura PNG: {error}"))
+    Ok(pixmap)
 }
 
 #[cfg(test)]

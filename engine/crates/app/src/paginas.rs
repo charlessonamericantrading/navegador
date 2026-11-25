@@ -1,0 +1,92 @@
+//! Páginas propias del navegador (inicio y error), en HTML/CSS que pinta el
+//! motor. Los enlaces llevan `data-accion="ir:<url>"` o `data-accion="reintentar"`.
+
+use crate::lienzo::escapar;
+
+/// Sitios de la página de inicio.
+pub const SITIOS: [(&str, &str); 3] = [
+    ("Wikipedia", "https://es.wikipedia.org"),
+    ("Hacker News", "https://news.ycombinator.com"),
+    ("Google", "https://www.google.com"),
+];
+
+/// La página de una pestaña nueva.
+pub fn inicio() -> String {
+    let sitios: String = SITIOS
+        .iter()
+        .map(|(nombre, url)| format!(r#"<div class="sitio" data-accion="ir:{url}">{}</div>"#, escapar(nombre)))
+        .collect();
+    format!(
+        r#"<html><head><style>
+body {{ margin: 0; background: #ffffff; font-family: sans-serif; color: #202124; }}
+#centro {{ width: 560px; margin: 120px auto 0 auto; text-align: center; }}
+h1 {{ font-size: 40px; font-weight: normal; margin: 0 0 12px 0; }}
+p {{ font-size: 16px; color: #5f6368; margin: 0 0 32px 0; }}
+#sitios {{ display: flex; width: 504px; margin: 0 auto; }}
+.sitio {{ width: 144px; height: 44px; line-height: 44px; margin: 0 12px; border-radius: 22px; background: #f1f3f4; font-size: 15px; text-align: center; }}
+</style></head><body><div id="centro">
+<h1>Navegador</h1>
+<p>Escribe una dirección o una búsqueda en la barra de arriba.</p>
+<div id="sitios">{sitios}</div>
+</div></body></html>"#
+    )
+}
+
+/// La página que se ve cuando una dirección no se puede abrir.
+pub fn error(url: &str, mensaje: &str) -> String {
+    format!(
+        r#"<html><head><style>
+body {{ margin: 0; background: #ffffff; font-family: sans-serif; color: #202124; }}
+#centro {{ width: 600px; margin: 100px auto 0 auto; }}
+h1 {{ font-size: 26px; font-weight: normal; margin: 0 0 16px 0; }}
+p {{ font-size: 15px; color: #3c4043; margin: 0 0 12px 0; }}
+.detalle {{ font-size: 13px; color: #80868b; margin-bottom: 28px; }}
+#reintentar {{ width: 140px; height: 40px; line-height: 40px; border-radius: 20px; background: #1a73e8; color: #ffffff; font-size: 15px; text-align: center; }}
+</style></head><body><div id="centro">
+<h1>{titulo}</h1>
+<p>{url}</p>
+<p class="detalle">{detalle}</p>
+<div id="reintentar" data-accion="reintentar">Reintentar</div>
+</div></body></html>"#,
+        titulo = escapar(explicar(mensaje)),
+        url = escapar(url),
+        detalle = escapar(mensaje),
+    )
+}
+
+/// Una frase clara para el error del motor.
+pub fn explicar(mensaje: &str) -> &'static str {
+    let m = mensaje.to_lowercase();
+    if m.contains("timed out") || m.contains("timeout") || m.contains("tiempo") {
+        "La página tardó demasiado en responder"
+    } else if m.contains("dns") || m.contains("resolve") || m.contains("lookup") || m.contains("no such host") {
+        "No se encuentra el sitio"
+    } else if m.contains("refused") || m.contains("rechaz") {
+        "El sitio rechazó la conexión"
+    } else if m.contains("certificate") || m.contains("tls") || m.contains("certificado") {
+        "La conexión segura con el sitio falló"
+    } else if m.contains("url") && (m.contains("invalid") || m.contains("válida") || m.contains("valida")) {
+        "La dirección no es válida"
+    } else {
+        "No se pudo abrir la página"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn el_error_se_explica_claro() {
+        assert_eq!(explicar("network_error: connection refused (os error 111)"), "El sitio rechazó la conexión");
+        assert_eq!(explicar("network_error: operation timed out"), "La página tardó demasiado en responder");
+        assert_eq!(explicar("algo raro"), "No se pudo abrir la página");
+    }
+
+    #[test]
+    fn el_error_no_mete_html_ajeno() {
+        let html = error("https://x.com/<script>", "fallo <b>");
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;b&gt;"));
+    }
+}
