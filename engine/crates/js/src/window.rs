@@ -129,10 +129,10 @@ pub fn register_window(context: &mut Context) -> JsResult<PendingWindowOpens> {
     // compatibilidad; sin el objeto, eso era un TypeError que se llevaba
     // por delante el script entero.
     //
-    // El User-Agent declara lo que este motor ES, no imita a Chrome. Eso
+    // El User-Agent declara lo que este motor ES, no imita a otro navegador. Eso
     // significa que el sniffing de navegador de algunas paginas no nos
     // reconocera - preferible a mentir: una pagina que crea estar hablando
-    // con Chrome usaria APIs que aqui no existen y fallaria mas adelante y
+    // con otro navegador usaria APIs que aqui no existen y fallaria mas adelante y
     // de forma mas confusa.
     let navigator = ObjectInitializer::new(context)
         .property(

@@ -3,7 +3,7 @@
 //! Cada mensaje es una **trama**: `[u32 LE largo de cabecera][cabecera JSON]
 //! [u32 LE largo del cuerpo][cuerpo]`. La cabecera dice qué es; el cuerpo son
 //! los bytes de una petición o respuesta HTTP, en crudo. No es NDJSON como el
-//! protocolo con Electron porque aquí viajan imágenes y fuentes: en base64
+//! protocolo con la ventana porque aquí viajan imágenes y fuentes: en base64
 //! dentro de JSON costarían un tercio más y otra copia.
 //!
 //! La conversación es:

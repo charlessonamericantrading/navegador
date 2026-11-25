@@ -2,6 +2,10 @@
 //! `engine_core::protocol`). La aplicación se lanza a sí misma con `--motor`:
 //! si una página tumba el motor, la ventana sigue viva.
 //!
+//! La red, las cookies y el almacenamiento van en un tercer proceso, el broker
+//! (`--broker`, ADR 0001): el motor, que interpreta contenido hostil, no abre
+//! ni la red ni el perfil; se los pide al broker con un token de un solo uso.
+//!
 //! Un hilo lee las respuestas, decodifica la captura (base64 + PNG) fuera del
 //! hilo de la ventana y las entrega con `al_recibir`.
 
@@ -14,6 +18,10 @@ use tiny_skia::{IntSize, Pixmap};
 
 /// Argumento con el que el ejecutable arranca como motor.
 pub const ARGUMENTO_MOTOR: &str = "--motor";
+/// Argumento con el que el ejecutable arranca como broker.
+pub const ARGUMENTO_BROKER: &str = "--broker";
+/// Cuánto se espera a que el broker conteste al arrancar.
+const ESPERA_BROKER: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Un elemento interactivo de la página (coordenadas de documento).
 #[derive(Debug, Clone, PartialEq)]
@@ -150,18 +158,108 @@ pub fn decodificar_captura(base64: &str) -> Option<Pixmap> {
     Pixmap::from_vec(imagen.rgba.clone(), IntSize::from_wh(imagen.width, imagen.height)?)
 }
 
-/// El proceso del motor.
+/// El proceso broker y su canal de control.
+pub struct Broker {
+    hijo: Child,
+    entrada: ChildStdin,
+    lineas: std::sync::mpsc::Receiver<String>,
+    endpoint: String,
+}
+
+impl Broker {
+    /// Lanza `ejecutable --broker` y espera a que anuncie su canal.
+    pub fn lanzar(ejecutable: &Path) -> std::io::Result<Self> {
+        let mut hijo = Command::new(ejecutable).arg(ARGUMENTO_BROKER).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
+        let entrada = hijo.stdin.take().ok_or_else(|| std::io::Error::other("el broker no tiene entrada"))?;
+        let salida = hijo.stdout.take().ok_or_else(|| std::io::Error::other("el broker no tiene salida"))?;
+        let (enviar, lineas) = std::sync::mpsc::channel();
+        std::thread::Builder::new().name("lector-broker".to_string()).spawn(move || {
+            for linea in BufReader::new(salida).lines() {
+                let Ok(linea) = linea else { break };
+                if enviar.send(linea).is_err() {
+                    break;
+                }
+            }
+        })?;
+        let mut broker = Self { hijo, entrada, lineas, endpoint: String::new() };
+        let listo = broker.siguiente()?;
+        broker.endpoint = listo
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .filter(|_| listo.get("type").and_then(Value::as_str) == Some("ready"))
+            .ok_or_else(|| std::io::Error::other(format!("el broker no anunció su canal: {listo}")))?
+            .to_string();
+        Ok(broker)
+    }
+
+    /// Da de alta un proceso del motor y devuelve su token de un solo uso.
+    pub fn registrar(&mut self, nombre: &str) -> std::io::Result<String> {
+        let peticion = serde_json::json!({ "id": nombre, "type": "register", "renderer": nombre });
+        writeln!(self.entrada, "{peticion}")?;
+        self.entrada.flush()?;
+        let respuesta = self.siguiente()?;
+        respuesta
+            .get("token")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| std::io::Error::other(format!("el broker no dio token: {respuesta}")))
+    }
+
+    fn siguiente(&self) -> std::io::Result<Value> {
+        let linea = self.lineas.recv_timeout(ESPERA_BROKER).map_err(|_| std::io::Error::other("el broker no contestó"))?;
+        serde_json::from_str(&linea).map_err(|e| std::io::Error::other(format!("respuesta del broker no válida: {e}")))
+    }
+
+    fn cerrar(&mut self) {
+        let _ = writeln!(self.entrada, "{}", serde_json::json!({ "id": "cierre", "type": "shutdown" }));
+        let _ = self.entrada.flush();
+        for _ in 0..20 {
+            if matches!(self.hijo.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = self.hijo.kill();
+        let _ = self.hijo.wait();
+    }
+}
+
+impl Drop for Broker {
+    fn drop(&mut self) {
+        if matches!(self.hijo.try_wait(), Ok(None)) {
+            let _ = self.hijo.kill();
+            let _ = self.hijo.wait();
+        }
+    }
+}
+
+/// El proceso del motor (y su broker).
 pub struct Motor {
     hijo: Child,
     entrada: ChildStdin,
+    broker: Option<Broker>,
 }
 
 impl Motor {
-    /// Lanza `ejecutable --motor` y entrega cada mensaje a `al_recibir` desde
-    /// un hilo propio.
-    pub fn lanzar(ejecutable: &Path, mut al_recibir: impl FnMut(MensajeMotor) + Send + 'static) -> std::io::Result<Self> {
+    /// Arranca el broker y el motor con `ejecutable` (`--broker` y `--motor`)
+    /// y entrega cada mensaje del motor a `al_recibir` desde un hilo propio.
+    pub fn lanzar(ejecutable: &Path, al_recibir: impl FnMut(MensajeMotor) + Send + 'static) -> std::io::Result<Self> {
+        let mut broker = Broker::lanzar(ejecutable)?;
+        let token = broker.registrar("motor-1")?;
+        let entorno = [
+            (engine_core::process::BROKER_ENDPOINT_ENV, broker.endpoint.clone()),
+            (engine_core::process::BROKER_TOKEN_ENV, token),
+        ];
+        let mut motor = Self::lanzar_solo(ejecutable, &entorno, al_recibir)?;
+        motor.broker = Some(broker);
+        Ok(motor)
+    }
+
+    /// Solo el motor, con las variables de entorno dadas.
+    fn lanzar_solo(ejecutable: &Path, entorno: &[(&str, String)], mut al_recibir: impl FnMut(MensajeMotor) + Send + 'static) -> std::io::Result<Self> {
         let mut hijo = Command::new(ejecutable)
             .arg(ARGUMENTO_MOTOR)
+            .envs(entorno.iter().map(|(k, v)| (*k, v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -178,7 +276,7 @@ impl Motor {
             }
             al_recibir(MensajeMotor::Terminado);
         })?;
-        Ok(Self { hijo, entrada })
+        Ok(Self { hijo, entrada, broker: None })
     }
 
     /// Lanza el motor con este mismo ejecutable.
@@ -193,17 +291,25 @@ impl Motor {
         self.entrada.flush()
     }
 
-    /// Pide al motor que termine y espera un poco; si no, lo cierra.
+    /// Pide al motor (y luego al broker) que terminen y espera un poco; si
+    /// no, los cierra.
     pub fn cerrar(&mut self) {
         let _ = self.enviar(&serde_json::json!({ "type": "shutdown", "id": "cierre" }));
+        let mut terminado = false;
         for _ in 0..20 {
             if matches!(self.hijo.try_wait(), Ok(Some(_))) {
-                return;
+                terminado = true;
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let _ = self.hijo.kill();
-        let _ = self.hijo.wait();
+        if !terminado {
+            let _ = self.hijo.kill();
+            let _ = self.hijo.wait();
+        }
+        if let Some(broker) = &mut self.broker {
+            broker.cerrar();
+        }
     }
 }
 

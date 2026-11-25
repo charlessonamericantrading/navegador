@@ -1,4 +1,4 @@
-//! Parsea CSS real usando `cssparser` (el tokenizador que usa Servo/Stylo):
+//! Parsea CSS real usando `cssparser` (un tokenizador CSS maduro de Rust):
 //! respeta bloques anidados, strings con `{`/`}`/`;`/`:` dentro, comentarios
 //! y arroba-reglas (`@media`, etc.) correctamente en vez de partir el texto
 //! por caracteres literales como hacia el parser anterior.

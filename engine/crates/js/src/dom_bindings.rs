@@ -1827,7 +1827,7 @@ fn build_element_object(node: &Arc<RwLock<Node>>, registry: &DocumentBindings, c
     // casi todo el codigo real.
     // ---------------------------------------------------------------------
 
-    // `matches(selector)` con el matcher REAL del crate `css` (el de Firefox),
+    // `matches(selector)` con el matcher REAL del crate `css`,
     // el mismo que usa la cascada. Reusarlo en vez de escribir otro comparador
     // es lo que garantiza que `el.matches('.a > .b')` responda igual que si esa
     // regla estuviera en una hoja de estilos.

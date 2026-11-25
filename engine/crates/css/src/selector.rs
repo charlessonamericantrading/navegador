@@ -1,5 +1,5 @@
-//! Matching de selectores real via el crate `selectors` (Servo/Stylo - el
-//! mismo que usa Firefox). Sustituye al matcher anterior, que solo entendia
+//! Matching de selectores real via el crate `selectors` (una biblioteca
+//! madura de Rust). Sustituye al matcher anterior, que solo entendia
 //! un tag/`.clase`/`#id` suelto sin combinadores ni selectores compuestos.
 //!
 //! La API publica (`SelectorMatcher::matches`, `::calculate_specificity`,

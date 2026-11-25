@@ -3,13 +3,14 @@
 //! - `navegador [dirección]` abre la ventana.
 //! - `navegador --captura salida.png [--ancho 1280] [--alto 800] [dirección]`
 //!   abre la dirección sin ventana y guarda la imagen (barra incluida).
-//! - `navegador --motor` es el proceso del motor (lo lanza la propia app).
+//! - `navegador --motor` y `navegador --broker` son el motor y el broker (los
+//!   lanza la propia app).
 
 // En Windows, sin consola detrás de la ventana (en las builds de depuración
 // se deja para ver los mensajes).
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use navegador::motor::ARGUMENTO_MOTOR;
+use navegador::motor::{ARGUMENTO_BROKER, ARGUMENTO_MOTOR};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -25,6 +26,16 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("[motor] {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if argumentos.first().map(String::as_str) == Some(ARGUMENTO_BROKER) {
+        return match engine_core::process::run_broker_process() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("[broker] {error}");
                 ExitCode::FAILURE
             }
         };

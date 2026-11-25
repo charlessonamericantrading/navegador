@@ -29,7 +29,7 @@ Consecuencias:
 2. Un cuelgue o pánico en una pestaña se lleva todas (H23: además, el proceso
    nativo no tiene reinicio supervisado).
 3. Pestaña y frontera de seguridad no son lo mismo: el destino es aislar por
-   sitio, no por pestaña (ver el diseño de *site isolation* de Chromium).
+   sitio, no por pestaña (como el *aislamiento por sitio* de los navegadores grandes).
 
 ## Decisión
 
@@ -37,7 +37,7 @@ Separar en tres etapas, cada una utilizable y reversible por sí sola.
 
 ### Etapa 1 — Un proceso de renderer por pestaña, supervisado (se implementa ahora)
 
-- El proceso principal de Electron hace de **supervisor**: arranca un
+- El proceso principal de la app de escritorio antigua hace de **supervisor**: arranca un
   `engine_server` por pestaña, enruta cada petición al proceso de su pestaña y
   detecta caídas.
 - La caída de un renderer se **contiene**: se rechazan sus peticiones
@@ -46,7 +46,7 @@ Separar en tres etapas, cada una utilizable y reversible por sí sola.
 - Cada renderer sigue haciendo su red y su disco. **Esta etapa aporta
   contención de fallos y de cuelgues, no confidencialidad**: un renderer
   comprometido todavía lee el disco del usuario.
-- La lógica vive en un módulo propio (`desktop/engine-supervisor.js`) con una
+- La lógica vive en un módulo propio (en la app de escritorio antigua; hoy, `engine/crates/app/src/motor.rs`) con una
   interfaz pequeña (abrir, pedir, cerrar, eventos de caída) para poder
   sustituir su implementación por un broker Rust sin tocar la interfaz.
 
@@ -68,8 +68,8 @@ Separar en tres etapas, cada una utilizable y reversible por sí sola.
 
 - **Decidido (23-09-2026):** el broker es un **proceso Rust propio**
   (`engine_broker`) que reutiliza `engine-net`, no el proceso principal de
-  Electron. Así la política de red, cookies, CORS y CSP sigue en un solo sitio
-  y el motor no queda atado a Electron.
+  La app de escritorio antigua. Así la política de red, cookies, CORS y CSP sigue en un solo sitio
+  y el motor no queda atado a la app de escritorio antigua.
 - **Hecho — la costura (Fase 64):** `engine_net::ResourceBroker` reúne todo lo
   que el renderer pide al exterior: `fetch`, cookies desde JavaScript y seis
   operaciones de Web Storage por origen. El motor entero (navegación, `fetch`,
@@ -92,7 +92,7 @@ Separar en tres etapas, cada una utilizable y reversible por sí sola.
   todavía puede navegar a cualquier sitio para obtener su origen (lo cierra la
   etapa 3). Los subrecursos no-cors siguen llegando con cookies (hace falta
   ORB).
-- **Hecho — en el producto (Fase 67):** Electron arranca `engine_broker`,
+- **Hecho — en el producto (Fase 67):** La app de escritorio antigua arranca `engine_broker`,
   registra el motor y lo lanza con el canal y el token. Falla cerrado si falta
   el broker, si no saluda o si el motor no confirma `broker: "remote"`. Va en el
   paquete, y la prueba de humo del paquete real lo comprueba.

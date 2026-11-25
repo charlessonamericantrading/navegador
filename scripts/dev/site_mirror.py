@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (compatible; navegador-espejo/1.0)"
 
 
 def make_handler(host):

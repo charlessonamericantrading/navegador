@@ -59,7 +59,7 @@ impl MediaCondition {
 /// El simple-selector "clave" de una rama: el mas a la derecha, que es el
 /// unico que se compara contra el elemento en si (todo lo que hay a su
 /// izquierda habla de sus ANCESTROS/hermanos). Es el mismo truco que usan
-/// Chromium y Firefox para no probar cada regla contra cada elemento.
+/// los navegadores grandes para no probar cada regla contra cada elemento.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyPart {
     Id(String),

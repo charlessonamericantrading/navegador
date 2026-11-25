@@ -154,7 +154,7 @@ pub fn presentational_hints(dom_node: &Arc<RwLock<Node>>) -> Vec<(String, String
                 }
                 _ => {
                     // Un navegador centra una tabla dentro de `<center>`: el
-                    // `text-align: -webkit-center` que le da su hoja de estilos
+                    // `text-align` centrado que le da su hoja de estilos
                     // alcanza tambien a los bloques hijos. Hacker News depende
                     // de esto.
                     if parent_of(dom_node).and_then(|p| element_info(&p)).is_some_and(|(parent, _)| parent == "center") {

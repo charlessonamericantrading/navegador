@@ -1,5 +1,12 @@
 # Arquitectura del motor — doctrina y estado real
 
+> **Diario histórico.** Cuenta cómo se llegó aquí, fase a fase. Las fases que
+> hablan de `desktop/`, `frontend/`, `backend/`, la interfaz antigua o la app de
+> escritorio antigua describen una etapa **retirada** que incumplía las reglas del
+> proyecto (`AGENTS.md`): no se toman como modelo. El estado de hoy está en
+> `engine/ESTADO.md`; la aplicación actual, en `engine/crates/app`.
+
+
 Este documento existe porque la version anterior de este codigo no lo tenia,
 y sin el, la tentacion de reescribir `rustls` a mano siempre vuelve. Tambien
 documenta el estado REAL del motor a fecha de este commit, sin adornos.
@@ -47,7 +54,7 @@ A fecha de esta limpieza, el motor:
   Simplificaciones documentadas ahi: namespaces foraneos (SVG/MathML) no
   tienen namespace correcto, `<template>` no usa un DocumentFragment inerte
   separado, doctype se ignora (sin representacion visual).
-- **Parsea CSS** con `cssparser` (el tokenizador real de Servo/Stylo): maneja
+- **Parsea CSS** con `cssparser` (un tokenizador CSS maduro de Rust): maneja
   bloques anidados, `@media` y otras arroba-reglas (se saltan sin corromper
   el resto de la hoja), strings con `{`/`}`/`;`/`:` dentro, y comentarios.
 - **Descarga `<link rel="stylesheet">`** (externo), no solo `<style>`
@@ -66,8 +73,8 @@ A fecha de esta limpieza, el motor:
   local que sirve HTML y CSS en rutas separadas. NO implementado: cache de
   hojas repetidas entre navegaciones, `@import` dentro de una hoja externa,
   precarga especulativa antes de que el HTML termine de parsear.
-- **Matchea selectores de verdad** con el crate `selectors` (el mismo motor
-  que usa Firefox/Stylo): combinadores (` `, `>`), selectores compuestos
+- **Matchea selectores de verdad** con el crate `selectors` (una biblioteca
+  madura de Rust): combinadores (` `, `>`), selectores compuestos
   (`div.foo`), selectores de atributo (`[href]`, `[type="text"]` con los 6
   operadores del spec) y especificidad real ordenada como tripleta
   (id, clase, tipo) — todo esto NO existia en el matcher anterior, que solo
@@ -556,7 +563,7 @@ A fecha de esta limpieza, el motor:
     lista principal, asi que NO queda recortado.
 - **Teclado real + foco + `checked` de checkbox/radio** (Fase 4.1): a
   diferencia de Fases anteriores, el punto de partida NO era cero -
-  `core::server` (el puente NDJSON real que usa el producto - Electron +
+  `core::server` (el puente NDJSON real que usa el producto - la app de escritorio antigua +
   `BrowserManager`, no la ventana winit de `core::main`, que sigue sin
   ninguna fuente de teclado) ya tenia `focused_node`, `type_text` (escribe
   texto real en `value`) y `press_key` (disparaba `keydown`/`keyup`) desde
@@ -925,7 +932,7 @@ A fecha de esta limpieza, el motor:
     Fase 4: `core::main`/`gfx::window` (la ventana winit nativa) NO
     ganaron esta capacidad - solo el camino NDJSON real (`core::server`)
     la tiene. El frontend React real (`frontend/`) tampoco consume este
-    protocolo todavia en absoluto - habla con un backend Python/Playwright
+    protocolo todavia en absoluto - habla con un backend Python con un navegador externo (etapa ya retirada)
     completamente distinto por WebSocket en el puerto 8000, sin ninguna
     conexion con este motor todavia. Esta fase implementa pestañas del
     LADO DEL MOTOR (protocolo +
@@ -2884,8 +2891,8 @@ A fecha de esta limpieza, el motor:
     puede permitirselo y un navegador comercial no**: su JavaScript corre
     en `boa`, un INTERPRETE sin JIT - y un JIT necesita exactamente eso que
     aqui se prohibe. Es una ventaja de seguridad real que sale de una
-    decision de diseño previa, no un extra; Chromium no puede activarla
-    porque V8 compila en caliente.
+    decision de diseño previa, no un extra; los navegadores grandes no pueden activarla
+    porque sus motores de JavaScript compilan en caliente.
   - **Prohibir procesos hijo** (`ProcessChildProcessPolicy`): casi toda
     cadena de explotacion termina lanzando `cmd.exe`/`powershell.exe`.
     `engine_server` no lanza procesos nunca, asi que prohibirlo no le
@@ -3114,7 +3121,7 @@ A fecha de esta limpieza, el motor:
   no de este motor: XHR con `GET`/`HEAD` IGNORA el cuerpo en silencio
   ("if data is not null and method is GET or HEAD, then set data to
   null"), mientras que `fetch` rechaza con `TypeError` - los dos motores
-  reales (Chrome/Firefox) tratan esas dos APIs distinto ahi, y este motor
+  reales grandes tratan esas dos APIs distinto ahi, y este motor
   ahora tambien. 4 tests nuevos en `xhr.rs` (`attach_send_body` con
   POST/GET/HEAD y con/sin `Content-Type` ya puesto, mas un `send('cuerpo')`
   de verdad que completa el ciclo hasta `DONE` sin lanzar). 632 tests en
@@ -3498,7 +3505,7 @@ A fecha de esta limpieza, el motor:
   el ancho-cero real de google.com que la motivo - re-verificado en vivo
   tras el fix, los mismos `<div>` siguen en 0px. Inspeccionando el HTML/
   CSS real de google.com se encontro que esos elementos llevan
-  `display:-webkit-box;display:-webkit-flex;display:flex` (el mismo
+  `display` con prefijos de proveedor seguido de `display:flex` (el mismo
   patron de fallback de compatibilidad que esta fase SI arregla para el
   caso simple), pero ademas hay TRES reglas `.gb_2d{...}` distintas y
   contradictorias en su hoja de estilos real (`display:none`,
@@ -3544,7 +3551,7 @@ logs que digan "verified"/"operational" sobre algo que no se ha probado.
 
 ## Doctrina de dependencias: que se escribe a mano y que no
 
-Ningun motor real — ni Servo ni Ladybird — escribe TLS, un parser HTML5
+Ningun motor real escribe TLS, un parser HTML5
 completo, o shaping de texto Unicode desde cero. Hacerlo no es una virtud;
 es un multiplicador de años que no compra nada porque esos problemas ya
 estan resueltos por crates maduros y probados en produccion.
@@ -3558,7 +3565,7 @@ estan resueltos por crates maduros y probados en produccion.
 | DNS | `hickory-dns` | Idem |
 | Parseo HTML5 | `html5ever` (integrado) | El algoritmo de recuperacion de errores del spec tiene ~800 estados |
 | Tokenizado CSS | `cssparser` (integrado) | Bloques anidados, arroba-reglas, strings — casos borde ya resueltos |
-| Selectores CSS | `selectors` (integrado) | Vienen de Servo, probados en produccion real |
+| Selectores CSS | `selectors` (integrado) | Probados en produccion real |
 | Shaping de texto | `rustybuzz` (integrado) | Ligaduras, kerning — decadas de trabajo acumulado. Arabe/devanagari sin probar todavia |
 | Fuentes | `fontdb` (integrado), `ttf-parser` (via reexport de rustybuzz) | Formatos binarios con casos límite sin fin |
 | Bidi / saltos de linea | `unicode-bidi`, `unicode-linebreak` | Es el algoritmo del estandar Unicode, no se mejora a mano |
@@ -3592,13 +3599,13 @@ Tres opciones reales, cada una con una compensacion distinta:
 - **Boa** (`boa_engine`, ya integrado en `engine-js`): Rust puro, facil de
   empotrar, pero sin JIT y con cobertura de spec incompleta. No movera con
   soltura una app React real.
-- **V8** (crate `v8` de Deno): el motor de Chrome. Rapido y completo.
-  Pesado de compilar, añade una dependencia de C++ al build.
-- **SpiderMonkey** (`mozjs`): el motor de Servo/Firefox. Compensaciones
-  similares a V8.
+- **Motores de JavaScript de otros navegadores**: rapidos y completos, pero
+  pesados de compilar, con dependencias de C++, y ajenos al proyecto: descartados
+  por las reglas (`AGENTS.md`).
 
 Decision para este proyecto: **Boa en las fases donde JS no es el foco
-(1-3)**, con **migracion planeada a V8 en la Fase 4**. El binding DOM en
+(1-3)**. La migracion a otro motor de JavaScript que se planeo queda
+descartada por las reglas del proyecto (`AGENTS.md`). El binding DOM en
 `engine-js::dom_bindings` debe quedar detras de un trait propio para que ese
 cambio, cuando llegue, no sea una reescritura del resto del motor.
 
@@ -3706,8 +3713,8 @@ bubbling/captura - pero sigue siendo casi ninguna categoria completa).
 
 ## Integracion con el producto
 
-El producto es un navegador nativo y NO incluye Chromium, Playwright ni otro
-motor de navegador externo. El renderer real debe venir del motor Rust de
+El producto es un navegador nativo y NO incluye ningun motor de navegador
+externo. El renderer real debe venir del motor Rust de
 `engine/`; no existe un fallback de navegador externo.
 
 El backend de la interfaz funciona como cliente del puente IPC Rust. Si el
@@ -3718,12 +3725,12 @@ La integracion se diseña detras de una
 interfaz comun (`BrowserBackend` — trait a definir cuando el motor tenga
 suficiente superficie para implementarlo: navegacion, arbol semantico para
 la IA, click). La interfaz debera quedar conectada unicamente al backend Rust.
-No hay un flag para activar Chromium ni una comparacion contra Playwright.
+No hay un modo que active otro navegador ni comparaciones automaticas contra uno.
 El puente ya cubre estado de página, captura PNG, hit-testing, navegación,
 clic, scroll, resize, escritura en `input`/`textarea` y eventos básicos de
 teclado. Submit de formularios, selección de texto y metadatos de tecla
 todavía no están implementados. No se deben añadir dependencias de
-Playwright ni copiar carpetas `ms-playwright` al instalador.
+automatizacion de navegadores externos.
 
 ### Protocolo IPC v1
 
@@ -3836,7 +3843,7 @@ PRODUCTO nodos x reglas, la firma de un bucle anidado.
 2. **Prefiltro por selector clave** (`css/src/stylesheet.rs::RuleKey`): cada
    regla lleva precalculado su simple-selector mas a la derecha (id, clase o
    tag), y la cascada descarta sin invocar al matcher completo. Es el mismo
-   truco que usan Chromium y Firefox. **Conservador por construccion**: ante
+   truco que usan los navegadores grandes. **Conservador por construccion**: ante
    cualquier duda (`[`, `(`, comillas, `*`, una rama no descartable de una
    lista) devuelve `Any`, que significa "pruebala igual" - por eso este
    atajo no puede perder un estilo, y esa propiedad esta cubierta por tests.
@@ -3906,8 +3913,8 @@ Anadidas (sonda 22/28 -> 26/28):
   `document.head.appendChild(style)` al arrancar para inyectar sus estilos.
 - `document.createTextNode` - el companero de `createElement` que faltaba.
 - `navigator.userAgent`/`language`/`platform`/`onLine`. El User-Agent
-  declara lo que este motor ES; no imita a Chrome a proposito: una pagina
-  que creyera estar hablando con Chrome usaria APIs que aqui no existen y
+  declara lo que este motor ES; no imita a otro navegador a proposito: una pagina
+  que creyera estar hablando con otro usaria APIs que aqui no existen y
   fallaria mas adelante y de forma mas confusa.
 - `requestAnimationFrame`/`cancelAnimationFrame` sobre la MISMA cola que
   `setTimeout(fn, 0)`. Sin sincronizacion con el refresco de pantalla y sin
@@ -3927,8 +3934,8 @@ Anadidas (sonda 22/28 -> 26/28):
 #### Otros
 
 - La captura se declaraba `data:image/jpeg` siendo PNG (`89504e47`
-  comprobado). Chromium lo decodificaba igual por olfateo de contenido - se
-  verifico en un Chrome real antes de descartarlo como causa del problema
+  comprobado). Otros navegadores lo decodificaban igual por olfateo de contenido -
+  se verifico antes de descartarlo como causa del problema
   original - pero declarar mal el tipo es falso y rompe cualquier consumidor
   mas estricto.
 - `futures-util` pasa a ser dependencia explicita de `engine-core`. Ya venia
@@ -4049,7 +4056,7 @@ El hallazgo que mas cambia el plan de trabajo: **no hay `<script type="module">`
 ni `import()`, ni `defer`/`async`**. Se creia que el techo eran las APIs del DOM
 que faltaban; es anterior a eso. Todo bundle de Vite/Next/Svelte se sirve como
 modulo, asi que ninguno puede arrancar por muchas APIs que se añadan. Es la
-tarea C9 del `plan.md` y es la que desbloquea el resto del bloque.
+tarea C9 del plan antiguo y es la que desbloquea el resto del bloque.
 
 #### Politica de lints, con motivo escrito
 
@@ -4080,7 +4087,7 @@ no sea JSON puede salir por stdout**. Un `println!` de depuracion mal puesto no
 lo veia ningun test y rompe la aplicacion entera.
 
 - Arranca el binario `engine_server` real (`env!("CARGO_BIN_EXE_engine_server")`)
-  y habla con el por tuberias, como hace Electron.
+  y habla con el por tuberias, como hace la app de escritorio antigua.
 - Sirve el HTML desde un `TcpListener` propio de 30 lineas, **sin `hyper`**
   aunque ya sea dependencia: si el test usara la misma pila HTTP que el motor,
   un fallo en esa pila podria cancelarse consigo mismo.
@@ -4101,7 +4108,7 @@ lo veia ningun test y rompe la aplicacion entera.
 
 `.github/workflows/engine.yml` (build, tests, clippy, los 24 tests estilo-WPT,
 auditoria de dependencias) y `app.yml` (tipos, build de la interfaz,
-empaquetado de Electron). Solo `windows-latest`: es la unica plataforma donde el
+empaquetado de la app de escritorio antigua). Solo `windows-latest`: es la unica plataforma donde el
 motor se ha verificado. Ambos comandos se ejecutaron en local antes de
 escribirlos, para que el CI no naciera en rojo.
 
@@ -4116,7 +4123,7 @@ decida bajar TypeScript a 5.x o aparezca soporte.
 
 ### Fase 42: Sonda de APIs medible y utilidades de plataforma (2026-09-09)
 
-Primer trabajo del bloque C del `plan.md`, el que decide si las webs modernas se
+Primer trabajo del bloque C del plan antiguo, el que decide si las webs modernas se
 ven. La regla de esta fase fue medir antes de implementar, porque la historia
 del proyecto dice que la intuicion falla aqui: la Fase 39 creia que faltaba
 medio motor de JavaScript y faltaban seis funciones sueltas.
@@ -4325,7 +4332,7 @@ heuristica hacia exactamente lo que documenta; lo poco realista era el test.
 
 ### Fase 44: Jerarquia de clases del DOM y los metodos de Element que faltaban (2026-09-09)
 
-Tareas C3 y C6 del `plan.md`. Con los modulos ES resueltos (Fase 43), el techo
+Tareas C3 y C6 del plan antiguo. Con los modulos ES resueltos (Fase 43), el techo
 pasa a ser la superficie de plataforma, y esto es el primer trozo grande de ella.
 
 Sonda de APIs: **56 -> 73 de 114**. Tests estilo-WPT: **24 -> 42**.
@@ -4381,7 +4388,7 @@ comprobacion debe medir capacidad real y no ausencia de excepcion.
 
 #### Metodos anadidos, elegidos por lo que rompen al faltar
 
-`matches` y `closest` usan el matcher REAL del crate `css` (el de Firefox), el
+`matches` y `closest` usan el matcher REAL del crate `css`, el
 mismo que la cascada: reusarlo y no escribir otro comparador es lo que garantiza
 que `el.matches('.a > .b')` responda igual que si esa regla estuviera en una
 hoja de estilos. Son la base de la delegacion de eventos, que es como funciona
@@ -4428,7 +4435,7 @@ etiqueta de un elemento no cambia nunca pero su `id` y sus clases si.
 
 ### Fase 45: Subclases de Event, entorno de `window` y el resto de `document` (2026-09-09)
 
-Tareas C4, C6 y C7 del `plan.md`. Sonda de APIs: **73 -> 85 de 114**. Tests
+Tareas C4, C6 y C7 del plan antiguo. Sonda de APIs: **73 -> 85 de 114**. Tests
 estilo-WPT: **42 -> 60**.
 
 #### Subclases de Event
@@ -4598,7 +4605,7 @@ aportaba nada.
 
 ### Fase 47: `wpt_runner` deja de aprobar documentos que no ejecuto (2026-09-23)
 
-Primera tarea del backlog del plan maestro (`plan.md`, F03 y seccion 9). El
+Primera tarea del backlog del plan maestro (el plan antiguo, F03 y seccion 9). El
 runner tiraba los resultados de script y trataba un documento sin tests como
 neutro, asi que un fixture cuyo script lanzaba antes de llegar a `test(...)`
 imprimia `0 pasaron, 0 fallaron, 0 en total` y salia con codigo 0.
@@ -4623,7 +4630,7 @@ llega como `Err` en los resultados de script).
 
 ### Fase 48: un proceso por documento en `wpt_runner`, con plazo (2026-09-23)
 
-Segunda tarea del backlog (`plan.md`, F03). El motor no tiene limite de
+Segunda tarea del backlog (el plan antiguo, F03). El motor no tiene limite de
 iteraciones en Boa, asi que un fixture con `while (true) {}` colgaba el runner
 entero y, con el, el job de CI hasta su propio timeout.
 
@@ -4658,7 +4665,7 @@ posterior sigue corriendo.
 
 ### Fase 49: la interfaz `Node` que faltaba, y el falso negativo de `append` (2026-09-23)
 
-Tercera tarea del backlog (`plan.md`, hallazgo H09). La sonda daba
+Tercera tarea del backlog (el plan antiguo, hallazgo H09). La sonda daba
 `el.append/prepend` por fallido desde la Fase 44, que lo anunciaba como
 conseguido. Reducido a un fixture minimo, `append` funcionaba
 (`children.length === 1`); lo que fallaba era la comprobacion, que lo verifica
@@ -4702,7 +4709,7 @@ Sonda: 85/114 a 86/114; el minimo del trinquete sube a 86.
 
 ### Fase 50: lo que cambia un temporizador llega solo a la interfaz (2026-09-23)
 
-Cuarta tarea del backlog (`plan.md`, hallazgo H07). El reloj de fondo de
+Cuarta tarea del backlog (el plan antiguo, hallazgo H07). El reloj de fondo de
 `run_stdio` (250 ms) disparaba los temporizadores de la pestaña activa y
 relayouteaba, pero no escribia nada en stdout: un `setTimeout` que cambiaba el
 titulo o el contenido solo se veia cuando llegaba el siguiente comando. La
@@ -4714,7 +4721,7 @@ reproduccion 11.2 del plan lo confirmaba: cero mensajes espontaneos, y un
 `tick_active_tab_timers` devuelve ahora el estado nuevo cuando disparo algun
 temporizador, y `run_stdio` lo escribe como un `state` con `id: null`. El
 protocolo no gana una variante: el `id` ya separaba respuesta de publicacion.
-Electron ya reenviaba cualquier `state` a la interfaz y la interfaz ya lo
+La app de escritorio antigua ya reenviaba cualquier `state` a la interfaz y la interfaz ya lo
 aplicaba, asi que el cambio visible no necesito tocar el frontend.
 
 Un temporizador que dispara sin cambiar nada visible (un `setInterval` de
@@ -4752,7 +4759,7 @@ llega con el titulo viejo).
 
 ### Fase 51: «Detener» detiene al agente, y rellenar ya no envía (2026-09-23)
 
-No toca el motor. Quinta tarea del backlog (`plan.md`, hallazgos H16 y H17),
+No toca el motor. Quinta tarea del backlog (el plan antiguo, hallazgos H16 y H17),
 las dos de prioridad de seguridad del agente.
 
 #### H16: detener era una bandera que nadie consultaba a tiempo
@@ -4807,7 +4814,7 @@ se muestran pero no se propagan y acciones desconocidas que acaban como
 
 ### Fase 52: un fallo del agente es un fallo, no «objetivo completado» (2026-09-23)
 
-No toca el motor. Sexta tarea del backlog (`plan.md`, hallazgo H15).
+No toca el motor. Sexta tarea del backlog (el plan antiguo, hallazgo H15).
 
 #### Cuatro caminos por los que un fallo se convertia en exito
 
@@ -4858,7 +4865,7 @@ bloque reescrito.
 
 ### Fase 53: la clave de IA sale del renderer (2026-09-23)
 
-No toca el motor. Septima tarea del backlog (`plan.md`, hallazgo H04). La
+No toca el motor. Septima tarea del backlog (el plan antiguo, hallazgo H04). La
 clave de Gemini vivia en `localStorage` de la interfaz y el renderer llamaba al
 proveedor con ella en la URL: cualquier script que corriera en esa pagina, una
 extension o un volcado del perfil la tenian a mano, y la URL con la clave podia
@@ -4879,21 +4886,21 @@ acabar en logs.
   desarrollo). La clave entra por `ai:credentials:set` y nunca sale: el
   renderer solo recibe `{configured, persisted, secureStorage}`.
 - El orquestador recibe un `ModelProvider` inyectado y ya no hace `fetch`.
-  Fuera de Electron no hay proveedor y el modo Gemini falla de forma explicita.
+  Fuera de la app de escritorio antigua no hay proveedor y el modo Gemini falla de forma explicita.
 
 #### Migracion
 
 Al abrir el panel, si `localStorage` todavia tiene `gemini_api_key`, se entrega
-al proceso principal y se borra en cuanto este confirma. Fuera de Electron se
+al proceso principal y se borra en cuanto este confirma. Fuera de la app de escritorio antigua se
 borra sin migrar: dejarla ahi es justo lo que esta fase elimina.
 
 #### Verificacion
 
 Once tests del proceso principal (`desktop`, `npm test`, con `safeStorage` y
 `fetch` inyectados) y los del orquestador portados a un modelo falso (12). El
-almacen se probo ademas con el `safeStorage` real de Electron en Windows
+almacen se probo ademas con el almacen cifrado real de la app antigua en Windows
 (DPAPI): se guarda cifrado, se recupera tras recrear el almacen y se borra.
-`electron-builder` lista sus ficheros a mano, asi que los dos modulos nuevos se
+el empaquetador de la app antigua lista sus ficheros a mano, asi que los dos modulos nuevos se
 anadieron a `build.files`; sin eso el instalador habria arrancado sin ellos.
 
 #### Limitaciones declaradas
@@ -4908,8 +4915,8 @@ anadieron a `build.files`; sin eso el instalador habria arrancado sin ellos.
 
 ### Fase 54: la frontera interfaz-motor valida, limita y no se sale de su carpeta (2026-09-23)
 
-Novena tarea del backlog (`plan.md`, F04: hallazgos H05, H06 y H21). Toca las
-dos puntas del canal: el proceso principal de Electron y `run_stdio`.
+Novena tarea del backlog (el plan antiguo, F04: hallazgos H05, H06 y H21). Toca las
+dos puntas del canal: el proceso principal de la app de escritorio antigua y `run_stdio`.
 
 #### H05: cualquier cosa llegaba al motor
 
@@ -4924,7 +4931,7 @@ principal. Maximo 64 peticiones pendientes a la vez.
 
 #### H06: buffers sin limite en las dos puntas
 
-- **Electron**: el stdout del motor se acumulaba en una cadena sin tope y se
+- **La app de escritorio antigua**: el stdout del motor se acumulaba en una cadena sin tope y se
   decodificaba trozo a trozo con `chunk.toString()`, que rompe un caracter
   UTF-8 partido entre dos trozos (las lineas `state` son enormes por la
   captura, asi que los cortes son frecuentes). `createLineSplitter` usa
@@ -4947,7 +4954,7 @@ ni decodificaba `%20`, y la URL `file:` se construia concatenando. Ahora
 normaliza el propio parser de URL dentro de la raiz; lo que no normaliza
 (separadores codificados `%2F`/`%5C`, rutas absolutas, `%00`, codificacion
 rota) se rechaza. No se habia demostrado un recorrido explotable con la version
-anterior: Chromium ya normaliza la URL de un esquema estandar antes del
+anterior: los navegadores grandes ya normalizan la URL de un esquema estandar antes del
 manejador. La comprobacion nueva no depende de eso.
 
 #### Verificacion
@@ -4969,12 +4976,12 @@ sin CSP de la aplicacion y con Google Fonts todavia en el arranque.
 
 ### Fase 55: el lint de la interfaz llega a cero (2026-09-23)
 
-No toca el motor. Decima tarea del backlog (`plan.md`, F01, hallazgo H20).
+No toca el motor. Decima tarea del backlog (el plan antiguo, F01, hallazgo H20).
 Cierra lo que la Fase 46 dejo como trinquete: 14 hallazgos que quedaban (de
 20; las Fases 51 a 53 ya habian retirado seis). Se arreglaron por grupos,
 porque varios cambian cuando se ejecuta el codigo y no son cosmeticos.
 
-- **Tipado del protocolo** (4 `any`): `electron.d.ts` describe las respuestas
+- **Tipado del protocolo** (4 `any`): el fichero de tipos de la interfaz antigua describe las respuestas
   del motor como union discriminada por `type` (`state`/`ready`, `tabs`,
   `error`, el resto) y `sendEngineRequest` deja de ser `any -> any`.
 - **Refs leidas o escritas durante el render** (5): las refs «siempre al dia»
@@ -5011,18 +5018,18 @@ DevTools:
 
 ### Fase 56: construir el navegador ya no exige Python (2026-09-23)
 
-No toca el motor. Undecima tarea del backlog (`plan.md`, F01, hallazgo H18).
-Electron solo arranca el backend FastAPI con `USE_PYTHON_BACKEND=true`, pero
+No toca el motor. Undecima tarea del backlog (el plan antiguo, F01, hallazgo H18).
+La app de escritorio antigua solo arranca el backend FastAPI con `USE_PYTHON_BACKEND=true`, pero
 `npm run build:app` exigia un `.venv` y PyInstaller, e `instalar.bat` y
 `instalar.sh` se negaban a seguir sin Python.
 
 #### Lo que cambia
 
-- `npm run build:app` compila interfaz, motor (`--locked`) y Electron. El
+- `npm run build:app` compila interfaz, motor (`--locked`) y la app de escritorio antigua. El
   backend solo entra con `--with-python-backend` (`npm run build:app:python`),
   que lo anade a `extraResources` desde el script; ya no figura fijo en
   `desktop/package.json` y el CI deja de crear su carpeta vacia.
-- `npm run install:all` instala interfaz y Electron **y compila el motor**
+- `npm run install:all` instala interfaz y la app de escritorio antigua **y compila el motor**
   (`build:engine`). Antes no lo compilaba y `npm run start` abria una ventana
   sin navegador. Los instaladores `.bat`/`.sh` exigen Rust en vez de Python.
 - El nombre del instalador sale de la version del manifiesto; antes se buscaba
@@ -5031,7 +5038,7 @@ Electron solo arranca el backend FastAPI con `USE_PYTHON_BACKEND=true`, pero
 
 #### El fallo que aparecio por el camino
 
-La primera version pasaba a la API de `electron-builder` la configuracion
+La primera version pasaba a la API de el empaquetador de la app antigua la configuracion
 entera de `package.json` con el backend anadido. El build fallaba siempre con
 `EBUSY` al copiar el motor. Causa, leida en `app-builder-lib`: aunque se le
 pase `config`, lee igualmente el campo `build` y le fusiona el objeto con
@@ -5051,8 +5058,8 @@ pasa solo el delta (la entrada del backend).
 
 ### Fase 57: el CI prueba el paquete que se distribuye, con el motor dentro (2026-09-23)
 
-Duodecima tarea del backlog (`plan.md`, hallazgo H19). El job `desktop` del CI
-empaquetaba con `build-resources/engine` vacia para que `electron-builder` no
+Duodecima tarea del backlog (el plan antiguo, hallazgo H19). El job `desktop` del CI
+empaquetaba con `build-resources/engine` vacia para que el empaquetador de la app antigua no
 abortara: el paquete se generaba, la puerta se ponia en verde y la aplicacion
 no tenia navegador. Nadie lo comprobaba.
 
@@ -5086,7 +5093,7 @@ secuencia se reprodujo en local (Windows) con el mismo resultado, 6/6.
 
 ### Fase 58: modelo de amenazas, ADR del broker y supervisor de renderers (2026-09-23)
 
-Decimotercera tarea del backlog (`plan.md`, F06, hallazgos H01 y H23).
+Decimotercera tarea del backlog (el plan antiguo, F06, hallazgos H01 y H23).
 
 #### Documentos
 
@@ -5130,7 +5137,7 @@ experimento no se salte.
 
 ### Fase 59: corpus de tareas y linea base de medicion (2026-09-23)
 
-Decimocuarta y ultima tarea del backlog inicial (`plan.md`, F25 y F39).
+Decimocuarta y ultima tarea del backlog inicial (el plan antiguo, F25 y F39).
 
 #### Perfil redirigible
 
@@ -5242,7 +5249,7 @@ actual.
 
 ### Fase 62: Boa 0.19 a 0.22 (2026-09-23)
 
-Tarea 8 del backlog, la parte que quedaba (`plan.md`, F02, hallazgo H02). Boa
+Tarea 8 del backlog, la parte que quedaba (el plan antiguo, F02, hallazgo H02). Boa
 0.19 arrastraba `fast-float` 0.2.0 con dos avisos de seguridad reales
 (RUSTSEC-2025-0003, fallo de segmentación por falta de comprobación de
 límites; RUSTSEC-2024-0379), alcanzables por el JavaScript de cualquier
@@ -5339,10 +5346,10 @@ y los sirve a los renderers por un canal local. Un `engine_server` arrancado con
 
 #### Decisiones
 
-- **Canal directo renderer ↔ broker, no reenviado por Electron.**
+- **Canal directo renderer ↔ broker, no reenviado por la app de escritorio antigua.**
   `localStorage.getItem` y `document.cookie` son síncronos en JavaScript: el
   hilo de la página espera la respuesta. Pasar cada lectura por el bucle de
-  eventos del proceso principal de Electron, que además pinta la interfaz,
+  eventos del proceso principal de la app de escritorio antigua, que además pinta la interfaz,
   metería su latencia en cada una. El canal es una tubería con nombre en
   Windows y un socket Unix (`0600`) en el resto: locales por construcción.
 - **Autenticación por token de un solo uso.** El supervisor registra cada
@@ -5392,7 +5399,7 @@ y los sirve a los renderers por un canal local. Un `engine_server` arrancado con
 - **No hay regla de origen.** El broker sabe qué renderer pide cada cosa, pero
   todavía no comprueba que el origen pedido sea el del documento de ese
   renderer. Es la Fase siguiente.
-- **Electron no lo usa aún.** El supervisor de la Fase 58 no arranca el
+- **La app de escritorio antigua no lo usa aún.** El supervisor de la Fase 58 no arranca el
   broker, y el empaquetado no incluye `engine_broker`.
 - **No es una sandbox.** El renderer no usa su red ni su disco porque no
   quiere, no porque no pueda: restringir su token es el paso de F07.
@@ -5440,11 +5447,11 @@ olvida.
   cada motor navega de verdad a su página.
 - 931 tests, clippy limpio.
 
-### Fase 67: Electron arranca el broker; el producto lo usa (2026-09-23)
+### Fase 67: La app de escritorio antigua arranca el broker; el producto lo usa (2026-09-23)
 
 Hasta aquí el broker existía y estaba probado, pero la aplicación seguía
 arrancando un `engine_server` con su propia red. Ahora el proceso principal de
-Electron:
+La app de escritorio antigua:
 
 1. Arranca `engine_broker` y espera su `ready` con el canal.
 2. Registra al motor (`main`) y recibe su token.

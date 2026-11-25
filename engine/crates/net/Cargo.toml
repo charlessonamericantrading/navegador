@@ -25,7 +25,7 @@ serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
 # Decodificacion de texto segun el charset (tarea 1.6 del plan): ISO-8859-1,
-# Windows-1252, Shift_JIS, GBK, KOI8-R... Es la misma biblioteca que usa Firefox;
+# Windows-1252, Shift_JIS, GBK, KOI8-R... Es una biblioteca madura y muy probada;
 # cada codificacion heredada tiene sus propios casos borde y no se reimplementa.
 encoding_rs = "0.8"
 psl.workspace = true

@@ -11,7 +11,7 @@ use std::sync::Arc;
 const INITIAL_COLOR: [u8; 4] = [0, 0, 0, 255];
 pub const INITIAL_FONT_SIZE: f32 = 16.0;
 /// Gris real de un `::placeholder` sin estilo de autor (Fase 34) - el mismo
-/// tono que usan Chrome/Firefox por defecto, para que un placeholder se
+/// tono que usan los navegadores grandes por defecto, para que un placeholder se
 /// distinga visualmente de un `value` real sin depender del `color` propio
 /// del control (que un placeholder, a diferencia de un valor, no hereda).
 const PLACEHOLDER_COLOR: [u8; 4] = [117, 117, 117, 255];

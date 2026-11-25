@@ -2,7 +2,7 @@
 //!
 //! # Lo que esto ES y lo que NO ES
 //!
-//! **NO es un sandbox.** Un sandbox de verdad (el de Chromium) separa el
+//! **NO es un sandbox.** Un sandbox de verdad (el de los navegadores grandes) separa el
 //! proceso que interpreta contenido hostil del que tiene permisos: el
 //! renderizador corre con un token restringido que no puede leer los
 //! ficheros del usuario, y un proceso "broker" hace por el las operaciones

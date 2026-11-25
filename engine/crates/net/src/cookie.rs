@@ -28,7 +28,7 @@
 //!
 //! - **Lista de sufijos publicos (PSL)**: un `Domain=co.uk`/`Domain=com`
 //!   (el sufijo entero, no un dominio bajo el) se rechaza via el crate
-//!   `psl` (tabla de Mozilla embebida, sin red) - sin esto, un sitio
+//!   `psl` (Public Suffix List embebida, sin red) - sin esto, un sitio
 //!   alojado bajo un sufijo publico podria poner una cookie valida para
 //!   CUALQUIER OTRO sitio bajo ese mismo sufijo.
 //!
@@ -65,7 +65,7 @@
 //!   SETTER de `document.cookie`) usa la misma gramatica de atributos que
 //!   un `Set-Cookie` real pero IGNORA `HttpOnly` si el script la escribe -
 //!   un script no puede crear una cookie a la que el mismo no pueda acceder
-//!   despues, igual que un navegador real (Chrome/Firefox no rechazan la
+//!   despues, igual que un navegador real (los navegadores grandes no rechazan la
 //!   cookie entera, simplemente no la marcan `HttpOnly`).
 //! - **SI persiste a disco** (misma tecnica que `WebStorage` en
 //!   `engine-net::storage`, ver su aviso): `CookieStore::load_from_disk`

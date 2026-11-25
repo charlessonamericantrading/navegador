@@ -1,5 +1,5 @@
 //! Un bundle moderno, servido como lo sirve un bundler de verdad, se ejecuta y
-//! pinta su contenido (tarea C9 del `plan.md`).
+//! pinta su contenido (tarea C9 del plan antiguo).
 //!
 //! **Qué prueba esto que no probaba nada más.** Todos los tests anteriores del
 //! motor cargan HTML que ya trae su contenido escrito. Este carga lo contrario:

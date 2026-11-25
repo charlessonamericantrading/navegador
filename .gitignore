@@ -1,21 +1,9 @@
-# Dependencies
-node_modules/
-
-# Python
-.venv/
+# Python (scripts de desarrollo)
 __pycache__/
 *.pyc
-*.pyo
 
-# Build output / generated artifacts
-backend/dist/
-backend/build/
-backend/backend-server.spec
-/backend-server.spec
-frontend/dist/
-desktop/dist/
-desktop/build-resources/
-engine/target/
+# Compilación
+engine/target
 *.exe
 
 # Local Claude Code runtime state (not shareable across machines/sessions)

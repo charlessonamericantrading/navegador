@@ -1,5 +1,5 @@
 //! Adaptador `selectors::Element`: conecta el arbol de matching generico del
-//! crate `selectors` (el mismo que usa Firefox/Stylo) con nuestro `Node`.
+//! crate `selectors` con nuestro `Node`.
 //!
 //! El trait `Element` exige ~26 metodos. Bastantes de los nuestros son `false`
 //! / `None` honestos, no fingidos: no hay shadow DOM, ni partes (`::part`),

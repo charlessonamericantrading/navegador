@@ -30,23 +30,7 @@ pub fn run_engine_process() -> Result<(), Box<dyn std::error::Error>> {
     let mitigations = crate::sandbox::apply_process_mitigations();
     eprintln!("[engine] {}", mitigations.summary());
 
-    // Los `tracing::info!/warn!` que el motor lleva sembrados por todo el
-    // pipeline no se emitian a ninguna parte: sin suscriptor instalado,
-    // `tracing` los descarta en silencio. Eso dejaba invisibles avisos que
-    // SI importan ("no se pudo descargar X, se omite") y hacia imposible
-    // medir en que fase se va el tiempo de una carga.
-    //
-    // El destino es STDERR obligatoriamente: stdout es el canal NDJSON y
-    // una sola linea que no sea JSON rompe el protocolo con el backend.
-    // Por defecto solo `warn` hacia arriba, para no llenar la consola en
-    // uso normal; `RUST_LOG=info` activa los tiempos por fase.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
+    init_tracing();
 
     let stack_mb = std::env::var("NAVEGADOR_IA_ENGINE_STACK_MB")
         .ok()
@@ -67,4 +51,39 @@ pub fn run_engine_process() -> Result<(), Box<dyn std::error::Error>> {
         Ok(result) => Ok(result?),
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+/// Variables con las que el motor encuentra al broker (ver
+/// `engine_net::broker_remote::from_env`).
+pub use engine_net::broker_remote::{BROKER_ENDPOINT_ENV, BROKER_TOKEN_ENV};
+
+/// El proceso broker: la red, las cookies y el almacenamiento, aparte del
+/// proceso que interpreta las páginas (ADR 0001). Anuncia su canal por stdout
+/// (`{"type":"ready","endpoint":...}`), reparte tokens a quien lo supervisa
+/// (`register`) y termina cuando su stdin se cierra.
+pub fn run_broker_process() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(engine_net::broker_server::run_stdio(engine_net::LocalBroker::persistent()))?;
+    Ok(())
+}
+
+fn init_tracing() {
+    // Los `tracing::info!/warn!` que el motor lleva sembrados por todo el
+    // pipeline no se emitian a ninguna parte: sin suscriptor instalado,
+    // `tracing` los descarta en silencio. Eso dejaba invisibles avisos que
+    // SI importan ("no se pudo descargar X, se omite") y hacia imposible
+    // medir en que fase se va el tiempo de una carga.
+    //
+    // El destino es STDERR obligatoriamente: stdout es el canal NDJSON y
+    // una sola linea que no sea JSON rompe el protocolo con el backend.
+    // Por defecto solo `warn` hacia arriba, para no llenar la consola en
+    // uso normal; `RUST_LOG=info` activa los tiempos por fase.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
 }

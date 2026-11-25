@@ -1,7 +1,7 @@
 # Puerta de calidad del motor Rust.
 #
 # Lo que esta puerta garantiza (y por tanto lo que NO hace falta comprobar a
-# mano antes de fusionar): que el workspace compila, que los 805 tests pasan,
+# mano antes de fusionar): que el workspace compila, que todos los tests pasan,
 # que `clippy` no tiene ni un aviso, y que los tests estilo-WPT siguen en verde.
 #
 # Lo que deliberadamente NO se exige aqui es `cargo fmt --check`. El motor
@@ -120,18 +120,25 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
-      - name: Compilar el motor (release)
+      - name: Compilar el motor y la app (release)
         working-directory: engine
-        run: cargo build --release --locked -p engine-core --bin engine_server
+        run: cargo build --release --locked -p engine-core --bin engine_server -p navegador
       - name: Banco de los fixtures
         run: python3 scripts/dev/bench_all.py --only fixture-css --only fixture-js
+      # La app entera (broker + motor + barra pintada por el motor) sin
+      # pantalla: abre el fixture CSS y guarda la ventana en un PNG.
+      - name: Prueba de humo de la app
+        run: |
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory engine/tests &
+          sleep 1
+          engine/target/release/navegador --captura app.png http://127.0.0.1:8765/css-basics-fixture.html | tee app.txt
+          grep -q "CSS basico" app.txt
 
   # Auditoria de dependencias (tarea F7 del plan). Va en un job aparte para
   # que un aviso de seguridad recien publicado no oculte un fallo de tests:
   # son dos senales distintas y se leen por separado.
   #
-  # Funciona como TRINQUETE, igual que el lint de la interfaz y la sonda de
-  # APIs del motor: los avisos ya conocidos se listan abajo con su motivo, y
+  # Funciona como TRINQUETE, igual que la sonda de APIs del motor: los avisos ya conocidos se listan abajo con su motivo, y
   # cualquiera NUEVO tumba el job. Lo que no se hace es apagar la puerta.
   audit:
     runs-on: ubuntu-latest
@@ -148,7 +155,7 @@ jobs:
           working-directory: engine
           # Avisos conocidos el 2026-09-09. Cada uno con su razon: ninguno se
           # silencia sin explicar por que. Estan anotados como deuda en
-          # `engine/huecos_sin_resolver.md` y como tarea en `plan.md`.
+          # `engine/huecos_sin_resolver.md`.
           #
           # RUSTSEC-2025-0003 y RUSTSEC-2024-0379 (`fast-float`) YA NO estan:
           #   llegaban por Boa 0.19 y desaparecieron con la migracion a Boa 0.22

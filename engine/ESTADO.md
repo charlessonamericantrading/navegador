@@ -32,7 +32,9 @@ cargo run --release -p navegador -- --captura v.png news.ycombinator.com   # sin
 ```
 
 - **Ventana** nativa (`winit` + `softbuffer`). El motor corre en otro proceso
-  (`navegador --motor`): si una página lo tumba, la ventana sigue.
+  (`navegador --motor`): si una página lo tumba, la ventana sigue. La red, las
+  cookies y el almacenamiento van en un tercero (`navegador --broker`), al que
+  el motor se presenta con un token de un solo uso.
 - **La barra la pinta nuestro motor:** pestañas, atrás/adelante, recargar/detener
   y la barra de direcciones son HTML/CSS que pasa por el mismo motor que las
   páginas (`engine/crates/app/src/barra.rs`). Los iconos son SVG.
@@ -42,7 +44,7 @@ cargo run --release -p navegador -- --captura v.png news.ycombinator.com   # sin
   Escape (detener). Rueda, Av Pág/Re Pág, espacio y flechas desplazan.
 - **Páginas propias:** inicio (con accesos) y error (con «Reintentar»),
   también pintadas por el motor.
-- **Pruebas:** 33 de la lógica y una de extremo a extremo con el motor real
+- **Pruebas:** 32 de la lógica y una de extremo a extremo con el motor real
   (`engine/crates/app/tests/extremo_a_extremo.rs`): escribe una dirección,
   pulsa un enlace, vuelve atrás, rellena un formulario, abre y cierra una
   pestaña y comprueba la página de error. Sin ningún navegador externo.
@@ -132,8 +134,6 @@ pantallas con escala (125 %, 200 %) la imagen se amplía (se ve algo borrosa).
    la máquina: el CI corre en Windows y los anchos y alturas cambian. Medir con
    la fuente en el propio test.
 2. Antes de subir: `cargo test --workspace --locked`, `cargo clippy ... -D warnings`
-   y el `wpt_runner`. Mientras `desktop/` y `frontend/` sigan en el repositorio,
-   su CI tiene que seguir en verde (pero no se les añade nada).
+   y el `wpt_runner`.
 3. La aplicación es 100 % Rust (reglas en `AGENTS.md`) y vive en
-   `engine/crates/app`. Nada se añade a `desktop/`, `frontend/` ni `backend/`,
-   que se retiran en la Fase 5 del plan.
+   `engine/crates/app`.

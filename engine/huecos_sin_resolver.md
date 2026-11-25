@@ -10,7 +10,7 @@ lo que sigue abierto y solo eso.
 
 **Cómo se mantiene.** Al cerrar un hueco: se borra de aquí y se documenta la fase
 en `ARCHITECTURE.md`. Al declarar una simplificación nueva en una fase: se añade
-aquí. Los identificadores entre corchetes remiten a las tareas de `../plan.md`.
+aquí. Los identificadores entre corchetes remiten a las tareas del plan antiguo (en el historial de git).
 
 **Última verificación contra el código: 2026-09-09** (actualizado tras la Fase 42). Cada entrada de este fichero
 se comprobó con `grep` sobre `engine/crates/*/src` en esa fecha, no se copió de
@@ -296,7 +296,7 @@ re-renderizando en cada pulsación es inutilizable. Falta invalidación por sub�
   (`RUSTSEC-2024-0436`). Las dos primeras son las piezas de tipografía del
   motor y no hay sustituto equivalente hoy; `paste` es una macro que no llega
   al binario.
-- `cargo deny` y `npm audit` siguen sin estar en CI `[plan F7]`.
+- `cargo deny` sigue sin estar en CI `[plan F7]`.
 
 ---
 

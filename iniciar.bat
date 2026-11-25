@@ -1,5 +1,9 @@
 @echo off
-title Iniciar Navegador para Agentes de IA
+title Navegador
 cd /d "%~dp0"
-echo Iniciando aplicacion...
-call npm start
+if not exist "engine\target\release\navegador.exe" (
+    echo Primero ejecuta instalar.bat
+    pause
+    exit /b 1
+)
+start "" "engine\target\release\navegador.exe" %*

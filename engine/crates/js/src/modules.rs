@@ -1,5 +1,5 @@
 //! Soporte de módulos ES: `<script type="module">` y sus `import` (tarea C9
-//! del `plan.md`, primera mitad).
+//! del plan antiguo, primera mitad).
 //!
 //! **Por qué esto es la tarea que desbloquea el bloque C.** Al verificar los
 //! huecos contra el código (Fase 41) se vio que el techo del motor no eran las

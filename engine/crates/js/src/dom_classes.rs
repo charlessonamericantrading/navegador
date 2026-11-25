@@ -1,5 +1,5 @@
 //! La jerarquía de clases del DOM: `EventTarget` → `Node` → `Element` →
-//! `HTMLElement` → `HTMLDivElement`… (tarea C3 del `plan.md`).
+//! `HTMLElement` → `HTMLDivElement`… (tarea C3 del plan antiguo).
 //!
 //! **Qué gana una página con esto, medido y no supuesto.** Antes, cada objeto
 //! de elemento era un objeto suelto sin ninguna cadena de prototipos, así que

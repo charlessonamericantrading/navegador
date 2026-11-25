@@ -245,7 +245,7 @@ impl Motor {
     ///
     /// Desde la Fase 50 el motor publica estados por su cuenta (`id: null`)
     /// cuando un temporizador cambia la pagina, y uno puede llegar entre la
-    /// peticion y su respuesta. Se saltan, igual que hace Electron al
+    /// peticion y su respuesta. Se saltan, igual que hace la ventana (`navegador`) al
     /// correlacionar por `id`; una peticion sin `id` se queda con la primera
     /// linea, que es lo que puede esperar de verdad.
     pub fn pedir(&mut self, peticion: Value) -> Value {

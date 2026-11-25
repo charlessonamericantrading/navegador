@@ -150,7 +150,7 @@ fn navigate_y_get_state_devuelven_la_pagina_real() {
 
     // La captura viaja en Base64 y debe ser PNG. Se comprueba la firma real
     // del formato porque la Fase 39 encontro justo lo contrario: se declaraba
-    // JPEG siendo PNG, y nadie se dio cuenta porque Chromium lo adivinaba.
+    // JPEG siendo PNG, y nadie se dio cuenta porque otros navegadores lo adivinaban.
     let captura = r["screenshot"].as_str().unwrap();
     assert!(!captura.is_empty(), "la captura no puede venir vacia");
     let bytes = decodificar_base64(captura);
@@ -590,7 +590,7 @@ fn shutdown_responde_y_despues_cierra_el_proceso() {
     );
 
     // Y despues de responder, stdout debe cerrarse: es la senal por la que el
-    // proceso padre (Electron) sabe que puede dejar de esperar.
+    // proceso padre (la ventana) sabe que puede dejar de esperar.
     let mut resto = String::new();
     motor
         .salida

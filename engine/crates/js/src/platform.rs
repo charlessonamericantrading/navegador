@@ -1,6 +1,6 @@
 //! Utilidades de plataforma que no son DOM ni red: `console`, `URL`,
 //! `URLSearchParams`, `performance`, `atob`/`btoa` y `TextEncoder`/
-//! `TextDecoder` (tarea C5 del `plan.md`).
+//! `TextDecoder` (tarea C5 del plan antiguo).
 //!
 //! **Por que estas y no otras.** La sonda `engine/tests/probes/api-probe.html`
 //! midio 48 de 114 el 2026-09-09. De lo que faltaba, estas son las que mas
