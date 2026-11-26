@@ -163,7 +163,11 @@ pub fn pistas(directas: &[PruebaDirecta], motor: &[PruebaMotor]) -> Vec<String> 
     if hay("notvalidyet") || hay("expired") {
         p.push("Un certificado aparece como caducado o aún no válido. Revisa que la fecha, la hora y la zona horaria del equipo sean correctas.".to_string());
     }
-    let desfase_grande = directas.iter().any(|d| matches!(&d.http, Ok((_, _, Some(s))) if s.abs() > DESFASE_AVISO_S));
+    // Se mira la mediana de todos los servidores: uno solo con la hora rara (una caché
+    // vieja, un servidor mal puesto) no significa que el reloj del equipo esté mal.
+    let mut desfases: Vec<i64> = directas.iter().filter_map(|d| d.http.as_ref().ok().and_then(|(_, _, s)| *s)).collect();
+    desfases.sort_unstable();
+    let desfase_grande = desfases.get(desfases.len() / 2).is_some_and(|mediana| mediana.abs() > DESFASE_AVISO_S);
     if desfase_grande {
         p.push("La hora del equipo se desvía más de 5 minutos de la del servidor: corrígela (fecha y hora automáticas).".to_string());
     }
@@ -254,7 +258,11 @@ fn peticion(url: &str) -> Result<(u16, u128, Option<i64>), String> {
     let t0 = Instant::now();
     let respuesta = runtime.block_on(async { NetworkEngine::new().with_request_timeout(ESPERA_HTTP).fetch(&pedido).await }).map_err(|e| e.to_string())?;
     let ahora = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    let desfase = respuesta.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("date")).and_then(|(_, v)| unix_de_fecha_http(v)).map(|servidor| servidor - ahora);
+    let cabecera = |nombre: &str| respuesta.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(nombre)).map(|(_, v)| v.as_str());
+    // Una respuesta que salió de una caché trae la hora en que se guardó: hay que
+    // sumarle su edad (`Age`) para saber qué hora era de verdad en el servidor.
+    let edad = cabecera("age").and_then(|a| a.trim().parse::<i64>().ok()).unwrap_or(0);
+    let desfase = cabecera("date").and_then(unix_de_fecha_http).map(|servidor| servidor + edad - ahora);
     Ok((respuesta.status_code, t0.elapsed().as_millis(), desfase))
 }
 
@@ -407,6 +415,25 @@ mod tests {
         assert!(pistas(&d, &[]).join(" ").contains("5 minutos"));
         let d = [directa("http://example.com/", Ok(()), Some(Ok(())), Ok((200, Some(-20))))];
         assert!(!pistas(&d, &[]).join(" ").contains("5 minutos"));
+        // Todos los servidores coinciden en que el reloj va adelantado: aviso.
+        let todos = [
+            directa("https://a.com/", Ok(()), Some(Ok(())), Ok((200, Some(-4000)))),
+            directa("https://b.com/", Ok(()), Some(Ok(())), Ok((200, Some(-3990)))),
+            directa("https://c.com/", Ok(()), Some(Ok(())), Ok((200, Some(-4010)))),
+        ];
+        assert!(pistas(&todos, &[]).join(" ").contains("5 minutos"));
+    }
+
+    #[test]
+    fn un_servidor_con_la_hora_rara_no_acusa_al_reloj_del_equipo() {
+        // Caso real: una respuesta de Wikipedia salida de una caché, 10 horas vieja,
+        // frente a otros dos servidores que coinciden con el equipo.
+        let d = [
+            directa("https://example.com/", Ok(()), Some(Ok(())), Ok((200, Some(0)))),
+            directa("https://es.wikipedia.org/", Ok(()), Some(Ok(())), Ok((200, Some(-35_096)))),
+            directa("https://www.google.com/", Ok(()), Some(Ok(())), Ok((200, Some(1)))),
+        ];
+        assert!(!pistas(&d, &[]).join(" ").contains("5 minutos"), "{:?}", pistas(&d, &[]));
     }
 
     #[test]
