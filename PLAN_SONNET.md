@@ -547,6 +547,10 @@ basado en tecnología web. La etapa anterior (`desktop/`, `frontend/`,
   (`navegador --broker`): si una página tumba el motor, la ventana sigue.
 - **Hecho:** abre páginas reales; `navegador --captura v.png <url>` guarda la
   ventana entera sin pantalla.
+- **Añadido después en el PR #3 (`cd3a348`):** en Windows el motor se lanza
+  aislado (token de integridad baja, escritorio oculto, *Job Object*), con una
+  prueba de aislamiento (`engine/crates/core/tests/sandbox_isolation.rs`). En
+  Linux y macOS todavía no hay sandbox.
 
 ### [x] 5.2 Barra del navegador en Rust
 
@@ -562,9 +566,13 @@ basado en tecnología web. La etapa anterior (`desktop/`, `frontend/`,
 
 - Clic, rueda (una sola petición de scroll en vuelo), teclas al campo
   enfocado, Av Pág/Re Pág/espacio/flechas, atajos (Ctrl+L/T/W/Tab/R, F5,
-  Alt+←/→, Escape). Pantallas con escala: la imagen se amplía (pendiente:
-  pintar a la escala real para que el texto se vea nítido).
+  Alt+←/→, Escape).
 - **Hecho:** probado en una ventana real con ratón y teclado virtuales.
+- **Ampliado después en el PR #3** (commits `f23f571` y `cd3a348`, según
+  `engine/ESTADO.md`): pantallas con escala (HiDPI) a la escala real,
+  portapapeles del sistema (Ctrl+C/X/V/A), Tab entre campos, selección con
+  ratón, cursor del ratón dinámico, `:hover`/`:focus`, historial, marcadores y
+  pestañas reordenables. CI en verde con todo ello (2026-11-26).
 
 ### [ ] 5.4 Agente IA en Rust
 
@@ -576,9 +584,14 @@ basado en tecnología web. La etapa anterior (`desktop/`, `frontend/`,
 - Mismo bucle que hoy: `get_page_text`, `elements`, `click_element`,
   `type_into_element`, `scroll`, `back`. Portar los tests del orquestador.
 
-### [ ] 5.5 Instalador en Rust
+### [~] 5.5 Instalador en Rust
 
-- `cargo-wix` (Windows) / `cargo-bundle`. Firma de código igual que hoy.
+- **Hecho (PR #3, commit `cd3a348`):** instalador y desinstalador en Rust
+  (`engine/crates/app/src/bin/instalador.rs`): accesos `.lnk` y Registro de
+  usuario en Windows; se empaqueta con `scripts/release/empaquetar_windows.ps1`.
+  Sus tests (3) pasan en el CI.
+- **Falta:** firma de código, y probarlo a mano en un Windows real (nadie lo ha
+  hecho todavía). En Linux y macOS solo se compila con `instalar.sh`.
 
 ### [x] 5.6 Retirar lo antiguo
 
@@ -630,7 +643,7 @@ workflows que ya existen en el PR #1.
 
 No aportan a que una página se vea bien hoy:
 
-- Broker de procesos, sandbox y aislamiento (fases 64–67 del PR #1).
+- Broker de procesos, sandbox y aislamiento (fases 64–67 del PR #1). *(El broker y el sandbox de Windows ya existen; ver 5.1. Queda fuera el sandbox por pestaña y el de Linux/macOS.)*
 - WPT oficial y Test262.
 - Workers, WebGL, audio, vídeo, extensiones, sincronización y móvil.
 
