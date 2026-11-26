@@ -1,0 +1,19 @@
+<!doctype html><html><head><meta charset="utf-8"><title>PENDIENTE</title>
+<script>
+function ok(cond, motivo) { document.title = cond ? 'OK' : 'FALLO: ' + motivo; }
+function fallo(e) { document.title = 'FALLO: ' + (e && e.message ? e.message : String(e)); }
+</script></head><body>
+<ul id="lista"></ul>
+<script>
+try {
+  var lista = document.getElementById('lista');
+  for (var i = 0; i < 200; i++) {
+    var li = document.createElement('li');
+    li.className = 'item';
+    li.textContent = 'Elemento ' + i;
+    lista.appendChild(li);
+  }
+  ok(lista.children.length === 200 && document.querySelectorAll('.item').length === 200, 'se esperaban 200 elementos');
+} catch (e) { fallo(e); }
+</script>
+</body></html>

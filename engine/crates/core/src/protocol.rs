@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+fn default_scale() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EngineRequest {
@@ -23,6 +27,8 @@ pub enum EngineRequest {
         id: Option<String>,
         width: u32,
         height: u32,
+        #[serde(default = "default_scale")]
+        scale: f32,
     },
     GetState {
         id: Option<String>,
@@ -47,6 +53,51 @@ pub enum EngineRequest {
     PressKey {
         id: Option<String>,
         key: String,
+    },
+    /// Mueve el puntero por la pagina para activar `:hover`.
+    Hover {
+        id: Option<String>,
+        x: f32,
+        y: f32,
+    },
+    /// Selecciona texto arrastrando entre dos coordenadas de viewport.
+    SelectText {
+        id: Option<String>,
+        from_x: f32,
+        from_y: f32,
+        to_x: f32,
+        to_y: f32,
+    },
+    /// Clic en un elemento de la lista `elements` por su `id` (tarea 3.1 del
+    /// plan). Las coordenadas de `elements[].rect` son del DOCUMENTO, y
+    /// `click` espera coordenadas de VIEWPORT: tras un scroll no coinciden.
+    /// Con esta peticion el motor desplaza el elemento a la vista y calcula
+    /// el punto exacto, que es la unica forma fiable de clicar lo que se ve.
+    ClickElement {
+        id: Option<String>,
+        element_id: u32,
+    },
+    /// Escribe en un elemento de la lista `elements` por su `id` (tarea 3.1).
+    /// `replace` borra antes el valor actual (rellenar un formulario no debe
+    /// concatenar al texto que ya hubiera).
+    TypeIntoElement {
+        id: Option<String>,
+        element_id: u32,
+        text: String,
+        #[serde(default)]
+        replace: bool,
+        #[serde(default)]
+        press_enter: bool,
+    },
+    /// Detiene la navegacion en curso (tarea 1.3 del plan). Solo hace algo si
+    /// hay un `navigate` a medias: el motor lo abandona y contesta a ese
+    /// `navigate` con un error `navegacion_cancelada`. Sin nada en curso es un
+    /// no-op. Un `navigate` nuevo mientras otro
+    /// sigue cargando tambien lo cancela: lo ultimo que pide el usuario manda.
+    /// La respuesta a `stop` es siempre `ok` (`stopped`), haya o no algo que
+    /// detener.
+    Stop {
+        id: Option<String>,
     },
     /// Historial atras/adelante (Fase 4.4) - sin parametros propios: la URL
     /// a la que ir ya se conoce del historial que `EngineServer` mantiene
@@ -88,6 +139,12 @@ pub enum EngineRequest {
     GetAccessibilityTree {
         id: Option<String>,
     },
+    /// El texto visible de la pagina, en orden de lectura y con saltos de linea
+    /// entre bloques (tarea 3.4). `elements` solo trae lo accionable; para
+    /// contestar "¿que dice la primera frase?" el agente necesita leer el resto.
+    GetPageText {
+        id: Option<String>,
+    },
     Shutdown {
         id: Option<String>,
     },
@@ -104,6 +161,11 @@ impl EngineRequest {
             | Self::Scroll { id, .. }
             | Self::TypeText { id, .. }
             | Self::PressKey { id, .. }
+            | Self::Hover { id, .. }
+            | Self::SelectText { id, .. }
+            | Self::Stop { id }
+            | Self::ClickElement { id, .. }
+            | Self::TypeIntoElement { id, .. }
             | Self::Back { id }
             | Self::Forward { id }
             | Self::NewTab { id, .. }
@@ -111,6 +173,7 @@ impl EngineRequest {
             | Self::SwitchTab { id, .. }
             | Self::ListTabs { id }
             | Self::GetAccessibilityTree { id }
+            | Self::GetPageText { id }
             | Self::Shutdown { id } => id.as_deref(),
         }
     }
@@ -126,12 +189,24 @@ pub enum EngineResponse {
         renderer_status: &'static str,
         width: u32,
         height: u32,
+        /// Quien hace la red y guarda cookies y almacenamiento: `"local"` (este
+        /// mismo proceso) o `"remote"` (un `engine_broker`, ADR 0001 etapa 2).
+        /// Lo dice el motor, no quien lo arranco: asi se comprueba que el modo
+        /// pedido es el que de verdad corre.
+        broker: &'static str,
     },
     Pong {
         id: Option<String>,
         protocol_version: u32,
         renderer_status: &'static str,
+        /// Lo mismo que en `Ready`: permite comprobar el modo de un motor ya
+        /// arrancado (la prueba de humo del paquete lo hace).
+        broker: &'static str,
     },
+    /// Con `id` es la respuesta a una peticion. Con `id: null` es una
+    /// publicacion espontanea (Fase 50): un temporizador de la pestaña activa
+    /// cambio lo que se ve. Un consumidor tiene que correlacionar por `id` y
+    /// no asumir que la siguiente linea responde a su ultima peticion.
     State {
         id: Option<String>,
         renderer_status: &'static str,
@@ -144,13 +219,36 @@ pub enum EngineResponse {
         url: String,
         title: String,
         screenshot: String,
-        elements: Vec<InteractiveElement>,
+        /// Los elementos interactivos de la pagina. `None` (el campo no se
+        /// envia) significa "no han cambiado desde el estado anterior": lo usa
+        /// `scroll`, que solo mueve el desplazamiento - las coordenadas de los
+        /// elementos son del documento, no de la ventana, asi que no cambian
+        /// - y reenviarlos pesaba tanto como la propia captura (tarea 1.5).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        elements: Option<Vec<InteractiveElement>>,
+        /// Fase 39: la pagina se descargo SIN error de red pero no tiene
+        /// nada visible que pintar, y trae `<script>` que podrian haberlo
+        /// generado. Es el caso de la inmensa mayoria de webs modernas
+        /// (React/Next/Vue): el servidor manda una cascara vacia y el
+        /// contenido lo construye JavaScript en el cliente. El motor no
+        /// ejecuta todavia esos bundles, asi que pintaba un blanco sin un
+        /// solo mensaje - indistinguible de "la app esta rota". Este flag
+        /// existe para que el frontend pueda DECIRLO en vez de callar.
+        /// NO es una promesa de que la pagina funcionaria con mas JS: es
+        /// una descripcion de lo que se observo (vacia + con scripts).
+        /// `None` (no se envia) = sin cambios, igual que `elements`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        requires_javascript: Option<bool>,
         /// Historial atras/adelante (Fase 4.4) - si hay una entrada real a
         /// la que ir con `back`/`forward` en este momento, para que el
         /// frontend pueda habilitar/deshabilitar sus botones sin tener que
         /// llevar su propia copia paralela del historial.
         can_go_back: bool,
         can_go_forward: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        focused_is_text: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selected_text: Option<String>,
     },
     /// Lista de pestañas abiertas (Fase 4.5, respuesta a `list_tabs`) - cada
     /// `TabInfo` lleva su propio titulo/URL (vacios si esa pestaña todavia
@@ -170,6 +268,16 @@ pub enum EngineResponse {
         title: String,
         tree: engine_ai::AccessibilityTree,
         prompt: String,
+    },
+    /// Respuesta a `GetPageText` (tarea 3.4). `truncated` avisa de que la pagina
+    /// tenia mas texto del que cabe.
+    PageText {
+        id: Option<String>,
+        tab_id: u32,
+        url: String,
+        title: String,
+        text: String,
+        truncated: bool,
     },
     Ok {
         id: Option<String>,
@@ -238,10 +346,19 @@ mod tests {
                 .expect("resize request should parse");
 
         match request {
-            EngineRequest::Resize { id, width, height } => {
+            EngineRequest::Resize { id, width, height, scale } => {
                 assert_eq!(id.as_deref(), Some("r1"));
                 assert_eq!((width, height), (900, 600));
+                assert_eq!(scale, 1.0);
             }
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let with_scale: EngineRequest =
+            serde_json::from_str(r#"{"type":"resize","id":"r2","width":900,"height":600,"scale":1.5}"#)
+                .expect("resize request with scale should parse");
+        match with_scale {
+            EngineRequest::Resize { scale, .. } => assert_eq!(scale, 1.5),
             other => panic!("unexpected request: {other:?}"),
         }
     }
@@ -255,6 +372,7 @@ mod tests {
             renderer_status: "ready",
             width: 1280,
             height: 720,
+            broker: "local",
         };
 
         let json = serde_json::to_string(&response).expect("response should serialize");

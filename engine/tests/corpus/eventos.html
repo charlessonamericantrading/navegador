@@ -1,0 +1,17 @@
+<!doctype html><html><head><meta charset="utf-8"><title>PENDIENTE</title>
+<script>
+function ok(cond, motivo) { document.title = cond ? 'OK' : 'FALLO: ' + motivo; }
+function fallo(e) { document.title = 'FALLO: ' + (e && e.message ? e.message : String(e)); }
+</script></head><body>
+<div id="fuera"><button id="boton">Pulsar</button></div>
+<script>
+try {
+  var orden = [];
+  document.getElementById('fuera').addEventListener('click', function () { orden.push('burbuja'); });
+  document.getElementById('fuera').addEventListener('click', function () { orden.push('captura'); }, true);
+  document.getElementById('boton').addEventListener('click', function (e) { orden.push('objetivo:' + e.type); });
+  document.getElementById('boton').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  ok(orden.join(',') === 'captura,objetivo:click,burbuja', 'orden=' + orden.join(','));
+} catch (e) { fallo(e); }
+</script>
+</body></html>

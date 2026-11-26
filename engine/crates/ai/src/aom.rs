@@ -163,6 +163,11 @@ impl AccessibilityTree {
 
         let mut children = Vec::new();
         for child in &layout_box.children {
+            // El espacio que el layout conserva entre elementos en linea no
+            // es contenido: no tiene sentido darselo a un modelo.
+            if matches!(&child.box_type, BoxType::Text(t) if t.trim().is_empty()) {
+                continue;
+            }
             // Omitir nodos sin dimensiones reales a menos que tengan hijos
             if child.dimensions.width > 0.0 || child.dimensions.height > 0.0 || !child.children.is_empty() {
                 children.push(Self::convert_box(child, total_nodes, interactive_count));

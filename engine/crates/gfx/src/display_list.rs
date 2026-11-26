@@ -1,5 +1,6 @@
 use engine_image::DecodedImage;
 use engine_layout::{ImageMap, LayoutBox, BoxType, Rect};
+use engine_text::FontFamily;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use std::sync::Arc;
 const INITIAL_COLOR: [u8; 4] = [0, 0, 0, 255];
 pub const INITIAL_FONT_SIZE: f32 = 16.0;
 /// Gris real de un `::placeholder` sin estilo de autor (Fase 34) - el mismo
-/// tono que usan Chrome/Firefox por defecto, para que un placeholder se
+/// tono que usan los navegadores grandes por defecto, para que un placeholder se
 /// distinga visualmente de un `value` real sin depender del `color` propio
 /// del control (que un placeholder, a diferencia de un valor, no hereda).
 const PLACEHOLDER_COLOR: [u8; 4] = [117, 117, 117, 255];
@@ -36,7 +37,9 @@ pub enum DisplayItem {
     /// `resolve_text_align` mas abajo) - el resto de `text-align` ya lo
     /// resolvio `engine-layout` desplazando la caja entera antes de
     /// llegar aqui.
-    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool, underline: bool, text_align: TextAlign },
+    /// `line_height` (tarea 2.6): la altura de linea en pixeles que el layout
+    /// resolvio desde `line-height`; `None` usa la altura natural de la fuente.
+    Text { rect: Rect, text: String, color: [u8; 4], font_size: f32, bold: bool, italic: bool, underline: bool, text_align: TextAlign, line_height: Option<f32>, font_family: FontFamily, first_line_indent: f32 },
     /// `rect` es el border-box COMPLETO (`layout_box.dimensions`, que ya
     /// incluye el propio border - ver `engine_layout::tree::
     /// flow_block_children`); quien pinta esto (`engine-gfx/src/paint.rs`)
@@ -52,16 +55,40 @@ pub enum DisplayItem {
     /// en `engine-layout::tree` - no necesariamente el tamaño natural de la
     /// imagen).
     Image { rect: Rect, image: Arc<DecodedImage> },
+    /// `background-image`/`background: url(...)` (Fase 40) - a diferencia
+    /// de `Image` (un `<img>`, que ESCALA la imagen al tamaño resuelto por
+    /// el layout, ver su doc-comment), esto pinta la imagen en su TAMAÑO
+    /// NATURAL repetida en mosaico hasta cubrir `rect` entero
+    /// (`background-repeat: repeat` y `background-size: auto`, los dos
+    /// valores iniciales reales del spec - no se leen otros valores de
+    /// ninguna de las dos propiedades todavia). `rect` es el border-box
+    /// completo de la caja (misma superficie que ya pinta
+    /// `background-color`, mismo criterio de `background-clip: border-box`
+    /// por defecto documentado alli), y el mosaico empieza en su esquina
+    /// superior-izquierda (aproxima `background-position: 0% 0%` sobre el
+    /// padding-box, el origen real por defecto - no distingue border-box
+    /// de padding-box). Se pinta DESPUES de `background-color` y ANTES de
+    /// `Border`, igual que el spec real (una imagen de fondo tapa el color
+    /// solido que haya debajo).
+    BackgroundImage { rect: Rect, image: Arc<DecodedImage> },
+    /// `background-image: linear-gradient(...)` (tarea 2.7 del plan, caso 7 del
+    /// fixture). Se pinta donde iria el color de fondo, despues de el y antes del
+    /// borde. `radius` mismo criterio que en `SolidRect`.
+    Gradient { rect: Rect, gradient: Gradient, radius: f32 },
     /// `box-shadow` (Fase 3.5) - `rect` YA lleva el desplazamiento
     /// (`offset-x`/`offset-y`) aplicado (ver `parse_css_box_shadow`), asi
     /// que quien pinta esto solo rellena `rect` con `color`, ni sabe que
     /// existio un desplazamiento por separado. Se pinta ANTES que
     /// `SolidRect`/`Border` de la misma caja (orden real del spec: la
-    /// sombra queda DETRAS del fondo/border). Simplificacion declarada:
-    /// sombra "dura" sin difuminado - el tercer valor de `box-shadow`
-    /// (blur radius) se PARSEA (para no romper el resto de tokens) pero se
-    /// descarta, un blur gaussiano real no esta implementado.
-    Shadow { rect: Rect, color: [u8; 4], radius: f32 },
+    /// sombra queda DETRAS del fondo/border). `blur` (el tercer valor de
+    /// `box-shadow`, en px) SI se difumina de verdad (ver `paint_blurred_shadow`
+    /// en `engine-gfx::paint`: se rellena en un lienzo aparte y se le
+    /// aplican 3 pasadas de blur de caja horizontal+vertical, la misma
+    /// tecnica de "cajas repetidas" que aproxima un gaussiano real en la
+    /// mayoria de motores de render) - `0.0` (sin blur declarado) pinta la
+    /// sombra "dura" de siempre, sin lienzo aparte. El spread-radius (4o
+    /// valor) sigue sin soportarse.
+    Shadow { rect: Rect, color: [u8; 4], radius: f32, blur: f32 },
     /// `overflow: hidden` (Fase 3.5) - todo lo que se pinte entre un
     /// `PushClip` y su `PopClip` correspondiente (mismo anidamiento que el
     /// arbol de cajas: `build_items` los emite envolviendo la recursion en
@@ -104,7 +131,7 @@ impl DisplayList {
     pub fn build(layout_root: &LayoutBox, images: &ImageMap) -> Self {
         let mut list = Self::default();
         let mut z_layers: Vec<(i32, Vec<DisplayItem>)> = Vec::new();
-        Self::build_items(layout_root, &mut list.items, images, &mut z_layers);
+        Self::build_items(layout_root, &mut list.items, images, &mut z_layers, &Vec::new());
         z_layers.sort_by_key(|(z, _)| *z);
         for (_, items) in z_layers {
             list.items.extend(items);
@@ -112,7 +139,41 @@ impl DisplayList {
         list
     }
 
-    fn build_items(layout_box: &LayoutBox, target: &mut Vec<DisplayItem>, images: &ImageMap, z_layers: &mut Vec<(i32, Vec<DisplayItem>)>) {
+    /// Envoltorio de `build_items_inner` que aplica `opacity` (tarea 2.6 del
+    /// plan): lo que emitio la caja y todo su subarbol queda con el alfa
+    /// multiplicado por la opacidad. Al envolver cada nivel, las opacidades
+    /// anidadas se multiplican solas (0.5 dentro de 0.5 = 0.25).
+    ///
+    /// Aproximacion declarada: es la opacidad de CADA elemento sumada, no la
+    /// del grupo compuesto (un hijo opaco encima de un padre translucido deja
+    /// ver el fondo del padre a traves, a diferencia del spec). Las imagenes no
+    /// se atenuan (sus items no llevan alfa) y el subarbol con `z-index`, que
+    /// se pinta aparte, tampoco.
+    fn build_items(
+        layout_box: &LayoutBox,
+        target: &mut Vec<DisplayItem>,
+        images: &ImageMap,
+        z_layers: &mut Vec<(i32, Vec<DisplayItem>)>,
+        active_clips: &[Rect],
+    ) {
+        let opacity = parse_css_opacity(&layout_box.computed_style);
+        if opacity >= 1.0 {
+            return Self::build_items_inner(layout_box, target, images, z_layers, active_clips);
+        }
+        let start = target.len();
+        Self::build_items_inner(layout_box, target, images, z_layers, active_clips);
+        for item in &mut target[start..] {
+            scale_item_alpha(item, opacity);
+        }
+    }
+
+    fn build_items_inner(
+        layout_box: &LayoutBox,
+        target: &mut Vec<DisplayItem>,
+        images: &ImageMap,
+        z_layers: &mut Vec<(i32, Vec<DisplayItem>)>,
+        active_clips: &[Rect],
+    ) {
         // `visibility: hidden` (a diferencia de `display: none`, ver
         // `engine-layout::tree::build_node`) SI genera caja - sigue
         // ocupando su espacio en el layout, solo no se pinta. Es heredable
@@ -128,18 +189,18 @@ impl DisplayList {
         // propio pintado con su propio `computed_style`.
         let hidden = layout_box.computed_style.get("visibility").map(String::as_str) == Some("hidden");
         if hidden {
-            return Self::build_clipped_children(layout_box, target, images, z_layers);
+            return Self::build_clipped_children(layout_box, target, images, z_layers, active_clips);
         }
         match &layout_box.box_type {
             BoxType::Block | BoxType::Inline => {
                 let radius = parse_css_border_radius(&layout_box.computed_style).unwrap_or(0.0);
                 // `box-shadow` se pinta ANTES que fondo/border (orden real
                 // del spec - ver el doc-comment de `DisplayItem::Shadow`).
-                if let Some((dx, dy, color)) = parse_css_box_shadow(&layout_box.computed_style) {
+                if let Some((dx, dy, color, blur)) = parse_css_box_shadow(&layout_box.computed_style) {
                     let mut rect = layout_box.dimensions.clone();
                     rect.x += dx;
                     rect.y += dy;
-                    target.push(DisplayItem::Shadow { rect, color, radius });
+                    target.push(DisplayItem::Shadow { rect, color, radius, blur });
                 }
                 // Sin background-color explicito en la cascada, las cajas de
                 // bloque no pintan fondo propio (transparente = se ve el
@@ -152,21 +213,23 @@ impl DisplayList {
                 if let Some(color) = layout_box.computed_style.get("background-color").and_then(|v| parse_css_color(v)) {
                     target.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color, radius });
                 }
+                push_background_image(layout_box, images, radius, target);
                 if let Some((width, color)) = parse_css_border(&layout_box.computed_style) {
                     target.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color, radius });
                 }
             }
             BoxType::Replaced => {
                 let radius = parse_css_border_radius(&layout_box.computed_style).unwrap_or(0.0);
-                if let Some((dx, dy, color)) = parse_css_box_shadow(&layout_box.computed_style) {
+                if let Some((dx, dy, color, blur)) = parse_css_box_shadow(&layout_box.computed_style) {
                     let mut rect = layout_box.dimensions.clone();
                     rect.x += dx;
                     rect.y += dy;
-                    target.push(DisplayItem::Shadow { rect, color, radius });
+                    target.push(DisplayItem::Shadow { rect, color, radius, blur });
                 }
                 if let Some(color) = layout_box.computed_style.get("background-color").and_then(|v| parse_css_color(v)) {
                     target.push(DisplayItem::SolidRect { rect: layout_box.dimensions.clone(), color, radius });
                 }
+                push_background_image(layout_box, images, radius, target);
                 let border_width = if let Some((width, color)) = parse_css_border(&layout_box.computed_style) {
                     target.push(DisplayItem::Border { rect: layout_box.dimensions.clone(), width, color, radius });
                     width
@@ -186,27 +249,62 @@ impl DisplayList {
                 if let Some(replaced) = &layout_box.replaced_text {
                     let font_size = layout_box.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
                     let inset = border_width + 3.0;
-                    let rect = Rect {
-                        x: layout_box.dimensions.x + inset,
-                        y: layout_box.dimensions.y + ((layout_box.dimensions.height - font_size * 1.2) / 2.0).max(0.0),
-                        width: (layout_box.dimensions.width - inset * 2.0).max(0.0),
-                        height: layout_box.dimensions.height,
-                    };
+                    let multiline = layout_box.dimensions.height > font_size * 2.5 && !replaced.centered;
+                    let inner_width = (layout_box.dimensions.width - inset * 2.0).max(0.0);
                     let color = if replaced.is_placeholder {
                         PLACEHOLDER_COLOR
                     } else {
                         layout_box.computed_style.get("color").and_then(|v| parse_css_color(v)).unwrap_or(INITIAL_COLOR)
                     };
-                    target.push(DisplayItem::Text {
-                        rect,
-                        text: replaced.text.clone(),
-                        color,
-                        font_size,
-                        bold: false,
-                        italic: false,
-                        underline: false,
-                        text_align: if replaced.centered { TextAlign::Center } else { TextAlign::Left },
-                    });
+                    if multiline && !replaced.is_placeholder && replaced.text.contains('\n') {
+                        let line_step = font_size * 1.2;
+                        let mut line_y = layout_box.dimensions.y + inset;
+                        for raw_line in replaced.text.split('\n') {
+                            if !raw_line.is_empty() {
+                                target.push(DisplayItem::Text {
+                                    rect: Rect { x: layout_box.dimensions.x + inset, y: line_y, width: inner_width, height: line_step },
+                                    text: raw_line.to_string(),
+                                    color,
+                                    font_size,
+                                    bold: false,
+                                    italic: false,
+                                    underline: false,
+                                    text_align: TextAlign::Left,
+                                    line_height: Some(line_step),
+                                    font_family: FontFamily::SansSerif,
+                                    first_line_indent: 0.0,
+                                });
+                            }
+                            line_y += line_step;
+                            if line_y > layout_box.dimensions.y + layout_box.dimensions.height - inset {
+                                break;
+                            }
+                        }
+                    } else {
+                        let rect = Rect {
+                            x: layout_box.dimensions.x + inset,
+                            y: if multiline {
+                                layout_box.dimensions.y + inset
+                            } else {
+                                layout_box.dimensions.y + ((layout_box.dimensions.height - font_size * 1.2) / 2.0).max(0.0)
+                            },
+                            width: inner_width,
+                            height: layout_box.dimensions.height,
+                        };
+                        target.push(DisplayItem::Text {
+                            rect,
+                            text: replaced.text.clone(),
+                            color,
+                            font_size,
+                            bold: false,
+                            italic: false,
+                            underline: false,
+                            text_align: if replaced.centered { TextAlign::Center } else { TextAlign::Left },
+                            line_height: None,
+                            font_family: FontFamily::SansSerif,
+                            first_line_indent: 0.0,
+                        });
+                    }
                 }
 
                 // A diferencia de `Block`/`Inline`, NO se recursa en los
@@ -226,13 +324,21 @@ impl DisplayList {
                 let font_size = layout_box.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
                 target.push(DisplayItem::Text {
                     rect: layout_box.dimensions.clone(),
-                    text: content.clone(),
+                    // El texto sin el espacio que quedo al principio de una linea, si
+                    // el layout lo quito (ver `LayoutBox::trimmed_text`).
+                    text: layout_box.trimmed_text.clone().unwrap_or_else(|| content.clone()),
                     color,
                     font_size,
                     bold: resolve_font_weight_is_bold(&layout_box.computed_style),
                     italic: resolve_font_style_is_italic(&layout_box.computed_style),
                     underline: resolve_text_decoration_is_underline(&layout_box.computed_style),
                     text_align: resolve_text_align(&layout_box.computed_style),
+                    // El layout deja en `line-height-px` el valor ya resuelto
+                    // cuando el autor declaro `line-height`; sin el, altura
+                    // natural de la fuente.
+                    line_height: layout_box.computed_style.get("line-height-px").and_then(|v| parse_css_length(v)),
+                    font_family: layout_box.computed_style.get("font-family").map(|v| FontFamily::from_css(v)).unwrap_or_default(),
+                    first_line_indent: layout_box.first_line_indent,
                 });
             }
             BoxType::Image(src) => {
@@ -249,7 +355,7 @@ impl DisplayList {
             }
         }
 
-        Self::build_clipped_children(layout_box, target, images, z_layers);
+        Self::build_clipped_children(layout_box, target, images, z_layers, active_clips);
     }
 
     /// `overflow: hidden` (Fase 3.5) envuelve TODO el subarbol de hijos
@@ -266,25 +372,101 @@ impl DisplayList {
     /// sigue recortando y recursando en sus hijos igual que si fuera
     /// visible (un hijo puede reactivar su propio pintado con `visibility:
     /// visible`, ver el doc-comment de esa rama).
-    fn build_clipped_children(layout_box: &LayoutBox, target: &mut Vec<DisplayItem>, images: &ImageMap, z_layers: &mut Vec<(i32, Vec<DisplayItem>)>) {
-        let clips = layout_box.computed_style.get("overflow").map(String::as_str) == Some("hidden");
+    fn build_clipped_children(
+        layout_box: &LayoutBox,
+        target: &mut Vec<DisplayItem>,
+        images: &ImageMap,
+        z_layers: &mut Vec<(i32, Vec<DisplayItem>)>,
+        active_clips: &[Rect],
+    ) {
+        let clips = establishes_clip(&layout_box.computed_style);
         if clips {
             target.push(DisplayItem::PushClip { rect: layout_box.dimensions.clone() });
         }
+        // Recorte(s) activos que un descendiente diverted a `z_layers`
+        // deberia seguir respetando - ver mas abajo. Solo se clona cuando
+        // hace falta (esta caja SI recorta): en el caso comun, sin ningun
+        // `overflow` recortando por el camino, es un slice vacio prestado
+        // sin ninguna asignacion.
+        let clips_para_hijos: Vec<Rect>;
+        let clips_para_hijos: &[Rect] = if clips {
+            clips_para_hijos = active_clips.iter().cloned().chain(std::iter::once(layout_box.dimensions.clone())).collect();
+            &clips_para_hijos
+        } else {
+            active_clips
+        };
         for child in &layout_box.children {
             match z_index_for_stacking(&child.computed_style) {
                 Some(z) => {
+                    // El sitio de ESTA capa se reserva ANTES de recursar.
+                    //
+                    // Si se empujara al terminar (que es lo que se hacia),
+                    // cualquier capa creada por un DESCENDIENTE durante esa
+                    // recursion quedaria ANTES en la lista, y como el orden
+                    // se decide con una ordenacion estable por z-index, a
+                    // igual z el ancestro acabaria pintandose ENCIMA de su
+                    // propio contenido. El fondo de un padre va siempre por
+                    // debajo de lo que contiene, y este motor lo estaba
+                    // invirtiendo: en la Wikipedia real, `.mw-page-container`
+                    // pintaba un rectangulo blanco de 1280x62707 sobre el
+                    // articulo entero y la pagina se veia en blanco de la
+                    // cabecera para abajo.
+                    //
+                    // Una capa z-index se pinta AL FINAL de la lista entera
+                    // (ver `build`), fuera de cualquier `PushClip`/`PopClip`
+                    // que un ANCESTRO haya emitido en el camino normal - asi
+                    // que aqui se envuelve ella misma con los recortes que
+                    // heredaria si no se hubiera desviado. Sin esto, un
+                    // `overflow: hidden/auto/scroll` con un descendiente
+                    // posicionado y con z-index se derramaba sin recortar -
+                    // hueco que se hizo mucho mas frecuente al ampliar
+                    // `establishes_clip` a `auto`/`scroll` (antes solo
+                    // `overflow: hidden` exacto lo disparaba).
+                    let slot = z_layers.len();
+                    z_layers.push((z, Vec::new()));
                     let mut layer_items = Vec::new();
-                    Self::build_items(child, &mut layer_items, images, z_layers);
-                    z_layers.push((z, layer_items));
+                    for rect in clips_para_hijos {
+                        layer_items.push(DisplayItem::PushClip { rect: rect.clone() });
+                    }
+                    Self::build_items(child, &mut layer_items, images, z_layers, clips_para_hijos);
+                    for _ in clips_para_hijos {
+                        layer_items.push(DisplayItem::PopClip);
+                    }
+                    z_layers[slot].1 = layer_items;
                 }
-                None => Self::build_items(child, target, images, z_layers),
+                None => Self::build_items(child, target, images, z_layers, clips_para_hijos),
             }
         }
         if clips {
             target.push(DisplayItem::PopClip);
         }
     }
+}
+
+/// Si esta caja recorta su contenido desbordado.
+///
+/// Antes se comparaba SOLO contra el literal `"hidden"`, asi que
+/// `overflow: auto` (igual de comun), `overflow: scroll`, la forma de dos
+/// valores `overflow: hidden auto` y las variantes por eje `overflow-x`/
+/// `overflow-y` no recortaban nada y su contenido se derramaba por encima
+/// del resto de la pagina.
+///
+/// `auto` y `scroll` recortan igual que `hidden` porque este motor todavia
+/// no puede desplazar el interior de una caja: lo que en un navegador real
+/// quedaria oculto tras una barra de scroll, aqui queda simplemente oculto.
+/// Es una simplificacion declarada, pero mucho mas cercana a la verdad que
+/// dejarlo salir.
+fn establishes_clip(computed_style: &HashMap<String, String>) -> bool {
+    let recorta = |valor: &str| matches!(valor.trim(), "hidden" | "clip" | "scroll" | "auto");
+    for prop in ["overflow", "overflow-x", "overflow-y"] {
+        let Some(valor) = computed_style.get(prop) else { continue };
+        // `overflow: hidden auto` son DOS valores (eje x y eje y): basta con
+        // que uno de los dos recorte.
+        if valor.split_whitespace().any(recorta) {
+            return true;
+        }
+    }
+    false
 }
 
 /// `z-index` SOLO participa en el orden de pintado si el elemento tambien
@@ -405,11 +587,16 @@ fn parse_rgb_component(token: &str) -> Option<u8> {
 /// mas abajo) - sin aproximacion, resultado identico al de un navegador
 /// real para el mismo triplete.
 ///
-/// NO implementado: `hwb()`/`lab()`/`lch()`/`oklab()`/`oklch()` y el resto
-/// de espacios de color modernos - devuelven `None` y la caja se queda
-/// sin pintar, en vez de fingir una conversion. Tampoco los ~90 nombres
-/// extendidos que faltan en la tabla.
-fn parse_css_color(value: &str) -> Option<[u8; 4]> {
+/// `hwb()` (blancura/negrura, misma familia que HSL - `hwb_to_rgb` mas
+/// abajo) y `oklch()` (el espacio de color perceptualmente uniforme de CSS
+/// Color 4 - `oklch_to_rgb` mas abajo, la formula de referencia de Björn
+/// Ottosson, sin aproximacion) tambien se parsean de verdad.
+///
+/// NO implementado: `lab()`/`lch()`/`oklab()` y el resto de espacios de
+/// color modernos - devuelven `None` y la caja se queda sin pintar, en vez
+/// de fingir una conversion. Tampoco los ~90 nombres extendidos que faltan
+/// en la tabla.
+pub(crate) fn parse_css_color(value: &str) -> Option<[u8; 4]> {
     let value = value.trim();
 
     if let Some(hex) = value.strip_prefix('#') {
@@ -438,7 +625,7 @@ fn parse_css_color(value: &str) -> Option<[u8; 4]> {
         // Acepta tanto la sintaxis clasica con comas (`rgb(1, 2, 3)`) como
         // la moderna con espacios (`rgb(1 2 3 / 0.5)`), que ya usan muchas
         // hojas de estilo reales.
-        let normalised = inner.replace(',', " ").replace('/', " ");
+        let normalised = inner.replace([',', '/'], " ");
         let parts: Vec<&str> = normalised.split_whitespace().collect();
         if parts.len() < 3 {
             return None;
@@ -464,7 +651,7 @@ fn parse_css_color(value: &str) -> Option<[u8; 4]> {
 
     if let Some(rest) = lower.strip_prefix("hsla(").or_else(|| lower.strip_prefix("hsl(")) {
         let inner = rest.strip_suffix(')')?;
-        let normalised = inner.replace(',', " ").replace('/', " ");
+        let normalised = inner.replace([',', '/'], " ");
         let parts: Vec<&str> = normalised.split_whitespace().collect();
         if parts.len() < 3 {
             return None;
@@ -488,7 +675,121 @@ fn parse_css_color(value: &str) -> Option<[u8; 4]> {
         return Some([r, g, b, a]);
     }
 
+    if let Some(rest) = lower.strip_prefix("hwb(") {
+        let inner = rest.strip_suffix(')')?;
+        let normalised = inner.replace([',', '/'], " ");
+        let parts: Vec<&str> = normalised.split_whitespace().collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let hue = parse_hue_degrees(parts[0])?;
+        let whiteness = parse_percentage_0_1(parts[1])?;
+        let blackness = parse_percentage_0_1(parts[2])?;
+        let (r, g, b) = hwb_to_rgb(hue, whiteness, blackness);
+        let a = match parts.get(3) {
+            Some(token) => parse_alpha_0_1_or_percent(token)?,
+            None => 255,
+        };
+        return Some([r, g, b, a]);
+    }
+
+    if let Some(rest) = lower.strip_prefix("oklch(") {
+        let inner = rest.strip_suffix(')')?;
+        let normalised = inner.replace('/', " ");
+        let parts: Vec<&str> = normalised.split_whitespace().collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let lightness = parse_oklch_lightness(parts[0])?;
+        let chroma = parts[1].trim().parse::<f32>().ok()?.max(0.0);
+        let hue = parse_hue_degrees(parts[2])?;
+        let (r, g, b) = oklch_to_rgb(lightness, chroma, hue);
+        let a = match parts.get(3) {
+            Some(token) => parse_alpha_0_1_or_percent(token)?,
+            None => 255,
+        };
+        return Some([r, g, b, a]);
+    }
+
     NAMED_COLORS.iter().find(|(name, _)| *name == lower).map(|(_, rgba)| *rgba)
+}
+
+/// Componente de alfa de `hwb()`/`oklch()` - mismo parseo (numero 0.0-1.0 o
+/// porcentaje) que ya usan `rgb()`/`hsl()` mas arriba, extraido aqui porque
+/// dos consumidores mas lo necesitan tal cual.
+fn parse_alpha_0_1_or_percent(token: &str) -> Option<u8> {
+    let t = token.trim();
+    let alpha = match t.strip_suffix('%') {
+        Some(percent) => percent.trim().parse::<f32>().ok()? / 100.0,
+        None => t.parse::<f32>().ok()?,
+    };
+    Some((alpha.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// `hwb(hue whiteness blackness)` -> RGB, la formula estandar de CSS Color
+/// 4 §7.1: si blancura+negrura cubren el 100% o mas, el resultado es un
+/// gris puro (proporcional a cuanta blancura hay respecto al total);
+/// si no, se parte del color puro de ese matiz (`hsl_to_rgb` con
+/// saturacion 100%/luminosidad 50%, el mismo helper que ya usa `hsl()`) y
+/// se mezcla hacia blanco/negro segun las dos proporciones.
+fn hwb_to_rgb(hue_deg: f32, whiteness: f32, blackness: f32) -> (u8, u8, u8) {
+    let w = whiteness.clamp(0.0, 1.0);
+    let b = blackness.clamp(0.0, 1.0);
+    if w + b >= 1.0 {
+        let gray = (w / (w + b) * 255.0).round() as u8;
+        return (gray, gray, gray);
+    }
+    let (r, g, bl) = hsl_to_rgb(hue_deg, 1.0, 0.5);
+    let mix = |c: u8| -> u8 {
+        let c = c as f32 / 255.0;
+        ((c * (1.0 - w - b) + w) * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    (mix(r), mix(g), mix(bl))
+}
+
+/// Luminosidad (`L`) de `oklch()`: `0.0..1.0` de verdad (mas comun como
+/// porcentaje, `70%`) o el numero directo que tambien acepta CSS Color 4 -
+/// acotado igual que el resto del parseador.
+fn parse_oklch_lightness(token: &str) -> Option<f32> {
+    let token = token.trim();
+    if let Some(percent) = token.strip_suffix('%') {
+        return Some((percent.trim().parse::<f32>().ok()? / 100.0).clamp(0.0, 1.0));
+    }
+    token.parse::<f32>().ok().map(|v| v.clamp(0.0, 1.0))
+}
+
+/// `oklch(L C H)` -> RGB: la formula de referencia de Björn Ottosson
+/// (creador de OKLab) sin aproximacion - LCH cilindrico a OKLab
+/// rectangular (`a = C*cos(H)`, `b = C*sin(H)`), OKLab a sRGB LINEAL via
+/// las matrices estandar del espacio, y de ahi a sRGB con la curva gamma
+/// real del spec (tramo lineal bajo `0.0031308`, potencia `1/2.4` el
+/// resto). Un `L`/`C`/`H` fuera de gama (el color pedido no cabe en sRGB)
+/// se ACOTA al canal 0..1 mas cercano tras la curva gamma en vez de
+/// devolver `None` o un color inventado - un navegador real hace lo mismo
+/// (gamut mapping por recorte).
+fn oklch_to_rgb(lightness: f32, chroma: f32, hue_deg: f32) -> (u8, u8, u8) {
+    let hue = hue_deg.to_radians();
+    let a = chroma * hue.cos();
+    let b = chroma * hue.sin();
+
+    let l_ = lightness + 0.396_337_78 * a + 0.215_803_76 * b;
+    let m_ = lightness - 0.105_561_346 * a - 0.063_854_17 * b;
+    let s_ = lightness - 0.089_484_18 * a - 1.291_485_5 * b;
+
+    let l3 = l_ * l_ * l_;
+    let m3 = m_ * m_ * m_;
+    let s3 = s_ * s_ * s_;
+
+    let r_lin = 4.076_741_7 * l3 - 3.307_711_6 * m3 + 0.230_969_94 * s3;
+    let g_lin = -1.268_438 * l3 + 2.609_757_4 * m3 - 0.341_319_38 * s3;
+    let b_lin = -0.0041960863 * l3 - 0.703_418_6 * m3 + 1.707_614_7 * s3;
+
+    let gamma_encode = |c: f32| -> u8 {
+        let c = c.clamp(0.0, 1.0);
+        let encoded = if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+        (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    (gamma_encode(r_lin), gamma_encode(g_lin), gamma_encode(b_lin))
 }
 
 /// El matiz (`hue`) de `hsl()` en cualquiera de las cuatro unidades de
@@ -695,7 +996,7 @@ fn parse_css_border(computed_style: &HashMap<String, String>) -> Option<(f32, [u
     let mut color: Option<[u8; 4]> = None;
     let mut is_solid = false;
 
-    for token in raw.split_whitespace() {
+    for token in engine_layout::split_css_tokens(raw) {
         if let Some(w) = parse_css_length(token) {
             width = Some(w);
         } else if token.eq_ignore_ascii_case("solid") {
@@ -719,6 +1020,344 @@ fn parse_css_border(computed_style: &HashMap<String, String>) -> Option<(f32, [u
     Some((resolved_width, resolved_color))
 }
 
+/// Color del anillo de foco de un control (azul de navegador).
+const FOCUS_RING_COLOR: [u8; 4] = [26, 115, 232, 255];
+const SELECTION_COLOR: [u8; 4] = [26, 115, 232, 70];
+
+/// Rectangulos de resaltado de seleccion de texto en pagina.
+pub fn selection_overlay_rects(rects: &[Rect]) -> Vec<DisplayItem> {
+    rects
+        .iter()
+        .filter(|r| r.width > 0.0 && r.height > 0.0)
+        .map(|r| DisplayItem::SolidRect { rect: r.clone(), color: SELECTION_COLOR, radius: 0.0 })
+        .collect()
+}
+
+/// Lo que se pinta ENCIMA de la pagina para el control con el foco (tarea 3.2):
+/// anillo azul alrededor de su caja y, en un campo de texto, seleccion + cursor.
+pub fn focus_overlay(focused: &LayoutBox, font_set: Option<&engine_text::FontSet>) -> Vec<DisplayItem> {
+    focus_overlay_with_state(focused, font_set, usize::MAX, None)
+}
+
+/// Como `focus_overlay`, pero colocando el cursor en `cursor_chars` y resaltando `selection`.
+pub fn focus_overlay_with_state(
+    focused: &LayoutBox,
+    font_set: Option<&engine_text::FontSet>,
+    cursor_chars: usize,
+    selection: Option<(usize, usize)>,
+) -> Vec<DisplayItem> {
+    let mut items = vec![DisplayItem::Border {
+        rect: focused.dimensions.clone(),
+        width: 2.0,
+        color: FOCUS_RING_COLOR,
+        radius: parse_css_border_radius(&focused.computed_style).unwrap_or(0.0),
+    }];
+
+    let is_text_field = matches!(focused.box_type, BoxType::Replaced) && !focused.replaced_text.as_ref().is_some_and(|r| r.centered);
+    if !is_text_field {
+        return items;
+    }
+
+    let font_size = focused.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
+    let border_width = parse_css_border(&focused.computed_style).map_or(0.0, |(width, _)| width);
+    let inset = border_width + 3.0;
+    let multiline = focused.dimensions.height > font_size * 2.5;
+    let font = font_set.and_then(|set| set.pick_family(FontFamily::SansSerif, false, false));
+    let typed: &str = match &focused.replaced_text {
+        Some(replaced) if !replaced.is_placeholder => &replaced.text,
+        _ => "",
+    };
+    let total_chars = typed.chars().count();
+    let cursor = cursor_chars.min(total_chars);
+    let caret_color = focused.computed_style.get("color").and_then(|v| parse_css_color(v)).unwrap_or(INITIAL_COLOR);
+    let line = font_size * 1.2;
+    let max_x = focused.dimensions.x + (focused.dimensions.width - inset).max(0.0);
+
+    let width_of = |s: &str| font.map_or(0.0, |f| engine_text::text_width(f, s, font_size));
+
+    if !multiline {
+        let top_y = focused.dimensions.y + ((focused.dimensions.height - line) / 2.0).max(0.0);
+        if let Some((start, end)) = selection {
+            let a = start.min(total_chars);
+            let b = end.min(total_chars);
+            if a < b {
+                let prefix_a: String = typed.chars().take(a).collect();
+                let prefix_b: String = typed.chars().take(b).collect();
+                let x0 = (focused.dimensions.x + inset + width_of(&prefix_a)).min(max_x);
+                let x1 = (focused.dimensions.x + inset + width_of(&prefix_b)).min(max_x);
+                if x1 > x0 {
+                    items.push(DisplayItem::SolidRect {
+                        rect: Rect { x: x0, y: top_y, width: x1 - x0, height: line.min(focused.dimensions.height) },
+                        color: SELECTION_COLOR,
+                        radius: 0.0,
+                    });
+                }
+            }
+        }
+        let before: String = typed.chars().take(cursor).collect();
+        items.push(DisplayItem::SolidRect {
+            rect: Rect {
+                x: (focused.dimensions.x + inset + width_of(&before)).min(max_x),
+                y: top_y,
+                width: 1.0,
+                height: line.min(focused.dimensions.height),
+            },
+            color: caret_color,
+            radius: 0.0,
+        });
+    } else {
+        // Textarea multilínea: posiciona cursor y selección por línea explícita (`\n`).
+        let mut line_start = 0usize;
+        let mut caret_pos = (0usize, 0.0f32);
+        let mut sel_rects = Vec::new();
+        for (line_idx, raw_line) in typed.split('\n').enumerate() {
+            let line_len = raw_line.chars().count();
+            let line_end = line_start + line_len;
+            let y = focused.dimensions.y + inset + line_idx as f32 * line;
+            if y >= focused.dimensions.y + focused.dimensions.height {
+                break;
+            }
+            if let Some((sa, sb)) = selection {
+                let oa = sa.max(line_start).min(line_end);
+                let ob = sb.max(line_start).min(line_end);
+                if oa < ob {
+                    let p0: String = raw_line.chars().take(oa - line_start).collect();
+                    let p1: String = raw_line.chars().take(ob - line_start).collect();
+                    let x0 = (focused.dimensions.x + inset + width_of(&p0)).min(max_x);
+                    let x1 = (focused.dimensions.x + inset + width_of(&p1)).min(max_x);
+                    if x1 > x0 {
+                        sel_rects.push(Rect { x: x0, y, width: x1 - x0, height: line });
+                    }
+                }
+            }
+            if cursor >= line_start && cursor <= line_end {
+                let before: String = raw_line.chars().take(cursor - line_start).collect();
+                caret_pos = (line_idx, width_of(&before));
+            }
+            line_start = line_end + 1;
+        }
+        items.extend(selection_overlay_rects(&sel_rects));
+        let caret_y = (focused.dimensions.y + inset + caret_pos.0 as f32 * line).min(focused.dimensions.y + focused.dimensions.height - line.min(focused.dimensions.height));
+        items.push(DisplayItem::SolidRect {
+            rect: Rect {
+                x: (focused.dimensions.x + inset + caret_pos.1).min(max_x),
+                y: caret_y.max(focused.dimensions.y),
+                width: 1.0,
+                height: line.min(focused.dimensions.height),
+            },
+            color: caret_color,
+            radius: 0.0,
+        });
+    }
+    items
+}
+
+/// Hacia donde apunta un degradado lineal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GradientDirection {
+    /// Angulo CSS: 0deg apunta arriba, 90deg a la derecha (en el sentido del reloj).
+    Degrees(f32),
+    /// `to bottom right`...: hacia una esquina. `sx`/`sy` valen +1 (derecha/abajo)
+    /// o -1 (izquierda/arriba). El angulo depende de la forma de la caja, asi que
+    /// se resuelve al pintar.
+    Corner { sx: f32, sy: f32 },
+}
+
+/// Donde cae una parada de color en la linea del degradado.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StopPosition {
+    /// Fraccion de 0 a 1 de la linea.
+    Fraction(f32),
+    Pixels(f32),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GradientStop {
+    pub color: [u8; 4],
+    pub position: StopPosition,
+}
+
+/// `linear-gradient(...)` ya interpretado: paradas con posicion resuelta (las
+/// que el autor no fijo se reparten por igual) y siempre ordenadas.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gradient {
+    pub direction: GradientDirection,
+    pub stops: Vec<GradientStop>,
+}
+
+/// El fondo de imagen de una caja: un degradado se pinta tal cual; un `url(...)`
+/// solo si su imagen ya esta descargada.
+fn push_background_image(layout_box: &LayoutBox, images: &ImageMap, radius: f32, target: &mut Vec<DisplayItem>) {
+    if let Some(gradient) = layout_box.computed_style.get("background-image").and_then(|v| parse_css_linear_gradient(v)) {
+        target.push(DisplayItem::Gradient { rect: layout_box.dimensions.clone(), gradient, radius });
+        return;
+    }
+    if let Some(image) = parse_css_background_image(&layout_box.computed_style).and_then(|url| images.get(&url)) {
+        target.push(DisplayItem::BackgroundImage { rect: layout_box.dimensions.clone(), image: image.clone() });
+    }
+}
+
+/// `linear-gradient([<angulo> | to <lado>,] <color> [<posicion>], ...)` (tarea
+/// 2.7). `None` si no es un degradado lineal, si tiene menos de dos colores o si
+/// algun color no se entiende: un degradado a medias seria peor que ninguno.
+/// Sin `repeating-` ni parada doble de dos posiciones.
+pub(crate) fn parse_css_linear_gradient(value: &str) -> Option<Gradient> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    let inner = lower.strip_prefix("linear-gradient(").and_then(|rest| rest.strip_suffix(')'))?;
+    // Los colores y posiciones se leen del texto original (los nombres de color
+    // no dependen de mayusculas, pero las URLs si; aqui solo hay colores).
+    let inner = &value[value.len() - inner.len() - 1..value.len() - 1];
+    let parts = engine_layout::split_css_commas(inner);
+    let mut parts = parts.into_iter().map(str::trim).collect::<Vec<_>>();
+
+    let mut direction = GradientDirection::Degrees(180.0);
+    if let Some(first) = parts.first().copied() {
+        let first_lower = first.to_ascii_lowercase();
+        if let Some(sides) = first_lower.strip_prefix("to ") {
+            let (mut sx, mut sy) = (0.0_f32, 0.0_f32);
+            for side in sides.split_whitespace() {
+                match side {
+                    "right" => sx = 1.0,
+                    "left" => sx = -1.0,
+                    "bottom" => sy = 1.0,
+                    "top" => sy = -1.0,
+                    _ => return None,
+                }
+            }
+            direction = match (sx, sy) {
+                (0.0, -1.0) => GradientDirection::Degrees(0.0),
+                (1.0, 0.0) => GradientDirection::Degrees(90.0),
+                (0.0, 1.0) => GradientDirection::Degrees(180.0),
+                (-1.0, 0.0) => GradientDirection::Degrees(270.0),
+                (sx, sy) if sx != 0.0 && sy != 0.0 => GradientDirection::Corner { sx, sy },
+                _ => return None,
+            };
+            parts.remove(0);
+        } else if let Some(degrees) = parse_gradient_angle(&first_lower) {
+            direction = GradientDirection::Degrees(degrees);
+            parts.remove(0);
+        }
+    }
+
+    let mut raw: Vec<([u8; 4], Option<StopPosition>)> = Vec::new();
+    for part in parts {
+        let tokens = engine_layout::split_css_tokens(part);
+        let color_token = tokens.first()?;
+        // Una "pista de color" (`50%` suelto, sin color) no es una parada: se salta.
+        if parse_gradient_position(color_token).is_some() && tokens.len() == 1 {
+            continue;
+        }
+        let color = parse_css_color(color_token)?;
+        let positions: Vec<StopPosition> = tokens[1..].iter().filter_map(|token| parse_gradient_position(token)).collect();
+        if positions.is_empty() {
+            raw.push((color, None));
+        } else {
+            // `red 10% 30%` son dos paradas del mismo color.
+            for position in positions.into_iter().take(2) {
+                raw.push((color, Some(position)));
+            }
+        }
+    }
+    if raw.len() < 2 {
+        return None;
+    }
+
+    // Posiciones que faltan: la primera 0, la ultima 1 y el resto se reparte por
+    // igual entre las paradas con posicion que la rodean. Solo se reparte entre
+    // fracciones; si hay pixeles se tratan aparte al pintar, y aqui las
+    // intermedias sin posicion cuentan desde el extremo anterior conocido.
+    let last_index = raw.len() - 1;
+    if raw[0].1.is_none() {
+        raw[0].1 = Some(StopPosition::Fraction(0.0));
+    }
+    if raw[last_index].1.is_none() {
+        raw[last_index].1 = Some(StopPosition::Fraction(1.0));
+    }
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index].1.is_some() {
+            index += 1;
+            continue;
+        }
+        let run_start = index - 1;
+        let mut run_end = index;
+        while raw[run_end].1.is_none() {
+            run_end += 1;
+        }
+        let (StopPosition::Fraction(from), StopPosition::Fraction(to)) = (raw[run_start].1?, raw[run_end].1?) else {
+            // Mezcla de pixeles y repartos automaticos: no se interpreta.
+            return None;
+        };
+        let missing = (run_end - run_start) as f32;
+        for (step, slot) in raw[run_start + 1..run_end].iter_mut().enumerate() {
+            slot.1 = Some(StopPosition::Fraction(from + (to - from) * (step as f32 + 1.0) / missing));
+        }
+        index = run_end + 1;
+    }
+
+    // Las posiciones no retroceden: una parada nunca queda antes que la anterior.
+    let mut stops = Vec::with_capacity(raw.len());
+    let mut floor = f32::NEG_INFINITY;
+    for (color, position) in raw {
+        let position = match position? {
+            StopPosition::Fraction(f) => StopPosition::Fraction(f.max(floor.min(f32::MAX))),
+            pixels => pixels,
+        };
+        if let StopPosition::Fraction(f) = position {
+            floor = floor.max(f);
+        }
+        stops.push(GradientStop { color, position });
+    }
+    Some(Gradient { direction, stops })
+}
+
+/// `45deg`, `0.25turn`, `1.5708rad`, `100grad` -> grados.
+fn parse_gradient_angle(token: &str) -> Option<f32> {
+    let token = token.trim();
+    for (suffix, to_degrees) in [("deg", 1.0), ("turn", 360.0), ("rad", 180.0 / std::f32::consts::PI), ("grad", 0.9)] {
+        if let Some(number) = token.strip_suffix(suffix) {
+            return number.trim().parse::<f32>().ok().map(|n| n * to_degrees);
+        }
+    }
+    None
+}
+
+/// `30%` o `40px` -> posicion; cualquier otra cosa (un color) no lo es.
+fn parse_gradient_position(token: &str) -> Option<StopPosition> {
+    let token = token.trim();
+    if let Some(percent) = token.strip_suffix('%') {
+        return percent.trim().parse::<f32>().ok().map(|n| StopPosition::Fraction(n / 100.0));
+    }
+    token.strip_suffix("px").and_then(|px| px.trim().parse::<f32>().ok()).map(StopPosition::Pixels)
+}
+
+/// `background-image` (Fase 40) - extrae la URL "desnuda" (sin
+/// `url(...)`/comillas) de la declaracion ya expandida por la cascada
+/// (`engine_css::parser::insert_declaration` ya deja aqui el `url(...)`
+/// tanto si el autor escribio el longhand como el shorthand `background:
+/// ... url(...) ...`). Mismo formato sin resolver que usa `ImageMap`/
+/// `BoxType::Image` para `<img src>` (ver su doc-comment en
+/// `engine-layout::tree`) - asi `images.get(...)` encuentra la misma
+/// entrada sin importar de cual de las dos fuentes vino. No distingue
+/// `url(...)` de otra funcion de imagen (`linear-gradient(...)`, sin
+/// soportar) - un valor sin `url(` simplemente no encuentra nada, la
+/// misma degradacion honesta de siempre.
+pub(crate) fn parse_css_background_image(computed_style: &HashMap<String, String>) -> Option<String> {
+    let raw = computed_style.get("background-image")?;
+    let lower = raw.to_ascii_lowercase();
+    let start = lower.find("url(")?;
+    let after = &raw[start + 4..];
+    let end = after.find(')')?;
+    let inner = after[..end].trim();
+    let inner = inner
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(inner);
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
 /// `border-radius` (Fase 3.5) - un unico valor en `px`, aplicado a las 4
 /// esquinas por igual (misma simplificacion "un solo numero" que
 /// `padding`/`margin`/`border-width`). `None`/cero/negativo resuelve a
@@ -738,20 +1377,52 @@ fn parse_css_border_radius(computed_style: &HashMap<String, String>) -> Option<f
     None
 }
 
-/// `box-shadow: <offset-x> <offset-y> [<blur-radius>] <color>` (Fase 3.5) -
-/// el `blur-radius` opcional SI se parsea (para no romper el resto de
-/// tokens, p.ej. tomar el color por el blur) pero se DESCARTA - ver el
-/// doc-comment de `DisplayItem::Shadow` para el porque (sombra "dura", sin
-/// difuminado real). `offset-x`/`offset-y` aceptan negativos (a diferencia
-/// de `parse_css_length`, que rechaza negativos porque un padding/border
-/// negativo no tiene sentido - un offset de sombra si) via `parse_css_offset`
-/// local, deliberadamente NO compartida con la copia de `engine-layout::tree`
-/// (misma razon de siempre: crates que no deben depender entre si). `None`
-/// si faltan offset-x/offset-y o el color, o si la propiedad no esta
-/// puesta - sin sombra por defecto, el valor inicial real de la propiedad.
-fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32, f32, [u8; 4])> {
+/// `opacity` (tarea 2.6 del plan): un numero de 0 a 1 o un porcentaje, acotado
+/// a ese rango. Ausente o invalido: 1 (opaco, el valor inicial).
+fn parse_css_opacity(computed_style: &HashMap<String, String>) -> f32 {
+    let Some(raw) = computed_style.get("opacity") else { return 1.0 };
+    let raw = raw.trim();
+    let value = match raw.strip_suffix('%') {
+        Some(percent) => percent.trim().parse::<f32>().ok().map(|n| n / 100.0),
+        None => raw.parse::<f32>().ok(),
+    };
+    value.map(|v| v.clamp(0.0, 1.0)).unwrap_or(1.0)
+}
+
+/// Multiplica el alfa del color de un item por `factor`. Los items sin color
+/// (imagenes, recortes) no se tocan.
+fn scale_item_alpha(item: &mut DisplayItem, factor: f32) {
+    let scale = |color: &mut [u8; 4]| color[3] = (color[3] as f32 * factor).round() as u8;
+    match item {
+        DisplayItem::SolidRect { color, .. } | DisplayItem::Text { color, .. } | DisplayItem::Border { color, .. } | DisplayItem::Shadow { color, .. } => scale(color),
+        DisplayItem::Gradient { gradient, .. } => gradient.stops.iter_mut().for_each(|stop| scale(&mut stop.color)),
+        _ => {}
+    }
+}
+
+/// `box-shadow: <offset-x> <offset-y> [<blur-radius>] <color>` (Fase 3.5,
+/// blur real desde entonces) - `offset-x`/`offset-y` aceptan negativos (a
+/// diferencia de `parse_css_length`, que rechaza negativos porque un
+/// padding/border negativo no tiene sentido - un offset de sombra si) via
+/// `parse_css_offset` local, deliberadamente NO compartida con la copia de
+/// `engine-layout::tree` (misma razon de siempre: crates que no deben
+/// depender entre si). El 3er numero (si esta) es el blur-radius, acotado a
+/// no-negativo igual que el resto del motor acota en vez de rechazar - un
+/// 4o numero (spread-radius) sigue sin soportarse (se ignora, no rompe el
+/// resto del parseo). `None` si faltan offset-x/offset-y o el color, o si la
+/// propiedad no esta puesta - sin sombra por defecto, el valor inicial real
+/// de la propiedad.
+fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32, f32, [u8; 4], f32)> {
     fn parse_offset(value: &str) -> Option<f32> {
-        let px = value.trim().strip_suffix("px")?;
+        let value = value.trim();
+        // `0` sin unidad es valido en CSS y es la forma habitual de escribir
+        // el desplazamiento nulo (`0 2px 8px ...`). Sin esto se saltaba y todos
+        // los numeros siguientes se corrian una posicion: dx/dy/blur
+        // equivocados.
+        if value == "0" {
+            return Some(0.0);
+        }
+        let px = value.strip_suffix("px")?;
         px.trim().parse::<f32>().ok()
     }
 
@@ -759,23 +1430,128 @@ fn parse_css_box_shadow(computed_style: &HashMap<String, String>) -> Option<(f32
     let mut offsets: Vec<f32> = Vec::new();
     let mut color: Option<[u8; 4]> = None;
 
-    for token in raw.split_whitespace() {
+    // Con varias sombras (`a, b`) se usa la primera EXTERIOR: el motor pinta
+    // una sola, y las `inset` (interiores) no se dibujan, porque pintarlas
+    // como exteriores ensuciaria el borde de la caja con una sombra que el
+    // autor puso dentro.
+    let layer = engine_layout::split_css_commas(raw).into_iter().find(|layer| !engine_layout::split_css_tokens(layer).iter().any(|t| t.eq_ignore_ascii_case("inset")))?;
+
+    for token in engine_layout::split_css_tokens(layer) {
         if let Some(c) = parse_css_color(token) {
             color = Some(c);
         } else if let Some(n) = parse_offset(token) {
             offsets.push(n);
         }
-        // Un tercer numero (blur-radius) cae aqui y se ignora a proposito.
     }
 
     let dx = *offsets.first()?;
     let dy = *offsets.get(1)?;
-    Some((dx, dy, color.unwrap_or(INITIAL_COLOR)))
+    let blur = offsets.get(2).copied().unwrap_or(0.0).max(0.0);
+    Some((dx, dy, color.unwrap_or(INITIAL_COLOR), blur))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tarea 2.6 del plan: `opacity` multiplica el alfa de la caja y de todo su
+    /// subarbol, y las opacidades anidadas se multiplican.
+    #[test]
+    fn opacity_scales_the_alpha_of_the_box_and_its_descendants() {
+        let construir = |opacidad_padre: Option<&str>, opacidad_hijo: Option<&str>| {
+            let mut padre = LayoutBox::new(BoxType::Block);
+            padre.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+            padre.computed_style.insert("background-color".to_string(), "#000000".to_string());
+            if let Some(o) = opacidad_padre {
+                padre.computed_style.insert("opacity".to_string(), o.to_string());
+            }
+            let mut hijo = LayoutBox::new(BoxType::Block);
+            hijo.dimensions = Rect { x: 10.0, y: 10.0, width: 20.0, height: 20.0 };
+            hijo.computed_style.insert("background-color".to_string(), "#ff0000".to_string());
+            if let Some(o) = opacidad_hijo {
+                hijo.computed_style.insert("opacity".to_string(), o.to_string());
+            }
+            padre.children.push(hijo);
+            DisplayList::build(&padre, &ImageMap::new())
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    DisplayItem::SolidRect { color, .. } => Some(color[3]),
+                    _ => None,
+                })
+                .collect::<Vec<u8>>()
+        };
+
+        assert_eq!(construir(None, None), vec![255, 255], "sin opacity no cambia nada");
+        assert_eq!(construir(Some("0.5"), None), vec![128, 128], "el padre translucido atenua tambien a su hijo");
+        assert_eq!(construir(Some("0.5"), Some("0.5")), vec![128, 64], "las opacidades anidadas se multiplican");
+        assert_eq!(construir(Some("30%"), None), vec![77, 77], "tambien en porcentaje");
+        assert_eq!(construir(Some("0"), None), vec![0, 0], "opacity 0: invisible");
+        assert_eq!(construir(Some("7"), None), vec![255, 255], "fuera de rango se acota a 1");
+        assert_eq!(construir(Some("nada"), None), vec![255, 255], "un valor invalido es opaco");
+    }
+
+    /// Tarea 2.6 del plan: el `line-height` que el layout dejo resuelto en la
+    /// hoja de texto llega al item de pintado; sin el, es `None` (altura
+    /// natural de la fuente).
+    #[test]
+    fn a_text_leaf_carries_its_resolved_line_height_into_the_display_list() {
+        let altura = |estilo: Option<&str>| {
+            let mut root = LayoutBox::new(BoxType::Block);
+            root.dimensions.width = 200.0;
+            root.dimensions.height = 100.0;
+            let mut hoja = LayoutBox::new(BoxType::Text("hola".to_string()));
+            hoja.dimensions = Rect { x: 0.0, y: 0.0, width: 40.0, height: 40.0 };
+            if let Some(valor) = estilo {
+                hoja.computed_style.insert("line-height-px".to_string(), valor.to_string());
+            }
+            root.children.push(hoja);
+            let lista = DisplayList::build(&root, &ImageMap::new());
+            lista.items.iter().find_map(|item| match item {
+                DisplayItem::Text { line_height, .. } => Some(*line_height),
+                _ => None,
+            })
+        };
+
+        assert_eq!(altura(Some("40px")), Some(Some(40.0)));
+        assert_eq!(altura(None), Some(None), "sin line-height: altura natural");
+        assert_eq!(altura(Some("1.5")), Some(None), "un valor que no es una longitud: altura natural");
+    }
+
+    /// Tarea 2.5 del plan: un `rgba(...)` con espacios dentro de `box-shadow`
+    /// se reconoce como color. Antes el valor se partia por esos espacios, el
+    /// color no se encontraba y la sombra se pintaba en NEGRO OPACO (la caja
+    /// negra de la portada de Google).
+    #[test]
+    fn a_box_shadow_with_a_spaced_rgba_color_keeps_that_color() {
+        let sombra = parse_css_box_shadow(&style_with("box-shadow", "0px 3px 10px 0px rgba(31, 31, 31, 0.08)"));
+        assert_eq!(sombra, Some((0.0, 3.0, [31, 31, 31, 20], 10.0)), "color con alfa 0.08, no negro opaco");
+    }
+
+    #[test]
+    fn with_several_box_shadows_the_first_outer_one_is_used_and_inset_ones_are_skipped() {
+        let varias = parse_css_box_shadow(&style_with("box-shadow", "0 1px 2px #ff0000, 0 4px 8px #00ff00"));
+        assert_eq!(varias, Some((0.0, 1.0, [255, 0, 0, 255], 2.0)));
+
+        let inset_primero = parse_css_box_shadow(&style_with("box-shadow", "inset 0 1px 0 #ffffff, 0 2px 4px #0000ff"));
+        assert_eq!(inset_primero, Some((0.0, 2.0, [0, 0, 255, 255], 4.0)), "la sombra inset no se pinta como exterior");
+
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "inset 0 1px 0 #ffffff")), None, "solo inset: no hay sombra exterior que pintar");
+    }
+
+    /// `0` sin unidad es un desplazamiento valido: `0 2px 8px #000` es dx=0,
+    /// dy=2, blur=8 (antes salia dx=2, dy=8, blur=0).
+    #[test]
+    fn a_unitless_zero_offset_in_a_box_shadow_is_read() {
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "0 2px 8px #000000")), Some((0.0, 2.0, [0, 0, 0, 255], 8.0)));
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "0 0 0 1px #ff0000")), Some((0.0, 0.0, [255, 0, 0, 255], 0.0)));
+    }
+
+    #[test]
+    fn a_border_with_a_spaced_rgba_color_keeps_that_color() {
+        let borde = parse_css_border(&style_with("border", "1px solid rgba(0, 0, 0, 0.3)"));
+        assert_eq!(borde, Some((1.0, [0, 0, 0, 77])), "borde translucido, no negro solido");
+    }
 
     #[test]
     fn parses_named_colors_case_insensitively() {
@@ -830,11 +1606,59 @@ mod tests {
 
     #[test]
     fn unsupported_color_syntaxes_are_none_instead_of_a_made_up_color() {
-        assert_eq!(parse_css_color("hwb(0 0% 0%)"), None, "hwb() no esta implementado");
-        assert_eq!(parse_css_color("oklch(0.5 0.2 30)"), None, "oklch() no esta implementado");
+        assert_eq!(parse_css_color("lab(50% 40 60)"), None, "lab() no esta implementado");
+        assert_eq!(parse_css_color("oklab(0.5 0.1 0.1)"), None, "oklab() no esta implementado");
         assert_eq!(parse_css_color("currentColor"), None, "currentColor exige el computed_style completo");
         assert_eq!(parse_css_color("basura"), None);
         assert_eq!(parse_css_color(""), None);
+    }
+
+    /// `hwb(0 0% 0%)` es rojo puro (matiz 0, sin blancura ni negrura que lo
+    /// desature) - mismo punto de referencia facil de verificar que ya usan
+    /// las pruebas de `hsl()`.
+    #[test]
+    fn hwb_with_no_whiteness_or_blackness_is_the_pure_hue() {
+        assert_eq!(parse_css_color("hwb(0 0% 0%)"), Some([255, 0, 0, 255]));
+    }
+
+    /// Blancura+negrura sumando 100% o mas colapsa a un gris puro
+    /// (proporcional a cuanta blancura hay) - el matiz deja de importar.
+    #[test]
+    fn hwb_with_whiteness_plus_blackness_over_100_percent_is_a_pure_gray() {
+        assert_eq!(parse_css_color("hwb(210 60% 60%)"), Some([128, 128, 128, 255]));
+    }
+
+    #[test]
+    fn hwb_reads_the_optional_alpha_after_a_slash() {
+        assert_eq!(parse_css_color("hwb(0 0% 0% / 0.5)"), Some([255, 0, 0, 128]));
+    }
+
+    /// `oklch(1 0 0)` es blanco puro (luminosidad maxima, sin croma) y
+    /// `oklch(0 0 0)` es negro puro (luminosidad minima) - los dos puntos
+    /// de referencia que cualquier implementacion de OKLCH tiene que dar
+    /// exactos, sin importar la formula interna.
+    #[test]
+    fn oklch_at_the_lightness_extremes_is_pure_white_or_black() {
+        assert_eq!(parse_css_color("oklch(1 0 0)"), Some([255, 255, 255, 255]));
+        assert_eq!(parse_css_color("oklch(0 0 0)"), Some([0, 0, 0, 255]));
+    }
+
+    /// `oklch(0.63 0.26 29)` es el rojo de referencia de CSS Color 4
+    /// (equivale casi exacto a `red`/`#ff0000`) - el punto de referencia
+    /// que documenta el propio spec para verificar una implementacion de
+    /// OKLCH contra un color RGB conocido.
+    #[test]
+    fn oklch_of_a_known_red_matches_srgb_red_closely() {
+        let Some([r, g, b, a]) = parse_css_color("oklch(0.627955 0.257683 29.2339)") else { panic!("deberia parsear") };
+        assert_eq!(a, 255);
+        assert!(r >= 250, "canal rojo deberia estar cerca de 255, salio {r}");
+        assert!(g <= 20, "canal verde deberia estar cerca de 0, salio {g}");
+        assert!(b <= 20, "canal azul deberia estar cerca de 0, salio {b}");
+    }
+
+    #[test]
+    fn oklch_lightness_accepts_a_percentage_or_a_bare_number() {
+        assert_eq!(parse_css_color("oklch(100% 0 0)"), parse_css_color("oklch(1 0 0)"));
     }
 
     /// Los tres primarios y los limites de luminosidad (0%/100% siempre dan
@@ -935,6 +1759,165 @@ mod tests {
         );
     }
 
+    /// Tarea 3.2: el foco de un campo de texto dibuja un anillo y un cursor que se
+    /// desplaza con lo escrito; un boton solo lleva anillo.
+    #[test]
+    fn focus_overlay_draws_a_ring_and_a_caret_that_follows_the_text() {
+        let font_set = engine_text::FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let field = |text: &str, placeholder: bool| {
+            let mut b = LayoutBox::new(BoxType::Replaced);
+            b.dimensions = Rect { x: 10.0, y: 10.0, width: 170.0, height: 21.0 };
+            b.replaced_text = Some(engine_layout::ReplacedText { text: text.to_string(), is_placeholder: placeholder, centered: false });
+            b.computed_style.insert("border".to_string(), "1px solid #767676".to_string());
+            b
+        };
+        let caret_x = |items: &[DisplayItem]| items.iter().find_map(|i| match i { DisplayItem::SolidRect { rect, .. } => Some(rect.x), _ => None }).expect("un cursor");
+
+        let empty = focus_overlay(&field("", true), Some(&font_set));
+        assert!(matches!(empty[0], DisplayItem::Border { .. }), "el anillo");
+        let at_start = caret_x(&empty);
+        assert!((at_start - 14.0).abs() < 0.5, "sin texto, el cursor al principio ({at_start})");
+
+        let typed = focus_overlay(&field("hola", false), Some(&font_set));
+        assert!(caret_x(&typed) > at_start + 15.0, "con texto, tras la ultima letra ({})", caret_x(&typed));
+
+        let mut button = field("Enviar", false);
+        button.replaced_text.as_mut().unwrap().centered = true;
+        assert_eq!(focus_overlay(&button, Some(&font_set)).len(), 1, "un boton solo lleva anillo");
+    }
+
+    fn gradient(value: &str) -> Gradient {
+        parse_css_linear_gradient(value).unwrap_or_else(|| panic!("no se interpreto: {value}"))
+    }
+
+    /// Tarea 2.7 (caso 7 del fixture): lo que se entiende de un `linear-gradient`.
+    #[test]
+    fn linear_gradient_directions_stops_and_positions_are_parsed() {
+        let g = gradient("linear-gradient(#000000, #ffffff)");
+        assert_eq!(g.direction, GradientDirection::Degrees(180.0), "por defecto, hacia abajo");
+        assert_eq!(g.stops.len(), 2);
+        assert_eq!(g.stops[0], GradientStop { color: [0, 0, 0, 255], position: StopPosition::Fraction(0.0) });
+        assert_eq!(g.stops[1], GradientStop { color: [255, 255, 255, 255], position: StopPosition::Fraction(1.0) });
+
+        assert_eq!(gradient("linear-gradient(to right, red, blue)").direction, GradientDirection::Degrees(90.0));
+        assert_eq!(gradient("linear-gradient(to top, red, blue)").direction, GradientDirection::Degrees(0.0));
+        assert_eq!(gradient("linear-gradient(to bottom right, red, blue)").direction, GradientDirection::Corner { sx: 1.0, sy: 1.0 });
+        assert_eq!(gradient("linear-gradient(45deg, red, blue)").direction, GradientDirection::Degrees(45.0));
+        assert_eq!(gradient("linear-gradient(0.25turn, red, blue)").direction, GradientDirection::Degrees(90.0));
+    }
+
+    #[test]
+    fn linear_gradient_stop_positions_are_distributed_and_kept_in_order() {
+        // Sin posiciones: reparto por igual.
+        let g = gradient("linear-gradient(#000, #888, #fff)");
+        let fractions: Vec<f32> = g.stops.iter().map(|s| match s.position { StopPosition::Fraction(f) => f, _ => panic!() }).collect();
+        assert_eq!(fractions, vec![0.0, 0.5, 1.0]);
+
+        // Con posiciones explicitas, colores con funcion y pixeles.
+        let g = gradient("linear-gradient(to right, rgba(0, 0, 0, 0.5) 20%, #fff 80%)");
+        assert_eq!(g.stops[0].color, [0, 0, 0, 128]);
+        assert_eq!(g.stops[0].position, StopPosition::Fraction(0.2));
+        assert_eq!(g.stops[1].position, StopPosition::Fraction(0.8));
+        assert_eq!(gradient("linear-gradient(red 10px, blue)").stops[0].position, StopPosition::Pixels(10.0));
+
+        // Una parada no puede quedar antes que la anterior.
+        let g = gradient("linear-gradient(red 60%, blue 20%)");
+        assert_eq!(g.stops[1].position, StopPosition::Fraction(0.6));
+        // `red 10% 30%` son dos paradas.
+        assert_eq!(gradient("linear-gradient(red 10% 30%, blue)").stops.len(), 3);
+    }
+
+    #[test]
+    fn linear_gradient_that_cannot_be_drawn_is_none_rather_than_half_drawn() {
+        for malo in ["linear-gradient(red)", "linear-gradient(to sideways, red, blue)", "linear-gradient(red, currentColor)", "radial-gradient(red, blue)", "url(x.png)", "linear-gradient(#000, #fff"] {
+            assert!(parse_css_linear_gradient(malo).is_none(), "{malo}");
+        }
+    }
+
+    /// El fondo se emite entre el color de fondo y el borde, y solo si hay degradado.
+    #[test]
+    fn a_box_with_a_gradient_emits_it_between_its_background_color_and_its_border() {
+        let mut caja = LayoutBox::new(BoxType::Block);
+        caja.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 40.0 };
+        caja.computed_style.insert("background-color".to_string(), "#ff0000".to_string());
+        caja.computed_style.insert("background-image".to_string(), "linear-gradient(#000, #fff)".to_string());
+        caja.computed_style.insert("border".to_string(), "1px solid #00ff00".to_string());
+        let list = DisplayList::build(&caja, &ImageMap::new());
+        let kinds: Vec<&str> = list.items.iter().map(|i| match i {
+            DisplayItem::SolidRect { .. } => "color",
+            DisplayItem::Gradient { .. } => "degradado",
+            DisplayItem::Border { .. } => "borde",
+            _ => "otro",
+        }).filter(|k| *k != "otro").collect();
+        assert_eq!(kinds, vec!["color", "degradado", "borde"]);
+    }
+
+    /// Tarea 2.7: el item de texto lleva la familia de letra que pidio la
+    /// pagina, para pintar con la misma cara con la que el layout midio.
+    #[test]
+    fn a_text_item_carries_the_font_family_of_its_box() {
+        let family_of = |font_family: Option<&str>| {
+            let mut text = LayoutBox::new(BoxType::Text("hola".to_string()));
+            text.dimensions = Rect { x: 0.0, y: 0.0, width: 40.0, height: 20.0 };
+            if let Some(value) = font_family {
+                text.computed_style.insert("font-family".to_string(), value.to_string());
+            }
+            let list = DisplayList::build(&text, &ImageMap::new());
+            list.items
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Text { font_family, .. } => Some(*font_family),
+                    _ => None,
+                })
+                .expect("un item de texto")
+        };
+        assert_eq!(family_of(Some("Georgia, 'Times New Roman', serif")), FontFamily::Serif);
+        assert_eq!(family_of(Some("ui-monospace, Menlo, monospace")), FontFamily::Monospace);
+        assert_eq!(family_of(Some("Arial, sans-serif")), FontFamily::SansSerif);
+        assert_eq!(family_of(None), FontFamily::SansSerif, "sin font-family, la de siempre");
+    }
+
+    /// Fase 40, el punto real de `background-image`: una caja con la
+    /// propiedad declarada Y la imagen ya presente en el `ImageMap` (mismo
+    /// mapa que sirve `<img src>`) deberia emitir `BackgroundImage`, en
+    /// tamaño natural (no escalado como `Image`) y ANTES de `Border` -
+    /// mismo orden real del spec que ya usa `background-color`.
+    #[test]
+    fn a_box_with_a_resolved_background_image_emits_a_background_image_item() {
+        let mut input = LayoutBox::new(BoxType::Block);
+        input.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        input.computed_style.insert("background-image".to_string(), "url(tile.png)".to_string());
+        input.computed_style.insert("border".to_string(), "2px solid black".to_string());
+
+        let mut images = ImageMap::new();
+        images.insert("tile.png".to_string(), Arc::new(DecodedImage { width: 4, height: 4, rgba: vec![255; 4 * 4 * 4] }));
+
+        let list = DisplayList::build(&input, &images);
+
+        let bg_index = list.items.iter().position(|item| matches!(item, DisplayItem::BackgroundImage { rect, .. } if rect.width == 100.0));
+        let border_index = list.items.iter().position(|item| matches!(item, DisplayItem::Border { .. }));
+        assert!(bg_index.is_some(), "deberia emitir BackgroundImage cuando la imagen esta resuelta");
+        assert!(bg_index.unwrap() < border_index.unwrap(), "el fondo se pinta ANTES que el border, igual que background-color");
+    }
+
+    /// Sin la imagen resuelta en el `ImageMap` (fallo de descarga/
+    /// decodificacion, `src` invalido) no deberia inventarse ningun
+    /// rectangulo - mismo criterio que `BoxType::Image` ya aplica para
+    /// `<img>`.
+    #[test]
+    fn a_background_image_url_missing_from_the_map_paints_nothing() {
+        let mut input = LayoutBox::new(BoxType::Block);
+        input.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        input.computed_style.insert("background-image".to_string(), "url(no-existe.png)".to_string());
+
+        let list = DisplayList::build(&input, &ImageMap::new());
+
+        assert!(!list.items.iter().any(|item| matches!(item, DisplayItem::BackgroundImage { .. })));
+    }
+
     /// Un placeholder se pinta en gris (`PLACEHOLDER_COLOR`), NO con el
     /// `color` normal de la cascada - para que se distinga de un valor real
     /// ya escrito, igual que en un navegador real.
@@ -1019,6 +2002,119 @@ mod tests {
         assert!(
             !list.items.iter().any(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [255, 0, 0, 255])),
             "el ancestro oculto en si no deberia pintar su propio fondo"
+        );
+    }
+
+    /// `overflow` recorta con cualquiera de sus valores de recorte, no solo
+    /// con el literal `hidden`: `auto` y `scroll` son igual de comunes, y la
+    /// forma de dos valores y las variantes por eje tambien. Comparando solo
+    /// contra `"hidden"`, todo eso se derramaba por encima del resto de la
+    /// pagina.
+    #[test]
+    fn overflow_recorta_con_auto_scroll_y_las_formas_por_eje() {
+        let con = |prop: &str, valor: &str| {
+            let mut m = HashMap::new();
+            m.insert(prop.to_string(), valor.to_string());
+            m
+        };
+        assert!(establishes_clip(&con("overflow", "hidden")));
+        assert!(establishes_clip(&con("overflow", "auto")), "`auto` recorta: este motor no puede desplazar el interior de una caja");
+        assert!(establishes_clip(&con("overflow", "scroll")));
+        assert!(establishes_clip(&con("overflow", "hidden auto")), "la forma de dos ejes recorta si cualquiera de los dos lo hace");
+        assert!(establishes_clip(&con("overflow-y", "auto")));
+        assert!(!establishes_clip(&con("overflow", "visible")), "`visible` es el valor inicial: no recorta nada");
+        assert!(!establishes_clip(&HashMap::new()), "sin `overflow` declarado tampoco");
+    }
+
+    /// El fondo de un ANCESTRO va siempre por debajo del contenido de sus
+    /// descendientes, aunque los dos creen capa propia con el MISMO
+    /// z-index.
+    ///
+    /// Se aplanan las capas en una sola lista, y el ancestro terminaba de
+    /// recursar DESPUES de sus hijos, asi que acababa el ultimo de la lista
+    /// y se pintaba encima de su propio contenido. En la Wikipedia real eso
+    /// tapaba el articulo entero con un rectangulo blanco de pagina
+    /// completa.
+    #[test]
+    fn el_fondo_de_un_ancestro_se_pinta_antes_que_el_contenido_de_sus_hijos() {
+        let mut hijo = LayoutBox::new(BoxType::Block);
+        hijo.computed_style.insert("position".to_string(), "relative".to_string());
+        hijo.computed_style.insert("z-index".to_string(), "0".to_string());
+        hijo.computed_style.insert("background-color".to_string(), "#00ff00".to_string());
+        hijo.dimensions = Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
+
+        let mut ancestro = LayoutBox::new(BoxType::Block);
+        ancestro.computed_style.insert("position".to_string(), "relative".to_string());
+        ancestro.computed_style.insert("z-index".to_string(), "0".to_string());
+        ancestro.computed_style.insert("background-color".to_string(), "#ffffff".to_string());
+        ancestro.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        ancestro.children.push(hijo);
+
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.children.push(ancestro);
+
+        let list = DisplayList::build(&root, &ImageMap::new());
+        let blanco = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [255, 255, 255, 255]))
+            .expect("deberia existir el fondo blanco del ancestro");
+        let verde = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [0, 255, 0, 255]))
+            .expect("deberia existir el fondo verde del hijo");
+
+        assert!(
+            blanco < verde,
+            "el fondo del ancestro (indice {blanco}) deberia pintarse ANTES que el del hijo (indice {verde}), no taparlo"
+        );
+    }
+
+    /// Un descendiente `position: relative` con `z-index` numerico se pinta
+    /// en una capa aparte, spliceada al FINAL de la lista entera - fuera de
+    /// cualquier `PushClip`/`PopClip` que un ANCESTRO con `overflow`
+    /// hubiera emitido en el camino normal. Sin envolver esa capa con los
+    /// mismos recortes que heredaria de no haberse desviado, un
+    /// `overflow: hidden` con un hijo asi por dentro no lo recorta.
+    #[test]
+    fn una_capa_z_index_hereda_el_recorte_de_su_ancestro_con_overflow() {
+        let mut hijo_posicionado = LayoutBox::new(BoxType::Block);
+        hijo_posicionado.computed_style.insert("position".to_string(), "relative".to_string());
+        hijo_posicionado.computed_style.insert("z-index".to_string(), "1".to_string());
+        hijo_posicionado.computed_style.insert("background-color".to_string(), "#ff0000".to_string());
+        // Deliberadamente mas grande que el contenedor, para que un recorte
+        // ausente sea observable con solo mirar el rectangulo de PushClip.
+        hijo_posicionado.dimensions = Rect { x: 0.0, y: 0.0, width: 500.0, height: 500.0 };
+
+        let mut contenedor = LayoutBox::new(BoxType::Block);
+        contenedor.computed_style.insert("overflow".to_string(), "hidden".to_string());
+        contenedor.dimensions = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        contenedor.children.push(hijo_posicionado);
+
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.children.push(contenedor);
+
+        let list = DisplayList::build(&root, &ImageMap::new());
+        let rojo = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::SolidRect { color, .. } if *color == [255, 0, 0, 255]))
+            .expect("deberia existir el fondo rojo del hijo posicionado");
+
+        let recorte_antes = list.items[..rojo].iter().rev().find_map(|item| match item {
+            DisplayItem::PushClip { rect } => Some(rect.clone()),
+            _ => None,
+        });
+        let recorte = recorte_antes.expect("deberia haber un PushClip inmediatamente antes del contenido de la capa z-index");
+        assert_eq!(
+            (recorte.width, recorte.height),
+            (100.0, 100.0),
+            "el recorte deberia ser el rectangulo del contenedor con overflow:hidden (100x100), no quedarse sin recortar"
+        );
+        assert!(
+            list.items[rojo..].iter().any(|item| matches!(item, DisplayItem::PopClip)),
+            "el PushClip de la capa deberia cerrarse con su PopClip"
         );
     }
 
@@ -1147,6 +2243,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_css_background_image_strips_the_url_wrapper_and_quotes() {
+        assert_eq!(parse_css_background_image(&style_with("background-image", "url(x.png)")), Some("x.png".to_string()));
+        assert_eq!(parse_css_background_image(&style_with("background-image", "url(\"x.png\")")), Some("x.png".to_string()));
+        assert_eq!(parse_css_background_image(&style_with("background-image", "url('x.png')")), Some("x.png".to_string()));
+    }
+
+    #[test]
+    fn parse_css_background_image_is_none_without_a_url_function() {
+        assert_eq!(parse_css_background_image(&style_with("background-image", "none")), None);
+        assert_eq!(parse_css_background_image(&style_with("background-image", "linear-gradient(red, blue)")), None, "solo url() esta soportado, no funciones de degradado");
+        assert_eq!(parse_css_background_image(&HashMap::new()), None);
+    }
+
+    #[test]
     fn parse_css_border_radius_reads_a_positive_px_value() {
         assert_eq!(parse_css_border_radius(&style_with("border-radius", "8px")), Some(8.0));
         assert_eq!(parse_css_border_radius(&style_with("border-radius", "8px 12px")), Some(8.0));
@@ -1161,26 +2271,23 @@ mod tests {
 
     #[test]
     fn parse_css_box_shadow_reads_offsets_and_color_in_any_order() {
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255])));
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "#ff0000 4px 6px")), Some((4.0, 6.0, [255, 0, 0, 255])), "el orden deberia ser libre, igual que border");
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255], 0.0)));
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "#ff0000 4px 6px")), Some((4.0, 6.0, [255, 0, 0, 255], 0.0)), "el orden deberia ser libre, igual que border");
     }
 
     #[test]
-    fn parse_css_box_shadow_ignores_the_optional_blur_radius_token() {
-        // El tercer numero (blur-radius) se parsea para no romper el color
-        // que viene despues, pero se descarta - offsets siguen siendo los
-        // dos primeros numeros encontrados.
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px 10px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255])));
+    fn parse_css_box_shadow_reads_the_optional_blur_radius_token() {
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px 10px #ff0000")), Some((4.0, 6.0, [255, 0, 0, 255], 10.0)));
     }
 
     #[test]
     fn parse_css_box_shadow_accepts_negative_offsets() {
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "-4px -6px #000000")), Some((-4.0, -6.0, [0, 0, 0, 255])));
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "-4px -6px #000000")), Some((-4.0, -6.0, [0, 0, 0, 255], 0.0)));
     }
 
     #[test]
     fn parse_css_box_shadow_defaults_color_to_black_when_missing() {
-        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px")), Some((4.0, 6.0, [0, 0, 0, 255])));
+        assert_eq!(parse_css_box_shadow(&style_with("box-shadow", "4px 6px")), Some((4.0, 6.0, [0, 0, 0, 255], 0.0)));
     }
 
     #[test]

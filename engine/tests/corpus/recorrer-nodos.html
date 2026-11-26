@@ -1,0 +1,24 @@
+<!doctype html><html><head><meta charset="utf-8"><title>PENDIENTE</title>
+<script>
+function ok(cond, motivo) { document.title = cond ? 'OK' : 'FALLO: ' + motivo; }
+function fallo(e) { document.title = 'FALLO: ' + (e && e.message ? e.message : String(e)); }
+</script></head><body>
+<div id="raiz"></div>
+<script>
+try {
+  var raiz = document.getElementById('raiz');
+  raiz.innerHTML = '<p>uno <b>dos</b> tres</p><!-- nota --><p>cuatro</p>';
+  // Recorrido como el de un framework al hidratar: firstChild/nextSibling.
+  var elementos = 0, textos = 0, comentarios = 0;
+  (function andar(n) {
+    for (var c = n.firstChild; c; c = c.nextSibling) {
+      if (c.nodeType === 1) elementos++;
+      else if (c.nodeType === 3) textos++;
+      else if (c.nodeType === 8) comentarios++;
+      andar(c);
+    }
+  })(raiz);
+  ok(elementos === 3 && textos === 4 && comentarios === 1, 'recuento ' + [elementos, textos, comentarios].join('/'));
+} catch (e) { fallo(e); }
+</script>
+</body></html>

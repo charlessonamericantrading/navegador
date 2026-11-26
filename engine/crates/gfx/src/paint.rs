@@ -8,24 +8,34 @@
 //! duplicacion (ver ARCHITECTURE.md). `border-radius`, `box-shadow` y
 //! `overflow: hidden` (Fase 3.5) se añaden aqui, una sola vez.
 
-use crate::display_list::{DisplayItem, TextAlign};
-use crate::image_paint::paint_image;
+use crate::display_list::{DisplayItem, Gradient, GradientDirection, StopPosition, TextAlign};
+use crate::image_paint::{paint_background_image_scaled, paint_image};
 use engine_layout::Rect;
-use engine_text::{baseline_offset, measure_text, shape_text, underline_metrics, wrap_text, FontSet, SystemFont};
+use engine_text::{baseline_offset, measure_text, shape_text, underline_metrics, wrap_text_from, FontFamily, FontSet, SystemFont};
 use tiny_skia::{FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Rect as SkiaRect, Stroke, Transform};
 
-/// Pinta cada `DisplayItem` de `items`, EN ORDEN, sobre `pixmap`.
-/// `scroll_offset_y` se resta de cada coordenada Y (transformacion
-/// content-space -> screen-space, unica aqui - `DisplayList` en si nunca se
-/// reconstruye por scroll). Se redondea a pixel entero ANTES de usarse en
-/// cualquier calculo: sin esto, un scroll a un offset fraccionario (posible
-/// con `MouseScrollDelta::PixelDelta` de un trackpad) podria reintroducir
-/// una coordenada fraccionaria en una franja de `border` YA redondeada por
-/// `border_strip_rects` (mismo bug de tiny-skia que la Fase 3.4 encontro y
-/// arreglo para columnas de tabla - ver su doc-comment) por la puerta de
-/// atras.
+fn scale_rect(rect: &Rect, scale: f32) -> Rect {
+    if (scale - 1.0).abs() < 0.001 {
+        rect.clone()
+    } else {
+        Rect {
+            x: rect.x * scale,
+            y: rect.y * scale,
+            width: rect.width * scale,
+            height: rect.height * scale,
+        }
+    }
+}
+
 pub fn paint_display_list(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: Option<&FontSet>, scroll_offset_y: f32) {
-    let scroll_offset_y = scroll_offset_y.round();
+    paint_display_list_scaled(pixmap, items, font_set, scroll_offset_y, 1.0);
+}
+
+/// Pinta cada `DisplayItem` de `items`, EN ORDEN, sobre `pixmap` multiplicando
+/// las coordenadas y tamaños por `scale` (HiDPI nítido, sin reescalar luego).
+pub fn paint_display_list_scaled(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: Option<&FontSet>, scroll_offset_y: f32, scale: f32) {
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let scroll_px = (scroll_offset_y * scale).round();
     let (width, height) = (pixmap.width(), pixmap.height());
 
     // Pila de rectangulos de recorte activos (`overflow: hidden`, Fase
@@ -37,46 +47,66 @@ pub fn paint_display_list(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: 
     let mut current_mask: Option<Mask> = None;
 
     for item in items {
-        // Descarte por viewport (Fase 5): un item cuyo rectangulo cae
-        // ENTERO por encima o por debajo del pixmap no puede pintar ni un
-        // pixel visible, asi que hacerlo es trabajo tirado. No es una
-        // optimizacion cosmetica: medido sobre una pagina de 200 filas
-        // (~4800px de contenido en un viewport de 800px), pintar era el
-        // 98% del coste de cada respuesta del servidor y ~5/6 de ese
-        // trabajo era para pixeles fuera de pantalla.
-        //
-        // `PushClip`/`PopClip` NUNCA se descartan aunque su rectangulo
-        // este fuera: no pintan nada, cambian ESTADO (la pila de recorte),
-        // y saltarselos desemparejaria la pila y recortaria mal todo lo
-        // que viniera despues.
         if let Some(rect) = item_rect(item) {
-            if is_offscreen(rect, height, scroll_offset_y) {
+            let scaled = scale_rect(rect, scale);
+            if is_offscreen_scaled(&scaled, height, scroll_px, MARGEN_DESCARTE * scale) {
                 continue;
             }
         }
         match item {
             DisplayItem::PushClip { rect } => {
-                clip_stack.push(rect.clone());
-                current_mask = build_clip_mask(width, height, &clip_stack, scroll_offset_y);
+                clip_stack.push(scale_rect(rect, scale));
+                current_mask = build_clip_mask(width, height, &clip_stack, scroll_px);
             }
             DisplayItem::PopClip => {
                 clip_stack.pop();
-                current_mask = build_clip_mask(width, height, &clip_stack, scroll_offset_y);
+                current_mask = build_clip_mask(width, height, &clip_stack, scroll_px);
             }
-            // `Shadow` y `SolidRect` son el mismo relleno (un rectangulo,
-            // posiblemente redondeado) - solo cambia de donde sale el
-            // color/rect, ya resueltos por `DisplayList::build`.
-            DisplayItem::Shadow { rect, color, radius } | DisplayItem::SolidRect { rect, color, radius } => {
-                fill_shape(pixmap, rect, *radius, &paint_of(*color), scroll_offset_y, current_mask.as_ref());
+            DisplayItem::SolidRect { rect, color, radius } => {
+                fill_shape(pixmap, &scale_rect(rect, scale), *radius * scale, &paint_of(*color), scroll_px, current_mask.as_ref());
             }
-            DisplayItem::Text { rect, text, color, font_size, bold, italic, underline, text_align } => {
-                paint_text(pixmap, rect, text, *color, *font_size, *bold, *italic, *underline, *text_align, font_set, scroll_offset_y, current_mask.as_ref());
+            DisplayItem::Shadow { rect, color, radius, blur } => {
+                let srect = scale_rect(rect, scale);
+                if *blur > 0.0 {
+                    paint_blurred_shadow(pixmap, &srect, *radius * scale, *blur * scale, *color, scroll_px, current_mask.as_ref());
+                } else {
+                    fill_shape(pixmap, &srect, *radius * scale, &paint_of(*color), scroll_px, current_mask.as_ref());
+                }
+            }
+            DisplayItem::Text { rect, text, color, font_size, bold, italic, underline, text_align, line_height, font_family, first_line_indent } => {
+                paint_text(
+                    pixmap,
+                    rect,
+                    text,
+                    *color,
+                    *font_size,
+                    *bold,
+                    *italic,
+                    *font_family,
+                    *underline,
+                    *text_align,
+                    *line_height,
+                    *first_line_indent,
+                    font_set,
+                    scroll_px,
+                    scale,
+                    current_mask.as_ref(),
+                );
+            }
+            DisplayItem::Gradient { rect, gradient, radius } => {
+                paint_gradient(pixmap, &scale_rect(rect, scale), gradient, *radius * scale, scroll_px, scale, current_mask.as_ref());
             }
             DisplayItem::Border { rect, width: border_width, color, radius } => {
-                paint_border(pixmap, rect, *border_width, *color, *radius, scroll_offset_y, current_mask.as_ref());
+                paint_border(pixmap, &scale_rect(rect, scale), *border_width * scale, *color, *radius * scale, scroll_px, current_mask.as_ref());
             }
             DisplayItem::Image { rect, image } => {
-                paint_image(pixmap, rect, image, scroll_offset_y, current_mask.as_ref());
+                paint_image(pixmap, &scale_rect(rect, scale), image, scroll_px, current_mask.as_ref());
+            }
+            DisplayItem::BackgroundImage { rect, image } => {
+                let mut own_clip = clip_stack.clone();
+                own_clip.push(scale_rect(rect, scale));
+                let mask = build_clip_mask(width, height, &own_clip, scroll_px);
+                paint_background_image_scaled(pixmap, rect, image, scroll_px / scale, mask.as_ref(), scale);
             }
         }
     }
@@ -92,7 +122,9 @@ fn item_rect(item: &DisplayItem) -> Option<&Rect> {
         | DisplayItem::SolidRect { rect, .. }
         | DisplayItem::Text { rect, .. }
         | DisplayItem::Border { rect, .. }
-        | DisplayItem::Image { rect, .. } => Some(rect),
+        | DisplayItem::Image { rect, .. }
+        | DisplayItem::Gradient { rect, .. }
+        | DisplayItem::BackgroundImage { rect, .. } => Some(rect),
     }
 }
 
@@ -112,10 +144,15 @@ const MARGEN_DESCARTE: f32 = 64.0;
 /// verdad (una pagina larga) y donde esta todo el ahorro. En horizontal el
 /// layout ya acota las cajas al ancho del viewport y no hay scroll lateral,
 /// asi que comprobarlo no descartaria practicamente nada.
-fn is_offscreen(rect: &Rect, viewport_height: u32, scroll_offset_y: f32) -> bool {
+fn is_offscreen_scaled(rect: &Rect, viewport_height: u32, scroll_offset_y: f32, margin: f32) -> bool {
     let top = rect.y - scroll_offset_y;
     let bottom = top + rect.height;
-    bottom < -MARGEN_DESCARTE || top > viewport_height as f32 + MARGEN_DESCARTE
+    bottom < -margin || top > viewport_height as f32 + margin
+}
+
+#[cfg(test)]
+fn is_offscreen(rect: &Rect, viewport_height: u32, scroll_offset_y: f32) -> bool {
+    is_offscreen_scaled(rect, viewport_height, scroll_offset_y, MARGEN_DESCARTE)
 }
 
 fn paint_of(color: [u8; 4]) -> Paint<'static> {
@@ -164,17 +201,19 @@ fn build_clip_mask(width: u32, height: u32, stack: &[Rect], scroll_offset_y: f32
 
 /// Construye el contorno de un rectangulo con esquinas redondeadas -
 /// tiny-skia no trae un `push_round_rect`, asi que se hace a mano con 4
-/// curvas cuadraticas (`quad_to`, control point EN la esquina exacta) por
-/// cada esquina: no es un arco circular matematicamente perfecto (eso
-/// exigiria curvas cubicas con la constante magica ~0.5522847498 de la
-/// aproximacion estandar de un arco de 90 grados), pero visualmente es
-/// indistinguible a los radios tipicos de una UI (unos pocos a unas pocas
-/// decenas de pixeles) - simplificacion declarada, suficiente sin inventar
-/// mas matematica de la que este motor necesita. `radius` ya viene
-/// clampado a la mitad del lado mas corto por quien llama (evita un
-/// rectangulo "imposible" con esquinas que se solaparian). `None` si
-/// `radius <= 0` (sin nada que redondear - quien llama cae al `fill_rect`
-/// normal en ese caso).
+/// curvas CUBICAS (`cubic_to`), una por esquina, via la aproximacion
+/// estandar de un arco de 90 grados con Bezier (constante `KAPPA`, ver su
+/// aviso) - el punto de control de cada curva cae en la TANGENTE real del
+/// circulo en su extremo, no en la esquina exacta del rectangulo (lo que
+/// hacia una curva cuadratica antigua, mas cuadrada que un circulo real
+/// en radios grandes - verificado midiendo el area pintada de un circulo
+/// completo contra `pi*r^2`, ver `a_fully_rounded_square_approximates_a_
+/// real_circles_area_closely`). `radius` ya viene clampado a la mitad del
+/// lado mas corto por quien llama (evita un rectangulo "imposible" con
+/// esquinas que se solaparian). `None` si `radius <= 0` (sin nada que
+/// redondear - quien llama cae al `fill_rect` normal en ese caso).
+const KAPPA: f32 = 0.552_284_8;
+
 fn rounded_rect_path(rect: SkiaRect, radius: f32) -> Option<Path> {
     if radius <= 0.0 {
         return None;
@@ -184,29 +223,238 @@ fn rounded_rect_path(rect: SkiaRect, radius: f32) -> Option<Path> {
     if r <= 0.0 {
         return None;
     }
+    let k = r * KAPPA;
 
     let mut pb = PathBuilder::new();
     pb.move_to(x + r, y);
     pb.line_to(x + w - r, y);
-    pb.quad_to(x + w, y, x + w, y + r);
+    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
     pb.line_to(x + w, y + h - r);
-    pb.quad_to(x + w, y + h, x + w - r, y + h);
+    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
     pb.line_to(x + r, y + h);
-    pb.quad_to(x, y + h, x, y + h - r);
+    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
     pb.line_to(x, y + r);
-    pb.quad_to(x, y, x + r, y);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
     pb.close();
     pb.finish()
 }
 
 /// Fondo (`SolidRect`) o sombra (`Shadow`) - el mismo relleno, redondeado
 /// si `radius > 0` (via `rounded_rect_path`), rectangular normal si no.
+/// Un `width`/`height` de CERO (o negativo - no deberia llegar, pero da lo
+/// mismo tratarlo igual) no pinta nada, en vez de fingir una linea de al
+/// menos 1px: una caja sin area no tiene nada que rellenar en un navegador
+/// real (encontrado en vivo contra rust-lang.org real - un `SolidRect` de
+/// `width: 0.0` con `x` en un limite EXACTO de medio pixel, `406.5`,
+/// hacia panic dentro de `tiny-skia`, `hairline_aa.rs:124: assertion
+/// failed: false` - un `debug_assert!` propio de esa dependencia que
+/// asume que "ancho cero tras restar la columna parcial izquierda" es
+/// imposible, y no lo es para este limite exacto: la columna izquierda
+/// parcial y la columna derecha parcial caen en la MISMA columna entera,
+/// dejando cero columnas completas de por medio - solo se manifestaba en
+/// build debug, `--release` compila el assert fuera y silenciosamente no
+/// pintaba nada, que ya era el comportamiento correcto de todas formas).
+/// Clampar a `1.0` (el comportamiento de antes) evitaba el panic
+/// en release por pura suerte de que ESE ancho concreto no cayera en el
+/// mismo limite fraccionario - la causa real era pintar una caja sin area
+/// en absoluto, asi que la correccion es no pintarla, no maquillar su
+/// ancho.
 fn fill_shape(pixmap: &mut Pixmap, rect: &Rect, radius: f32, paint: &Paint<'static>, scroll_offset_y: f32, mask: Option<&Mask>) {
-    let Some(sk_rect) = SkiaRect::from_xywh(rect.x, rect.y - scroll_offset_y, rect.width.max(1.0), rect.height.max(1.0)) else { return };
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let Some(sk_rect) = SkiaRect::from_xywh(rect.x, rect.y - scroll_offset_y, rect.width, rect.height) else { return };
     if let Some(path) = rounded_rect_path(sk_rect, radius) {
         pixmap.fill_path(&path, paint, FillRule::Winding, Transform::identity(), mask);
+    } else if sk_rect.width() < 2.0 || sk_rect.height() < 2.0 {
+        // Una franja de 1 px (el cursor de un campo, una linea fina) con
+        // antialias entra en la ruta de "hairline" de tiny-skia, que en debug
+        // aborta con un `debug_assert!` para algunas fracciones de `x`. Se ajusta
+        // a la rejilla de pixeles y se pinta sin antialias: una linea de 1 px
+        // nitida es ademas lo que se quiere ver.
+        let (left, top) = (sk_rect.left().round(), sk_rect.top().round());
+        let right = sk_rect.right().round().max(left + 1.0);
+        let bottom = sk_rect.bottom().round().max(top + 1.0);
+        if let Some(snapped) = SkiaRect::from_ltrb(left, top, right, bottom) {
+            let mut crisp = paint.clone();
+            crisp.anti_alias = false;
+            pixmap.fill_rect(snapped, &crisp, Transform::identity(), mask);
+        }
     } else {
         pixmap.fill_rect(sk_rect, paint, Transform::identity(), mask);
+    }
+}
+
+/// `linear-gradient` (tarea 2.7): `Shader` lineal de tiny-skia sobre la caja.
+///
+/// La linea del degradado pasa por el centro de la caja con el angulo pedido y
+/// mide lo justo para que las esquinas de salida caigan en el 0 % y el 100 %
+/// (`|w·sen| + |h·cos|`), que es la definicion de CSS.
+fn paint_gradient(pixmap: &mut Pixmap, rect: &Rect, gradient: &Gradient, radius: f32, scroll_offset_y: f32, scale: f32, mask: Option<&Mask>) {
+    use tiny_skia::{Color, GradientStop as SkStop, LinearGradient, Point, SpreadMode};
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let (w, h) = (rect.width, rect.height);
+    let (dx, dy) = match gradient.direction {
+        GradientDirection::Degrees(degrees) => {
+            let radians = degrees.to_radians();
+            (radians.sin(), -radians.cos())
+        }
+        GradientDirection::Corner { sx, sy } => {
+            let (vx, vy) = (sx * h, sy * w);
+            let norm = (vx * vx + vy * vy).sqrt().max(f32::EPSILON);
+            (vx / norm, vy / norm)
+        }
+    };
+    let length = (w * dx).abs() + (h * dy).abs();
+    if length <= 0.0 {
+        return;
+    }
+    let (cx, cy) = (rect.x + w / 2.0, rect.y - scroll_offset_y + h / 2.0);
+    let start = Point::from_xy(cx - dx * length / 2.0, cy - dy * length / 2.0);
+    let end = Point::from_xy(cx + dx * length / 2.0, cy + dy * length / 2.0);
+
+    let mut last = 0.0_f32;
+    let stops: Vec<SkStop> = gradient
+        .stops
+        .iter()
+        .map(|stop| {
+            let fraction = match stop.position {
+                StopPosition::Fraction(f) => f,
+                StopPosition::Pixels(px) => (px * scale) / length,
+            };
+            // tiny-skia exige posiciones en [0, 1] y no decrecientes.
+            last = fraction.clamp(0.0, 1.0).max(last);
+            SkStop::new(last, Color::from_rgba8(stop.color[0], stop.color[1], stop.color[2], stop.color[3]))
+        })
+        .collect();
+    let Some(shader) = LinearGradient::new(start, end, stops, SpreadMode::Pad, Transform::identity()) else { return };
+    let paint = Paint { shader, anti_alias: true, ..Paint::default() };
+    fill_shape(pixmap, rect, radius, &paint, scroll_offset_y, mask);
+}
+
+/// `box-shadow` con `blur-radius > 0` de verdad difuminado: tiny-skia (a
+/// diferencia de Skia completo) no trae un `MaskFilter` de blur, asi que se
+/// construye a mano - la misma tecnica que usan la mayoria de motores de
+/// render para aproximar un gaussiano real barato: 3 pasadas de blur de
+/// caja (horizontal+vertical cada una, ver `box_blur`) sobre un lienzo
+/// APARTE (solo la forma de la sombra, en el color/radio que le tocan),
+/// que despues se compone sobre `pixmap` en la posicion correcta
+/// (`draw_pixmap`, mismo patron que `image_paint::paint_image`). Un lienzo
+/// aparte (en vez de difuminar `pixmap` entero) es necesario porque el blur
+/// tiene que leer pixeles MAS ALLA del propio rectangulo de la sombra
+/// (por eso `margin`) sin arrastrar contenido ajeno que ya estuviera
+/// pintado ahi debajo.
+fn paint_blurred_shadow(pixmap: &mut Pixmap, rect: &Rect, radius: f32, blur: f32, color: [u8; 4], scroll_offset_y: f32, mask: Option<&Mask>) {
+    if rect.width <= 0.0 && rect.height <= 0.0 {
+        return;
+    }
+    // Radio de blur de CADA una de las 3 pasadas de caja - no es una
+    // conversion exacta del `stdDev` gaussiano que pide el spec (eso exige
+    // la formula de Getreuer para 3 cajas desiguales), es una aproximacion
+    // deliberada: lo que importa visualmente es que una sombra con MAS
+    // blur se vea MAS difusa, no coincidir pixel a pixel con un navegador
+    // real.
+    let per_pass_radius = (blur / 4.0).round().max(1.0) as u32;
+    let margin = (per_pass_radius * 3) as f32 + 1.0;
+    let buffer_width = (rect.width + margin * 2.0).ceil().max(1.0) as u32;
+    let buffer_height = (rect.height + margin * 2.0).ceil().max(1.0) as u32;
+    let Some(mut offscreen) = Pixmap::new(buffer_width, buffer_height) else { return };
+
+    let shape_rect = Rect { x: margin, y: margin, width: rect.width, height: rect.height };
+    fill_shape(&mut offscreen, &shape_rect, radius, &paint_of(color), 0.0, None);
+    box_blur(&mut offscreen, per_pass_radius);
+
+    let transform = Transform::from_translate(rect.x - margin, rect.y - margin - scroll_offset_y);
+    pixmap.draw_pixmap(0, 0, offscreen.as_ref(), &tiny_skia::PixmapPaint::default(), transform, mask);
+}
+
+/// 3 pasadas de blur de caja horizontal+vertical sobre `pixmap` completo -
+/// ver `paint_blurred_shadow` para el porque de la tecnica.
+fn box_blur(pixmap: &mut Pixmap, radius: u32) {
+    if radius == 0 {
+        return;
+    }
+    let width = pixmap.width() as usize;
+    let height = pixmap.height() as usize;
+    for _ in 0..3 {
+        box_blur_horizontal(pixmap.data_mut(), width, height, radius);
+        box_blur_vertical(pixmap.data_mut(), width, height, radius);
+    }
+}
+
+/// Media movil (ventana deslizante, O(ancho) por fila, no O(ancho*radio))
+/// de los 4 canales RGBA PREMULTIPLICADOS - promediar premultiplicado es
+/// matematicamente correcto para difuminar (a diferencia de otras
+/// operaciones con alpha, un promedio no necesita despremultiplicar
+/// primero). Los bordes de la fila se recortan al pixel mas cercano
+/// (clamp), no envuelven ni salen negros.
+fn box_blur_horizontal(data: &mut [u8], width: usize, height: usize, radius: u32) {
+    if width == 0 {
+        return;
+    }
+    let radius = radius as i64;
+    let window = radius * 2 + 1;
+    let mut row = vec![0u8; width * 4];
+    for y in 0..height {
+        let base = y * width * 4;
+        row.copy_from_slice(&data[base..base + width * 4]);
+        let mut sum = [0i64; 4];
+        for xx in -radius..=radius {
+            let cx = xx.clamp(0, width as i64 - 1) as usize;
+            for c in 0..4 {
+                sum[c] += row[cx * 4 + c] as i64;
+            }
+        }
+        for x in 0..width {
+            for c in 0..4 {
+                data[base + x * 4 + c] = (sum[c] / window) as u8;
+            }
+            if x + 1 < width {
+                let leaving = (x as i64 - radius).clamp(0, width as i64 - 1) as usize;
+                let entering = (x as i64 + 1 + radius).clamp(0, width as i64 - 1) as usize;
+                for c in 0..4 {
+                    sum[c] += row[entering * 4 + c] as i64 - row[leaving * 4 + c] as i64;
+                }
+            }
+        }
+    }
+}
+
+/// Misma tecnica que `box_blur_horizontal`, por columnas.
+fn box_blur_vertical(data: &mut [u8], width: usize, height: usize, radius: u32) {
+    if height == 0 {
+        return;
+    }
+    let radius = radius as i64;
+    let window = radius * 2 + 1;
+    let mut col = vec![0u8; height * 4];
+    for x in 0..width {
+        for y in 0..height {
+            let idx = (y * width + x) * 4;
+            col[y * 4..y * 4 + 4].copy_from_slice(&data[idx..idx + 4]);
+        }
+        let mut sum = [0i64; 4];
+        for yy in -radius..=radius {
+            let cy = yy.clamp(0, height as i64 - 1) as usize;
+            for c in 0..4 {
+                sum[c] += col[cy * 4 + c] as i64;
+            }
+        }
+        for y in 0..height {
+            let idx = (y * width + x) * 4;
+            for c in 0..4 {
+                data[idx + c] = (sum[c] / window) as u8;
+            }
+            if y + 1 < height {
+                let leaving = (y as i64 - radius).clamp(0, height as i64 - 1) as usize;
+                let entering = (y as i64 + 1 + radius).clamp(0, height as i64 - 1) as usize;
+                for c in 0..4 {
+                    sum[c] += col[entering * 4 + c] as i64 - col[leaving * 4 + c] as i64;
+                }
+            }
+        }
     }
 }
 
@@ -218,70 +466,56 @@ fn paint_text(
     font_size: f32,
     bold: bool,
     italic: bool,
+    font_family: FontFamily,
     underline: bool,
     text_align: TextAlign,
+    line_height: Option<f32>,
+    first_line_indent: f32,
     font_set: Option<&FontSet>,
-    scroll_offset_y: f32,
+    scroll_px: f32,
+    scale: f32,
     mask: Option<&Mask>,
 ) {
     let paint = paint_of(color);
-    let screen_y = rect.y - scroll_offset_y;
+    let screen_y = rect.y * scale - scroll_px;
 
-    match font_set.and_then(|set| set.pick(bold, italic)) {
+    match font_set.and_then(|set| set.pick_family(font_family, bold, italic)) {
         Some(font) => {
-            // Mismo `wrap_text` que ya uso el layout para reservar el alto
-            // de esta caja (mismo font_size, mismo ancho) - el numero de
-            // lineas que se pinta aqui coincide con el que se reservo alli
-            // por construccion, no por coincidencia.
-            let lines = wrap_text(font, text, font_size, rect.width);
-            let line_height = measure_text(font, "", font_size).line_height;
+            // La partición de líneas ocurre en píxeles CSS para coincidir con el layout;
+            // los glifos se rasterizan al tamaño físico (`font_size * scale`).
+            let lines = wrap_text_from(font, text, font_size, rect.width - first_line_indent, rect.width);
+            let natural_height = engine_text::line_height(font, font_size);
+            let line_height = line_height.unwrap_or(natural_height);
+            let half_leading = (line_height - natural_height) / 2.0;
+            let scaled_font = font_size * scale;
             for (index, line) in lines.iter().enumerate() {
-                let line_y = screen_y + index as f32 * line_height;
-                // `text-align` (Fase 31) DENTRO de una caja que envuelve
-                // varias lineas por si sola - el unico caso que
-                // `engine-layout` deja sin resolver (ver el aviso de
-                // `resolve_text_align` mas arriba): cada linea se centra/
-                // alinea segun SU PROPIO ancho real (`measure_text` de
-                // ESA linea, no `rect.width` entero), igual que un
-                // navegador real alinea cada linea de un parrafo
-                // envuelto por separado.
+                let line_y = screen_y + (index as f32 * line_height + half_leading) * scale;
                 let line_width = measure_text(font, line, font_size).width;
-                let line_x = match text_align {
-                    TextAlign::Left => rect.x,
+                let line_x_css = match text_align {
+                    TextAlign::Left => rect.x + if index == 0 { first_line_indent } else { 0.0 },
                     TextAlign::Center => rect.x + ((rect.width - line_width) / 2.0).max(0.0),
                     TextAlign::Right => rect.x + (rect.width - line_width).max(0.0),
                 };
-                for glyph in shape_text(font, line, font_size, line_x, line_y) {
+                let line_x = line_x_css * scale;
+                for glyph in shape_text(font, line, scaled_font, line_x, line_y) {
                     pixmap.fill_path(&glyph.path, &paint, FillRule::Winding, Transform::identity(), mask);
                 }
                 if underline && !line.trim().is_empty() {
-                    paint_underline(pixmap, font, line, font_size, line_x, line_y, &paint, mask);
+                    paint_underline(pixmap, font, line_width * scale, scaled_font, line_x, line_y, &paint, mask);
                 }
             }
         }
         None => {
             // Sin fuente de sistema disponible: bloque de relleno en vez
             // de fingir que hay glifos.
-            if let Some(sk_rect) = SkiaRect::from_xywh(rect.x, screen_y, rect.width.max(1.0), rect.height.max(1.0)) {
+            if let Some(sk_rect) = SkiaRect::from_xywh(rect.x * scale, screen_y, (rect.width * scale).max(1.0), (rect.height * scale).max(1.0)) {
                 pixmap.fill_rect(sk_rect, &paint, Transform::identity(), mask);
             }
         }
     }
 }
 
-/// La franja de `text-decoration: underline` (Fase 29) de UNA linea ya
-/// shapeada - ancho real de esa linea (`measure_text`, no `rect.width`
-/// entero: una linea mas corta que su caja, la ultima de un parrafo
-/// envuelto, no deberia subrayarse hasta el borde derecho de la caja) y
-/// posicion/grosor reales de la propia fuente (`underline_metrics`,
-/// mismas metricas que declara para el resto de sus glifos) - con
-/// respaldo a una fraccion de `font_size` (~8% bajo el baseline, ~6% de
-/// grosor, valores tipograficos tipicos) si la fuente no las declara.
-/// `line_top_y` es la MISMA coordenada de pantalla que ya recibio
-/// `shape_text` para esta linea, asi que el subrayado queda alineado con
-/// los glifos que acaba de pintar, no con un calculo aparte.
-fn paint_underline(pixmap: &mut Pixmap, font: &SystemFont, line: &str, font_size: f32, origin_x: f32, line_top_y: f32, paint: &Paint<'static>, mask: Option<&Mask>) {
-    let width = measure_text(font, line, font_size).width;
+fn paint_underline(pixmap: &mut Pixmap, font: &SystemFont, width: f32, font_size: f32, origin_x: f32, line_top_y: f32, paint: &Paint<'static>, mask: Option<&Mask>) {
     if width <= 0.0 {
         return;
     }
@@ -490,6 +724,30 @@ mod tests {
         assert!(!path.is_empty());
     }
 
+    /// El punto real de la aproximacion CUBICA (vs la cuadratica de
+    /// antes): un cuadrado con `radius = lado/2` es un CIRCULO completo -
+    /// el area pintada tiene que acercarse mucho al area real de ese
+    /// circulo (`pi * r^2`). Una curva cuadratica con el punto de control
+    /// en la esquina EXACTA del cuadrado se aleja perceptiblemente mas
+    /// del circulo real que la cubica (que usa la constante estandar
+    /// `kappa` para que el punto de control caiga en la tangente real del
+    /// circulo) - 1% de tolerancia basta para la cubica, no para la
+    /// cuadratica de antes (verificado revirtiendo el fix: sube a mas de
+    /// 2% de diferencia).
+    #[test]
+    fn a_fully_rounded_square_approximates_a_real_circles_area_closely() {
+        let side = 100.0_f32;
+        let radius = side / 2.0;
+        let mut pixmap = Pixmap::new(side as u32, side as u32).unwrap();
+        let items = vec![DisplayItem::SolidRect { rect: Rect { x: 0.0, y: 0.0, width: side, height: side }, color: [0, 0, 0, 255], radius }];
+        paint_display_list(&mut pixmap, &items, None, 0.0);
+
+        let painted_pixels = pixmap.data().as_chunks::<4>().0.iter().filter(|p| p[3] > 128).count() as f32;
+        let circle_area = std::f32::consts::PI * radius * radius;
+        let relative_error = (painted_pixels - circle_area).abs() / circle_area;
+        assert!(relative_error < 0.01, "el area pintada ({painted_pixels}px) deberia acercarse al area real del circulo ({circle_area}px, error {relative_error})");
+    }
+
     #[test]
     fn rounded_rect_path_is_none_for_a_non_positive_radius() {
         let rect = SkiaRect::from_xywh(0.0, 0.0, 100.0, 20.0).unwrap();
@@ -511,7 +769,7 @@ mod tests {
     #[test]
     fn paint_display_list_does_not_panic_on_a_box_shadow_and_border_radius() {
         let items = vec![
-            DisplayItem::Shadow { rect: Rect { x: 5.0, y: 5.0, width: 50.0, height: 30.0 }, color: [0, 0, 0, 128], radius: 8.0 },
+            DisplayItem::Shadow { rect: Rect { x: 5.0, y: 5.0, width: 50.0, height: 30.0 }, color: [0, 0, 0, 128], radius: 8.0, blur: 10.0 },
             DisplayItem::SolidRect { rect: Rect { x: 0.0, y: 0.0, width: 50.0, height: 30.0 }, color: [255, 255, 255, 255], radius: 8.0 },
             DisplayItem::Border { rect: Rect { x: 0.0, y: 0.0, width: 50.0, height: 30.0 }, width: 2.0, color: [0, 0, 0, 255], radius: 8.0 },
             DisplayItem::PushClip { rect: Rect { x: 0.0, y: 0.0, width: 20.0, height: 20.0 } },
@@ -525,6 +783,117 @@ mod tests {
         // un estado valido tras pintar.
         paint_display_list(&mut pixmap, &items, None, 0.0);
         assert!(pixmap.encode_png().is_ok());
+    }
+
+    /// Regresion encontrada en vivo contra rust-lang.org real: un
+    /// `SolidRect` de ancho CERO cuyo `x` cae en un limite EXACTO de medio
+    /// pixel (`406.5`, el caso real observado) hacia panic dentro de
+    /// `tiny-skia` en build debug (`hairline_aa.rs:124: assertion failed:
+    /// false`) - `fill_shape` clampaba el ancho a `1.0` en vez de no pintar
+    /// nada, y ESE ancho concreto (1.0px arrancando en `.5`) caia en el
+    /// mismo limite fraccionario que hacia panic. La correccion real (no
+    /// pintar una caja sin area) evita la geometria degenerada de raiz, no
+    /// solo esquiva el limite fraccionario exacto de este caso.
+    #[test]
+    fn a_zero_width_solid_rect_at_a_half_pixel_x_does_not_panic() {
+        let items = vec![DisplayItem::SolidRect { rect: Rect { x: 406.5, y: 115.0, width: 0.0, height: 55.195313 }, color: [0, 0, 0, 255], radius: 0.0 }];
+        let mut pixmap = Pixmap::new(800, 200).unwrap();
+        paint_display_list(&mut pixmap, &items, None, 0.0);
+        assert!(pixmap.encode_png().is_ok());
+    }
+
+    /// La prueba real del blur de `box-shadow`: sin blur, el borde de un
+    /// rectangulo sin `border-radius` es completamente duro (cada pixel
+    /// esta a alpha 0 o a alpha maximo, nada intermedio); con blur, tiene
+    /// que existir un borde difuso de verdad (pixeles con alpha
+    /// INTERMEDIO, ni transparentes ni opacos) - eso es lo que
+    /// `box_blur`/`paint_blurred_shadow` deberian producir.
+    #[test]
+    fn box_shadow_with_blur_produces_soft_partially_transparent_edge_pixels() {
+        let paint_with = |blur: f32| {
+            let mut pixmap = Pixmap::new(100, 100).unwrap();
+            let items = vec![DisplayItem::Shadow {
+                rect: Rect { x: 30.0, y: 30.0, width: 20.0, height: 20.0 },
+                color: [0, 0, 0, 255],
+                radius: 0.0,
+                blur,
+            }];
+            paint_display_list(&mut pixmap, &items, None, 0.0);
+            pixmap
+        };
+        let count_partial_alpha = |pixmap: &Pixmap| pixmap.data().as_chunks::<4>().0.iter().filter(|p| p[3] > 0 && p[3] < 255).count();
+
+        let hard = paint_with(0.0);
+        let soft = paint_with(20.0);
+        assert_eq!(count_partial_alpha(&hard), 0, "sin blur, el borde deberia ser completamente duro");
+        assert!(count_partial_alpha(&soft) > 0, "con blur, deberia haber pixeles de borde con alpha intermedio (difuminado real, no una sombra dura)");
+    }
+
+    /// Un rectangulo de 1 px de ancho (el cursor de un campo) con la `x` en
+    /// cualquier fraccion no puede hacer entrar en panico al rasterizador: la
+    /// ruta de "hairline" con antialias de tiny-skia tiene un `debug_assert!`
+    /// que saltaba con algunos anchos (rompia los tests de humo en debug).
+    #[test]
+    fn a_one_pixel_wide_rect_at_any_fractional_x_paints_without_panicking() {
+        for tenth in 0..20 {
+            let x = 10.0 + tenth as f32 / 10.0;
+            for height in [1.0_f32, 17.0, 19.2, 21.0] {
+                let mut pixmap = Pixmap::new(40, 40).unwrap();
+                let items = vec![DisplayItem::SolidRect { rect: Rect { x, y: 5.3, width: 1.0, height }, color: [0, 0, 0, 255], radius: 0.0 }];
+                paint_display_list(&mut pixmap, &items, None, 0.0);
+            }
+        }
+    }
+
+    /// Tarea 2.7: un degradado horizontal de negro a blanco arranca negro a la
+    /// izquierda y termina blanco a la derecha, con tonos intermedios entre medias
+    /// (no dos bloques de color).
+    #[test]
+    fn a_horizontal_gradient_runs_from_its_first_color_to_its_last() {
+        use crate::display_list::GradientStop;
+        let mut pixmap = Pixmap::new(100, 20).unwrap();
+        let items = vec![DisplayItem::Gradient {
+            rect: Rect { x: 0.0, y: 0.0, width: 100.0, height: 20.0 },
+            gradient: Gradient {
+                direction: GradientDirection::Degrees(90.0),
+                stops: vec![
+                    GradientStop { color: [0, 0, 0, 255], position: StopPosition::Fraction(0.0) },
+                    GradientStop { color: [255, 255, 255, 255], position: StopPosition::Fraction(1.0) },
+                ],
+            },
+            radius: 0.0,
+        }];
+        paint_display_list(&mut pixmap, &items, None, 0.0);
+        let red_at = |x: u32| pixmap.pixel(x, 10).unwrap().red();
+        assert!(red_at(1) < 15, "el extremo izquierdo es casi negro: {}", red_at(1));
+        assert!(red_at(98) > 240, "el derecho, casi blanco: {}", red_at(98));
+        let middle = red_at(50);
+        assert!((110..=145).contains(&middle), "y en medio, un gris intermedio: {middle}");
+        assert!(red_at(25) < middle && middle < red_at(75), "monotono de izquierda a derecha");
+    }
+
+    /// `to bottom` (el valor por defecto) va de arriba a abajo, y las paradas
+    /// con posicion dejan zonas de color solido a los lados.
+    #[test]
+    fn a_vertical_gradient_with_positioned_stops_keeps_solid_bands() {
+        use crate::display_list::GradientStop;
+        let mut pixmap = Pixmap::new(20, 100).unwrap();
+        let items = vec![DisplayItem::Gradient {
+            rect: Rect { x: 0.0, y: 0.0, width: 20.0, height: 100.0 },
+            gradient: Gradient {
+                direction: GradientDirection::Degrees(180.0),
+                stops: vec![
+                    GradientStop { color: [255, 0, 0, 255], position: StopPosition::Fraction(0.3) },
+                    GradientStop { color: [0, 0, 255, 255], position: StopPosition::Fraction(0.7) },
+                ],
+            },
+            radius: 0.0,
+        }];
+        paint_display_list(&mut pixmap, &items, None, 0.0);
+        let top = pixmap.pixel(10, 5).unwrap();
+        let bottom = pixmap.pixel(10, 95).unwrap();
+        assert_eq!((top.red(), top.blue()), (255, 0), "antes del 30 %, rojo solido");
+        assert_eq!((bottom.red(), bottom.blue()), (0, 255), "despues del 70 %, azul solido");
     }
 
     /// La prueba real de `text-decoration: underline` (Fase 29): con una
@@ -553,6 +922,9 @@ mod tests {
                 italic: false,
                 underline,
                 text_align: TextAlign::Left,
+                line_height: None,
+                font_family: FontFamily::SansSerif,
+                first_line_indent: 0.0,
             }];
             paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
             pixmap
@@ -586,6 +958,9 @@ mod tests {
             italic: false,
             underline: true,
             text_align: TextAlign::Left,
+            line_height: None,
+            font_family: FontFamily::SansSerif,
+            first_line_indent: 0.0,
         }];
         paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
         assert!(pixmap.pixels().iter().all(|p| p.alpha() == 0), "una linea en blanco no deberia pintar nada, ni siquiera un subrayado");
@@ -616,6 +991,9 @@ mod tests {
                 italic: false,
                 underline: false,
                 text_align,
+                line_height: None,
+                font_family: FontFamily::SansSerif,
+                first_line_indent: 0.0,
             }];
             paint_display_list(&mut pixmap, &items, Some(&font_set), 0.0);
             let width = pixmap.width();

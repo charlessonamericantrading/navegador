@@ -1,0 +1,19 @@
+<!doctype html><html><head><meta charset="utf-8"><title>PENDIENTE</title>
+<script>
+function ok(cond, motivo) { document.title = cond ? 'OK' : 'FALLO: ' + motivo; }
+function fallo(e) { document.title = 'FALLO: ' + (e && e.message ? e.message : String(e)); }
+</script></head><body>
+<div id="objetivo"></div>
+<script>
+try {
+  var registros = 0;
+  var mo = new MutationObserver(function (lista) {
+    registros += lista.length;
+    ok(registros >= 2, 'registros=' + registros);
+  });
+  mo.observe(document.getElementById('objetivo'), { childList: true, attributes: true });
+  document.getElementById('objetivo').appendChild(document.createElement('span'));
+  document.getElementById('objetivo').setAttribute('data-x', '1');
+} catch (e) { fallo(e); }
+</script>
+</body></html>

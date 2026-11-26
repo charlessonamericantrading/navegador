@@ -16,7 +16,7 @@ Se revisaron las dos líneas de trabajo que existen:
 
 Antes que todo lo demás (detalle en `AGENTS.md`):
 
-1. La aplicación es **100 % Rust**: motor, ventana, interfaz, agente e instalador.
+1. La aplicación es **100 % Rust**: motor, ventana, interfaz e instalador. (El agente de IA quedó descartado del plan).
 2. **Prohibido** usar, instalar, sugerir o nombrar cualquier motor de navegador
    ajeno, también para pruebas o como "modo de compatibilidad".
 3. **Prohibido** cualquier envoltorio de escritorio basado en tecnología web.
@@ -74,7 +74,7 @@ Un motor propio **no va a mostrar bien las aplicaciones web pesadas**
 (YouTube, Gmail, bancos, redes sociales) en meses. Eso lleva años a
 equipos grandes. Lo que este plan sí consigue: que **no se cuelgue nunca
 y pinte bien y rápido las webs de documento** (Wikipedia, noticias,
-blogs, buscadores simples), con el agente IA funcionando sobre ellas.
+blogs, buscadores HTML simples).
 
 ### Tres decisiones tuyas
 
@@ -91,9 +91,9 @@ blogs, buscadores simples), con el agente IA funcionando sobre ellas.
 | 0 | Una sola versión del código, y medible | 1 |
 | 1 | Nunca se cuelga. Rápido | 3–4 |
 | 2 | Las páginas se ven bien | 5–6 |
-| 3 | Escribir, scroll y agente IA fiables | 3–4 |
+| 3 | Escribir y scroll fiables | 3–4 |
 | 4 | JavaScript que falta | 1–2 |
-| 5 | Aplicación 100 % Rust: ventana, interfaz y agente | 6–8 |
+| 5 | Aplicación 100 % Rust: ventana, interfaz e instalador | 6–8 |
 | 6 | Documentación al día | 1 |
 
 Con las fases 0 a 3 el producto ya es usable y demostrable.
@@ -126,7 +126,7 @@ scroll en menos de 0,2 s. Ninguna operación supera nunca 10 s.
   probó HTTPS real, ni inicio de sesión en sitios reales.
 - **Imágenes de otros dominios.** Por el mismo motivo no cargaron. Las
   capturas sin imágenes no cuentan como fallo del motor.
-- **Windows, el instalador y el agente con una clave real de Gemini.**
+- **Windows e instalador.**
 
 ---
 
@@ -438,7 +438,7 @@ del fixture, ya se ven los 17 casos).
 
 ---
 
-## Fase 3 — Escribir, hacer scroll y agente IA
+## Fase 3 — Escribir y hacer scroll
 
 ### [x] 3.1 Coordenadas correctas tras hacer scroll
 
@@ -479,30 +479,12 @@ del fixture, ya se ven los 17 casos).
 
 - **Hecho (PR #3):** `elements` solo trae enlaces con `href`, controles de formulario y lo que la página declara accionable (`role`, `onclick`, `tabindex` ≥ 0, `contenteditable`), con área visible; texto colapsado y recortado a 120 caracteres; tope de 500. **Hacker News: 229 elementos** (antes 799) y Google 13. Los tests que leían texto desde `elements` leen ahora del árbol de accesibilidad.
 
-### [~] 3.4 Agente IA
+### [—] 3.4 Agente IA *(retirado y descartado)*
 
-**Esta tarea pasó a la Fase 5.4:** el agente de la etapa anterior se retiró y
-se reescribe en Rust. Lo de abajo es la especificación y lo que el motor ya
-ofrece (`get_page_text`, `click_element`, `type_into_element`, `scroll`,
-`back`).
-
-- **Modelo retirado.** El agente antiguo llamaba a
-  `gemini-2.0-flash`, retirado el 1-jun-2026 según varias fuentes.
-  Confirmar el sustituto en la página oficial de Google. Hacer el modelo
-  configurable en Ajustes.
-- **Árbol de accesibilidad sin conectar.** El motor lo ofrece
-  (`get_accessibility_tree`), pero el agente antiguo no lo pasaba. En
-  `main` sus ids no coincidían con los de `elements`: unificarlos.
-- **Faltan acciones.** El agente no puede hacer scroll ni volver atrás.
-- **Verificar:** tarea real: "busca Navegador web en Wikipedia y dime la
-  primera frase". Debe completarse.
-
-- **Hecho en parte (PR #3):**
-  - Modelo configurable: variable `NAVEGADOR_GEMINI_MODEL` > ajuste en la barra del agente > valor por defecto `gemini-3.5-flash`. El nombre se valida porque acaba en la URL. **Hay que confirmar el valor por defecto:** las páginas oficiales de Google no coinciden sobre el sustituto de `gemini-2.0-flash` (hablan de 3.5, 3.6 y 3.8); mirar https://ai.google.dev/gemini-api/docs/deprecations y, si es otro, ponerlo en Ajustes.
-  - Una sola numeración: el prompt usa la lista `elements`, cuyos ids son los que entienden `click_element`/`type_into_element` (el árbol de accesibilidad numeraba aparte y no coincidía).
-  - El agente lee: petición `get_page_text` (texto legible, bloques en líneas, tope de 12.000 caracteres, prefiere `<main>`). En Wikipedia la primera frase del artículo aparece en el carácter 736.
-  - Acciones nuevas: `scroll` y `back`.
-- **Falta:** la verificación real ("busca Navegador web en Wikipedia y dime la primera frase") necesita una clave de Gemini y un PC con internet; en la nube solo se probó con modelos falsos y la cañería (texto de página y ajuste del modelo).
+El agente de la etapa anterior se retiró (Fase 5.6) y **queda descartado del
+proyecto por decisión del propietario** (ver 5.4). Lo único que permanece en el
+motor de aquel trabajo son utilidades generales de lectura/accesibilidad
+(`get_page_text` y numeración de `elements`).
 
 ---
 
@@ -574,24 +556,23 @@ basado en tecnología web. La etapa anterior (`desktop/`, `frontend/`,
   ratón, cursor del ratón dinámico, `:hover`/`:focus`, historial, marcadores y
   pestañas reordenables. CI en verde con todo ello (2026-11-26).
 
-### [ ] 5.4 Agente IA en Rust
+### [—] 5.4 Agente IA en Rust *(descartado)*
 
-- **Es lo siguiente.** Sustituye a la tarea 3.4. La app ya tiene el motor, la
-  barra y las pestañas; falta el panel del agente (también pintado por
-  nuestro motor) y el bucle.
-- Llamada al modelo con `hyper` + `rustls` (ya están en el motor), clave en el
-  almacén de credenciales del sistema (crate `keyring`), modelo configurable.
-- Mismo bucle que hoy: `get_page_text`, `elements`, `click_element`,
-  `type_into_element`, `scroll`, `back`. Portar los tests del orquestador.
+Descartado del plan por decisión del propietario (2026-11-26): no se
+implementarán agentes de IA ni panel del agente en el navegador.
 
 ### [~] 5.5 Instalador en Rust
 
-- **Hecho (PR #3, commit `cd3a348`):** instalador y desinstalador en Rust
-  (`engine/crates/app/src/bin/instalador.rs`): accesos `.lnk` y Registro de
-  usuario en Windows; se empaqueta con `scripts/release/empaquetar_windows.ps1`.
-  Sus tests (3) pasan en el CI.
-- **Falta:** firma de código, y probarlo a mano en un Windows real (nadie lo ha
-  hecho todavía). En Linux y macOS solo se compila con `instalar.sh`.
+- **Hecho (PR #3, commits `cd3a348` y `0329bfa`):** instalador y desinstalador
+  visuales en Rust (`engine/crates/app/src/bin/instalador.rs`): diálogos nativos
+  en Windows (`windows_subsystem = "windows"`), accesos `.lnk` en Menú Inicio y
+  Escritorio por defecto, Registro HKCU de usuario (`Uninstall` y `App Paths`),
+  autodetección como `desinstalar.exe` y empaquetado con
+  `scripts/release/empaquetar_windows.ps1` (`NavegadorIA-windows.zip`). Probado
+  en Windows 11 (`instalar.bat --silencioso`, desinstalación y captura del
+  binario instalado); sus 4 tests pasan. En Linux/macOS genera `.desktop` /
+  instala vía `instalar.sh`.
+- **Falta:** firma digital (*Authenticode*) y autoactualizador.
 
 ### [x] 5.6 Retirar lo antiguo
 

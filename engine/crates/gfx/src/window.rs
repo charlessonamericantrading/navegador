@@ -202,7 +202,8 @@ impl NativeEngineWindow {
                     };
 
                     let Some(mut pixmap) = Pixmap::new(size.width, size.height) else { return };
-                    pixmap.fill(Color::from_rgba8(245, 245, 245, 255));
+                    let [r, g, b, a] = crate::raster::DEFAULT_CANVAS_COLOR;
+                    pixmap.fill(Color::from_rgba8(r, g, b, a));
 
                     // `display_list` guarda geometria en content-space (las
                     // mismas coordenadas que calculo el layout, ajenas al

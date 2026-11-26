@@ -8,10 +8,17 @@
 //! doc-comment de `paint.rs` para el bug real que costo esa duplicacion).
 
 use crate::display_list::DisplayList;
-use crate::paint::paint_display_list;
+use crate::paint::paint_display_list_scaled;
 use engine_layout::{ImageMap, LayoutBox};
 use engine_text::FontSet;
 use tiny_skia::{Color, Pixmap};
+
+/// Color del lienzo cuando la pagina no declara fondo en `<html>` ni en
+/// `<body>`: blanco, igual que cualquier navegador. Antes era gris 245, asi
+/// que una pagina sin fondo propio (Google, Hacker News fuera de su tabla)
+/// se veia sobre un gris que no existe en el original. Compartido con la
+/// ventana nativa para que las dos superficies no vuelvan a discrepar.
+pub const DEFAULT_CANVAS_COLOR: [u8; 4] = [255, 255, 255, 255];
 
 pub fn render_layout_to_png(
     layout_root: &LayoutBox,
@@ -21,22 +28,97 @@ pub fn render_layout_to_png(
     height: u32,
     scroll_offset_y: f32,
 ) -> Result<Vec<u8>, String> {
-    let mut pixmap = Pixmap::new(width, height)
-        .ok_or_else(|| format!("no se pudo crear la superficie de rasterizado {width}x{height}"))?;
-    pixmap.fill(Color::from_rgba8(245, 245, 245, 255));
+    render_layout_to_png_with_overlay(layout_root, font_set, images, width, height, scroll_offset_y, &[])
+}
 
-    let display_list = DisplayList::build(layout_root, images);
-    paint_display_list(&mut pixmap, &display_list.items, font_set, scroll_offset_y);
+/// Como `render_layout_to_png`, con items extra pintados ENCIMA de la pagina
+/// (en coordenadas de documento, como el resto): el foco de un control, por
+/// ejemplo (`display_list::focus_overlay`). No forman parte de la pagina.
+pub fn render_layout_to_png_with_overlay(
+    layout_root: &LayoutBox,
+    font_set: Option<&FontSet>,
+    images: &ImageMap,
+    width: u32,
+    height: u32,
+    scroll_offset_y: f32,
+    overlay: &[crate::display_list::DisplayItem],
+) -> Result<Vec<u8>, String> {
+    render_layout_to_png_with_overlay_scaled(layout_root, font_set, images, width, height, scroll_offset_y, overlay, 1.0)
+}
 
-    pixmap
+/// Como `render_layout_to_png_with_overlay`, renderizando directamente a la
+/// escala física de pantalla `scale` (HiDPI nítido).
+pub fn render_layout_to_png_with_overlay_scaled(
+    layout_root: &LayoutBox,
+    font_set: Option<&FontSet>,
+    images: &ImageMap,
+    width: u32,
+    height: u32,
+    scroll_offset_y: f32,
+    overlay: &[crate::display_list::DisplayItem],
+    scale: f32,
+) -> Result<Vec<u8>, String> {
+    render_layout_to_pixmap_scaled(layout_root, font_set, images, width, height, scroll_offset_y, overlay, scale)?
         .encode_png()
         .map_err(|error| format!("no se pudo codificar la captura PNG: {error}"))
+}
+
+/// Pinta la pagina (y `overlay` encima) en un `Pixmap` en memoria, sin
+/// codificar: lo usa la aplicacion `navegador` para pintar su propia barra con
+/// el motor sin pasar por PNG.
+pub fn render_layout_to_pixmap(
+    layout_root: &LayoutBox,
+    font_set: Option<&FontSet>,
+    images: &ImageMap,
+    width: u32,
+    height: u32,
+    scroll_offset_y: f32,
+    overlay: &[crate::display_list::DisplayItem],
+) -> Result<Pixmap, String> {
+    render_layout_to_pixmap_scaled(layout_root, font_set, images, width, height, scroll_offset_y, overlay, 1.0)
+}
+
+/// Como `render_layout_to_pixmap`, pero pintando directamente a `scale` píxeles
+/// físicos por píxel CSS.
+pub fn render_layout_to_pixmap_scaled(
+    layout_root: &LayoutBox,
+    font_set: Option<&FontSet>,
+    images: &ImageMap,
+    width: u32,
+    height: u32,
+    scroll_offset_y: f32,
+    overlay: &[crate::display_list::DisplayItem],
+    scale: f32,
+) -> Result<Pixmap, String> {
+    let scale = if scale.is_finite() && scale > 0.0 { scale.clamp(0.5, 4.0) } else { 1.0 };
+    let phys_width = ((width as f32 * scale).round() as u32).max(1);
+    let phys_height = ((height as f32 * scale).round() as u32).max(1);
+    let mut pixmap = Pixmap::new(phys_width, phys_height)
+        .ok_or_else(|| format!("no se pudo crear la superficie de rasterizado {phys_width}x{phys_height}"))?;
+    let canvas_color = engine_layout::canvas_background(layout_root)
+        .and_then(|value| crate::display_list::parse_css_color(&value))
+        .map(|[r, g, b, a]| Color::from_rgba8(r, g, b, a))
+        .unwrap_or_else(|| {
+            let [r, g, b, a] = DEFAULT_CANVAS_COLOR;
+            Color::from_rgba8(r, g, b, a)
+        });
+    pixmap.fill(canvas_color);
+
+    let display_list = DisplayList::build(layout_root, images);
+    paint_display_list_scaled(&mut pixmap, &display_list.items, font_set, scroll_offset_y, scale);
+    if !overlay.is_empty() {
+        paint_display_list_scaled(&mut pixmap, overlay, font_set, scroll_offset_y, scale);
+    }
+
+    Ok(pixmap)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_image::DecodedImage;
     use engine_layout::BoxType;
+    use std::sync::Arc;
 
     /// **La garantia de correccion del descarte por viewport (Fase 5)**:
     /// pintar una pagina larga tiene que dar EXACTAMENTE los mismos
@@ -110,6 +192,21 @@ mod tests {
         );
     }
 
+    /// Tarea 2.9 del plan: sin fondo declarado, el lienzo es blanco (255), no
+    /// el gris 245 de antes.
+    #[test]
+    fn a_page_without_a_background_is_painted_on_a_white_canvas() {
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.dimensions.width = 40.0;
+        root.dimensions.height = 30.0;
+        let png = render_layout_to_png(&root, None, &engine_layout::ImageMap::new(), 40, 30, 0.0).expect("PNG should encode");
+        let pixmap = Pixmap::decode_png(&png).expect("el PNG generado debe poder leerse");
+        for (x, y) in [(0, 0), (39, 29), (20, 15)] {
+            let pixel = pixmap.pixel(x, y).expect("pixel dentro del lienzo");
+            assert_eq!((pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()), (255, 255, 255, 255), "pixel ({x}, {y})");
+        }
+    }
+
     #[test]
     fn renders_a_non_empty_png_from_a_layout() {
         let mut root = LayoutBox::new(BoxType::Block);
@@ -169,5 +266,81 @@ mod tests {
 
         let png = render_layout_to_png(&root, None, &engine_layout::ImageMap::new(), 200, 150, 0.0).expect("PNG should encode");
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    /// Fase 40, el punto real de `background-image`: el mosaico tiene que
+    /// pintar pixeles DE VERDAD, repetidos - no basta con que no haga
+    /// panic. Un pixel lejos de la esquina superior-izquierda (35,35 en
+    /// una caja de 40x40 con un tile de 2x2) solo puede ser rojo si el
+    /// tile se repitio de verdad hasta llegar ahi.
+    #[test]
+    fn a_background_image_tiles_a_solid_color_across_its_box() {
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.dimensions.width = 40.0;
+        root.dimensions.height = 40.0;
+        root.computed_style.insert("background-image".to_string(), "url(tile.png)".to_string());
+
+        let mut images = engine_layout::ImageMap::new();
+        images.insert("tile.png".to_string(), Arc::new(DecodedImage { width: 2, height: 2, rgba: [255u8, 0, 0, 255].repeat(4) }));
+
+        let png = render_layout_to_png(&root, None, &images, 40, 40, 0.0).expect("PNG should encode");
+        let pixmap = Pixmap::decode_png(&png).expect("deberia decodificar el PNG");
+        let far_pixel = pixmap.pixel(35, 35).expect("pixel dentro del pixmap");
+        assert_eq!((far_pixel.red(), far_pixel.green(), far_pixel.blue()), (255, 0, 0), "el mosaico deberia seguir repitiendose lejos de la esquina superior-izquierda");
+    }
+
+    /// La razon real de reconstruir la mascara con el propio `rect` metido
+    /// (ver el doc-comment de `DisplayItem::BackgroundImage` en
+    /// `paint.rs`): un tile MAS GRANDE que la caja no deberia derramarse
+    /// sobre el resto de la pagina. Sin ese recorte propio, `draw_pixmap`
+    /// pintaria el tile entero sin respetar el borde de una caja mas
+    /// pequeña que el.
+    #[test]
+    fn a_background_image_larger_than_its_box_does_not_bleed_past_its_own_edges() {
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.dimensions.width = 40.0;
+        root.dimensions.height = 40.0;
+
+        let mut small_box = LayoutBox::new(BoxType::Block);
+        small_box.dimensions.x = 5.0;
+        small_box.dimensions.y = 5.0;
+        small_box.dimensions.width = 10.0;
+        small_box.dimensions.height = 10.0;
+        small_box.computed_style.insert("background-image".to_string(), "url(big.png)".to_string());
+        root.children.push(small_box);
+
+        let mut images = engine_layout::ImageMap::new();
+        images.insert("big.png".to_string(), Arc::new(DecodedImage { width: 30, height: 30, rgba: [0u8, 200, 0, 255].repeat(30 * 30) }));
+
+        let png = render_layout_to_png(&root, None, &images, 40, 40, 0.0).expect("PNG should encode");
+        let pixmap = Pixmap::decode_png(&png).expect("deberia decodificar el PNG");
+        let outside = pixmap.pixel(30, 30).expect("pixel dentro del pixmap");
+        assert_ne!(
+            (outside.red(), outside.green(), outside.blue()),
+            (0, 200, 0),
+            "el mosaico no deberia derramarse fuera de su propia caja aunque el tile sea mas grande que ella"
+        );
+    }
+
+    #[test]
+    fn scaled_render_draws_at_physical_dimensions_without_clipping_box() {
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.dimensions.width = 100.0;
+        root.dimensions.height = 60.0;
+        let mut child = LayoutBox::new(BoxType::Block);
+        child.dimensions.x = 10.0;
+        child.dimensions.y = 10.0;
+        child.dimensions.width = 40.0;
+        child.dimensions.height = 20.0;
+        child.computed_style.insert("background-color".to_string(), "#112233".to_string());
+        root.children.push(child);
+
+        let pixmap = render_layout_to_pixmap_scaled(&root, None, &engine_layout::ImageMap::new(), 100, 60, 0.0, &[], 2.0)
+            .expect("scaled render");
+        assert_eq!((pixmap.width(), pixmap.height()), (200, 120));
+        let inside = pixmap.pixel(30, 30).expect("dentro de 20..100, 20..60");
+        assert_eq!((inside.red(), inside.green(), inside.blue()), (0x11, 0x22, 0x33));
+        let outside = pixmap.pixel(150, 90).expect("fuera");
+        assert_eq!((outside.red(), outside.green(), outside.blue()), (255, 255, 255));
     }
 }

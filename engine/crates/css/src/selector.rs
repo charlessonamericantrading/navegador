@@ -1,5 +1,5 @@
-//! Matching de selectores real via el crate `selectors` (Servo/Stylo - el
-//! mismo que usa Firefox). Sustituye al matcher anterior, que solo entendia
+//! Matching de selectores real via el crate `selectors` (una biblioteca
+//! madura de Rust). Sustituye al matcher anterior, que solo entendia
 //! un tag/`.clase`/`#id` suelto sin combinadores ni selectores compuestos.
 //!
 //! La API publica (`SelectorMatcher::matches`, `::calculate_specificity`,
@@ -18,9 +18,13 @@ use selectors::context::{MatchingContext, MatchingForInvalidation, MatchingMode,
 use selectors::matching::matches_selector_list;
 use selectors::parser::{NonTSPseudoClass, ParseRelative, PseudoElement, SelectorImpl, SelectorList};
 use std::borrow::Borrow;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::element::ElementRef;
+use crate::stylesheet::{KeyPart, Rule, RuleKey};
+use selectors::parser::Component;
 
 /// Cadena de texto propia usada para varios tipos asociados de
 /// `SelectorImpl` (id, clase, nombre de etiqueta, prefijo de namespace).
@@ -256,13 +260,133 @@ fn parse_selector_list(selector_str: &str) -> Option<SelectorList<EngineSelector
     }
 }
 
+thread_local! {
+    /// Fase 39: selectores ya parseados, indexados por su texto original.
+    ///
+    /// Sin esto, `matches` volvia a parsear el selector DESDE LA CADENA en
+    /// cada comparacion. La cascada compara CADA nodo contra CADA regla,
+    /// asi que una pagina real como el articulo "Espana" de Wikipedia
+    /// (13.000 nodos) contra una hoja de ~2.000 reglas hacia del orden de
+    /// 26 MILLONES de parseos del mismo punado de cadenas. Medido en vivo
+    /// antes del cambio: 150 s para esa pagina, y 69,7 s para una pagina
+    /// sintetica de 13.000 nodos x 2.000 reglas (la misma pagina con solo
+    /// 5 reglas tardaba 1,8 s - la lentitud era el PRODUCTO nodos x reglas,
+    /// no ninguno de los dos por separado).
+    ///
+    /// Es `thread_local` y no un `static` global a proposito: los tipos del
+    /// crate `selectors` no son `Sync`, y ademas asi no hace falta ningun
+    /// candado en el camino mas caliente del motor. El coste es una copia
+    /// de la cache por hilo, que es despreciable frente a lo que ahorra.
+    ///
+    /// Se cachea tambien el FALLO (`None`): un selector no soportado se
+    /// reintentaba y volvia a fallar 26 millones de veces igual que uno
+    /// valido. La cache crece con el numero de selectores DISTINTOS vistos
+    /// (acotado por el tamano de las hojas de estilo cargadas), no con el
+    /// numero de comparaciones. NO se vacia entre paginas todavia: en una
+    /// sesion muy larga con muchas hojas distintas iria creciendo.
+    static PARSED_SELECTORS: RefCell<HashMap<String, Option<SelectorList<EngineSelectorImpl>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Ejecuta `f` con el selector ya parseado (o `None` si no es valido/
+/// soportado), parseandolo solo la PRIMERA vez que se ve esa cadena.
+///
+/// Se pasa una clausura en vez de devolver el `SelectorList` para no tener
+/// que clonarlo: el valor vive dentro de la cache y solo se presta. Es
+/// seguro mantener el prestamo mientras se matchea porque el matching solo
+/// lee el DOM - no vuelve a entrar aqui (comprobado: `first_match_in_subtree`
+/// y `collect_matches_in_subtree` reciben la lista YA parseada).
+fn with_parsed_selector<R>(
+    selector_str: &str,
+    f: impl FnOnce(Option<&SelectorList<EngineSelectorImpl>>) -> R,
+) -> R {
+    PARSED_SELECTORS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(selector_str) {
+            cache.insert(selector_str.to_owned(), parse_selector_list(selector_str));
+        }
+        f(cache[selector_str].as_ref())
+    })
+}
+
+pub(crate) struct SelectorAnalysis {
+    pub valid: bool,
+    pub specificity: Specificity,
+    pub index_key: RuleKey,
+}
+
+/// Extrae la clave mas selectiva del compuesto mas a la derecha del selector
+/// (hasta el primer combinador, donde `selector.iter()` se detiene).
+fn compound_key(selector: &selectors::parser::Selector<EngineSelectorImpl>) -> Option<KeyPart> {
+    let mut best_id: Option<&str> = None;
+    let mut best_class: Option<&str> = None;
+    let mut best_tag: Option<&str> = None;
+    for component in selector.iter() {
+        match component {
+            Component::ID(id) => {
+                best_id = Some(id.as_str());
+                break;
+            }
+            Component::Class(class) if best_class.is_none() => {
+                best_class = Some(class.as_str());
+            }
+            Component::LocalName(local) if best_tag.is_none() => {
+                best_tag = Some(local.lower_name.as_str());
+            }
+            _ => {}
+        }
+    }
+    if let Some(id) = best_id {
+        Some(KeyPart::Id(id.to_string()))
+    } else if let Some(class) = best_class {
+        Some(KeyPart::Class(class.to_string()))
+    } else {
+        best_tag.map(|tag| KeyPart::Tag(tag.to_string()))
+    }
+}
+
 pub struct SelectorMatcher;
 
 impl SelectorMatcher {
-    pub fn matches(selector_str: &str, node: &Arc<RwLock<Node>>) -> bool {
-        let Some(list) = parse_selector_list(selector_str) else { return false };
-        let element = ElementRef(node.clone());
+    /// Parsea `selector_str` una sola vez para saber si es valido, su
+    /// especificidad y la clave de indexacion para el `RuleIndex`.
+    pub(crate) fn analyze_selector(selector_str: &str) -> SelectorAnalysis {
+        with_parsed_selector(selector_str, |list| {
+            let Some(list) = list else {
+                return SelectorAnalysis {
+                    valid: false,
+                    specificity: Specificity::default(),
+                    index_key: RuleKey::Any,
+                };
+            };
+            let specificity = list.slice().iter().map(|selector| Specificity(selector.specificity())).max().unwrap_or_default();
+            let mut parts = Vec::with_capacity(list.slice().len());
+            let mut all_keyed = !list.slice().is_empty();
+            for selector in list.slice() {
+                match compound_key(selector) {
+                    Some(part) => {
+                        if !parts.contains(&part) {
+                            parts.push(part);
+                        }
+                    }
+                    None => {
+                        all_keyed = false;
+                        break;
+                    }
+                }
+            }
+            let index_key = if all_keyed { RuleKey::OneOf(parts) } else { RuleKey::Any };
+            SelectorAnalysis { valid: true, specificity, index_key }
+        })
+    }
 
+    /// Evalua un lote de reglas candidatas contra `node` tomando el prestamo de
+    /// `PARSED_SELECTORS` y el `SelectorCaches` una sola vez para todo el nodo.
+    pub(crate) fn filter_matching_rules<'a>(rules: &[&'a Rule], node: &Arc<RwLock<Node>>) -> Vec<&'a Rule> {
+        if rules.is_empty() {
+            return Vec::new();
+        }
+        let element = ElementRef(node.clone());
         let mut caches = SelectorCaches::default();
         let mut context = MatchingContext::new(
             MatchingMode::Normal,
@@ -272,13 +396,47 @@ impl SelectorMatcher {
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
+        PARSED_SELECTORS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let mut matched = Vec::with_capacity(rules.len().min(16));
+            for &rule in rules {
+                if !cache.contains_key(rule.selector.as_str()) {
+                    cache.insert(rule.selector.clone(), parse_selector_list(&rule.selector));
+                }
+                if let Some(list) = cache[rule.selector.as_str()].as_ref() {
+                    if matches_selector_list(list, &element, &mut context) {
+                        matched.push(rule);
+                    }
+                }
+            }
+            matched
+        })
+    }
 
-        matches_selector_list(&list, &element, &mut context)
+    pub fn matches(selector_str: &str, node: &Arc<RwLock<Node>>) -> bool {
+        with_parsed_selector(selector_str, |list| {
+            let Some(list) = list else { return false };
+            let element = ElementRef(node.clone());
+
+            let mut caches = SelectorCaches::default();
+            let mut context = MatchingContext::new(
+                MatchingMode::Normal,
+                None,
+                &mut caches,
+                QuirksMode::NoQuirks,
+                NeedsSelectorFlags::No,
+                MatchingForInvalidation::No,
+            );
+
+            matches_selector_list(list, &element, &mut context)
+        })
     }
 
     pub fn calculate_specificity(selector_str: &str) -> Specificity {
-        let Some(list) = parse_selector_list(selector_str) else { return Specificity::default() };
-        list.slice().iter().map(|selector| Specificity(selector.specificity())).max().unwrap_or_default()
+        with_parsed_selector(selector_str, |list| {
+            let Some(list) = list else { return Specificity::default() };
+            list.slice().iter().map(|selector| Specificity(selector.specificity())).max().unwrap_or_default()
+        })
     }
 
     /// Primer elemento en orden de documento (preorden: el nodo antes que
@@ -286,17 +444,46 @@ impl SelectorMatcher {
     /// `document.querySelector`. `None` si el selector es invalido/no
     /// soportado o si nada matchea.
     pub fn query_first(selector_str: &str, root: &Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
-        let list = parse_selector_list(selector_str)?;
-        first_match_in_subtree(&list, root)
+        with_parsed_selector(selector_str, |list| first_match_in_subtree(list?, root))
     }
 
     /// Todos los elementos en orden de documento (incluida la raiz) que
     /// matchean `selector_str` - base de `document.querySelectorAll`. Vacio
     /// si el selector es invalido/no soportado o si nada matchea.
     pub fn query_all(selector_str: &str, root: &Arc<RwLock<Node>>) -> Vec<Arc<RwLock<Node>>> {
-        let Some(list) = parse_selector_list(selector_str) else { return Vec::new() };
         let mut out = Vec::new();
-        collect_matches_in_subtree(&list, root, &mut out);
+        with_parsed_selector(selector_str, |list| {
+            if let Some(list) = list {
+                collect_matches_in_subtree(list, root, &mut out);
+            }
+        });
+        out
+    }
+
+    /// Como `query_first`, pero SIN la raiz: solo sus descendientes. Es la
+    /// semantica de `element.querySelector` (plan H26). El selector se sigue
+    /// evaluando contra el documento entero, asi que `el.querySelector('div
+    /// span')` encuentra un `span` de `el` aunque el `div` sea un antepasado
+    /// de `el`, igual que en un navegador.
+    pub fn query_first_descendant(selector_str: &str, root: &Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
+        let children = root.read().unwrap().children.clone();
+        with_parsed_selector(selector_str, |list| {
+            let list = list?;
+            children.iter().find_map(|child| first_match_in_subtree(list, child))
+        })
+    }
+
+    /// Como `query_all`, pero sin la raiz - `element.querySelectorAll`.
+    pub fn query_all_descendants(selector_str: &str, root: &Arc<RwLock<Node>>) -> Vec<Arc<RwLock<Node>>> {
+        let children = root.read().unwrap().children.clone();
+        let mut out = Vec::new();
+        with_parsed_selector(selector_str, |list| {
+            if let Some(list) = list {
+                for child in &children {
+                    collect_matches_in_subtree(list, child, &mut out);
+                }
+            }
+        });
         out
     }
 }

@@ -1,0 +1,15 @@
+<!doctype html><html><head><meta charset="utf-8"><title>PENDIENTE</title>
+<script>
+function ok(cond, motivo) { document.title = cond ? 'OK' : 'FALLO: ' + motivo; }
+function fallo(e) { document.title = 'FALLO: ' + (e && e.message ? e.message : String(e)); }
+</script></head><body>
+<script>
+try {
+  localStorage.setItem('corpus', JSON.stringify({ n: 42 }));
+  sessionStorage.setItem('s', 'x');
+  var leido = JSON.parse(localStorage.getItem('corpus'));
+  localStorage.removeItem('corpus');
+  ok(leido.n === 42 && sessionStorage.getItem('s') === 'x' && localStorage.getItem('corpus') === null, 'lectura/escritura incorrecta');
+} catch (e) { fallo(e); }
+</script>
+</body></html>

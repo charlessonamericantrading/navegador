@@ -24,15 +24,19 @@
 //!
 //! # Consecuencias honestas de que sea un snapshot y no un reflow
 //!
-//! - **Durante la carga de la pagina el snapshot esta VACIO**: todavia no
-//!   ha corrido ningun layout. Un `<script>` que llame a
-//!   `getBoundingClientRect()` en ese momento recibe un rect de ceros, y
-//!   `getComputedStyle(el)` un objeto sin ninguna propiedad. No es un
-//!   invento: es exactamente lo que devuelve un navegador real para un
-//!   elemento que no esta en el arbol de render (`display: none`, o
-//!   desconectado del documento). Donde estas APIs se usan de verdad -
-//!   dentro de un listener de `click`/`input`/`popstate` - el snapshot ya
-//!   esta publicado y los valores son reales.
+//! - **Antes del PRIMER layout el snapshot esta VACIO**: un `<script>`
+//!   sincrono que llame a `getBoundingClientRect()` mientras el HTML
+//!   todavia se esta parseando (antes de que exista ningun arbol de
+//!   layout) recibe un rect de ceros, y `getComputedStyle(el)` un objeto
+//!   sin ninguna propiedad. No es un invento: es exactamente lo que
+//!   devuelve un navegador real para un elemento que no esta en el arbol
+//!   de render (`display: none`, o desconectado del documento). Donde
+//!   estas APIs se usan de verdad - dentro de un listener de
+//!   `click`/`input`/`popstate`, o de `DOMContentLoaded` (el listener de
+//!   arranque mas comun de una pagina real) - el snapshot ya esta
+//!   publicado y los valores son reales: `build_page_keeping_runtime`
+//!   construye el layout y publica el snapshot ANTES de disparar
+//!   `DOMContentLoaded`, no despues.
 //! - **Mutar el DOM no actualiza el snapshot al instante.** Si un listener
 //!   cambia `el.style.width` y acto seguido lee `getBoundingClientRect()`,
 //!   ve la geometria de ANTES del cambio; el navegador real veria la de
@@ -106,6 +110,12 @@ pub struct LayoutSnapshotData {
     /// `core::server` puede actualizar solo este campo sin volver a
     /// recorrer el arbol entero.
     pub scroll_offset_y: f32,
+    /// Tamano del viewport en pixeles CSS (Fase 45). Vive aqui y no en un
+    /// global suelto por lo mismo que el scroll: es un dato del ESTADO de la
+    /// pestana que JS consulta (`window.innerWidth`, `matchMedia`) y que solo
+    /// `core::pipeline` conoce al construir la pagina.
+    pub viewport_width: f32,
+    pub viewport_height: f32,
 }
 
 impl LayoutSnapshotData {
@@ -476,6 +486,7 @@ mod tests {
         let data = LayoutSnapshotData {
             boxes: vec![(one.clone(), BoxMetrics { x: 7.0, ..Default::default() })],
             scroll_offset_y: 0.0,
+            ..Default::default()
         };
 
         assert_eq!(data.metrics_for(&one).map(|m| m.x), Some(7.0));

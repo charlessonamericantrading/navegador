@@ -88,8 +88,10 @@ impl StorageArea {
 pub struct QuotaExceeded;
 
 /// Las dos areas del spec. Son almacenes SEPARADOS incluso para el mismo
-/// origen: lo que escribe una no lo ve la otra.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// origen: lo que escribe una no lo ve la otra. Serializable porque viaja
+/// en el protocolo del broker (`crate::broker_wire`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StorageKind {
     Local,
     Session,
@@ -122,7 +124,7 @@ impl WebStorage {
     /// realista fuera de un contenedor roto), tratado como "sin
     /// persistencia disponible" en vez de un error fatal.
     fn default_persist_path() -> Option<PathBuf> {
-        Some(dirs::data_dir()?.join("navegador-ia").join("local_storage.json"))
+        Some(crate::profile::profile_dir()?.join("local_storage.json"))
     }
 
     /// La version que usa `core::server` en produccion: carga `local` de

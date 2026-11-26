@@ -1,0 +1,15 @@
+<!doctype html><html><head><meta charset="utf-8"><title>PENDIENTE</title>
+<script>
+function ok(cond, motivo) { document.title = cond ? 'OK' : 'FALLO: ' + motivo; }
+function fallo(e) { document.title = 'FALLO: ' + (e && e.message ? e.message : String(e)); }
+</script></head><body>
+<p id="estado">cargando</p>
+<script>
+try {
+  setTimeout(function () {
+    document.getElementById('estado').textContent = 'listo';
+    ok(document.getElementById('estado').textContent === 'listo', 'no se actualizo');
+  }, 300);
+} catch (e) { fallo(e); }
+</script>
+</body></html>

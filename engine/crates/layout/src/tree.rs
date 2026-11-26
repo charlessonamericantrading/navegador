@@ -1,5 +1,5 @@
 use crate::box_model::EdgeSizes;
-use crate::layout_box::{LayoutBox, BoxType, Rect, ReplacedText};
+use crate::layout_box::{AvailableAxis, BoxType, LayoutBox, MeasureKey, Rect, ReplacedText};
 use engine_dom::{Node, NodeType};
 use engine_css::StyleSheet;
 use engine_image::DecodedImage;
@@ -20,11 +20,15 @@ pub type ImageMap = HashMap<String, Arc<DecodedImage>>;
 /// Propiedades que SI se propagan de un elemento a sus descendientes cuando
 /// estos no las redefinen (herencia CSS real). Ampliada en la Fase 2.5 a la
 /// lista real de propiedades heredables del spec que tienen sentido para
-/// este motor hoy - se excluyen a proposito las que son especificas de
-/// tablas (`border-collapse`, `border-spacing`, `caption-side`,
-/// `empty-cells` - el motor no tiene layout de tablas, Fase 3.4 pendiente)
-/// y las de paginacion impresa (`orphans`/`widows` - un renderer de
-/// pantalla sin paginacion no tiene "pagina" que romper).
+/// este motor hoy - se excluyen a proposito las especificas de tablas
+/// (`border-collapse`, `border-spacing`, `caption-side`, `empty-cells` -
+/// el layout de tablas (Fase 3.4, y `border-spacing`/`border-collapse`
+/// despues) las lee directo del `computed_style` de la propia `<table>`,
+/// no via herencia - el caso real casi siempre las declara ahi mismo con
+/// un selector `table { ... }`, no en un ancestro mas arriba, asi que no
+/// hacia falta la lista de herencia para que funcionaran) y las de
+/// paginacion impresa (`orphans`/`widows` - un renderer de pantalla sin
+/// paginacion no tiene "pagina" que romper).
 ///
 /// Igual que ya pasaba con `font-weight`/`font-style` (Fase 2.4) antes de
 /// que `engine-gfx` las pintara: que una propiedad este aqui significa que
@@ -40,6 +44,90 @@ pub type ImageMap = HashMap<String, Arc<DecodedImage>>;
 /// `resolve_font_size` porque algo -el layout- ya consume ese valor
 /// resuelto) - se propagan como el string crudo que declaro el autor, igual
 /// que `color` siempre ha hecho.
+/// Sustituye cada `var(--nombre, respaldo)` de `value` por el valor de esa
+/// propiedad personalizada, o por el respaldo si no esta definida.
+///
+/// Las propiedades personalizadas (`--color-base: #fff`) son la forma en
+/// que se escribe CSS hoy: MDN usa `var()` 547 veces y Wikipedia declara
+/// hasta sus colores de fondo asi. Sin resolverlas, el valor que llega al
+/// layout es la cadena literal "var(--algo)", que no parsea como longitud
+/// ni como color, y la declaracion entera se pierde - la pagina se maqueta
+/// como si su hoja de estilos no existiera.
+///
+/// Se resuelve de dentro hacia fuera y de forma recursiva (una variable
+/// puede valer otra `var()`), con un tope de profundidad que corta las
+/// referencias circulares: `--a: var(--b); --b: var(--a)` es CSS valido de
+/// escribir y no debe colgar el motor.
+fn substitute_css_vars(value: &str, vars: &HashMap<String, String>, depth: u8) -> String {
+    const MAX_DEPTH: u8 = 8;
+    if depth >= MAX_DEPTH || !value.contains("var(") {
+        return value.to_string();
+    }
+
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if !value[i..].starts_with("var(") {
+            let ch_len = value[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+            out.push_str(&value[i..i + ch_len]);
+            i += ch_len;
+            continue;
+        }
+        // Buscar el parentesis que cierra ESTE `var(`, contando los que se
+        // abran por dentro (el respaldo puede llevar otro `var()` o un
+        // `calc()`).
+        let open = i + 3;
+        let mut level = 0usize;
+        let mut close = None;
+        for (offset, ch) in value[open..].char_indices() {
+            match ch {
+                '(' => level += 1,
+                ')' => {
+                    level -= 1;
+                    if level == 0 {
+                        close = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            // `var(` sin cerrar: se copia tal cual y se deja de interpretar.
+            out.push_str(&value[i..]);
+            break;
+        };
+
+        let inner = &value[open + 1..close];
+        let (name, fallback) = match inner.find(',') {
+            Some(comma) => (inner[..comma].trim(), Some(inner[comma + 1..].trim())),
+            None => (inner.trim(), None),
+        };
+
+        let replacement = match vars.get(name) {
+            Some(found) => substitute_css_vars(found, vars, depth + 1),
+            None => match fallback {
+                Some(f) => substitute_css_vars(f, vars, depth + 1),
+                // Sin valor ni respaldo, el spec declara la propiedad
+                // invalida; dejarla vacia es lo mas parecido que puede hacer
+                // este motor sin un concepto de "valor no valido".
+                None => String::new(),
+            },
+        };
+        out.push_str(&replacement);
+        i = close + 1;
+    }
+    out
+}
+
+/// Una propiedad personalizada es cualquiera cuyo nombre empieza por `--`.
+/// Heredan SIEMPRE (por eso no estan ni pueden estar en
+/// `INHERITABLE_PROPERTIES`, que es una lista cerrada).
+fn is_custom_property(name: &str) -> bool {
+    name.starts_with("--")
+}
+
 const INHERITABLE_PROPERTIES: &[&str] = &[
     "color",
     "font-size",
@@ -57,6 +145,7 @@ const INHERITABLE_PROPERTIES: &[&str] = &[
     "visibility",
     "cursor",
     "direction",
+    "list-style",
     "list-style-type",
     "list-style-position",
     "list-style-image",
@@ -75,6 +164,273 @@ const INITIAL_FONT_SIZE: f32 = 16.0;
 /// diseño, `resolve_font_size` (mas abajo) ya deja resuelto a `px` todo lo
 /// que la cascada consigue resolver antes de que nada mas lo lea, asi que
 /// ni esta funcion ni la copia de `engine-gfx` necesitan saber de `em`/`%`.
+/// Convierte a pixeles una longitud escrita en cualquier unidad que dependa
+/// SOLO del elemento y del viewport - `em`, `rem`, `vw`, `vh`, `vmin`,
+/// `vmax`, `pt` - y evalua `calc()` cuando todos sus operandos son de ese
+/// tipo. Los PORCENTAJES no: dependen del bloque contenedor, que en este
+/// punto todavia no existe, asi que se dejan intactos para que los resuelva
+/// la maquetacion (ver `resolve_block_width`, `resolve_box_edges`).
+///
+/// `None` si no es una longitud de esta familia (un color, `auto`, un
+/// porcentaje suelto...), en cuyo caso quien llama deja el valor como esta.
+fn absolute_length_to_px(token: &str, font_px: f32, viewport: (f32, f32)) -> Option<f32> {
+    let t = token.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t == "0" {
+        return Some(0.0);
+    }
+    let (vw, vh) = viewport;
+    // El orden importa: `rem` termina en "em", asi que se prueba antes.
+    for (sufijo, escala) in [
+        ("rem", 16.0),
+        ("em", font_px),
+        ("vmin", vw.min(vh) / 100.0),
+        ("vmax", vw.max(vh) / 100.0),
+        ("vw", vw / 100.0),
+        ("vh", vh / 100.0),
+        ("pt", 4.0 / 3.0),
+        ("px", 1.0),
+    ] {
+        if let Some(numero) = t.strip_suffix(sufijo) {
+            return numero.trim().parse::<f32>().ok().map(|n| n * escala);
+        }
+    }
+    None
+}
+
+/// Evalua un `calc()` cuyos operandos sean longitudes absolutas o numeros
+/// puros. Soporta `+ - * /` con la precedencia normal y parentesis
+/// anidados.
+///
+/// `None` si aparece algo que no se puede resolver aqui (un porcentaje, una
+/// `var()` sin sustituir, una funcion desconocida): entonces la declaracion
+/// se deja tal cual, que es mejor que inventarse un numero.
+fn eval_calc(expr: &str, font_px: f32, viewport: (f32, f32), percent_base: Option<f32>) -> Option<f32> {
+    let tokens = tokenize_calc(expr);
+    let mut pos = 0usize;
+    let valor = eval_suma(&tokens, &mut pos, font_px, viewport, percent_base)?;
+    if pos != tokens.len() {
+        return None;
+    }
+    Some(valor)
+}
+
+/// Tokenizado de un `calc()`: numeros-con-unidad, operadores y parentesis. Un
+/// `-` solo es operador si va rodeado de espacios o sigue a otro operador; en
+/// CSS `10px -5px` son dos valores y `10px-5px` no es valido, asi que exigir
+/// el espacio es lo correcto y ademas evita partir "e-5" de un numero.
+fn tokenize_calc(expr: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut actual = String::new();
+    let mut anterior_es_valor = false;
+    let chars = expr.chars().peekable();
+    for c in chars {
+        match c {
+            '(' | ')' => {
+                if !actual.trim().is_empty() {
+                    tokens.push(actual.trim().to_string());
+                }
+                actual.clear();
+                tokens.push(c.to_string());
+                anterior_es_valor = c == ')';
+            }
+            '+' | '*' | '/' => {
+                if !actual.trim().is_empty() {
+                    tokens.push(actual.trim().to_string());
+                }
+                actual.clear();
+                tokens.push(c.to_string());
+                anterior_es_valor = false;
+            }
+            '-' if anterior_es_valor && actual.trim().is_empty() => {
+                tokens.push("-".to_string());
+                anterior_es_valor = false;
+            }
+            c if c.is_whitespace() => {
+                if !actual.trim().is_empty() {
+                    tokens.push(actual.trim().to_string());
+                    anterior_es_valor = true;
+                }
+                actual.clear();
+            }
+            c => actual.push(c),
+        }
+    }
+    if !actual.trim().is_empty() {
+        tokens.push(actual.trim().to_string());
+    }
+    tokens
+}
+
+fn eval_suma(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f32, f32), percent_base: Option<f32>) -> Option<f32> {
+    let mut acc = eval_producto(tokens, pos, font_px, viewport, percent_base)?;
+    while *pos < tokens.len() && (tokens[*pos] == "+" || tokens[*pos] == "-") {
+        let op = tokens[*pos].clone();
+        *pos += 1;
+        let derecha = eval_producto(tokens, pos, font_px, viewport, percent_base)?;
+        acc = if op == "+" { acc + derecha } else { acc - derecha };
+    }
+    Some(acc)
+}
+
+fn eval_producto(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f32, f32), percent_base: Option<f32>) -> Option<f32> {
+    let mut acc = eval_atomo(tokens, pos, font_px, viewport, percent_base)?;
+    while *pos < tokens.len() && (tokens[*pos] == "*" || tokens[*pos] == "/") {
+        let op = tokens[*pos].clone();
+        *pos += 1;
+        let derecha = eval_atomo(tokens, pos, font_px, viewport, percent_base)?;
+        if op == "*" {
+            acc *= derecha;
+        } else {
+            if derecha == 0.0 {
+                return None;
+            }
+            acc /= derecha;
+        }
+    }
+    Some(acc)
+}
+
+fn eval_atomo(tokens: &[String], pos: &mut usize, font_px: f32, viewport: (f32, f32), percent_base: Option<f32>) -> Option<f32> {
+    let token = tokens.get(*pos)?.clone();
+    if token == "(" {
+        *pos += 1;
+        let dentro = eval_suma(tokens, pos, font_px, viewport, percent_base)?;
+        if tokens.get(*pos)? != ")" {
+            return None;
+        }
+        *pos += 1;
+        return Some(dentro);
+    }
+    *pos += 1;
+    if let Some(px) = absolute_length_to_px(&token, font_px, viewport) {
+        return Some(px);
+    }
+    // Un porcentaje solo se puede evaluar si se conoce el bloque contenedor
+    // (`percent_base`): en la cascada no se conoce y el calc se deja para la
+    // maquetacion (ver `rewrite_calc_keeping_percent`).
+    if let Some(porcentaje) = token.strip_suffix('%') {
+        return porcentaje.trim().parse::<f32>().ok().and_then(|n| percent_base.map(|base| n / 100.0 * base));
+    }
+    // Un numero puro (el factor de un `* 2`).
+    token.parse::<f32>().ok()
+}
+
+/// Reescribe un `calc()` con porcentajes dejando en PIXELES todo lo demas
+/// (tarea 2.4 del plan): `calc(100% - 2em)` -> `calc(100% - 32px)`. Asi, en
+/// la maquetacion, donde ya se conoce el bloque contenedor, solo quedan
+/// porcentajes y pixeles y `parse_css_length_relative` puede resolverlo sin
+/// saber del tamaño de fuente. `None` si hay algo que no se entiende.
+fn rewrite_calc_keeping_percent(expr: &str, font_px: f32, viewport: (f32, f32)) -> Option<String> {
+    let mut salida = Vec::new();
+    for token in tokenize_calc(expr) {
+        if matches!(token.as_str(), "(" | ")" | "+" | "-" | "*" | "/") || token.ends_with('%') {
+            salida.push(token);
+        } else if let Some(px) = absolute_length_to_px(&token, font_px, viewport) {
+            salida.push(format!("{px}px"));
+        } else if token.parse::<f32>().is_ok() {
+            salida.push(token);
+        } else {
+            return None;
+        }
+    }
+    Some(format!("calc({})", salida.join(" ")))
+}
+
+/// Reescribe un valor de propiedad dejando en PIXELES todo lo que se pueda
+/// resolver sin conocer el bloque contenedor. Respeta los valores de varios
+/// tokens (`padding: 1em 2em`) convirtiendo cada uno por separado.
+///
+/// Devuelve `None` si no habia nada que convertir, para no reescribir el
+/// mapa de estilos sin motivo.
+fn resolve_relative_units(value: &str, font_px: f32, viewport: (f32, f32)) -> Option<String> {
+    if !necesita_resolver_unidades(value) {
+        return None;
+    }
+    let mut salida: Vec<String> = Vec::new();
+    let mut cambiado = false;
+    for token in dividir_en_tokens(value) {
+        let bajo = token.to_ascii_lowercase();
+        if let Some(interior) = bajo.strip_prefix("calc(").and_then(|r| r.strip_suffix(')')) {
+            match eval_calc(interior, font_px, viewport, None) {
+                Some(px) => {
+                    salida.push(format!("{px}px"));
+                    cambiado = true;
+                }
+                // Con porcentajes no se puede evaluar todavia: se dejan en
+                // pixeles las demas unidades y se resuelve al maquetar.
+                None if interior.contains('%') => match rewrite_calc_keeping_percent(interior, font_px, viewport) {
+                    Some(reescrito) => {
+                        salida.push(reescrito);
+                        cambiado = true;
+                    }
+                    None => salida.push(token.to_string()),
+                },
+                None => salida.push(token.to_string()),
+            }
+            continue;
+        }
+        // `px` no se toca: ya esta en la unidad final y reescribirlo solo
+        // introduciria ruido de coma flotante.
+        if bajo.ends_with("px") {
+            salida.push(token.to_string());
+            continue;
+        }
+        match absolute_length_to_px(&bajo, font_px, viewport) {
+            Some(px) => {
+                salida.push(format!("{px}px"));
+                cambiado = true;
+            }
+            None => salida.push(token.to_string()),
+        }
+    }
+    if cambiado {
+        Some(salida.join(" "))
+    } else {
+        None
+    }
+}
+
+/// Filtro barato para no tokenizar cada valor de cada caja: solo los que
+/// pueden contener una unidad relativa o un `calc()`.
+fn necesita_resolver_unidades(value: &str) -> bool {
+    let v = value.as_bytes();
+    // "em" cubre tambien "rem"; "v" cubre vw/vh/vmin/vmax.
+    value.contains("em") || value.contains("calc(") || value.contains("pt") || value.contains("vw") || value.contains("vh") || value.contains("vmin") || value.contains("vmax") || v.is_empty()
+}
+
+/// Parte un valor en tokens separados por espacios, SIN romper el interior
+/// de una funcion (`calc(1em + 2px)` es un solo token pese a sus espacios).
+fn dividir_en_tokens(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut actual = String::new();
+    let mut nivel = 0usize;
+    for c in value.chars() {
+        match c {
+            '(' => {
+                nivel += 1;
+                actual.push(c);
+            }
+            ')' => {
+                nivel = nivel.saturating_sub(1);
+                actual.push(c);
+            }
+            c if c.is_whitespace() && nivel == 0 => {
+                if !actual.is_empty() {
+                    out.push(std::mem::take(&mut actual));
+                }
+            }
+            c => actual.push(c),
+        }
+    }
+    if !actual.is_empty() {
+        out.push(actual);
+    }
+    out
+}
+
 fn parse_css_font_size(value: &str) -> Option<f32> {
     let trimmed = value.trim();
     if let Some(px) = trimmed.strip_suffix("px") {
@@ -135,6 +491,13 @@ fn parse_css_offset_relative(value: &str, reference_size: f32) -> Option<f32> {
 /// `relative` NO cuenta como fuera de flujo (sigue reservando su espacio
 /// normal, solo se desplaza visualmente despues - ver
 /// `apply_relative_offset`); `static` (el valor inicial real) tampoco.
+/// La familia de letra de una caja (tarea 2.7): serifa, monoespaciada o
+/// sans-serif, la de siempre. `font-family` ya se hereda hasta las hojas de
+/// texto (`INHERITABLE_PROPERTIES`).
+fn resolve_font_family(computed_style: &HashMap<String, String>) -> engine_text::FontFamily {
+    computed_style.get("font-family").map(|value| engine_text::FontFamily::from_css(value)).unwrap_or_default()
+}
+
 fn is_out_of_flow(computed_style: &HashMap<String, String>) -> bool {
     matches!(computed_style.get("position").map(String::as_str), Some("absolute") | Some("fixed"))
 }
@@ -156,6 +519,164 @@ fn float_side(computed_style: &HashMap<String, String>) -> Option<FloatSide> {
         Some("right") => Some(FloatSide::Right),
         _ => None,
     }
+}
+
+/// `display: list-item` (Fase 40, hoja UA: `li { display: list-item; }`) -
+/// el `<li>` sigue siendo `BoxType::Block` de siempre
+/// (`override_box_type_from_display` no reconoce este valor, cae al
+/// `default.clone()` tag-based), esto solo decide si `flow_normal_block_children`
+/// le antepone una vineta.
+fn is_list_item(computed_style: &HashMap<String, String>) -> bool {
+    computed_style.get("display").map(String::as_str) == Some("list-item")
+}
+
+/// `list-style-type: none` o el shorthand `list-style: none` (ambos ya
+/// heredables, ver `INHERITABLE_PROPERTIES`) - la forma real, MUY comun,
+/// con la que una pagina real quita las vinetas por defecto de una lista
+/// entera desde el `<ul>`/`<ol>` (encontrado en vivo contra la Wikipedia
+/// real: su tabla de contenidos es un `<ul>` con `list-style: none` que
+/// pinta su propia numeracion via `<span>`, no la del navegador - sin este
+/// chequeo, `place_list_marker` le anteponia una vineta encima de la suya
+/// propia). El shorthand no se expande a longhand en ningun sitio de este
+/// motor (ver el aviso de `user_agent_stylesheet.rs`), asi que se busca
+/// "none" como TOKEN suelto del valor crudo, no con una comparacion
+/// exacta (cubre `list-style: none outside` igual que el `list-style:
+/// none` simple).
+fn list_style_is_none(computed_style: &HashMap<String, String>) -> bool {
+    if computed_style.get("list-style-type").is_some_and(|v| v.trim().eq_ignore_ascii_case("none")) {
+        return true;
+    }
+    computed_style.get("list-style").is_some_and(|v| v.split_whitespace().any(|token| token.eq_ignore_ascii_case("none")))
+}
+
+/// Etiqueta HTML del elemento que produjo esta caja, o `None` para una
+/// caja de texto/sintetica sin `dom_node` (ver su doc-comment en
+/// `layout_box.rs`) - lo unico que necesita `place_list_marker` para
+/// distinguir `<ol>` (numerado) de cualquier otro contenedor de lista
+/// (con vineta).
+fn tag_name_of(node: &LayoutBox) -> Option<String> {
+    let dom_node = node.dom_node.as_ref()?;
+    match &dom_node.read().unwrap().node_type {
+        NodeType::Element { tag_name, .. } => Some(tag_name.clone()),
+        _ => None,
+    }
+}
+
+/// Palabras clave de `list-style-type` que este motor reconoce (para
+/// buscarlas sueltas dentro del shorthand `list-style`, que no se expande
+/// a longhand en ningun sitio - ver el aviso de `user_agent_stylesheet.rs`
+/// y de `list_style_is_none`). `inside`/`outside` (list-style-position) y
+/// una `url(...)` (list-style-image) nunca coinciden con ninguna de
+/// estas, asi que un shorthand combinado (`list-style: square outside`)
+/// encuentra el tipo correcto sin confundirlo con la posicion.
+const LIST_STYLE_TYPE_KEYWORDS: &[&str] = &[
+    "disc", "circle", "square", "decimal", "decimal-leading-zero", "lower-roman", "upper-roman", "lower-alpha", "upper-alpha", "lower-latin", "upper-latin",
+];
+
+/// El valor de `list-style-type`, declarado directo o dentro del
+/// shorthand `list-style` - `None` si no hay ninguno reconocido (quien
+/// llama cae entonces al valor por defecto real segun el tipo de lista).
+fn declared_list_style_type(computed_style: &HashMap<String, String>) -> Option<String> {
+    if let Some(v) = computed_style.get("list-style-type") {
+        let v = v.trim().to_ascii_lowercase();
+        if LIST_STYLE_TYPE_KEYWORDS.contains(&v.as_str()) {
+            return Some(v);
+        }
+    }
+    computed_style
+        .get("list-style")
+        .and_then(|v| v.split_whitespace().map(|t| t.to_ascii_lowercase()).find(|t| LIST_STYLE_TYPE_KEYWORDS.contains(&t.as_str())))
+}
+
+/// `n` (1-based) en numeros romanos, MAYUSCULA - la formula estandar de
+/// sustraccion (`CM`, `CD`... antes que sumar de uno en uno) sobre los 13
+/// simbolos/valores del sistema, sin libreria: es una tabla cerrada de 13
+/// pares, no vale la pena una dependencia para esto.
+fn to_roman_numeral(mut n: u32) -> String {
+    const VALUES: &[(u32, &str)] = &[(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")];
+    let mut result = String::new();
+    for &(value, symbol) in VALUES {
+        while n >= value {
+            result.push_str(symbol);
+            n -= value;
+        }
+    }
+    result
+}
+
+/// `n` (1-based) como letras, MAYUSCULA - numeracion "bijective base-26"
+/// real del spec: `a`..`z` (1-26), despues `aa`..`az`, `ba`... (27+), NO
+/// como contar en base 26 normal (que tendria un digito "cero" que el
+/// alfabeto no tiene - por eso se resta 1 antes de cada modulo, el truco
+/// estandar de la numeracion bijective).
+fn to_alpha_marker(mut n: u32) -> String {
+    let mut letters = Vec::new();
+    while n > 0 {
+        n -= 1;
+        letters.push((b'A' + (n % 26) as u8) as char);
+        n /= 26;
+    }
+    letters.iter().rev().collect()
+}
+
+/// El texto de la vineta segun `list-style-type` (heredable, ver
+/// `INHERITABLE_PROPERTIES` - un `<li>` normalmente lo hereda de su
+/// `<ul>`/`<ol>`, pero tambien puede declararlo el mismo). Sin ninguno
+/// declarado, cae al valor por defecto real del spec segun el tipo de
+/// lista (`decimal` para `<ol>`, `disc` para cualquier otra) - `ordered`
+/// solo importa para ESE fallback, un `list-style-type` explicito manda
+/// siempre, incluso llevando la cuenta contraria a la del propio tag
+/// (`<ul style="list-style-type: decimal">` numera de verdad, igual que
+/// en un navegador real). Cualquier valor no reconocido (o `disc`
+/// explicito) cae a la bala solida - ni inventa un simbolo ni rompe.
+fn list_marker_text(computed_style: &HashMap<String, String>, ordinal: u32, ordered: bool) -> String {
+    let kind = declared_list_style_type(computed_style).unwrap_or_else(|| if ordered { "decimal".to_string() } else { "disc".to_string() });
+    match kind.as_str() {
+        "circle" => "\u{25E6}".to_string(),
+        "square" => "\u{25AA}".to_string(),
+        "decimal" => format!("{ordinal}."),
+        "decimal-leading-zero" => format!("{ordinal:02}."),
+        "lower-roman" => format!("{}.", to_roman_numeral(ordinal).to_ascii_lowercase()),
+        "upper-roman" => format!("{}.", to_roman_numeral(ordinal)),
+        "lower-alpha" | "lower-latin" => format!("{}.", to_alpha_marker(ordinal).to_ascii_lowercase()),
+        "upper-alpha" | "upper-latin" => format!("{}.", to_alpha_marker(ordinal)),
+        _ => "\u{2022}".to_string(),
+    }
+}
+
+/// Antepone una vineta real a `child` (un `<li>`, ya con sus `dimensions`
+/// finales resueltas por el flujo de bloque normal - por eso se llama
+/// DESPUES de `flow_block_children(child, ...)`, no antes: necesita saber
+/// donde empieza `child` de verdad). El texto sale de `list_marker_text`
+/// (ver su aviso) segun `list-style-type`, via `ordinal` (posicion
+/// 1-based entre sus hermanos `list-item`, llevada por quien llama -
+/// `place_list_marker` en si no sabe nada de hermanos).
+///
+/// El marcador se posiciona FUERA de la caja de contenido de `child`, en
+/// el hueco que le da su propio `margin-left` (ver la hoja UA) -
+/// equivalente honesto-minimo de `list-style-position: outside`, el valor
+/// inicial real de la propiedad: no reserva su propio ancho en el flujo
+/// (no lo necesita, vive en un margen que ya nadie mas ocupa) y no cambia
+/// nada de la posicion/ancho de `child`. Se inserta como el PRIMER hijo de
+/// `child` (una caja de texto sintetica, sin `dom_node`) para que pinte
+/// por el mismo camino que cualquier otro texto, sin tocar `engine-gfx`.
+fn place_list_marker(child: &mut LayoutBox, ordinal: u32, ordered: bool, font_set: Option<&FontSet>) {
+    let text = list_marker_text(&child.computed_style, ordinal, ordered);
+    let font_size = child.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
+    let natural_width = match font_set.and_then(|set| set.pick_family(resolve_font_family(&child.computed_style), false, false)) {
+        Some(f) => engine_text::wrapped_line_width(f, &text, font_size),
+        None => text.chars().count() as f32 * 8.0,
+    };
+    const GAP_BEFORE_CONTENT: f32 = 6.0;
+    let mut marker = LayoutBox::new(BoxType::Text(text));
+    marker.computed_style = child.computed_style.clone();
+    marker.dimensions = Rect {
+        x: child.dimensions.x - natural_width - GAP_BEFORE_CONTENT,
+        y: child.dimensions.y,
+        width: natural_width,
+        height: font_size * 1.2,
+    };
+    child.children.insert(0, marker);
 }
 
 /// Un float TODAVIA activo en la posicion vertical actual del flujo
@@ -226,6 +747,56 @@ fn apply_relative_offset(node: &mut LayoutBox) {
     node.dimensions.y += dy;
 }
 
+/// Reparte `available` entre las columnas de una tabla a partir de la
+/// anchura minima y maxima de contenido de cada una - el algoritmo de
+/// "tabla automatica" del spec, simplificado a un solo reparto
+/// proporcional (sin `colspan`, sin `table-layout: fixed`).
+///
+/// Antes cada columna recibia `available / numero_de_columnas`, a partes
+/// iguales. Eso descuadra CUALQUIER pagina maquetada con tablas: en Hacker
+/// News la columna del numero de orden ("1.", "2.") se llevaba un tercio de
+/// la pantalla y empujaba el titular fuera de su sitio.
+fn distribute_table_columns(min_widths: &[f32], max_widths: &[f32], available: f32) -> Vec<f32> {
+    if min_widths.is_empty() {
+        return Vec::new();
+    }
+    let total_max: f32 = max_widths.iter().sum();
+    let total_min: f32 = min_widths.iter().sum();
+
+    // Cabe todo sin cortar nada: cada columna a su anchura maxima, y el
+    // espacio sobrante se reparte EN PROPORCION a esa anchura para que la
+    // tabla siga ocupando el ancho que se le dio (lo que hace una tabla real
+    // al 100%). Proporcional y no a partes iguales, que es lo que dice CSS
+    // 2.1 y ademas lo unico razonable: repartiendo por igual, la columna del
+    // numero de orden de Hacker News ("1.", "2.") se llevaba los mismos ~200
+    // px que la del titular y empujaba todo el contenido a la derecha.
+    if total_max <= available {
+        let extra = available - total_max;
+        if total_max <= 0.0 {
+            let each = available / max_widths.len() as f32;
+            return vec![each; max_widths.len()];
+        }
+        return max_widths.iter().map(|w| w + extra * (w / total_max)).collect();
+    }
+    // Ni con todas las columnas en su minimo cabe: se quedan en el minimo y
+    // la tabla desborda, igual que una tabla real demasiado ancha.
+    if total_min >= available {
+        return min_widths.to_vec();
+    }
+    // Caso normal: cada columna parte de su minimo y el espacio que sobra se
+    // reparte en proporcion a cuanto quiere crecer cada una.
+    let slack = available - total_min;
+    let total_want: f32 = max_widths.iter().zip(min_widths).map(|(mx, mn)| (mx - mn).max(0.0)).sum();
+    if total_want <= 0.0 {
+        return min_widths.to_vec();
+    }
+    min_widths
+        .iter()
+        .zip(max_widths)
+        .map(|(mn, mx)| mn + slack * ((mx - mn).max(0.0) / total_want))
+        .collect()
+}
+
 fn is_table_cell(b: &LayoutBox) -> bool {
     b.computed_style.get("display").map(String::as_str) == Some("table-cell")
 }
@@ -247,6 +818,35 @@ fn is_table_cell(b: &LayoutBox) -> bool {
 /// ella como cualquier otro hijo de bloque normal) - sin este corte, una
 /// tabla dentro de una celda aplanaria sus filas con las de la tabla
 /// exterior.
+/// Si `node` aporta alguna `table-row` a la tabla que lo contiene,
+/// siguiendo exactamente las mismas reglas de travesia que
+/// `collect_table_rows` (los contenedores intermedios son transparentes; la
+/// busqueda se detiene en una celda o en una tabla anidada).
+///
+/// Sirve para distinguir los hijos de una tabla que SI participan en el
+/// algoritmo de filas y columnas de los que no participan en absoluto -
+/// tipicamente un `<caption>` (`display: table-caption`). Los segundos no
+/// los colocaba nadie: se quedaban en `Rect::default()` y se pintaban todos
+/// superpuestos en la esquina (0,0) de la pagina.
+fn contributes_table_rows(node: &LayoutBox) -> bool {
+    // Comprueba PRIMERO el propio `node`, no solo sus hijos: un `display:
+    // table-row` colocado como hijo DIRECTO de la tabla (sin envoltorio -
+    // valido en CSS puro con divs, aunque un `<table>` HTML real siempre
+    // interpone un `<tbody>` implicito) se perdia, porque la version
+    // anterior solo miraba los HIJOS de `node`, nunca `node` mismo. Se
+    // enmascaraba en cualquier tabla HTML real (el `<tbody>` de por medio
+    // hacia que se llamara sobre el, cuyo hijo SI es el `<tr>`), pero no en
+    // una tabla montada con `display: table`/`table-row` sin ese
+    // envoltorio - encontrado al escribir un test que evitaba a proposito
+    // el "foster parenting" del parser HTML usando divs en vez de
+    // `<table>` real.
+    match node.computed_style.get("display").map(String::as_str) {
+        Some("table-row") => true,
+        Some("table") | Some("table-cell") => false,
+        _ => node.children.iter().any(contributes_table_rows),
+    }
+}
+
 fn collect_table_rows(node: &mut LayoutBox) -> Vec<&mut LayoutBox> {
     let mut rows = Vec::new();
     for child in &mut node.children {
@@ -270,9 +870,30 @@ fn collect_table_rows(node: &mut LayoutBox) -> Vec<&mut LayoutBox> {
 /// propiedad, no un numero inventado. `padding` no es una propiedad
 /// heredable (ni en el spec real ni en `INHERITABLE_PROPERTIES`) - cada
 /// caja resuelve la suya propia desde su propio `computed_style`.
-fn resolve_padding(computed_style: &HashMap<String, String>) -> EdgeSizes {
-    let px = computed_style.get("padding").and_then(|v| parse_css_length(v)).unwrap_or(0.0);
-    EdgeSizes { top: px, right: px, bottom: px, left: px }
+fn resolve_padding(computed_style: &HashMap<String, String>, containing_width: f32) -> EdgeSizes {
+    resolve_box_edges(computed_style, "padding", containing_width)
+}
+
+/// Lee los cuatro lados de `padding`/`margin` desde sus LONGHANDS
+/// (`padding-top`...), que es donde el parser deja ya expandida cualquier
+/// forma abreviada de 1/2/3/4 valores.
+///
+/// Se sigue mirando la propiedad abreviada como ultimo recurso para el caso
+/// que el parser no expande (valores con `calc()`/`var()`), y porque hay
+/// tests que construyen el `computed_style` a mano con solo la abreviada.
+fn resolve_box_edges(computed_style: &HashMap<String, String>, name: &str, containing_width: f32) -> EdgeSizes {
+    // OJO: los cuatro lados resuelven su porcentaje contra el ANCHO del
+    // bloque contenedor, tambien arriba y abajo. No es un descuido: asi lo
+    // define el spec, para que un `padding: 5%` de un lado a otro de una
+    // caja produzca un hueco cuadrado.
+    let fallback = computed_style.get(name).and_then(|v| parse_css_length_relative(v, containing_width)).unwrap_or(0.0);
+    let side = |suffix: &str| {
+        computed_style
+            .get(&format!("{name}-{suffix}"))
+            .and_then(|v| parse_css_length_relative(v, containing_width))
+            .unwrap_or(fallback)
+    };
+    EdgeSizes { top: side("top"), right: side("right"), bottom: side("bottom"), left: side("left") }
 }
 
 /// `margin` real, leido de la cascada - sustituye a `BLOCK_GAP`, otra
@@ -284,9 +905,58 @@ fn resolve_padding(computed_style: &HashMap<String, String>) -> EdgeSizes {
 /// margin-top del siguiente, quedandose con el mayor de los dos en vez de
 /// sumarlos - eso no esta implementado, `flow_block_children` simplemente
 /// suma ambos) - simplificacion declarada, no un bug escondido.
-fn resolve_margin(computed_style: &HashMap<String, String>) -> EdgeSizes {
-    let px = computed_style.get("margin").and_then(|v| parse_css_length(v)).unwrap_or(0.0);
-    EdgeSizes { top: px, right: px, bottom: px, left: px }
+fn resolve_margin(computed_style: &HashMap<String, String>, containing_width: f32) -> EdgeSizes {
+    resolve_box_edges(computed_style, "margin", containing_width)
+}
+
+/// Si `margin-left` / `margin-right` valen `auto` (tarea 2.1 del plan). El
+/// parser ya expande `margin: 0 auto` a sus cuatro longhands, asi que basta
+/// con mirarlos; la abreviada se mira solo si es de un unico valor
+/// (`margin: auto`), que es el caso en que no hay longhands. `resolve_margin`
+/// trata `auto` como cero (no es una longitud), por eso hace falta esto
+/// aparte: sin ello ninguna caja con ancho propio se centraba nunca.
+fn auto_horizontal_margins(computed_style: &HashMap<String, String>) -> (bool, bool) {
+    let is_auto = |name: &str| computed_style.get(name).is_some_and(|v| v.trim().eq_ignore_ascii_case("auto"));
+    let shorthand_auto = is_auto("margin");
+    (is_auto("margin-left") || (shorthand_auto && !computed_style.contains_key("margin-left")), is_auto("margin-right") || (shorthand_auto && !computed_style.contains_key("margin-right")))
+}
+
+/// Reparte el espacio sobrante entre los margenes `auto` de un bloque
+/// (CSS 2.1 §10.3.3): con los dos en `auto` la caja se centra, con uno solo
+/// ese margen absorbe todo el sobrante. Devuelve los margenes laterales ya
+/// resueltos y el ancho de la caja.
+///
+/// El ancho se calcula con los margenes `auto` a cero y se compara con lo
+/// que queda libre, asi que tambien cubre `max-width` (el patron mas comun:
+/// `max-width: 1200px; margin: 0 auto`). Si el bloque ocupa todo el ancho,
+/// no sobra nada y los margenes quedan en cero, igual que antes. Si no cabe
+/// (sobrante negativo) tambien: el spec manda poner a cero el margen auto.
+fn resolve_auto_margins(
+    computed_style: &HashMap<String, String>,
+    mut margin: EdgeSizes,
+    auto_left: bool,
+    auto_right: bool,
+    containing_width: f32,
+) -> (EdgeSizes, f32) {
+    if auto_left {
+        margin.left = 0.0;
+    }
+    if auto_right {
+        margin.right = 0.0;
+    }
+    let available = (containing_width - margin.left - margin.right).max(0.0);
+    let width = resolve_block_width_with_reference(computed_style, available, containing_width);
+    let spare = (available - width).max(0.0);
+    match (auto_left, auto_right) {
+        (true, true) => {
+            margin.left = spare / 2.0;
+            margin.right = spare / 2.0;
+        }
+        (true, false) => margin.left = spare,
+        (false, true) => margin.right = spare,
+        (false, false) => {}
+    }
+    (margin, width)
 }
 
 /// SOLO el ancho de `border` (forma abreviada `border: <ancho> <estilo>
@@ -306,7 +976,7 @@ fn resolve_border_width(computed_style: &HashMap<String, String>) -> EdgeSizes {
     let Some(raw) = computed_style.get("border") else { return EdgeSizes::default() };
     let mut width: Option<f32> = None;
     let mut is_solid = false;
-    for token in raw.split_whitespace() {
+    for token in engine_css::split_css_tokens(raw) {
         if let Some(w) = parse_css_length(token) {
             width = Some(w);
         } else if token.eq_ignore_ascii_case("solid") {
@@ -318,6 +988,33 @@ fn resolve_border_width(computed_style: &HashMap<String, String>) -> EdgeSizes {
     }
     let px = width.unwrap_or(0.0);
     EdgeSizes { top: px, right: px, bottom: px, left: px }
+}
+
+/// `border-spacing`/`border-collapse` de una `display: table` - el hueco
+/// (horizontal, vertical) entre celdas adyacentes Y entre las celdas del
+/// borde y el propio borde/padding de la tabla (el spec real trata ese
+/// hueco exterior con la MISMA magnitud que el interior, no la mitad).
+/// `border-collapse: collapse` colapsa el hueco a cero SIEMPRE, sin
+/// importar lo que diga `border-spacing` - simplificacion declarada: el
+/// spec real ADEMAS fusiona los bordes adyacentes en uno solo (resolviendo
+/// que borde "gana" segun estilo/grosor/color, un algoritmo aparte); este
+/// motor solo quita el hueco, cada celda sigue pintando su propio borde
+/// sin fusionar - el efecto visible que mas se nota (la tabla deja de
+/// verse con doble borde entre celdas) sin el algoritmo completo de
+/// resolucion de conflictos.
+///
+/// Sin `border-spacing` declarado el valor inicial real del spec es
+/// `2px` (no cero) - un `<table>` sin CSS de autor SI tiene un hueco
+/// visible entre celdas en un navegador real.
+fn resolve_border_spacing(computed_style: &HashMap<String, String>) -> (f32, f32) {
+    if computed_style.get("border-collapse").map(|v| v.trim()) == Some("collapse") {
+        return (0.0, 0.0);
+    }
+    let Some(raw) = computed_style.get("border-spacing") else { return (2.0, 2.0) };
+    let mut lengths = raw.split_whitespace().filter_map(parse_css_length);
+    let Some(first) = lengths.next() else { return (2.0, 2.0) };
+    let second = lengths.next().unwrap_or(first);
+    (first, second)
 }
 
 /// Colapsa cualquier RACHA de espacios en blanco (incluidos saltos de
@@ -361,23 +1058,136 @@ fn is_border_box(computed_style: &HashMap<String, String>) -> bool {
 /// Si `box-sizing: border-box` esta presente, `width`/`max-width`/`min-width`
 /// son directamente el ancho border-box. De lo contrario (el default `content-box`),
 /// se suman padding + border para obtener el border-box.
+/// Longitud que ademas admite PORCENTAJE, resuelto contra `reference`.
+///
+/// Los porcentajes no se pueden resolver donde se resuelven `em` o `calc()`
+/// (ver `resolve_relative_units`): dependen del bloque contenedor, que solo
+/// existe ya durante la maquetacion. Por eso viven aqui, en las funciones
+/// que SI conocen esa referencia.
+fn parse_css_length_relative(value: &str, reference: f32) -> Option<f32> {
+    let trimmed = value.trim();
+    // `calc(100% - 200px)` (tarea 2.4 del plan): la cascada ya dejo en pixeles
+    // todo lo que no es un porcentaje, asi que aqui solo falta resolver estos
+    // contra el bloque contenedor.
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(interior) = lower.strip_prefix("calc(").and_then(|r| r.strip_suffix(')')) {
+        return eval_calc(interior, INITIAL_FONT_SIZE, (0.0, 0.0), Some(reference));
+    }
+    if let Some(pct) = trimmed.strip_suffix('%') {
+        return pct.trim().parse::<f32>().ok().filter(|n| *n >= 0.0).map(|n| n / 100.0 * reference);
+    }
+    parse_css_length(trimmed)
+}
+
+/// `height` explicito de una caja, ya acotado por `min-height`/`max-height`,
+/// resolviendo los porcentajes contra `containing_height`.
+///
+/// `None` cuando no hay `height` declarada, o cuando la hay en porcentaje
+/// pero el bloque contenedor no tiene un alto definido - en ese caso el
+/// spec dice que se comporta como `auto`, y devolver `None` es exactamente
+/// eso: la caja sigue creciendo con su contenido.
+fn resolve_explicit_height(computed_style: &HashMap<String, String>, containing_height: f32) -> Option<f32> {
+    let porcentaje_resoluble = |v: &String| -> Option<f32> {
+        if v.trim().ends_with('%') && containing_height <= 0.0 {
+            return None;
+        }
+        parse_css_length_relative(v, containing_height)
+    };
+
+    let mut height = computed_style.get("height").and_then(porcentaje_resoluble);
+    // `min`/`max-height` acotan tambien una altura AUTO, no solo una
+    // declarada: un `max-height` sobre contenido que crece es justo su caso
+    // de uso. Por eso se aplican aunque `height` sea `None`... salvo que
+    // entonces no hay nada que acotar todavia y decidirlo aqui seria
+    // adivinar el alto del contenido, asi que solo se acota lo declarado.
+    if let Some(h) = height.as_mut() {
+        if let Some(max_h) = computed_style.get("max-height").and_then(porcentaje_resoluble) {
+            *h = h.min(max_h);
+        }
+        if let Some(min_h) = computed_style.get("min-height").and_then(porcentaje_resoluble) {
+            *h = h.max(min_h);
+        }
+    }
+    height
+}
+
+/// Acota un alto ya calculado (el del contenido) con `min-height`/
+/// `max-height`. Separado de `resolve_explicit_height` porque aqui SI hay un
+/// numero que acotar.
+///
+/// `border_box`/`box_model_extra`: `max-height`/`min-height` declaran un
+/// valor de BORDER-BOX cuando `box-sizing: border-box` esta activo (igual
+/// que `height`), pero `height` aqui es CONTENIDO puro. Sin convertir el
+/// limite, `max-height: 120px` con `box-sizing: border-box` y 40px de
+/// padding+border acotaba el CONTENIDO a 120px y el `dimensions.height`
+/// final salia en 160px en vez de los 120px que el autor pidio.
+fn clamp_height(height: f32, computed_style: &HashMap<String, String>, containing_height: f32, border_box: bool, box_model_extra: f32) -> f32 {
+    let porcentaje_resoluble = |v: &String| -> Option<f32> {
+        if v.trim().ends_with('%') && containing_height <= 0.0 {
+            return None;
+        }
+        parse_css_length_relative(v, containing_height)
+    };
+    let a_contenido = |limite: f32| if border_box { (limite - box_model_extra).max(0.0) } else { limite };
+    let mut h = height;
+    if let Some(max_h) = computed_style.get("max-height").and_then(porcentaje_resoluble) {
+        h = h.min(a_contenido(max_h));
+    }
+    if let Some(min_h) = computed_style.get("min-height").and_then(porcentaje_resoluble) {
+        h = h.max(a_contenido(min_h));
+    }
+    h
+}
+
 fn resolve_block_width(computed_style: &HashMap<String, String>, auto_width: f32) -> f32 {
-    let padding = resolve_padding(computed_style);
+    resolve_block_width_with_reference(computed_style, auto_width, auto_width)
+}
+
+/// Resuelve `line-height` a pixeles (tarea 2.6 del plan). `None` cuando es
+/// `normal` o no se entiende: quien llama usa entonces la altura natural de
+/// la fuente, que es lo que hacia el motor siempre.
+///
+/// Un numero sin unidad (`1.5`) es un multiplicador del tamaño de fuente DE
+/// ESA CAJA; un porcentaje tambien se mide sobre su propio tamaño de fuente;
+/// los `em` ya llegan en pixeles desde la cascada.
+fn resolve_line_height(raw: &str, font_size: f32) -> Option<f32> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("normal") || trimmed.is_empty() {
+        return None;
+    }
+    if let Some(percent) = trimmed.strip_suffix('%') {
+        return percent.trim().parse::<f32>().ok().filter(|n| *n >= 0.0).map(|n| n / 100.0 * font_size);
+    }
+    if let Ok(multiplier) = trimmed.parse::<f32>() {
+        return (multiplier >= 0.0).then_some(multiplier * font_size);
+    }
+    parse_css_length(trimmed)
+}
+
+/// `auto_width` es el ancho que se usa cuando `width` es `auto` (lo que
+/// queda del contenedor tras los margenes); `percent_reference` es contra lo
+/// que se resuelven los porcentajes de `width`, `min-width`, `max-width` y
+/// `padding`: el ancho del bloque contenedor ENTERO, no lo que queda tras los
+/// margenes del propio elemento (tarea 2.4 del plan). Con `margin-left: 10%`
+/// y `width: calc(100% - 20px)` el 100% es el contenedor, no el contenedor
+/// menos el margen.
+fn resolve_block_width_with_reference(computed_style: &HashMap<String, String>, auto_width: f32, percent_reference: f32) -> f32 {
+    let padding = resolve_padding(computed_style, percent_reference);
     let border = resolve_border_width(computed_style);
     let box_model_extra = padding.left + padding.right + border.left + border.right;
     let border_box = is_border_box(computed_style);
 
     let mut width = computed_style
         .get("width")
-        .and_then(|v| parse_css_length(v))
+        .and_then(|v| parse_css_length_relative(v, percent_reference))
         .map(|w| if border_box { w } else { w + box_model_extra })
         .unwrap_or(auto_width);
 
-    if let Some(max_w) = computed_style.get("max-width").and_then(|v| parse_css_length(v)) {
+    if let Some(max_w) = computed_style.get("max-width").and_then(|v| parse_css_length_relative(v, percent_reference)) {
         let max_limit = if border_box { max_w } else { max_w + box_model_extra };
         width = width.min(max_limit);
     }
-    if let Some(min_w) = computed_style.get("min-width").and_then(|v| parse_css_length(v)) {
+    if let Some(min_w) = computed_style.get("min-width").and_then(|v| parse_css_length_relative(v, percent_reference)) {
         let min_limit = if border_box { min_w } else { min_w + box_model_extra };
         width = width.max(min_limit);
     }
@@ -592,7 +1402,7 @@ fn override_box_type_from_display(default: &BoxType, display: Option<&str>) -> B
 /// navegador real tampoco pinta el `value` de un checkbox como texto.
 /// `<select>` (Fase 35) resuelve la opcion seleccionada via
 /// `resolve_select_text`.
-fn resolve_replaced_text(tag_name: &str, attributes: &HashMap<String, String>, dom_node: &Arc<RwLock<Node>>) -> Option<ReplacedText> {
+pub fn resolve_replaced_text(tag_name: &str, attributes: &HashMap<String, String>, dom_node: &Arc<RwLock<Node>>) -> Option<ReplacedText> {
     let input_type = attributes.get("type").map(|v| v.to_lowercase()).unwrap_or_default();
     let has_value = |v: &&String| !v.is_empty();
 
@@ -634,14 +1444,14 @@ fn resolve_replaced_text(tag_name: &str, attributes: &HashMap<String, String>, d
             }
         },
         "textarea" => {
-            // A diferencia de `input`, el valor inicial de un `<textarea>`
-            // es su CONTENIDO DOM (un nodo de texto hijo), no un atributo -
-            // por eso hace falta `Node::text_content` en vez de
-            // `attributes.get("value")`.
-            let content = Node::text_content(dom_node);
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                Some(ReplacedText { text: trimmed.to_string(), is_placeholder: false, centered: false })
+            // Lo escrito por el usuario (`value`) conserva espacios/saltos exactos;
+            // el contenido inicial del DOM recorta espacios exteriores de maquetado.
+            let content = match attributes.get("value") {
+                Some(v) => v.clone(),
+                None => Node::text_content(dom_node).trim().to_string(),
+            };
+            if !content.is_empty() {
+                Some(ReplacedText { text: content, is_placeholder: false, centered: false })
             } else {
                 attributes
                     .get("placeholder")
@@ -717,11 +1527,32 @@ fn flex_container_style(computed_style: &HashMap<String, String>) -> taffy::Styl
         Some("stretch") => Some(taffy::AlignItems::STRETCH),
         _ => None,
     };
+    // `gap` se leia solo en `grid_container_style`, asi que en un contenedor
+    // flex se ignoraba por completo y los items salian pegados. Misma
+    // propiedad, mismo parseo: es la propiedad unificada del spec, no una
+    // exclusiva de grid.
+    let gap_val = computed_style.get("gap").and_then(|v| parse_css_length(v)).unwrap_or(0.0);
+
+    // `flex-wrap`: sin el, un contenedor cuyos items no caben los aplasta a
+    // todos en una sola linea en vez de pasarlos a la siguiente - que es
+    // justo para lo que se declara `wrap`. Lo resuelve taffy, solo hay que
+    // traducirle el valor.
+    let flex_wrap = match computed_style.get("flex-wrap").map(String::as_str) {
+        Some("wrap") => taffy::FlexWrap::Wrap,
+        Some("wrap-reverse") => taffy::FlexWrap::WrapReverse,
+        _ => taffy::FlexWrap::NoWrap,
+    };
+
     taffy::Style {
         display: taffy::Display::Flex,
         flex_direction,
+        flex_wrap,
         justify_content,
         align_items,
+        gap: taffy::geometry::Size {
+            width: taffy::style_helpers::length(gap_val),
+            height: taffy::style_helpers::length(gap_val),
+        },
         ..Default::default()
     }
 }
@@ -746,15 +1577,129 @@ fn parse_grid_template_tracks(value: &str) -> Vec<taffy::GridTemplateComponent<S
 
 /// Traduce las propiedades CSS de un contenedor GRID (`grid-template-columns`,
 /// `grid-template-rows`, `gap`/`grid-gap`) a `taffy::Style`.
+/// Rectangulo que ocupa un area con nombre dentro de la rejilla, en LINEAS
+/// de grid (base 1, como el spec).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GridArea {
+    row_start: u16,
+    row_end: u16,
+    column_start: u16,
+    column_end: u16,
+}
+
+/// Interpreta `grid-template-areas` - la rejilla dibujada con nombres, una
+/// cadena por fila:
+///
+/// ```text
+/// grid-template-areas: 'siteNotice siteNotice' 'columnStart pageContent'
+/// ```
+///
+/// Devuelve, para cada nombre, el rectangulo de lineas que ocupa. Es como
+/// se maqueta hoy una pagina de dos columnas: sin esto, los items caen en
+/// posiciones automaticas y el orden visual no tiene nada que ver con el
+/// que pidio el autor - en la Wikipedia real, el indice de contenidos se
+/// colaba ENTERO por delante del articulo.
+fn parse_grid_template_areas(value: &str) -> HashMap<String, GridArea> {
+    let mut filas: Vec<Vec<String>> = Vec::new();
+    let mut actual = String::new();
+    let mut dentro: Option<char> = None;
+    for c in value.chars() {
+        match dentro {
+            Some(comilla) if c == comilla => {
+                filas.push(actual.split_whitespace().map(str::to_string).collect());
+                actual.clear();
+                dentro = None;
+            }
+            Some(_) => actual.push(c),
+            None if c == '\'' || c == '"' => dentro = Some(c),
+            None => {}
+        }
+    }
+
+    let mut areas: HashMap<String, GridArea> = HashMap::new();
+    for (indice_fila, fila) in filas.iter().enumerate() {
+        for (indice_col, nombre) in fila.iter().enumerate() {
+            // `.` es el nombre reservado para "hueco vacio".
+            if nombre == "." {
+                continue;
+            }
+            let r = indice_fila as u16 + 1;
+            let c = indice_col as u16 + 1;
+            areas
+                .entry(nombre.clone())
+                .and_modify(|a| {
+                    // Un mismo nombre repetido en celdas contiguas define un
+                    // area RECTANGULAR que las abarca todas.
+                    a.row_start = a.row_start.min(r);
+                    a.row_end = a.row_end.max(r + 1);
+                    a.column_start = a.column_start.min(c);
+                    a.column_end = a.column_end.max(c + 1);
+                })
+                .or_insert(GridArea { row_start: r, row_end: r + 1, column_start: c, column_end: c + 1 });
+        }
+    }
+    areas
+}
+
+/// Traduce las propiedades de colocacion de UN item de rejilla
+/// (`grid-area`, `grid-column`, `grid-row`) a las lineas que taffy entiende.
+///
+/// `areas` es el mapa de `grid-template-areas` del contenedor: un
+/// `grid-area: pageContent` no significa nada sin el.
+fn grid_item_style(computed_style: &HashMap<String, String>, areas: &HashMap<String, GridArea>, margin: EdgeSizes) -> taffy::Style {
+    use taffy::style_helpers::line;
+    let mut style = flex_item_style(computed_style, margin);
+
+    if let Some(area) = computed_style.get("grid-area").and_then(|nombre| areas.get(nombre.trim())) {
+        style.grid_row = taffy::geometry::Line { start: line(area.row_start as i16), end: line(area.row_end as i16) };
+        style.grid_column = taffy::geometry::Line { start: line(area.column_start as i16), end: line(area.column_end as i16) };
+        return style;
+    }
+
+    // Formas numericas: `grid-column: 2`, `grid-column: 1 / 3`,
+    // `grid-column: 1 / -1` (hasta el final).
+    let colocar = |valor: &str| -> Option<taffy::geometry::Line<taffy::GridPlacement>> {
+        let (a, b) = match valor.split_once('/') {
+            Some((a, b)) => (a.trim(), Some(b.trim())),
+            None => (valor.trim(), None),
+        };
+        let inicio: i16 = a.parse().ok()?;
+        let fin = match b {
+            Some(b) => b.parse::<i16>().ok()?,
+            None => inicio + 1,
+        };
+        Some(taffy::geometry::Line { start: line(inicio), end: line(fin) })
+    };
+    if let Some(l) = computed_style.get("grid-column").and_then(|v| colocar(v)) {
+        style.grid_column = l;
+    }
+    if let Some(l) = computed_style.get("grid-row").and_then(|v| colocar(v)) {
+        style.grid_row = l;
+    }
+    style
+}
+
 fn grid_container_style(computed_style: &HashMap<String, String>) -> taffy::Style {
+    // `grid-template: <filas> / <columnas>` es la forma abreviada, y es la
+    // que usan las paginas reales (Wikipedia entre ellas). Los longhands
+    // ganan si estan puestos.
+    let (abreviada_filas, abreviada_columnas) = match computed_style.get("grid-template").and_then(|v| v.split_once('/')) {
+        Some((filas, columnas)) => (Some(filas.trim().to_string()), Some(columnas.trim().to_string())),
+        None => (None, None),
+    };
+
     let grid_template_columns = computed_style
         .get("grid-template-columns")
-        .map(|v| parse_grid_template_tracks(v))
+        .cloned()
+        .or(abreviada_columnas)
+        .map(|v| parse_grid_template_tracks(&v))
         .unwrap_or_else(|| vec![taffy::GridTemplateComponent::Single(taffy::style_helpers::fr(1.0))]);
 
     let grid_template_rows = computed_style
         .get("grid-template-rows")
-        .map(|v| parse_grid_template_tracks(v))
+        .cloned()
+        .or(abreviada_filas)
+        .map(|v| parse_grid_template_tracks(&v))
         .unwrap_or_default();
 
     let gap_val = computed_style
@@ -780,7 +1725,17 @@ fn grid_container_style(computed_style: &HashMap<String, String>) -> taffy::Styl
 /// del nodo hoja correspondiente. Valores iniciales reales del spec cuando
 /// la propiedad no esta puesta: `flex-grow: 0`, `flex-shrink: 1`,
 /// `flex-basis: auto`.
-fn flex_item_style(computed_style: &HashMap<String, String>) -> taffy::Style {
+/// `margin` va aparte de `computed_style`: ya viene RESUELTO en pixeles (los
+/// porcentajes se miden contra el ancho del contenedor, que esta funcion no
+/// conoce) por quien llama, con `resolve_margin`.
+///
+/// Faltaba antes por completo - `..Default::default()` deja el margen de
+/// taffy en cero, asi que el ALGORITMO DE FLEX (no solo el pintado)
+/// ignoraba cualquier `margin` de un item. Es justo como Wikipedia separa
+/// los items de su barra de usuario (`margin: 0 4px` en cada `<li>`, no
+/// `gap`): sin esto, taffy los coloca pegados, sin ningun hueco entre
+/// "Donaciones" y "Crear una cuenta".
+fn flex_item_style(computed_style: &HashMap<String, String>, margin: EdgeSizes) -> taffy::Style {
     let flex_grow = computed_style.get("flex-grow").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.0);
     let flex_shrink = computed_style.get("flex-shrink").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0);
     let flex_basis: taffy::Dimension = computed_style
@@ -797,6 +1752,12 @@ fn flex_item_style(computed_style: &HashMap<String, String>) -> taffy::Style {
         flex_shrink,
         flex_basis,
         size: taffy::geometry::Size { width, height },
+        margin: taffy::geometry::Rect {
+            left: taffy::style_helpers::length(margin.left),
+            right: taffy::style_helpers::length(margin.right),
+            top: taffy::style_helpers::length(margin.top),
+            bottom: taffy::style_helpers::length(margin.bottom),
+        },
         ..Default::default()
     }
 }
@@ -812,8 +1773,50 @@ fn flex_item_style(computed_style: &HashMap<String, String>) -> taffy::Style {
 /// que `compute_layout_with_measure` espera.
 /// Mide el ancho intrínseco (min-content / max-content) de un elemento para
 /// que taffy no colapse cajas flex a 0 cuando consulta pasadas especulativas.
-fn measure_intrinsic_width(child: &LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
-    let padding = resolve_padding(&child.computed_style);
+/// Cual de las dos anchuras intrinsecas del spec se esta preguntando.
+///
+/// La distincion NO es un matiz: el `min-width: auto` que todo item flex
+/// tiene por defecto resuelve precisamente a `MinContent`, y `taffy` (como
+/// cualquier motor real) se niega a encoger un item por debajo de ese
+/// valor. Cuando este motor devolvia la misma anchura para las dos, todo
+/// item flex con texto declaraba un minimo igual a su frase entera en una
+/// sola linea, asi que NADA podia encogerse: los contenedores flex de
+/// cualquier web moderna se desbordaban por la derecha (medido en la
+/// Wikipedia real: cajas de 8.225 px dentro de un viewport de 1.280) y el
+/// texto no llegaba nunca a cortar linea porque su caja era enorme.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum IntrinsicWidth {
+    /// Lo minimo sin desbordar: para un texto, su palabra mas larga.
+    Min,
+    /// Sin ningun corte de linea: para un texto, la frase entera.
+    Max,
+}
+
+impl IntrinsicWidth {
+    fn cache_key(self) -> MeasureKey {
+        match self {
+            Self::Min => MeasureKey::MinContentWidth,
+            Self::Max => MeasureKey::MaxContentWidth,
+        }
+    }
+}
+
+fn measure_intrinsic_width(child: &mut LayoutBox, mode: IntrinsicWidth, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+    let key = mode.cache_key();
+    if let Some(&(_, (w, _))) = child.measure_cache.iter().find(|(k, _)| *k == key) {
+        return w;
+    }
+    INTRINSIC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let width = measure_intrinsic_width_uncached(child, mode, font_set, images);
+    child.measure_cache.push((key, (width, 0.0)));
+    width
+}
+
+fn measure_intrinsic_width_uncached(child: &mut LayoutBox, mode: IntrinsicWidth, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+    // Al medir el tamano INTRINSECO no hay bloque contenedor contra el que
+    // resolver un porcentaje (justo se esta calculando cuanto pide la caja),
+    // asi que cuentan como cero - el mismo criterio del spec.
+    let padding = resolve_padding(&child.computed_style, 0.0);
     let border = resolve_border_width(&child.computed_style);
     let extra = padding.left + padding.right + border.left + border.right;
 
@@ -831,17 +1834,79 @@ fn measure_intrinsic_width(child: &LayoutBox, font_set: Option<&FontSet>, images
             let font_size = child.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
             let bold = resolve_font_weight_is_bold(&child.computed_style);
             let italic = resolve_font_style_is_italic(&child.computed_style);
-            let font = font_set.and_then(|s| s.pick(bold, italic));
-            let text_w = font.map(|f| engine_text::measure_text(f, text, font_size).width).unwrap_or(text.len() as f32 * font_size * 0.5);
+            let font = font_set.and_then(|s| s.pick_family(resolve_font_family(&child.computed_style), bold, italic));
+            let text_w = match font {
+                // `Min`: la caja mas estrecha en la que este texto cabe sin
+                // desbordar es la de su palabra mas larga - por debajo de eso
+                // esa palabra sobresaldria, porque el motor no parte palabras
+                // por la mitad (igual que un navegador real sin
+                // `overflow-wrap: break-word`).
+                Some(f) if mode == IntrinsicWidth::Min => text
+                    .split_whitespace()
+                    .map(|word| engine_text::text_width(f, word, font_size))
+                    .fold(0.0_f32, f32::max),
+                // Mismo motivo que en `place_inline_node`: la anchura
+                // maxima de contenido es la de la linea tal como el pintor
+                // la va a componer.
+                Some(f) => engine_text::wrapped_line_width(f, text, font_size),
+                // Sin fuente de sistema, la misma aproximacion por numero de
+                // caracteres que ya usaba el motor, aplicada a la palabra mas
+                // larga o a la cadena entera segun el modo.
+                None if mode == IntrinsicWidth::Min => {
+                    text.split_whitespace().map(|w| w.chars().count()).max().unwrap_or(0) as f32 * font_size * 0.5
+                }
+                None => text.chars().count() as f32 * font_size * 0.5,
+            };
             text_w + extra
         }
         BoxType::Replaced => 150.0 + extra,
+        // Un contenedor flex NO apila a sus hijos verticalmente, asi que su
+        // anchura intrinseca no es la del hijo mas ancho: en una FILA los
+        // items van uno al lado del otro y sus anchuras se SUMAN (mas los
+        // `gap`). Medirlo como si fuera flujo de bloque lo dejaba mucho mas
+        // estrecho de lo que necesita, y entonces sus propios hijos se
+        // salian de el - eso era la cabecera de Wikipedia, con las cajas
+        // desbordando a la derecha y pisandose unas a otras.
+        //
+        // En una COLUMNA el eje principal es el vertical, asi que la anchura
+        // sigue siendo la del hijo mas ancho, igual que en flujo normal.
+        _ if child.computed_style.get("display").map(String::as_str) == Some("flex") => {
+            let column = matches!(
+                child.computed_style.get("flex-direction").map(String::as_str),
+                Some("column") | Some("column-reverse")
+            );
+            let gap = child.computed_style.get("gap").and_then(|v| parse_css_length(v)).unwrap_or(0.0);
+            let mut total: f32 = 0.0;
+            let mut widest: f32 = 0.0;
+            let mut items = 0;
+            for c in &mut child.children {
+                if is_out_of_flow(&c.computed_style) {
+                    continue;
+                }
+                let cw = measure_intrinsic_width(c, mode, font_set, images);
+                total += cw;
+                widest = widest.max(cw);
+                items += 1;
+            }
+            if column {
+                widest + extra
+            } else {
+                total + gap * (items.max(1) - 1) as f32 + extra
+            }
+        }
         _ => {
             let mut max_w: f32 = 0.0;
             let mut inline_w: f32 = 0.0;
-            for c in &child.children {
-                let cw = measure_intrinsic_width(c, font_set, images);
-                if c.computed_style.get("display").map(String::as_str) == Some("inline") || matches!(c.box_type, BoxType::Text(_)) {
+            for c in &mut child.children {
+                let cw = measure_intrinsic_width(c, mode, font_set, images);
+                let is_inline = c.computed_style.get("display").map(String::as_str) == Some("inline") || matches!(c.box_type, BoxType::Text(_));
+                // Los hermanos inline SUMAN solo para `Max`: van todos en la
+                // misma linea si no hay que cortar. Para `Min` cada uno puede
+                // caer en su propia linea, asi que el minimo del conjunto es
+                // el MAYOR de sus minimos y no su suma - sumarlos era lo que
+                // inflaba el minimo de un parrafo entero hasta su ancho
+                // completo.
+                if is_inline && mode == IntrinsicWidth::Max {
                     inline_w += cw;
                     max_w = max_w.max(inline_w);
                 } else {
@@ -857,6 +1922,32 @@ fn measure_intrinsic_width(child: &LayoutBox, font_set: Option<&FontSet>, images
 /// Funcion de medida que `taffy` llama para saber cuanto espacio necesita
 /// UN item flex - taffy puede llamarla varias veces con distintos
 /// `known_dimensions`/`available_space` mientras resuelve el layout final.
+/// Traduce el `AvailableSpace` de taffy al tipo neutro que usa la clave de
+/// cache (ver `layout_box::AvailableAxis`).
+fn available_axis(space: taffy::AvailableSpace) -> AvailableAxis {
+    match space {
+        taffy::AvailableSpace::Definite(v) => AvailableAxis::Definite(v),
+        taffy::AvailableSpace::MinContent => AvailableAxis::MinContent,
+        taffy::AvailableSpace::MaxContent => AvailableAxis::MaxContent,
+    }
+}
+
+/// `measure_flex_item` con memoria. Medir un item significa MAQUETAR SU
+/// SUBARBOL ENTERO (ver el cuerpo de `measure_flex_item_uncached`), y taffy
+/// pide la medida del mismo item varias veces mientras resuelve el reparto
+/// de espacio. Sin recordar el resultado, cada nivel de anidamiento flex
+/// multiplica el trabajo del nivel de abajo en vez de sumarlo - medido en
+/// la Wikipedia real: 505.765 remaquetados y 289.419 medidas para 35.000
+/// nodos, 84 s de reloj solo en el flujo normal.
+///
+/// La clave son las entradas de las que el resultado depende de verdad
+/// (`known_dimensions` y `available_space`); el subarbol no cambia durante
+/// una maquetacion, asi que misma clave implica mismo resultado.
+///
+/// Devolver un valor cacheado se salta el efecto secundario de colocar los
+/// descendientes, y eso es CORRECTO aqui: la posicion definitiva de los
+/// nietos no la fija esta medida sino `finalize_flex_item_children`, que
+/// corre despues con las dimensiones que taffy acabo eligiendo.
 fn measure_flex_item(
     child: &mut LayoutBox,
     known_dimensions: taffy::geometry::Size<Option<f32>>,
@@ -864,6 +1955,28 @@ fn measure_flex_item(
     font_set: Option<&FontSet>,
     images: &ImageMap,
 ) -> taffy::geometry::Size<f32> {
+    let key = MeasureKey::Flex {
+        known_width: known_dimensions.width,
+        known_height: known_dimensions.height,
+        available_width: available_axis(available_space.width),
+        available_height: available_axis(available_space.height),
+    };
+    if let Some(&(_, (width, height))) = child.measure_cache.iter().find(|(k, _)| *k == key) {
+        return taffy::geometry::Size { width, height };
+    }
+    let size = measure_flex_item_uncached(child, known_dimensions, available_space, font_set, images);
+    child.measure_cache.push((key, (size.width, size.height)));
+    size
+}
+
+fn measure_flex_item_uncached(
+    child: &mut LayoutBox,
+    known_dimensions: taffy::geometry::Size<Option<f32>>,
+    available_space: taffy::geometry::Size<taffy::AvailableSpace>,
+    font_set: Option<&FontSet>,
+    images: &ImageMap,
+) -> taffy::geometry::Size<f32> {
+    MEASURE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let BoxType::Image(src) = &child.box_type {
         let natural = images.get(src).map(|img| (img.width as f32, img.height as f32));
         let explicit_width = child.computed_style.get("width").and_then(|v| parse_css_length(v));
@@ -895,9 +2008,8 @@ fn measure_flex_item(
                 w
             }
         }
-        taffy::AvailableSpace::MinContent | taffy::AvailableSpace::MaxContent => {
-            measure_intrinsic_width(child, font_set, images)
-        }
+        taffy::AvailableSpace::MinContent => measure_intrinsic_width(child, IntrinsicWidth::Min, font_set, images),
+        taffy::AvailableSpace::MaxContent => measure_intrinsic_width(child, IntrinsicWidth::Max, font_set, images),
     });
 
     child.dimensions.x = 0.0;
@@ -938,18 +2050,75 @@ fn finalize_flex_item_children(child: &mut LayoutBox, font_set: Option<&FontSet>
     };
 }
 
+/// Contadores de diagnostico (solo `RUST_LOG=info`): cuantas veces se
+/// maqueta un subarbol y cuantas se mide un item flex durante UNA carga.
+/// Existen porque el coste del flujo normal resulto no ser proporcional al
+/// numero de nodos sino al numero de REMAQUETADOS, y eso solo se ve
+/// contandolos.
+pub(crate) static FLOW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static MEASURE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static INTRINSIC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static FLEX_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static TABLE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GRID_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static INLINE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Aplica el scroll de cada elemento con `overflow: auto/scroll` que lo
+/// tenga registrado (`offsets`: puntero de nodo DOM -> (scrollLeft,
+/// scrollTop), el mismo registro que llenan `scrollTop`/`scrollLeft` desde
+/// JS - ver `engine_js`). Se llama DESPUES de `LayoutTreeBuilder::build`,
+/// no dentro: el arbol de layout no sabe nada de JS ni de registros, solo
+/// de posiciones.
+///
+/// La idea es la misma que ya usa `apply_relative_offset` para `position:
+/// relative`: el CONTENEDOR se queda donde estaba (su `PushClip` en
+/// `engine-gfx` sigue recortando exactamente el mismo rectangulo), pero
+/// TODO su contenido se desplaza en bloque - hacia arriba/izquierda el
+/// numero de pixeles que se ha scrolleado. Reusar el recorte que
+/// `overflow` ya emite es lo que hace que esto sea scroll de verdad
+/// (contenido que se sale por arriba desaparece, contenido nuevo entra por
+/// abajo) sin tocar `engine-gfx` para nada: pintura y hit-testing leen
+/// `dimensions` como siempre, y `dimensions` ya viene desplazada.
+///
+/// Simplificacion declarada: se desplazan TODOS los descendientes por
+/// igual, incluidos los `position: absolute`/`fixed` que en el spec real
+/// escapan al scroll de un ancestro que no sea su containing block. Cubre
+/// el caso comun (contenido en flujo normal dentro de un contenedor con
+/// scroll) sin resolver el caso raro de un absoluto anidado dentro de un
+/// contenedor con scroll.
+pub fn apply_scroll_offsets(root: &mut LayoutBox, offsets: &HashMap<usize, (f32, f32)>) {
+    if offsets.is_empty() {
+        return;
+    }
+    apply_scroll_offsets_rec(root, offsets);
+}
+
+fn apply_scroll_offsets_rec(node: &mut LayoutBox, offsets: &HashMap<usize, (f32, f32)>) {
+    let propio = node.dom_node.as_ref().and_then(|n| offsets.get(&(Arc::as_ptr(n) as usize)).copied());
+    if let Some((scroll_left, scroll_top)) = propio {
+        if scroll_left != 0.0 || scroll_top != 0.0 {
+            for hijo in &mut node.children {
+                LayoutTreeBuilder::shift_subtree_x(hijo, -scroll_left);
+                LayoutTreeBuilder::shift_subtree_y(hijo, -scroll_top);
+            }
+        }
+    }
+    for hijo in &mut node.children {
+        apply_scroll_offsets_rec(hijo, offsets);
+    }
+}
+
 pub struct LayoutTreeBuilder;
 
 impl LayoutTreeBuilder {
     /// Construye el arbol de layout, resuelve el estilo CSS de cada caja
     /// (ver `resolve_style`) y le asigna posiciones/tamanos reales mediante
-    /// un flujo de bloque top-to-bottom muy simplificado: cada caja ocupa el
-    /// ancho completo del contenedor y se apilan verticalmente. `padding`,
+    /// un flujo de bloque top-to-bottom para el caso general, mas flex/grid
+    /// reales via `taffy`, floats (`float_left`/`float_right`, ver
+    /// `place_float_child`) e inline real (`place_inline_node`). `padding`,
     /// `border` y `margin` reales ya se resuelven desde la cascada (ver
     /// `resolve_padding`/`resolve_border_width`/`resolve_margin`,
-    /// `box_dimensions` en cada `LayoutBox`, sin colapso de margenes);
-    /// floats e inline real todavia no — eso sigue siendo Fase 2, ver
-    /// ARCHITECTURE.md. Esto es honesto-minimo, no el layout final.
+    /// `box_dimensions` en cada `LayoutBox`, sin colapso de margenes).
     /// `font_set`: las 4 variantes de peso/estilo de la MISMA fuente de
     /// sistema que usara `engine-gfx` para pintar (cargadas una sola vez
     /// por quien orquesta el pipeline, ver `core/main.rs`), para que el
@@ -971,9 +2140,35 @@ impl LayoutTreeBuilder {
             width: viewport_width,
             height: viewport_height,
         };
+        // La caja raiz hace de bloque contenedor inicial: cualquier
+        // porcentaje de primer nivel se mide contra el viewport.
+        root_box.containing_width = viewport_width;
+        root_box.containing_height = viewport_height;
 
-        Self::build_node(dom_root, &mut root_box, stylesheet, &HashMap::new(), viewport_width);
+        // Cronometro de las tres pasadas (cascada+construccion del arbol,
+        // flujo normal, posicionados). Nivel `info`, igual que el resto del
+        // pipeline: en uso normal no cuesta nada y con `RUST_LOG=info` dice
+        // cual de las tres domina, en vez de dejarlas como un solo numero.
+        let t = std::time::Instant::now();
+        let empty_map = Arc::new(HashMap::new());
+        Self::build_node(dom_root, &mut root_box, stylesheet, &empty_map, &empty_map, (viewport_width, viewport_height));
+        tracing::info!("[tiempo]     cascada + construccion del arbol {:?}", t.elapsed());
+        let t = std::time::Instant::now();
         Self::flow_block_children(&mut root_box, font_set, images);
+        tracing::info!(
+            "[tiempo]     flujo normal {:?} ({} remaquetados, {} medidas flex, {} medidas intrinsecas)",
+            t.elapsed(),
+            FLOW_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed),
+            MEASURE_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed),
+            INTRINSIC_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed)
+        );
+        tracing::info!(
+            "[tiempo]     desglose: {} flex, {} tabla, {} grid, {} rachas inline",
+            FLEX_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed),
+            TABLE_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed),
+            GRID_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed),
+            INLINE_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed)
+        );
         // Segunda pasada (Fase 3.3): `flow_block_children`/`flow_inline_run`/
         // `flow_flex_children`, arriba, ya dejaron cada `position: absolute`/
         // `fixed` SIN resolver a proposito (`is_out_of_flow`, ver esas
@@ -981,7 +2176,9 @@ impl LayoutTreeBuilder {
         // entero ya existe de verdad y hay "containing blocks" reales contra
         // los que resolverlos. Ver el doc-comment de `resolve_positioned_boxes`.
         let viewport = root_box.dimensions.clone();
+        let t = std::time::Instant::now();
         Self::resolve_positioned_boxes(&mut root_box, &viewport, &viewport, font_set, images);
+        tracing::info!("[tiempo]     posicionados {:?}", t.elapsed());
         root_box
     }
 
@@ -1007,6 +2204,7 @@ impl LayoutTreeBuilder {
 
         if matches!(position.as_deref(), Some("absolute") | Some("fixed")) {
             let reference = if position.as_deref() == Some("fixed") { viewport } else { containing_block };
+            node.containing_width = reference.width;
 
             let left = node.computed_style.get("left").and_then(|v| parse_css_offset_relative(v, reference.width));
             let right = node.computed_style.get("right").and_then(|v| parse_css_offset_relative(v, reference.width));
@@ -1021,10 +2219,18 @@ impl LayoutTreeBuilder {
             // hueco que `measure_flex_item`, ver su doc-comment).
             let width = resolve_block_width(&node.computed_style, reference.width);
             node.dimensions.width = width;
+            // Con `left` y `right` ambos en `auto` manda la posicion
+            // estatica (donde el flujo normal habria dejado la caja), no la
+            // esquina del bloque contenedor - ver `LayoutBox::
+            // static_position`. Sin posicion estatica anotada (una caja
+            // fuera de flujo dentro de un contenedor que no la registro
+            // todavia) se cae al comportamiento anterior, que al menos la
+            // deja dentro del contenedor.
+            let static_position = node.static_position;
             node.dimensions.x = match (left, right) {
                 (Some(l), _) => reference.x + l,
                 (None, Some(r)) => reference.x + reference.width - width - r,
-                (None, None) => reference.x,
+                (None, None) => static_position.map(|(x, _)| x).unwrap_or(reference.x),
             };
             // Y provisional: si `top` esta puesto, ya es el Y final (`bottom`
             // se ignora cuando ambos estan puestos - un caso sobre-
@@ -1034,7 +2240,10 @@ impl LayoutTreeBuilder {
             // (mas abajo) y poder aplicar `bottom` correctamente.
             node.dimensions.y = match top {
                 Some(t) => reference.y + t,
-                None => reference.y,
+                // Igual que en X: sin `top`, la posicion estatica. Sigue
+                // siendo PROVISIONAL cuando hay `bottom`, que se aplica mas
+                // abajo una vez se conoce el alto real del contenido.
+                None => static_position.map(|(_, y)| y).unwrap_or(reference.y),
             };
 
             let content_height = Self::flow_block_children(node, font_set, images);
@@ -1095,12 +2304,19 @@ impl LayoutTreeBuilder {
     /// resuelve contra la VENTANA, no contra el contenedor de cada
     /// elemento (eso serian container queries, que son otra cosa y no
     /// estan implementadas).
-    fn build_node(dom_node: &Arc<RwLock<Node>>, parent_layout_box: &mut LayoutBox, stylesheet: &StyleSheet, inherited: &HashMap<String, String>, viewport_width: f32) {
+    fn build_node(
+        dom_node: &Arc<RwLock<Node>>,
+        parent_layout_box: &mut LayoutBox,
+        stylesheet: &StyleSheet,
+        inherited_props: &Arc<HashMap<String, String>>,
+        inherited_vars: &Arc<HashMap<String, String>>,
+        viewport: (f32, f32),
+    ) {
         let r = dom_node.read().unwrap();
         match &r.node_type {
             NodeType::Document => {
                 for child in &r.children {
-                    Self::build_node(child, parent_layout_box, stylesheet, inherited, viewport_width);
+                    Self::build_node(child, parent_layout_box, stylesheet, inherited_props, inherited_vars, viewport);
                 }
             }
             NodeType::Element { tag_name, attributes } => {
@@ -1170,6 +2386,12 @@ impl LayoutTreeBuilder {
                 };
                 let mut current_box = LayoutBox::new(box_type);
                 current_box.dom_node = Some(dom_node.clone());
+                // `colspan` solo tiene sentido en una celda; un valor de 0 o
+                // ilegible cuenta como 1, igual que exige el propio HTML.
+                if matches!(tag_name.as_str(), "td" | "th") {
+                    current_box.colspan = attributes.get("colspan").and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(1).max(1);
+                    current_box.rowspan = attributes.get("rowspan").and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(1).max(1);
+                }
                 if matches!(&current_box.box_type, BoxType::Replaced) {
                     current_box.replaced_text = resolve_replaced_text(tag_name, attributes, dom_node);
                 }
@@ -1179,7 +2401,7 @@ impl LayoutTreeBuilder {
                 // (`getComputedStyle`, en construccion) tambien pueda
                 // reusarla sin depender de `layout` solo para esto. Misma
                 // logica exacta, cero cambio de comportamiento.
-                current_box.computed_style = engine_css::resolve_style(dom_node, stylesheet, viewport_width);
+                current_box.computed_style = engine_css::resolve_style(dom_node, stylesheet, viewport.0);
 
                 // `display: none` (no confundir con `visibility: hidden`,
                 // que SI genera caja - ver `engine-gfx::display_list`): el
@@ -1203,50 +2425,98 @@ impl LayoutTreeBuilder {
                     apply_image_size_attributes(&mut current_box.computed_style, attributes);
                 }
 
-                // Herencia real EN LA CAJA DEL ELEMENTO (Fase 8). Hasta
-                // aqui, `computed_style` de una caja de elemento solo
-                // llevaba lo que ESE elemento declaraba; lo heredado
-                // viajaba unicamente en `inherited` y solo aterrizaba en
-                // las cajas de TEXTO (mas abajo). Bastaba para pintar -el
-                // color/tamaño de letra solo hacen falta donde hay texto-
-                // pero deja la caja del elemento diciendo una verdad a
-                // medias, y `getComputedStyle` (que por definicion
-                // devuelve el valor DESPUES de la herencia) no tenia de
-                // donde sacar el valor: un `<div>` dentro de un `<body>`
-                // con `color` reportaba "" en vez del color heredado.
-                //
-                // `or_insert_with`, nunca sobrescribir: lo que el elemento
-                // declare el mismo gana siempre sobre lo heredado, que es
-                // exactamente el orden de la cascada. Y tiene que ir ANTES
-                // del bucle de abajo para que un `font-size: 2em` propio
-                // siga sin resolver a estas alturas y lo resuelva ese
-                // bucle contra el tamaño del padre.
-                //
-                // `inherited` solo contiene propiedades de
-                // `INHERITABLE_PROPERTIES` (es quien lo construye), asi
-                // que copiarlo entero no puede colar nada no heredable.
-                for (prop, value) in inherited {
+                let has_own_vars = current_box.computed_style.keys().any(|k| is_custom_property(k));
+                let child_vars: Arc<HashMap<String, String>> = if has_own_vars {
+                    let mut next = (**inherited_vars).clone();
+                    for (prop, value) in &current_box.computed_style {
+                        if is_custom_property(prop) {
+                            next.insert(prop.clone(), value.clone());
+                        }
+                    }
+                    Arc::new(next)
+                } else {
+                    Arc::clone(inherited_vars)
+                };
+
+                let had_own_inheritable = INHERITABLE_PROPERTIES.iter().any(|prop| current_box.computed_style.contains_key(*prop));
+
+                // Herencia real EN LA CAJA DEL ELEMENTO (Fase 8): solo las
+                // propiedades heredables reales (`INHERITABLE_PROPERTIES`),
+                // nunca la tabla entera de `--*` que iria en `inherited_vars`.
+                for (prop, value) in inherited_props.iter() {
                     current_box.computed_style.entry(prop.clone()).or_insert_with(|| value.clone());
                 }
 
-                let mut child_inherited = inherited.clone();
-                for prop in INHERITABLE_PROPERTIES {
-                    let Some(value) = current_box.computed_style.get(*prop) else { continue };
-                    let resolved = if *prop == "font-size" {
-                        let parent_font_size_px = inherited
-                            .get("font-size")
-                            .and_then(|v| parse_css_font_size(v))
-                            .unwrap_or(INITIAL_FONT_SIZE);
-                        format!("{}px", resolve_font_size(value, parent_font_size_px))
-                    } else {
-                        value.clone()
-                    };
-                    current_box.computed_style.insert(prop.to_string(), resolved.clone());
-                    child_inherited.insert(prop.to_string(), resolved);
+                // Con todas las variables visibles (`child_vars` compartidas por
+                // `Arc` sin clonarlas), se resuelve `var()` solo si alguna
+                // propiedad del elemento realmente contiene `var(`.
+                if !child_vars.is_empty() && current_box.computed_style.iter().any(|(k, v)| !is_custom_property(k) && v.contains("var(")) {
+                    let pending: Vec<(String, String)> = current_box
+                        .computed_style
+                        .iter()
+                        .filter(|(k, v)| !is_custom_property(k) && v.contains("var("))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (prop, value) in pending {
+                        let resolved = substitute_css_vars(&value, &child_vars, 0);
+                        if resolved.trim().is_empty() {
+                            current_box.computed_style.remove(&prop);
+                        } else {
+                            current_box.computed_style.insert(prop, resolved);
+                        }
+                    }
+                }
+
+                let child_inherited: Arc<HashMap<String, String>> = if had_own_inheritable {
+                    let mut next = HashMap::with_capacity(inherited_props.len() + 2);
+                    for prop in INHERITABLE_PROPERTIES {
+                        let Some(value) = current_box.computed_style.get(*prop) else { continue };
+                        let resolved = if *prop == "font-size" {
+                            let parent_font_size_px = inherited_props
+                                .get("font-size")
+                                .and_then(|v| parse_css_font_size(v))
+                                .unwrap_or(INITIAL_FONT_SIZE);
+                            let px = format!("{}px", resolve_font_size(value, parent_font_size_px));
+                            current_box.computed_style.insert(prop.to_string(), px.clone());
+                            px
+                        } else {
+                            value.clone()
+                        };
+                        next.insert(prop.to_string(), resolved);
+                    }
+                    Arc::new(next)
+                } else {
+                    Arc::clone(inherited_props)
+                };
+
+                // Unidades relativas -> pixeles. Va AQUI, despues del bucle
+                // de herencia, porque `em` se mide contra el `font-size` YA
+                // resuelto de esta caja, y ese bucle es quien lo deja en px.
+                if current_box
+                    .computed_style
+                    .iter()
+                    .any(|(k, v)| !is_custom_property(k) && k.as_str() != "font-size" && necesita_resolver_unidades(v))
+                {
+                    let font_px = current_box
+                        .computed_style
+                        .get("font-size")
+                        .and_then(|v| parse_css_font_size(v))
+                        .unwrap_or(INITIAL_FONT_SIZE);
+                    let por_resolver: Vec<(String, String)> = current_box
+                        .computed_style
+                        .iter()
+                        .filter(|(k, v)| !is_custom_property(k) && k.as_str() != "font-size" && necesita_resolver_unidades(v))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (prop, value) in por_resolver {
+                        if let Some(resuelto) = resolve_relative_units(&value, font_px, viewport) {
+                            current_box.computed_style.insert(prop, resuelto);
+                        }
+                    }
                 }
 
                 for child in &r.children {
-                    Self::build_node(child, &mut current_box, stylesheet, &child_inherited, viewport_width);
+                    Self::build_node(child, &mut current_box, stylesheet, &child_inherited, &child_vars, viewport);
                 }
                 parent_layout_box.children.push(current_box);
             }
@@ -1264,9 +2534,29 @@ impl LayoutTreeBuilder {
                 // cualquier RACHA de espacios en blanco a uno solo, sin
                 // quitar los bordes por completo.
                 let collapsed = collapse_whitespace(content);
-                if !collapsed.trim().is_empty() {
+                // Un texto SOLO en blanco entre dos elementos en linea
+                // (`<b>a</b> <i>b</i>`) es el espacio que separa las palabras
+                // (tarea 2.2 del plan). Antes se descartaba siempre y
+                // "negrita cursiva enlace" salia pegado. Solo se conserva
+                // cuando de verdad separa algo; ver `keeps_inter_element_space`.
+                let keep = if collapsed.trim().is_empty() {
+                    !collapsed.is_empty() && Self::keeps_inter_element_space(parent_layout_box)
+                } else {
+                    true
+                };
+                if keep {
                     let mut text_box = LayoutBox::new(BoxType::Text(collapsed));
-                    text_box.computed_style = inherited.clone();
+                    text_box.computed_style = (**inherited_props).clone();
+                    // `line-height` heredado en `em` (`1.5em`) llega crudo: las
+                    // hojas de texto no pasan por la conversion de unidades de
+                    // arriba, asi que se resuelve aqui con SU tamaño de fuente
+                    // (tarea 2.6). Un numero sin unidad (`1.5`) se deja como esta.
+                    if let Some(raw) = text_box.computed_style.get("line-height").cloned() {
+                        let font_px = text_box.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
+                        if let Some(resolved) = resolve_relative_units(&raw, font_px, viewport) {
+                            text_box.computed_style.insert("line-height".to_string(), resolved);
+                        }
+                    }
                     parent_layout_box.children.push(text_box);
                 }
             }
@@ -1303,6 +2593,7 @@ impl LayoutTreeBuilder {
     /// el `cursor_y` final ya resuelve eso por construccion, sin necesitar
     /// un caso aparte para "hijos que se solapan".
     fn flow_block_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+        FLOW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // `display: flex` desvia el contenedor entero a `flow_flex_children`
         // (Fase 3.2, via el crate `taffy` - ver ARCHITECTURE.md "Doctrina de
         // dependencias") ANTES de tocar nada del flujo de bloque normal: un
@@ -1323,9 +2614,18 @@ impl LayoutTreeBuilder {
             return Self::flow_table_children(container, font_set, images);
         }
 
-        const LINE_HEIGHT_FALLBACK: f32 = 22.0;
+        Self::flow_normal_block_children(container, font_set, images)
+    }
 
-        let padding = resolve_padding(&container.computed_style);
+    /// El flujo de bloque propiamente dicho, ya sin el despacho por
+    /// `display` que hace `flow_block_children`. Separado para que un
+    /// contenedor que se desvio a otro algoritmo pueda VOLVER aqui sin
+    /// rebotar en ese despacho para siempre - lo necesita
+    /// `flow_table_children` cuando una `display: table` no tiene ninguna
+    /// fila (ver alli).
+    fn flow_normal_block_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
+
+        let padding = resolve_padding(&container.computed_style, container.containing_width);
         let border = resolve_border_width(&container.computed_style);
         container.box_dimensions.padding = padding;
         container.box_dimensions.border = border;
@@ -1339,6 +2639,15 @@ impl LayoutTreeBuilder {
         let content_top = container.dimensions.y + inset_top;
         let mut cursor_y = content_top;
 
+        // Alto de contenido de ESTE contenedor, pero solo si es DEFINIDO -
+        // o sea, si el autor lo declaro. Con `height: auto` (lo normal) no
+        // hay numero: el contenedor crece con su contenido, asi que un
+        // `height: 50%` de un hijo no tiene contra que medirse y el spec lo
+        // trata como `auto`. `0.0` codifica ese "indefinido".
+        let definite_inner_height = resolve_explicit_height(&container.computed_style, container.containing_height)
+            .map(|h| if is_border_box(&container.computed_style) { (h - border.top - border.bottom - padding.top - padding.bottom).max(0.0) } else { h })
+            .unwrap_or(0.0);
+
         // `float: left`/`right` (Fase 12) - a lo sumo UN float activo por
         // lado a la vez (simplificacion declarada, ver el doc-comment de
         // `place_float_child`). Se declaran aqui, no dentro del bucle,
@@ -1349,6 +2658,14 @@ impl LayoutTreeBuilder {
         let mut float_left: Option<ActiveFloat> = None;
         let mut float_right: Option<ActiveFloat> = None;
 
+        // `display: list-item` (Fase 40) - se leen UNA sola vez antes del
+        // bucle: `ordered` es una propiedad del CONTENEDOR (`<ol>` vs
+        // cualquier otra lista), no de cada hijo, y el ordinal 1-based
+        // cuenta solo entre hermanos `list-item` (un nodo de texto suelto
+        // entre `<li>` por espacio en blanco del propio HTML no cuenta).
+        let ordered_list = tag_name_of(container).as_deref() == Some("ol");
+        let mut list_item_ordinal: u32 = 0;
+
         let mut i = 0;
         while i < container.children.len() {
             // `position: absolute`/`fixed` (Fase 3.3) se saca del flujo por
@@ -1357,6 +2674,11 @@ impl LayoutTreeBuilder {
             // `resolve_positioned_boxes`, despues de que el flujo normal
             // entero ya este resuelto.
             if is_out_of_flow(&container.children[i].computed_style) {
+                // No reserva espacio ni avanza `cursor_y` - pero SI se
+                // anota donde habria caido, que es lo que el spec usa
+                // cuando `left`/`top` son `auto` (ver
+                // `LayoutBox::static_position`).
+                container.children[i].static_position = Some((origin_x, cursor_y));
                 i += 1;
                 continue;
             }
@@ -1453,7 +2775,19 @@ impl LayoutTreeBuilder {
             // `build_node`) - por construccion, una caja de texto nunca
             // tiene "margin" en su mapa, asi que esto resuelve a cero para
             // texto de forma automatica, sin necesitar un caso aparte.
-            let margin = resolve_margin(&child.computed_style);
+            child.containing_width = eff_inner_width;
+            child.containing_height = definite_inner_height;
+            let mut margin = resolve_margin(&child.computed_style, eff_inner_width);
+            // `margin: auto` (tarea 2.1): reparte el espacio sobrante entre
+            // los margenes laterales. El ancho ya sale resuelto de aqui para
+            // no calcularlo dos veces con margenes distintos.
+            let (auto_left, auto_right) = auto_horizontal_margins(&child.computed_style);
+            let mut centered_width = None;
+            if auto_left || auto_right {
+                let (resolved_margin, width) = resolve_auto_margins(&child.computed_style, margin, auto_left, auto_right, eff_inner_width);
+                margin = resolved_margin;
+                centered_width = Some(width);
+            }
             child.box_dimensions.margin = margin;
 
             cursor_y += margin.top;
@@ -1464,7 +2798,7 @@ impl LayoutTreeBuilder {
             // unico comportamiento antes de esta tarea - ver
             // `resolve_block_width`.
             let auto_width = (eff_inner_width - margin.left - margin.right).max(0.0);
-            child.dimensions.width = resolve_block_width(&child.computed_style, auto_width);
+            child.dimensions.width = centered_width.unwrap_or_else(|| resolve_block_width_with_reference(&child.computed_style, auto_width, eff_inner_width));
             let child_width = child.dimensions.width;
             // `position: relative` (Fase 3.3): `child` YA ocupo su lugar
             // normal arriba (sigue reservando su espacio de siempre, esto
@@ -1482,25 +2816,32 @@ impl LayoutTreeBuilder {
             let child_border = child.box_dimensions.border;
             // `height` (si esta puesta) sustituye la altura AUTO (la que
             // acaba de devolver la recursion) por el valor explicito del
-            // autor - a diferencia del ancho auto, aqui NO se aplica el
-            // minimo `LINE_HEIGHT_FALLBACK`: ese minimo es un heuristico
-            // propio del motor para no colapsar una caja vacia a cero, no
-            // una regla real del spec, y no deberia pisar un `height` que
-            // el autor puso a proposito (aunque sea mas pequeño que el
-            // contenido - el contenido simplemente desborda, sin recorte:
-            // `overflow` no esta implementado todavia). Sin
-            // `max-height`/`min-height` todavia (fuera del alcance de esta
-            // tarea).
+            // autor; `max-height`/`min-height` se aplican despues via
+            // `clamp_height`. El layout en si no reduce el contenido para
+            // que quepa (igual que un navegador real: `overflow` no cambia
+            // el tamano de las cajas) - lo que SI ocurre es el recorte
+            // visual en pintura cuando `overflow` lo pide (`hidden`/
+            // `auto`/`scroll`), ver `establishes_clip` en
+            // `engine-gfx::display_list`.
+            //
+            // Una caja de bloque con `height: auto` y sin contenido en flujo
+            // mide CERO, que es lo que dice el spec. Antes se le aplicaba un
+            // suelo de `LINE_HEIGHT_FALLBACK` (un heuristico del motor "para
+            // no colapsar una caja vacia") que le daba 22 px fantasma a cada
+            // `<div>` estructural vacio - y una pagina real tiene cientos.
+            // En la Wikipedia real eso metia mas de 100 px de hueco en
+            // blanco entre la cabecera y el titulo del articulo, y separaba
+            // entre si todas las secciones.
             let vertical_extra = child_padding.top + child_padding.bottom + child_border.top + child_border.bottom;
-            let explicit_height = child.computed_style.get("height").and_then(|v| parse_css_length(v));
+            let explicit_height = resolve_explicit_height(&child.computed_style, child.containing_height);
             let border_box = is_border_box(&child.computed_style);
             let resolved_content_height = match explicit_height {
                 Some(h) => if border_box { (h - vertical_extra).max(0.0) } else { h },
-                None => content_height,
+                None => clamp_height(content_height, &child.computed_style, child.containing_height, border_box, vertical_extra),
             };
             child.dimensions.height = match explicit_height {
                 Some(h) => if border_box { h } else { h + vertical_extra },
-                None => (content_height + vertical_extra).max(LINE_HEIGHT_FALLBACK),
+                None => resolved_content_height + vertical_extra,
             };
             // El area de contenido real (sin padding NI border, los dos ya
             // sumados arriba) - poblar esto es lo que hace que
@@ -1514,6 +2855,16 @@ impl LayoutTreeBuilder {
                 width: child_width - child_border.left - child_border.right - child_padding.left - child_padding.right,
                 height: resolved_content_height,
             };
+
+            // `display: list-item` (Fase 40) - `child.dimensions` ya es
+            // FINAL en este punto, que es justo lo que `place_list_marker`
+            // necesita para saber donde colgar la vineta a su izquierda.
+            if is_list_item(&child.computed_style) {
+                list_item_ordinal += 1;
+                if !list_style_is_none(&child.computed_style) {
+                    place_list_marker(child, list_item_ordinal, ordered_list, font_set);
+                }
+            }
 
             cursor_y += child.dimensions.height + margin.bottom;
             i += 1;
@@ -1575,7 +2926,8 @@ impl LayoutTreeBuilder {
     ) {
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
-        let margin = resolve_margin(&child.computed_style);
+        child.containing_width = inner_width;
+        let margin = resolve_margin(&child.computed_style, inner_width);
         child.box_dimensions.margin = margin;
 
         let width = resolve_block_width(&child.computed_style, DEFAULT_FLOAT_WIDTH);
@@ -1642,7 +2994,8 @@ impl LayoutTreeBuilder {
     /// evitaria partir palabras - aproximacion razonable para la mayoria de
     /// paginas reales, exacta cuando el item tiene su propio `width`).
     fn flow_flex_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
-        let padding = resolve_padding(&container.computed_style);
+        FLEX_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let padding = resolve_padding(&container.computed_style, container.containing_width);
         let border = resolve_border_width(&container.computed_style);
         container.box_dimensions.padding = padding;
         container.box_dimensions.border = border;
@@ -1668,11 +3021,22 @@ impl LayoutTreeBuilder {
         // con `container.children` - de ahi la tupla en vez de un `Vec`
         // simple.
         let mut child_node_ids: Vec<(usize, taffy::NodeId)> = Vec::with_capacity(container.children.len());
-        for (index, child) in container.children.iter().enumerate() {
+        for (index, child) in container.children.iter_mut().enumerate() {
             if is_out_of_flow(&child.computed_style) {
                 continue;
             }
-            let style = flex_item_style(&child.computed_style);
+            // Se fija ANTES de medir, no solo al comprometer la posicion
+            // final (mas abajo): `measure_flex_item` recursa en
+            // `flow_block_children`, que resuelve el PROPIO padding/height
+            // en porcentaje del item contra `containing_width` - con el
+            // valor por defecto (0.0) de una caja recien creada, un item con
+            // `padding: 5%` mediria con padding cero durante la pasada de
+            // medida de taffy, y el tamaño que taffy comete quedaria
+            // pequeño de mas aunque la segunda pasada corrija el padding
+            // pintado despues.
+            child.containing_width = inner_width;
+            let margin = resolve_margin(&child.computed_style, inner_width);
+            let style = flex_item_style(&child.computed_style, margin);
             let node_id = taffy_tree
                 .new_leaf_with_context(style, index)
                 .expect("crear un nodo hoja de taffy no deberia fallar (sin limite de nodos alcanzado)");
@@ -1733,6 +3097,11 @@ impl LayoutTreeBuilder {
         for (index, node_id) in &child_node_ids {
             let layout = *taffy_tree.layout(*node_id).expect("layout deberia existir tras compute_layout_with_measure");
             let child = &mut container.children[*index];
+            child.containing_width = inner_width;
+            // Ver el mismo comentario en `flow_grid_children`: puebla el
+            // margen que taffy ya uso para colocar el item, no solo el
+            // `Style` que se le paso.
+            child.box_dimensions.margin = resolve_margin(&child.computed_style, inner_width);
             child.dimensions.x = origin_x + layout.location.x;
             child.dimensions.y = origin_y + layout.location.y;
             child.dimensions.width = layout.size.width;
@@ -1751,7 +3120,8 @@ impl LayoutTreeBuilder {
 
     /// Layout real de `display: grid` (Fase 3) - delegado al motor CSS Grid de `taffy`.
     fn flow_grid_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
-        let padding = resolve_padding(&container.computed_style);
+        GRID_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let padding = resolve_padding(&container.computed_style, container.containing_width);
         let border = resolve_border_width(&container.computed_style);
         container.box_dimensions.padding = padding;
         container.box_dimensions.border = border;
@@ -1768,13 +3138,26 @@ impl LayoutTreeBuilder {
             return 0.0;
         }
 
+        // Las areas con nombre del contenedor: hacen falta para colocar cada
+        // item (`grid-area: pageContent`), asi que se leen una vez aqui y no
+        // por hijo.
+        let areas = container
+            .computed_style
+            .get("grid-template-areas")
+            .map(|v| parse_grid_template_areas(v))
+            .unwrap_or_default();
+
         let mut taffy_tree: taffy::TaffyTree<usize> = taffy::TaffyTree::new();
         let mut child_node_ids: Vec<(usize, taffy::NodeId)> = Vec::with_capacity(container.children.len());
-        for (index, child) in container.children.iter().enumerate() {
+        for (index, child) in container.children.iter_mut().enumerate() {
             if is_out_of_flow(&child.computed_style) {
                 continue;
             }
-            let style = flex_item_style(&child.computed_style);
+            // Mismo motivo que en `flow_flex_children`: hace falta ANTES de
+            // que taffy mida, no solo al comprometer la posicion final.
+            child.containing_width = inner_width;
+            let margin = resolve_margin(&child.computed_style, inner_width);
+            let style = grid_item_style(&child.computed_style, &areas, margin);
             let node_id = taffy_tree
                 .new_leaf_with_context(style, index)
                 .expect("crear nodo hoja de taffy para grid");
@@ -1813,6 +3196,13 @@ impl LayoutTreeBuilder {
         for (index, node_id) in &child_node_ids {
             let layout = *taffy_tree.layout(*node_id).expect("layout deberia existir tras compute_layout_with_measure");
             let child = &mut container.children[*index];
+            child.containing_width = inner_width;
+            // `box_dimensions.margin` tambien se puebla aqui, no solo el
+            // `Style` que taffy ya consumio - es lo que `getBoundingClientRect`/
+            // `margin_box()` leen despues, y sin esto un item flex/grid
+            // reportaba margen cero aunque taffy ya lo hubiera respetado al
+            // colocarlo.
+            child.box_dimensions.margin = resolve_margin(&child.computed_style, inner_width);
             child.dimensions.x = origin_x + layout.location.x;
             child.dimensions.y = origin_y + layout.location.y;
             child.dimensions.width = layout.size.width;
@@ -1853,18 +3243,30 @@ impl LayoutTreeBuilder {
     ///    `vertical-align` inicial es `baseline`, pero el efecto visible por
     ///    defecto es que las celdas de una fila comparten alto).
     ///
-    /// Sin `colspan`/`rowspan`, sin `border-collapse`/`border-spacing`
-    /// (cada celda pinta su propio `border` via el box model normal, sin
-    /// fusionar bordes adyacentes), sin celdas fuera de flujo
-    /// (`position: absolute` en una `td` participa en el reparto de
-    /// columnas igual que cualquier otra, en vez de sacarse del algoritmo
-    /// como hace `flow_block_children`/`flow_flex_children` con
-    /// `is_out_of_flow` - caso raro en tablas reales).
+    /// `colspan`/`rowspan` SI se resuelven (una celda con cualquiera de los
+    /// dos ocupa varias columnas/filas de verdad, ver `ocupadas`/
+    /// `celdas_que_abarcan` mas abajo). `border-spacing` SI se respeta
+    /// (`resolve_border_spacing`, con `2px` como valor inicial real del
+    /// spec cuando no esta declarado) y `border-collapse: collapse` SI lo
+    /// colapsa a cero - lo que sigue sin implementarse de esos dos es la
+    /// fusion de bordes adyacentes en uno solo que el spec real hace
+    /// ADEMAS con `collapse` (que borde "gana" segun estilo/grosor/color):
+    /// cada celda sigue pintando su propio `border` por su cuenta, sin
+    /// fusionar. Sin celdas fuera de flujo (`position: absolute` en una
+    /// `td` participa en el reparto de columnas igual que cualquier otra,
+    /// en vez de sacarse del algoritmo como hace `flow_block_children`/
+    /// `flow_flex_children` con `is_out_of_flow` - caso raro en tablas
+    /// reales).
     fn flow_table_children(container: &mut LayoutBox, font_set: Option<&FontSet>, images: &ImageMap) -> f32 {
-        let padding = resolve_padding(&container.computed_style);
+        TABLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let padding = resolve_padding(&container.computed_style, container.containing_width);
         let border = resolve_border_width(&container.computed_style);
         container.box_dimensions.padding = padding;
         container.box_dimensions.border = border;
+        // Calculado AQUI, antes de `collect_table_rows` (que devuelve
+        // prestamos mutables de los hijos de `container` y por tanto
+        // impide seguir leyendo `container.computed_style` mas abajo).
+        let (h_spacing, v_spacing) = resolve_border_spacing(&container.computed_style);
 
         let inset_left = border.left + padding.left;
         let inset_right = border.right + padding.right;
@@ -1874,23 +3276,247 @@ impl LayoutTreeBuilder {
         let inner_width = (container.dimensions.width - inset_left - inset_right).max(0.0);
         let content_top = container.dimensions.y + inset_top;
 
+        // Hijos directos que no aportan NINGUNA fila (un `<caption>`, o
+        // contenido suelto dentro de la tabla) se maquetan como bloque
+        // ENCIMA de las filas: es donde un navegador real pinta un caption
+        // por defecto (`caption-side: top` es el valor inicial), y para el
+        // contenido suelto es la aproximacion mas cercana a la celda
+        // anonima que el spec generaria. Antes no se colocaban en ningun
+        // sitio.
+        let mut caption_height = 0.0;
+        for index in 0..container.children.len() {
+            if contributes_table_rows(&container.children[index]) {
+                continue;
+            }
+            if is_table_cell(&container.children[index]) {
+                continue;
+            }
+            // Un `position: absolute`/`fixed` NO ocupa espacio de flujo -
+            // `resolve_positioned_boxes` lo coloca aparte, DESPUES, igual
+            // que hace `flow_normal_block_children`/`flow_flex_children`
+            // con cualquier otro hijo fuera de flujo. Sin este corte, su
+            // alto se sumaba a `caption_height` y empujaba hacia abajo TODA
+            // fila real de la tabla - aunque esa posicion se sobreescribiera
+            // despues, el desplazamiento que ya habia provocado en el resto
+            // del contenido no se deshacia.
+            if is_out_of_flow(&container.children[index].computed_style) {
+                // Misma posicion estatica que anota `flow_normal_block_
+                // children` para cualquier otro hijo fuera de flujo -
+                // `resolve_positioned_boxes` la usa cuando `left`/`top`
+                // estan en `auto`. Sin apuntarla, un absoluto sin
+                // `left`/`top` dentro de una tabla caia a la esquina del
+                // bloque contenedor en vez de a donde el flujo lo habria
+                // dejado.
+                container.children[index].static_position = Some((origin_x, content_top + caption_height));
+                continue;
+            }
+            let child = &mut container.children[index];
+            child.containing_width = inner_width;
+            child.dimensions.x = origin_x;
+            child.dimensions.y = content_top + caption_height;
+            child.dimensions.width = inner_width;
+            let content_height = Self::flow_normal_block_children(child, font_set, images);
+            let child_padding = child.box_dimensions.padding;
+            let child_border = child.box_dimensions.border;
+            let explicit_height = child.computed_style.get("height").and_then(|v| parse_css_length(v));
+            child.dimensions.height = explicit_height.unwrap_or(content_height)
+                + child_padding.top
+                + child_padding.bottom
+                + child_border.top
+                + child_border.bottom;
+            caption_height += child.dimensions.height;
+        }
+        let content_top = content_top + caption_height;
+
         let rows = collect_table_rows(container);
         if rows.is_empty() {
-            return 0.0;
+            // Una caja `display: table` SIN ninguna `table-row` dentro sigue
+            // teniendo contenido que hay que colocar. Devolver 0 aqui (lo
+            // que se hacia antes) dejaba ese contenido entero sin posicionar
+            // en `Rect::default()`, o sea en la esquina (0,0) del viewport,
+            // donde ademas se PINTA: en la Wikipedia real eso amontonaba
+            // cientos de pies de foto y enlaces unos sobre otros en una
+            // franja ilegible pegada al borde superior de la pagina.
+            //
+            // El caso es de lo mas comun: MediaWiki maqueta cada miniatura
+            // con `figure { display: table }` + `figcaption { display:
+            // table-caption }`, sin ninguna fila de por medio.
+            //
+            // Un navegador real envuelve ese contenido en cajas anonimas de
+            // fila y celda; el equivalente honesto aqui, sin inventarse
+            // cajas nuevas en el arbol, es maquetarlo con el flujo de bloque
+            // normal - una celda anonima que ocupa la tabla entera se
+            // comporta exactamente asi.
+            return Self::flow_normal_block_children(container, font_set, images);
         }
 
-        let column_count = rows.iter().map(|row| row.children.iter().filter(|c| is_table_cell(c)).count()).max().unwrap_or(0).max(1);
-        let column_width = inner_width / column_count as f32;
+        // El numero de columnas es el maximo de columnas OCUPADAS por una
+        // fila, no el de celdas: una celda con `colspan="2"` ocupa dos.
+        let column_count = rows
+            .iter()
+            .map(|row| row.children.iter().filter(|c| is_table_cell(c)).map(|c| c.colspan as usize).sum::<usize>())
+            .max()
+            .unwrap_or(0)
+            .max(1);
 
-        let mut cursor_y = content_top;
-        for row in rows {
+        // Anchura minima y maxima de contenido de cada columna: el maximo,
+        // columna a columna, de lo que pide cada celda de esa columna. Las
+        // medidas van a la cache de la propia celda, asi que recorrer las
+        // filas una vez mas aqui no las vuelve a calcular despues.
+        let mut min_widths = vec![0.0_f32; column_count];
+        let mut max_widths = vec![0.0_f32; column_count];
+        let mut rows = rows;
+        // Primera pasada: solo las celdas de UNA columna, que son las unicas
+        // que atribuyen su anchura a una columna concreta sin ambiguedad.
+        // Las que abarcan varias se reparten despues, cuando ya se sabe
+        // cuanto piden las columnas por su cuenta.
+        let mut spanning: Vec<(usize, u32, f32, f32)> = Vec::new();
+        // Misma ocupacion por `rowspan` que la pasada de POSICIONAMIENTO de
+        // mas abajo (ver `ocupadas` alli) - hace falta TAMBIEN aqui: sin
+        // ella, esta pasada de medida no sabe que una celda con rowspan
+        // sigue bloqueando su columna en las filas siguientes, y le
+        // atribuye el ancho de la primera celda de esas filas a la columna
+        // EQUIVOCADA (la que sigue ocupada, no la que esa celda ocupara de
+        // verdad una vez colocada).
+        let mut ocupadas_medida: Vec<u32> = vec![0; column_count];
+        for row in rows.iter_mut() {
+            let mut col = 0usize;
+            for cell in row.children.iter_mut().filter(|c| is_table_cell(c)) {
+                while col < column_count && ocupadas_medida[col] > 0 {
+                    col += 1;
+                }
+                if col >= column_count {
+                    break;
+                }
+                let span = (cell.colspan as usize).min(column_count - col);
+                let min = measure_intrinsic_width(cell, IntrinsicWidth::Min, font_set, images);
+                let max = measure_intrinsic_width(cell, IntrinsicWidth::Max, font_set, images);
+                if span <= 1 {
+                    min_widths[col] = min_widths[col].max(min);
+                    max_widths[col] = max_widths[col].max(max);
+                } else {
+                    spanning.push((col, span as u32, min, max));
+                }
+                let filas_abarcadas = cell.rowspan.max(1);
+                if filas_abarcadas > 1 {
+                    let fin = (col + span).min(column_count);
+                    ocupadas_medida[col..fin].fill(filas_abarcadas);
+                }
+                col += span.max(1);
+            }
+            for o in ocupadas_medida.iter_mut() {
+                *o = o.saturating_sub(1);
+            }
+        }
+        // Segunda pasada: una celda que abarca varias columnas solo obliga a
+        // ensanchar si lo que ya piden esas columnas juntas no le basta, y
+        // entonces el defecto se reparte a partes iguales entre ellas.
+        for (start, span, min, max) in spanning {
+            let span = span as usize;
+            let range = start..(start + span).min(column_count);
+            let current_min: f32 = range.clone().map(|i| min_widths[i]).sum();
+            if min > current_min {
+                let share = (min - current_min) / span as f32;
+                for i in range.clone() {
+                    min_widths[i] += share;
+                }
+            }
+            let current_max: f32 = range.clone().map(|i| max_widths[i]).sum();
+            if max > current_max {
+                let share = (max - current_max) / span as f32;
+                for i in range {
+                    max_widths[i] += share;
+                }
+            }
+        }
+        // El hueco horizontal se resta ANTES de repartir el ancho entre
+        // columnas (hay `column_count + 1` huecos: antes de la primera
+        // columna, entre cada par, y despues de la ultima) - si no,
+        // `distribute_table_columns` repartiria mas ancho del que de verdad
+        // cabe y la ultima columna se saldria de la tabla.
+        let width_for_columns = (inner_width - (column_count as f32 + 1.0) * h_spacing).max(0.0);
+        let column_widths = distribute_table_columns(&min_widths, &max_widths, width_for_columns);
+        // Desplazamiento horizontal acumulado de cada columna - arranca en
+        // `h_spacing` (el hueco antes de la primera) y cada columna deja
+        // otro `h_spacing` detras de si.
+        let mut column_offsets = Vec::with_capacity(column_widths.len());
+        let mut accumulated = h_spacing;
+        for w in &column_widths {
+            column_offsets.push(accumulated);
+            accumulated += w + h_spacing;
+        }
+
+        // Ocupacion arrastrada por `rowspan`: cuantas filas mas sigue ocupada
+        // cada columna por una celda que empezo mas arriba. Sin esto, las
+        // celdas de las filas siguientes se corren a la izquierda y toda la
+        // tabla queda descuadrada a partir de la primera celda con
+        // `rowspan`.
+        let mut ocupadas: Vec<u32> = vec![0; column_count];
+        // Para la segunda pasada: (fila, indice de celda dentro de la fila,
+        // filas que abarca). El alto real de una celda con `rowspan` no se
+        // sabe hasta haber medido todas las filas que cruza.
+        let mut celdas_que_abarcan: Vec<(usize, usize, u32)> = Vec::new();
+        let mut tops_de_fila: Vec<f32> = Vec::with_capacity(rows.len());
+        let mut altos_de_fila: Vec<f32> = Vec::with_capacity(rows.len());
+
+        // Hueco vertical antes de la primera fila, mismo criterio que
+        // `column_offsets` arriba con la primera columna.
+        let mut cursor_y = content_top + v_spacing;
+        for (indice_fila, row) in rows.iter_mut().enumerate() {
+            row.containing_width = inner_width;
             row.dimensions.x = origin_x;
             row.dimensions.y = cursor_y;
             row.dimensions.width = inner_width;
 
+            // Una fila sin ninguna `table-cell` dentro tiene el mismo
+            // problema que una tabla sin filas (ver arriba): su contenido se
+            // quedaria sin posicionar. Se maqueta como bloque, que es lo que
+            // hace la celda anonima que un navegador real generaria.
+            if !row.children.iter().any(is_table_cell) {
+                let height = Self::flow_normal_block_children(row, font_set, images);
+                row.dimensions.height = height;
+                // Tambien apunta su top/alto: la segunda pasada indexa estos
+                // vectores POR NUMERO DE FILA, y saltarse una los
+                // desalinearia con todas las de despues.
+                tops_de_fila.push(cursor_y);
+                altos_de_fila.push(height);
+                cursor_y += height + v_spacing;
+                // Esta fila tambien tiene que consumir una fila de
+                // ocupacion pendiente de un `rowspan` anterior - sin esto,
+                // una fila SIN celdas (poco comun pero valida) desalineaba
+                // la cuenta en una fila para todas las de despues.
+                for o in ocupadas.iter_mut() {
+                    *o = o.saturating_sub(1);
+                }
+                continue;
+            }
+
             let mut row_height: f32 = 0.0;
-            for (col, cell) in row.children.iter_mut().filter(|c| is_table_cell(c)).enumerate() {
-                cell.dimensions.x = origin_x + column_width * col as f32;
+            let mut col = 0usize;
+            for (indice_celda, cell) in row.children.iter_mut().filter(|c| is_table_cell(c)).enumerate() {
+                // Saltar las columnas que sigue ocupando una celda de una
+                // fila anterior.
+                while col < column_count && ocupadas[col] > 0 {
+                    col += 1;
+                }
+                if col >= column_count {
+                    break;
+                }
+                let span = (cell.colspan as usize).clamp(1, column_count - col);
+                let filas_abarcadas = cell.rowspan.max(1);
+                if filas_abarcadas > 1 {
+                    // El contador se decrementa al CERRAR cada fila,
+                    // incluida esta, asi que se apunta el numero total de
+                    // filas y no una menos: si no, la ocupacion se agota
+                    // justo antes de la primera fila que deberia saltar.
+                    let fin = (col + span).min(column_count);
+                    ocupadas[col..fin].fill(filas_abarcadas);
+                    celdas_que_abarcan.push((indice_fila, indice_celda, filas_abarcadas));
+                }
+                // Una celda con `colspan` ocupa el ancho SUMADO de todas las
+                // columnas que abarca.
+                let column_width: f32 = (col..col + span).map(|i| column_widths.get(i).copied().unwrap_or(0.0)).sum();
+                cell.dimensions.x = origin_x + column_offsets.get(col).copied().unwrap_or(0.0);
                 cell.dimensions.y = cursor_y;
                 cell.dimensions.width = column_width;
                 apply_relative_offset(cell);
@@ -1915,6 +3541,7 @@ impl LayoutTreeBuilder {
                     height: resolved_content_height,
                 };
                 row_height = row_height.max(cell.dimensions.height);
+                col += span;
             }
 
             // Segunda pasada corta: estira cada celda de la fila al alto
@@ -1929,14 +3556,59 @@ impl LayoutTreeBuilder {
             }
 
             row.dimensions.height = row_height;
-            cursor_y += row_height;
+            tops_de_fila.push(cursor_y);
+            altos_de_fila.push(row_height);
+            cursor_y += row_height + v_spacing;
+
+            // Consumir una fila de ocupacion pendiente.
+            for o in ocupadas.iter_mut() {
+                *o = o.saturating_sub(1);
+            }
         }
 
-        (cursor_y - content_top).max(0.0)
+        // Segunda pasada: una celda con `rowspan` llega hasta el borde
+        // inferior de la ultima fila que abarca. Hasta aqui tenia el alto de
+        // su propia fila, porque las siguientes todavia no estaban medidas.
+        for (indice_fila, indice_celda, filas) in celdas_que_abarcan {
+            let ultima = (indice_fila + filas as usize - 1).min(altos_de_fila.len().saturating_sub(1));
+            let fondo = tops_de_fila[ultima] + altos_de_fila[ultima];
+            let alto = (fondo - tops_de_fila[indice_fila]).max(0.0);
+            if let Some(cell) = rows[indice_fila].children.iter_mut().filter(|c| is_table_cell(c)).nth(indice_celda) {
+                cell.dimensions.height = alto;
+                let p = cell.box_dimensions.padding;
+                let b = cell.box_dimensions.border;
+                cell.box_dimensions.content.height = (alto - p.top - p.bottom - b.top - b.bottom).max(0.0);
+            }
+        }
+
+        // `content_top` ya viene desplazado por el alto de los captions, asi
+        // que se vuelve a sumar para que el alto devuelto sea el de la
+        // tabla COMPLETA (caption incluido) y no solo el de sus filas.
+        (cursor_y - content_top).max(0.0) + caption_height
     }
 
     fn is_inline_level(b: &LayoutBox) -> bool {
         matches!(b.box_type, BoxType::Text(_) | BoxType::Inline | BoxType::Image(_) | BoxType::Replaced)
+    }
+
+    /// Si un texto SOLO en blanco que viene despues de lo ya construido en
+    /// `parent` debe conservarse como un espacio (tarea 2.2 del plan).
+    ///
+    /// Sí cuando lo que lo precede es un elemento o texto en linea: es el
+    /// espacio entre palabras. No cuando es el primer hijo, o lo precede un
+    /// bloque (el espacio de `</div>\n<div>` no genera nada), ni dentro de
+    /// un contenedor flex/grid/tabla, donde el espacio en blanco entre hijos
+    /// nunca se pinta y no debe convertirse en un elemento anonimo.
+    ///
+    /// El espacio de principio y de fin de linea se descarta despues, al
+    /// colocar la racha (`place_inline_node` le da ancho cero).
+    fn keeps_inter_element_space(parent: &LayoutBox) -> bool {
+        let display = parent.computed_style.get("display").map(|v| v.trim().to_ascii_lowercase());
+        let lays_children_out_itself = matches!(
+            display.as_deref(),
+            Some("flex" | "inline-flex" | "grid" | "inline-grid" | "table" | "table-row" | "table-row-group" | "table-header-group" | "table-footer-group" | "table-column" | "table-column-group")
+        );
+        !lays_children_out_itself && parent.children.last().is_some_and(Self::is_inline_level)
     }
 
     /// Coloca una RACHA de hijos inline-level (`BoxType::Text`/
@@ -1974,18 +3646,26 @@ impl LayoutTreeBuilder {
     /// Devuelve el `cursor_y` final (el tope de una linea nueva lista para
     /// lo que venga despues de la racha).
     fn flow_inline_run(nodes: &mut [LayoutBox], origin_x: f32, inner_width: f32, start_y: f32, font_set: Option<&FontSet>, images: &ImageMap, text_align: TextAlign) -> f32 {
+        INLINE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         const LINE_HEIGHT_FALLBACK: f32 = 22.0;
 
-        let text_line_height = match font_set {
+        let natural_line_height = match font_set {
             Some(set) => {
-                let (font_size, bold, italic) = Self::first_leaf_font_info(nodes).unwrap_or((INITIAL_FONT_SIZE, false, false));
-                match set.pick(bold, italic) {
-                    Some(f) => engine_text::measure_text(f, "", font_size).line_height,
+                let (font_size, bold, italic, family) = Self::first_leaf_font_info(nodes).unwrap_or((INITIAL_FONT_SIZE, false, false, engine_text::FontFamily::default()));
+                match set.pick_family(family, bold, italic) {
+                    Some(f) => engine_text::line_height(f, font_size),
                     None => LINE_HEIGHT_FALLBACK,
                 }
             }
             None => LINE_HEIGHT_FALLBACK,
         };
+        // `line-height` declarado (tarea 2.6): sustituye a la altura natural de
+        // la fuente y se deja resuelto en las hojas para el pintado.
+        let declared_line_height = Self::first_leaf_line_height(nodes);
+        let text_line_height = declared_line_height.unwrap_or(natural_line_height);
+        if let Some(height) = declared_line_height {
+            Self::set_run_line_height(nodes, height);
+        }
 
         let mut cursor_x = origin_x;
         let mut cursor_y = start_y;
@@ -1997,6 +3677,14 @@ impl LayoutTreeBuilder {
         let mut line_extent = text_line_height;
         for node in nodes.iter_mut() {
             Self::place_inline_node(node, origin_x, inner_width, text_line_height, &mut line_extent, &mut cursor_x, &mut cursor_y, font_set, images);
+        }
+        // El espacio al final de la racha (`<b>x</b> ` antes de un bloque o del
+        // cierre del padre) no debe contar: desplazaria el centrado.
+        for node in nodes.iter_mut().rev() {
+            match &node.box_type {
+                BoxType::Text(content) if content.trim().is_empty() => node.dimensions.width = 0.0,
+                _ => break,
+            }
         }
         if text_align != TextAlign::Left {
             Self::apply_text_align(nodes, origin_x, inner_width, text_align);
@@ -2077,7 +3765,7 @@ impl LayoutTreeBuilder {
     /// `<i>`...) - la base para el `line_height` COMPARTIDO de toda la
     /// racha (ver `flow_inline_run`). `None` si la racha no tiene ninguna
     /// hoja de texto real (p.ej. un `<span></span>` vacio suelto).
-    fn first_leaf_font_info(nodes: &[LayoutBox]) -> Option<(f32, bool, bool)> {
+    fn first_leaf_font_info(nodes: &[LayoutBox]) -> Option<(f32, bool, bool, engine_text::FontFamily)> {
         for node in nodes {
             match &node.box_type {
                 BoxType::Text(_) => {
@@ -2088,7 +3776,7 @@ impl LayoutTreeBuilder {
                         .unwrap_or(INITIAL_FONT_SIZE);
                     let bold = resolve_font_weight_is_bold(&node.computed_style);
                     let italic = resolve_font_style_is_italic(&node.computed_style);
-                    return Some((font_size, bold, italic));
+                    return Some((font_size, bold, italic, resolve_font_family(&node.computed_style)));
                 }
                 BoxType::Inline => {
                     if let Some(info) = Self::first_leaf_font_info(&node.children) {
@@ -2101,9 +3789,115 @@ impl LayoutTreeBuilder {
         None
     }
 
+    /// El `line-height` declarado de la primera hoja de texto de la racha, ya
+    /// en pixeles (tarea 2.6). Mismo criterio de "la primera hoja manda" que
+    /// `first_leaf_font_info`: una racha usa una altura de linea uniforme.
+    fn first_leaf_line_height(nodes: &[LayoutBox]) -> Option<f32> {
+        for node in nodes {
+            match &node.box_type {
+                BoxType::Text(_) => {
+                    let font_size = node.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
+                    return node.computed_style.get("line-height").and_then(|v| resolve_line_height(v, font_size));
+                }
+                BoxType::Inline => {
+                    if let Some(height) = Self::first_leaf_line_height(&node.children) {
+                        return Some(height);
+                    }
+                }
+                BoxType::Block | BoxType::Image(_) | BoxType::Replaced => {}
+            }
+        }
+        None
+    }
+
+    /// Deja en cada hoja de texto de la racha su `line-height` YA resuelto en
+    /// pixeles, en la clave aparte `line-height-px` (la `line-height` original,
+    /// que es heredable y puede ser un numero, no se toca). Quien pinta lo lee
+    /// de ahi para repartir las lineas de un texto que se parte con el mismo
+    /// interlineado que reservo el layout.
+    fn set_run_line_height(nodes: &mut [LayoutBox], line_height: f32) {
+        for node in nodes {
+            match &node.box_type {
+                BoxType::Text(_) => {
+                    node.computed_style.insert("line-height-px".to_string(), format!("{line_height}px"));
+                }
+                BoxType::Inline => Self::set_run_line_height(&mut node.children, line_height),
+                BoxType::Block | BoxType::Image(_) | BoxType::Replaced => {}
+            }
+        }
+    }
+
     /// Coloca UN nodo inline-level (hoja de texto, o elemento inline cuyos
     /// hijos se recorren recursivamente con el MISMO cursor compartido) -
     /// ver `flow_inline_run` para la logica de ajuste de linea.
+    /// `display: inline-block` con `width` o `height` explicitos (tarea 2.3).
+    fn is_sized_inline_block(computed_style: &HashMap<String, String>) -> bool {
+        computed_style.get("display").map(String::as_str) == Some("inline-block")
+            && (computed_style.contains_key("width") || computed_style.contains_key("height"))
+    }
+
+    /// Coloca un `inline-block` con tamaño explicito como una caja atomica en
+    /// la linea: respeta `width`/`height`, `padding`, `border` y `margin`, salta
+    /// de linea si no cabe, y su contenido se reparte dentro de SU ancho (no del
+    /// de la linea). Antes un `<span style="display:inline-block;width:100px;
+    /// height:30px">` vacio medía 0x0 y no se pintaba.
+    ///
+    /// Simplificaciones: se alinea por arriba de la linea (no por la linea de
+    /// base) y `box-sizing` se trata siempre como `content-box`.
+    #[allow(clippy::too_many_arguments)]
+    fn place_sized_inline_block(node: &mut LayoutBox, origin_x: f32, inner_width: f32, text_line_height: f32, line_extent: &mut f32, cursor_x: &mut f32, cursor_y: &mut f32, font_set: Option<&FontSet>, images: &ImageMap) {
+        let padding = resolve_padding(&node.computed_style, inner_width);
+        let border = resolve_border_width(&node.computed_style);
+        let margin = resolve_margin(&node.computed_style, inner_width);
+        let explicit_width = node.computed_style.get("width").and_then(|v| parse_css_length_relative(v, inner_width));
+        let explicit_height = node.computed_style.get("height").and_then(|v| parse_css_length(v));
+        let horizontal_extras = padding.left + padding.right + border.left + border.right;
+        let vertical_extras = padding.top + padding.bottom + border.top + border.bottom;
+
+        // Salto de linea previo: solo si el ancho se conoce de antemano y no
+        // cabe en lo que queda de la linea (que ya tiene algo).
+        if let Some(width) = explicit_width {
+            let remaining = origin_x + inner_width - *cursor_x;
+            if width + horizontal_extras + margin.left + margin.right > remaining && *cursor_x > origin_x {
+                *cursor_y += *line_extent;
+                *cursor_x = origin_x;
+                *line_extent = text_line_height;
+            }
+        }
+
+        let box_x = *cursor_x + margin.left;
+        let box_y = *cursor_y + margin.top;
+        let content_x = box_x + border.left + padding.left;
+        let content_y = box_y + border.top + padding.top;
+        let available = (origin_x + inner_width - content_x - padding.right - border.right - margin.right).max(0.0);
+        let content_limit = explicit_width.unwrap_or(available);
+
+        // Los hijos se reparten en un contexto de linea propio: su ancho es el
+        // de esta caja, no el de la linea que la contiene.
+        let (mut child_x, mut child_y, mut child_extent) = (content_x, content_y, text_line_height);
+        for child in &mut node.children {
+            Self::place_inline_node(child, content_x, content_limit, text_line_height, &mut child_extent, &mut child_x, &mut child_y, font_set, images);
+        }
+        let natural_width = node
+            .children
+            .iter()
+            .filter(|c| c.dimensions.width > 0.0)
+            .map(|c| c.dimensions.x + c.dimensions.width - content_x)
+            .fold(0.0_f32, f32::max);
+        let natural_height = if node.children.is_empty() { 0.0 } else { (child_y - content_y) + child_extent };
+        let width = explicit_width.unwrap_or(natural_width);
+        let height = explicit_height.unwrap_or(natural_height);
+
+        node.dimensions = Rect { x: box_x, y: box_y, width: width + horizontal_extras, height: height + vertical_extras };
+        node.box_dimensions.content = Rect { x: content_x, y: content_y, width, height };
+        node.box_dimensions.padding = padding;
+        node.box_dimensions.border = border;
+        node.box_dimensions.margin = margin;
+
+        *cursor_x = box_x + node.dimensions.width + margin.right;
+        *line_extent = line_extent.max(margin.top + node.dimensions.height + margin.bottom);
+    }
+
     fn place_inline_node(node: &mut LayoutBox, origin_x: f32, inner_width: f32, text_line_height: f32, line_extent: &mut f32, cursor_x: &mut f32, cursor_y: &mut f32, font_set: Option<&FontSet>, images: &ImageMap) {
         // Mismo criterio que en `flow_block_children`: `position: absolute`/
         // `fixed` (Fase 3.3) no consume espacio ni avanza el cursor de la
@@ -2113,6 +3907,11 @@ impl LayoutTreeBuilder {
         }
         match &node.box_type {
             BoxType::Text(content) => {
+                // La misma caja se coloca varias veces con anchos distintos
+                // (medidas de flex, remaquetados): la sangria de la colocacion
+                // anterior no puede sobrevivir a la siguiente.
+                node.first_line_indent = 0.0;
+                node.trimmed_text = None;
                 let font_size = node
                     .computed_style
                     .get("font-size")
@@ -2128,18 +3927,67 @@ impl LayoutTreeBuilder {
                 // pintar seleccionen exactamente la misma cara de fuente.
                 let bold = resolve_font_weight_is_bold(&node.computed_style);
                 let italic = resolve_font_style_is_italic(&node.computed_style);
-                let font = font_set.and_then(|set| set.pick(bold, italic));
+                let font = font_set.and_then(|set| set.pick_family(resolve_font_family(&node.computed_style), bold, italic));
 
                 let natural_width = match font {
-                    Some(f) => engine_text::measure_text(f, content, font_size).width,
+                    // `wrapped_line_width` y no `measure_text`: tiene que ser
+                    // la misma aritmetica con la que `engine-gfx` repartira
+                    // este texto en lineas (ver su doc-comment).
+                    Some(f) => engine_text::wrapped_line_width(f, content, font_size),
                     // Sin fuente de sistema (ver engine-gfx/window.rs, mismo
                     // caso): misma aproximacion por caracteres que el resto
                     // del motor sin fuente real.
                     None => content.len() as f32 * 8.0,
                 };
 
+                // Un espacio entre elementos en linea (tarea 2.2): ocupa su ancho
+                // solo si esta en medio de una linea y cabe. Al principio de una
+                // linea o al final no ocupa nada, y nunca provoca un salto: en
+                // CSS los espacios en los bordes de una linea desaparecen.
+                let measure = |text: &str| match font {
+                    Some(f) => engine_text::wrapped_line_width(f, text, font_size),
+                    None => text.len() as f32 * 8.0,
+                };
+                let mut natural_width = natural_width;
+                let mut content: &str = content;
+                // Si el texto salta de linea, el espacio con que empezaba (el que
+                // lo separaba del hermano anterior) deja de existir: se quita del
+                // texto de la caja al terminar.
+                let mut stripped_after_jump: Option<String> = None;
+                if content.trim().is_empty() {
+                    let space_width = match font {
+                        Some(f) => engine_text::measure_text(f, " ", font_size).width,
+                        None => content.len() as f32 * 8.0,
+                    };
+                    let fits = *cursor_x > origin_x && space_width <= origin_x + inner_width - *cursor_x;
+                    let width = if fits { space_width } else { 0.0 };
+                    node.dimensions = Rect { x: *cursor_x, y: *cursor_y, width, height: text_line_height };
+                    *cursor_x += width;
+                    return;
+                }
+
                 let mut remaining = origin_x + inner_width - *cursor_x;
                 if natural_width > remaining && *cursor_x > origin_x {
+                    // Tarea 2.2b: antes de saltar de linea, se intenta partir el
+                    // texto por palabras. Lo que cabe se queda en lo que resta
+                    // de la linea actual (junto al hermano en linea que ya hay)
+                    // y el resto sigue en las siguientes. Sin esto, todo el
+                    // texto que seguia a un enlace o una cursiva bajaba entero.
+                    if let Some(f) = font {
+                        let indent = *cursor_x - origin_x;
+                        let first_width = inner_width - indent;
+                        let lines = engine_text::wrap_text_from(f, content, font_size, first_width, inner_width);
+                        if lines.len() >= 2 && !lines[0].trim().is_empty() {
+                            let last = lines.last().map(String::as_str).unwrap_or("");
+                            let last_width = engine_text::text_width(f, last, font_size);
+                            node.first_line_indent = indent;
+                            node.dimensions = Rect { x: origin_x, y: *cursor_y, width: inner_width, height: lines.len() as f32 * text_line_height };
+                            *cursor_y += (lines.len() - 1) as f32 * text_line_height;
+                            *cursor_x = origin_x + last_width;
+                            *line_extent = text_line_height;
+                            return;
+                        }
+                    }
                     // No cabe en lo que queda de la linea actual, pero la
                     // linea ya tiene contenido de un hermano anterior: salta
                     // a una linea nueva antes de decidir nada mas. Avanza
@@ -2151,6 +3999,12 @@ impl LayoutTreeBuilder {
                     *cursor_x = origin_x;
                     *line_extent = text_line_height;
                     remaining = inner_width;
+                    let stripped = content.trim_start();
+                    if stripped.len() != content.len() {
+                        content = stripped;
+                        natural_width = measure(content);
+                        stripped_after_jump = Some(content.to_string());
+                    }
                 }
 
                 if natural_width <= remaining {
@@ -2163,26 +4017,55 @@ impl LayoutTreeBuilder {
                     // igual que una caja de texto de bloque de siempre.
                     let lines = match font {
                         Some(f) => engine_text::wrap_text(f, content, font_size, inner_width),
-                        None => vec![content.clone()],
+                        None => vec![content.to_string()],
                     };
                     let consumed_lines = lines.len().max(1) as f32;
                     node.dimensions = Rect { x: origin_x, y: *cursor_y, width: inner_width, height: consumed_lines * text_line_height };
-                    *cursor_y += consumed_lines * text_line_height;
-                    *cursor_x = origin_x;
+                    // El cursor se queda al final de la ULTIMA linea (tarea 2.2b),
+                    // no en el principio de la siguiente: lo que siga en linea (un
+                    // enlace, una cursiva, mas texto) continua ahi. Antes saltaba
+                    // siempre una linea de mas: cada parrafo que se partia en varias
+                    // lineas medía una linea mas de la cuenta, y lo que venia justo
+                    // despues del texto empezaba en la linea de abajo.
+                    *cursor_y += (consumed_lines - 1.0) * text_line_height;
+                    *cursor_x = match (font, lines.last()) {
+                        (Some(f), Some(last)) => origin_x + engine_text::text_width(f, last, font_size),
+                        _ => origin_x,
+                    };
                     *line_extent = text_line_height;
                 }
+                node.trimmed_text = stripped_after_jump;
             }
             BoxType::Inline => {
-                // `margin`/`padding`/`border` de elementos inline no se
-                // resuelven todavia (fuera de alcance de esta tarea) - el
-                // spec real solo les aplica margen/padding HORIZONTAL de
-                // todas formas (el vertical no afecta el alto de linea), y
-                // es un caso raro en paginas reales para span/a/b/i.
+                // `display: inline-block` con `width`/`height` (tarea 2.3): una
+                // caja atomica del tamaño pedido, no el recorrido de hijos de
+                // un elemento inline normal (que ignora ambos).
+                if Self::is_sized_inline_block(&node.computed_style) {
+                    Self::place_sized_inline_block(node, origin_x, inner_width, text_line_height, line_extent, cursor_x, cursor_y, font_set, images);
+                    return;
+                }
+                // `padding`/`border` de elementos inline (span/a/b/button...)
+                // SI se resuelven: el spec real solo les da efecto HORIZONTAL
+                // sobre el flujo (empujan donde arrancan/terminan los hijos
+                // en la linea; el vertical no reserva mas alto de linea ni
+                // desplaza a los hermanos), pero SI se pintan verticalmente
+                // (el fondo/borde crece simetrico arriba/abajo desde el
+                // texto) - es como un boton real con `padding` se ve
+                // "relleno" sin que la linea entera se separe de la
+                // siguiente. `margin` de un inline sigue sin resolverse
+                // (mismo criterio: horizontal-only en el spec real, caso
+                // raro fuera de `button`).
+                let padding = resolve_padding(&node.computed_style, inner_width);
+                let border = resolve_border_width(&node.computed_style);
                 let start_x = *cursor_x;
                 let start_y = *cursor_y;
+                *cursor_x += padding.left + border.left;
                 for child in &mut node.children {
                     Self::place_inline_node(child, origin_x, inner_width, text_line_height, line_extent, cursor_x, cursor_y, font_set, images);
                 }
+                *cursor_x += padding.right + border.right;
+                node.box_dimensions.padding = padding;
+                node.box_dimensions.border = border;
                 // Rectangulo delimitador de todo lo que contuvo - honesto
                 // solo para el caso comun (contenido que cabe en una sola
                 // linea); si sus hijos terminaron repartidos en mas de una
@@ -2191,11 +4074,26 @@ impl LayoutTreeBuilder {
                 // fragmentos rectangulares, no uno) - simplificacion
                 // declarada, suficiente para pintar/hit-testear el caso
                 // comun.
+                // Si el contenido se partio en varias lineas, el cursor acaba a la
+                // izquierda de donde empezo y `cursor_x - start_x` salia negativo
+                // (se quedaba en 0: un enlace largo no se podia clicar). El
+                // rectangulo es la union de lo que contiene.
+                let (mut left, mut right) = (start_x, *cursor_x);
+                for child in &node.children {
+                    if child.dimensions.width > 0.0 {
+                        left = left.min(child.dimensions.x);
+                        right = right.max(child.dimensions.x + child.dimensions.width);
+                    }
+                }
+                // Si el primer hijo salto de linea (el enlace no cabia al final
+                // de la anterior), la caja empieza donde empieza ese hijo y no
+                // una linea mas arriba, donde estaba el cursor antes de saltar.
+                let top = node.children.iter().find(|child| child.dimensions.width > 0.0).map_or(start_y, |child| child.dimensions.y.max(start_y));
                 node.dimensions = Rect {
-                    x: start_x,
-                    y: start_y,
-                    width: (*cursor_x - start_x).max(0.0),
-                    height: (*cursor_y - start_y) + *line_extent,
+                    x: left,
+                    y: top - padding.top - border.top,
+                    width: (right - left).max(0.0),
+                    height: (*cursor_y - top) + *line_extent + padding.top + padding.bottom + border.top + border.bottom,
                 };
             }
             BoxType::Image(src) => {
@@ -2264,8 +4162,9 @@ impl LayoutTreeBuilder {
                 node.dimensions.x = origin_x;
                 node.dimensions.y = *cursor_y;
                 node.dimensions.width = inner_width;
+                node.containing_width = inner_width;
                 let block_height = Self::flow_block_children(node, font_set, images);
-                let padding = resolve_padding(&node.computed_style);
+                let padding = resolve_padding(&node.computed_style, inner_width);
                 let border = resolve_border_width(&node.computed_style);
                 node.box_dimensions.padding = padding;
                 node.box_dimensions.border = border;
@@ -2304,6 +4203,545 @@ mod tests {
             }
         }
         root.children.iter().find_map(|c| find_box_for_dom_node(c, target))
+    }
+
+    /// Igual que `find_box_for_dom_node` pero prestando la caja de forma
+    /// MUTABLE - lo necesitan los tests que llaman a `measure_intrinsic_
+    /// width`, que escribe en la cache de medidas de la propia caja.
+    fn find_box_for_dom_node_mut<'a>(root: &'a mut LayoutBox, target: &Arc<RwLock<Node>>) -> Option<&'a mut LayoutBox> {
+        if let Some(node) = &root.dom_node {
+            if Arc::ptr_eq(node, target) {
+                return Some(root);
+            }
+        }
+        root.children.iter_mut().find_map(|c| find_box_for_dom_node_mut(c, target))
+    }
+
+    /// `em`, `rem`, `vw` y `calc()` tienen que llegar al layout ya en
+    /// pixeles. Cuando no se resolvian, la declaracion no parseaba como
+    /// longitud y la caja caia a "ocupo todo el contenedor": cualquier
+    /// diseño de varias columnas se renderizaba como una sola a ancho
+    /// completo.
+    #[test]
+    fn las_unidades_relativas_y_calc_se_resuelven_a_pixeles() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="em">e</div><div id="vw">v</div><div id="calc">c</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse(
+            "body { margin: 0px; font-size: 20px; } #em { width: 10em; } #vw { width: 25vw; } #calc { width: calc(100px + 50px); }",
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let ancho = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja").dimensions.width;
+
+        assert_eq!(ancho("em"), 200.0, "10em con font-size 20px son 200px");
+        assert_eq!(ancho("vw"), 200.0, "25vw de un viewport de 800px son 200px");
+        assert_eq!(ancho("calc"), 150.0, "calc(100px + 50px) son 150px");
+    }
+
+    /// Los porcentajes se miden contra el BLOQUE CONTENEDOR, tambien
+    /// anidados. No se pueden resolver junto a `em` (ahi todavia no hay
+    /// bloque contenedor), de ahi que vivan en la maquetacion.
+    #[test]
+    fn los_porcentajes_se_miden_contra_el_bloque_contenedor() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="mitad"><div id="cuarto">c</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } #mitad { width: 50%; } #cuarto { width: 50%; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let ancho = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja").dimensions.width;
+
+        assert_eq!(ancho("mitad"), 400.0, "50% de un viewport de 800px");
+        assert_eq!(ancho("cuarto"), 200.0, "50% del PADRE (400px), no del viewport");
+    }
+
+    /// Un `padding` en porcentaje se mide contra el ANCHO del bloque
+    /// contenedor por los cuatro lados, tambien arriba y abajo - asi lo
+    /// define el spec, para que un `padding: 5%` produzca un hueco cuadrado.
+    #[test]
+    fn un_padding_en_porcentaje_se_mide_contra_el_ancho() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="caja">c</div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } #caja { width: 100px; padding: 10%; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "caja").unwrap()).expect("caja");
+
+        // 10% de 800 = 80 por lado; el ancho de borde suma los dos.
+        assert_eq!(caja.dimensions.width, 260.0, "100px de contenido mas 80px de padding a cada lado");
+        assert_eq!(caja.box_dimensions.padding.top, 80.0, "el padding vertical tambien se mide contra el ANCHO");
+    }
+
+    /// `height: 50%` necesita que el contenedor tenga un alto DEFINIDO. Si
+    /// no lo tiene (`height: auto`, lo normal), el spec dice que se comporta
+    /// como `auto` - y devolver eso es mas correcto que inventarse un alto.
+    #[test]
+    fn un_alto_en_porcentaje_solo_aplica_si_el_contenedor_lo_tiene_definido() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="fijo"><div id="dentro">d</div></div><div id="suelto"><div id="huerfano">h</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse(
+            "body { margin: 0px; } div { margin: 0px; } #fijo { height: 400px; } #dentro { height: 50%; } #huerfano { height: 50%; }",
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let alto = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja").dimensions.height;
+
+        assert_eq!(alto("dentro"), 200.0, "50% de un contenedor de 400px");
+        assert!(alto("huerfano") < 100.0, "sin alto definido en el padre, el 50% no aplica y la caja crece con su contenido");
+    }
+
+    /// `min-height`/`max-height` acotan tanto un alto declarado como el que
+    /// sale del contenido.
+    #[test]
+    fn min_height_y_max_height_acotan_el_alto() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="tope">t</div><div id="suelo">s</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse(
+            "body { margin: 0px; } div { margin: 0px; } #tope { height: 900px; max-height: 120px; } #suelo { height: 5px; min-height: 60px; }",
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let alto = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja").dimensions.height;
+
+        assert_eq!(alto("tope"), 120.0, "max-height recorta un height mayor");
+        assert_eq!(alto("suelo"), 60.0, "min-height eleva un height menor");
+    }
+
+    /// Una celda con `rowspan` ocupa su columna tambien en las filas
+    /// siguientes: las celdas de esas filas NO deben correrse a su hueco.
+    /// Ignorarlo descuadra la tabla entera a partir de la primera celda que
+    /// abarque filas.
+    #[test]
+    fn una_celda_con_rowspan_reserva_su_columna_en_las_filas_siguientes() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table>
+               <tr><td id="alta" rowspan="2">alta</td><td id="a1">a1</td></tr>
+               <tr><td id="b1">b1</td></tr>
+               <tr><td id="c1">c1</td><td id="c2">c2</td></tr>
+               </table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; border-spacing: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
+
+        let a1 = caja("a1").dimensions.x;
+        assert!(a1 > 0.0, "a1 esta en la segunda columna");
+        assert_eq!(caja("b1").dimensions.x, a1, "b1 deberia quedarse en la SEGUNDA columna, no correrse al hueco de la celda alta");
+        assert_eq!(caja("c1").dimensions.x, 0.0, "pasado el rowspan, la fila vuelve a empezar en la primera columna");
+        assert!(
+            caja("alta").dimensions.height > caja("a1").dimensions.height * 1.5,
+            "la celda con rowspan=2 deberia llegar hasta el fondo de la segunda fila"
+        );
+    }
+
+    /// `max-height`/`min-height` declaran un valor de BORDER-BOX cuando
+    /// `box-sizing: border-box` esta activo, igual que `height` - pero el
+    /// alto que se acota en la rama `height: auto` es CONTENIDO puro. Sin
+    /// convertir el limite, un `max-height` con padding se quedaba corto:
+    /// el `dimensions.height` final superaba el `max-height` declarado en
+    /// el padding+border que nadie habia restado.
+    #[test]
+    fn max_height_border_box_incluye_el_padding_en_el_limite() {
+        // Tres bloques de 60px (180px de contenido en total, sin depender
+        // de wrap de texto ni de tener una fuente real) desbordan con
+        // creces cualquier limite razonable.
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="caja"><div style="height: 60px;"></div><div style="height: 60px;"></div><div style="height: 60px;"></div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse(
+            "body { margin: 0px; } div { margin: 0px; } #caja { box-sizing: border-box; max-height: 120px; padding: 20px 0px; }",
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "caja").unwrap()).expect("caja");
+
+        assert_eq!(
+            caja.dimensions.height, 120.0,
+            "border-box: 120px de max-height es el alto TOTAL (contenido + 40px de padding), no 120px de contenido mas el padding encima"
+        );
+    }
+
+    /// El bucle que coloca el contenido "suelto" de una tabla (lo que no es
+    /// ni fila ni celda - un `<caption>`, por ejemplo) tenia que saltarse
+    /// los hijos FUERA DE FLUJO igual que hace `flow_normal_block_children`
+    /// con cualquier otro contenido: un `position: absolute` no ocupa
+    /// espacio de flujo, y sumar su alto a `caption_height` empujaba TODA
+    /// fila real hacia abajo aunque `resolve_positioned_boxes` fuera a
+    /// reposicionarlo despues - el desplazamiento que ya habia provocado en
+    /// el resto del contenido no se deshacia.
+    ///
+    /// Se usa `display: table` sobre `<div>`s normales (no `<table>` real):
+    /// el parser HTML reubica ("foster parenting") cualquier `<div>` que no
+    /// sea celda/fila puesto directamente dentro de un `<table>` de
+    /// verdad, lo que taparia el propio escenario que este test quiere
+    /// comprobar.
+    #[test]
+    fn el_contenido_fuera_de_flujo_de_una_tabla_no_empuja_las_filas() {
+        // Sin ningun espacio en blanco entre etiquetas a proposito: un hueco
+        // se parsearia como un nodo de TEXTO (whitespace) hijo directo del
+        // contenedor, que caeria en el mismo bucle de "contenido suelto"
+        // que esta prueba quiere aislar y confundiria el resultado.
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="display: table; width: 200px;"><div style="position: absolute;"><div style="height: 500px;"></div></div><div style="display: table-row;"><div id="celda" style="display: table-cell;">x</div></div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let celda = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "celda").unwrap()).expect("caja");
+
+        assert!(
+            celda.dimensions.y < 10.0,
+            "la celda deberia empezar cerca de y=0 - el hermano fuera de flujo (500px de alto) no deberia empujarla hacia abajo; midio y={}",
+            celda.dimensions.y
+        );
+    }
+
+    /// La pasada que MIDE min/max-content de cada columna tiene que
+    /// respetar la misma ocupacion por `rowspan` que la pasada que las
+    /// COLOCA - si no, atribuye el contenido de una celda a la columna
+    /// equivocada (la que sigue ocupada, no la que esa celda ocupara de
+    /// verdad una vez colocada).
+    #[test]
+    fn la_medida_de_columnas_respeta_la_ocupacion_por_rowspan() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table>
+               <tr><td id="a" rowspan="2">a</td><td id="b0">b0</td></tr>
+               <tr><td id="d">contenidoMuyLargoQueDeberiaEstarEnLaColumnaUno</td></tr>
+               <tr><td id="e">e0</td><td id="f">f1</td></tr>
+               </table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
+
+        // `e` ocupa en solitario la columna 0 en la fila 3, ya fuera del
+        // rowspan de `a` - su ancho ES el ancho real que la tabla decidio
+        // para esa columna. `d` deberia caer en la columna 1 (la 0 sigue
+        // ocupada por `a`); si la medida no lo sabe, le atribuye a la
+        // columna 0 su contenido largo, y esa columna sale mucho mas ancha
+        // de lo que "a"/"e0" (ambos cortos) piden.
+        assert!(
+            caja("e").dimensions.width < caja("f").dimensions.width,
+            "columna 0 (a/e0, cortos: {}) deberia ser mas ESTRECHA que columna 1 (b0 y el contenido largo de d: {})",
+            caja("e").dimensions.width,
+            caja("f").dimensions.width
+        );
+    }
+
+    /// Una fila sin ninguna celda (poco comun, pero valida en HTML) tiene
+    /// que consumir su turno de ocupacion pendiente de un `rowspan`
+    /// anterior igual que cualquier otra fila - saltarselo desalineaba la
+    /// cuenta una fila para todo lo que viniera despues.
+    #[test]
+    fn una_fila_sin_celdas_no_desalinea_el_rowspan_de_las_siguientes() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table>
+               <tr><td id="alta" rowspan="2">alta</td><td id="a1">a1</td></tr>
+               <tr></tr>
+               <tr><td id="c1">c1</td><td id="c2">c2</td></tr>
+               </table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; border-spacing: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
+
+        assert_eq!(
+            caja("c1").dimensions.x, 0.0,
+            "pasado el rowspan (y la fila vacia intermedia), la fila deberia volver a empezar en la primera columna"
+        );
+    }
+
+    /// Las propiedades personalizadas (`--x`) se resuelven donde se USAN,
+    /// heredando desde donde se declararon - casi siempre `:root`. Sin
+    /// esto, el valor que llega al layout es la cadena literal
+    /// "var(--algo)", que no parsea como longitud, y la declaracion se
+    /// pierde: la pagina se maqueta como si su hoja de estilos no
+    /// existiera.
+    #[test]
+    fn las_variables_css_se_resuelven_y_heredan_desde_la_raiz() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="a">a</div><div id="b">b</div><div id="c">c</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse(
+            ":root { --ancho: 300px; --alias: var(--ancho); } body { margin: 0px; }              #a { width: var(--ancho); } #b { width: var(--noexiste, 150px); } #c { width: var(--alias); }",
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let ancho = |id: &str| {
+            find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja").dimensions.width
+        };
+
+        assert_eq!(ancho("a"), 300.0, "una var() declarada en :root deberia heredarse y resolverse");
+        assert_eq!(ancho("b"), 150.0, "una var() sin declarar deberia caer a su valor de respaldo");
+        assert_eq!(ancho("c"), 300.0, "una var() cuyo valor es otra var() deberia resolverse en cadena");
+    }
+
+    /// Una caja de bloque vacia mide CERO de alto. Antes se le aplicaba un
+    /// suelo de 22px "para no colapsarla", que en una pagina real - llena de
+    /// `<div>` estructurales sin contenido propio - metia mas de 100px de
+    /// hueco en blanco entre secciones.
+    #[test]
+    fn una_caja_de_bloque_vacia_no_ocupa_alto() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="vacio"></div><div id="siguiente" style="height: 30px;">x</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let vacio = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "vacio").unwrap()).expect("caja");
+        let siguiente = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "siguiente").unwrap()).expect("caja");
+
+        assert_eq!(vacio.dimensions.height, 0.0, "un div sin contenido mide cero de alto");
+        assert_eq!(siguiente.dimensions.y, 0.0, "y por tanto no empuja hacia abajo a lo que viene despues");
+    }
+
+    /// `margin` de un item flex/grid tenia que separar a sus hermanos, no
+    /// solo pintarse: `flex_item_style` nunca lo pasaba a taffy, asi que el
+    /// ALGORITMO de flex los colocaba pegados sin importar el margen
+    /// declarado. Es exactamente como Wikipedia separa los items de su
+    /// barra de usuario (`margin: 0 4px`, no `gap`) - sin esto,
+    /// "Donaciones" y "Crear una cuenta" quedaban unidos sin espacio.
+    #[test]
+    fn el_margin_de_un_item_flex_separa_a_sus_hermanos() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="display: flex; width: 300px;"><div id="a" style="margin: 0px 4px;">Uno</div><div id="b" style="margin: 0px 4px;">Dos</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let a = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "a").unwrap()).expect("caja");
+        let b = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "b").unwrap()).expect("caja");
+
+        let hueco = b.dimensions.x - (a.dimensions.x + a.dimensions.width);
+        assert!(
+            (hueco - 8.0).abs() < 0.5,
+            "deberia haber 8px de hueco (4px margin-right de 'a' + 4px margin-left de 'b'), midio {hueco}"
+        );
+    }
+
+    /// `apply_scroll_offsets` desplaza el CONTENIDO de un contenedor con
+    /// scroll (no el contenedor en si), reusando el mismo mecanismo de
+    /// desplazar un subarbol que ya usa `position: relative` - es lo que
+    /// hace que pintura y hit-testing salgan correctos sin tocar
+    /// `engine-gfx` para nada.
+    #[test]
+    fn apply_scroll_offsets_desplaza_el_contenido_no_el_contenedor() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="caja" style="overflow:auto;width:200px;height:100px;"><div id="uno" style="height:100px;">u</div><div id="dos" style="height:100px;">d</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let caja_node = Node::find_by_id(&dom, "caja").expect("caja");
+        let uno_node = Node::find_by_id(&dom, "uno").expect("uno");
+        let dos_node = Node::find_by_id(&dom, "dos").expect("dos");
+        let caja_ptr = std::sync::Arc::as_ptr(&caja_node) as usize;
+
+        let caja_y_antes = find_box_for_dom_node(&root, &caja_node).unwrap().dimensions.y;
+        let uno_y_antes = find_box_for_dom_node(&root, &uno_node).unwrap().dimensions.y;
+
+        let mut root = root;
+        let mut offsets = HashMap::new();
+        offsets.insert(caja_ptr, (0.0_f32, 100.0_f32));
+        apply_scroll_offsets(&mut root, &offsets);
+
+        let caja_y_despues = find_box_for_dom_node(&root, &caja_node).unwrap().dimensions.y;
+        let uno_y_despues = find_box_for_dom_node(&root, &uno_node).unwrap().dimensions.y;
+        let dos_y_despues = find_box_for_dom_node(&root, &dos_node).unwrap().dimensions.y;
+
+        assert_eq!(caja_y_despues, caja_y_antes, "el CONTENEDOR no se mueve, solo su contenido");
+        assert_eq!(uno_y_despues, uno_y_antes - 100.0, "el contenido se desplaza hacia arriba el scroll aplicado");
+        assert_eq!(dos_y_despues, uno_y_despues + 100.0, "los hermanos mantienen su posicion relativa entre si");
+    }
+
+    /// La anchura intrinseca de un contenedor flex en FILA es la SUMA de
+    /// las de sus items (van uno al lado del otro), no la del mas ancho.
+    /// Medirla como flujo de bloque lo dejaba demasiado estrecho y sus
+    /// propios hijos se salian por la derecha.
+    #[test]
+    fn la_anchura_intrinseca_de_una_fila_flex_suma_sus_items() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="fila" style="display: flex;"><div>aaaa</div><div>bbbb</div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let mut root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let fila = find_box_for_dom_node_mut(&mut root, &Node::find_by_id(&dom, "fila").unwrap()).expect("caja");
+        let suma_esperada: f32 = fila
+            .children
+            .iter_mut()
+            .map(|c| measure_intrinsic_width(c, IntrinsicWidth::Max, None, &ImageMap::new()))
+            .sum();
+        let medida = measure_intrinsic_width(fila, IntrinsicWidth::Max, None, &ImageMap::new());
+
+        assert!(
+            (medida - suma_esperada).abs() < 0.5,
+            "la fila deberia medir la suma de sus items ({suma_esperada}), no {medida}"
+        );
+    }
+
+    /// La anchura MINIMA de contenido de un texto es la de su palabra mas
+    /// larga, no la de la frase entera: por debajo de esa palabra el texto
+    /// desbordaria, pero por encima siempre puede cortar linea.
+    ///
+    /// Es la distincion que faltaba y que rompia el renderizado entero (ver
+    /// `IntrinsicWidth`): con min == max, ningun item flex podia encogerse.
+    #[test]
+    fn la_anchura_minima_de_un_texto_es_su_palabra_mas_larga() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="t">uno dos tresmuchomaslarga</div></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let mut root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let t_node = Node::find_by_id(&dom, "t").expect("t deberia existir");
+        let t_box = find_box_for_dom_node_mut(&mut root, &t_node).expect("t deberia tener caja");
+        let min = measure_intrinsic_width(t_box, IntrinsicWidth::Min, None, &ImageMap::new());
+        let max = measure_intrinsic_width(t_box, IntrinsicWidth::Max, None, &ImageMap::new());
+
+        assert!(min > 0.0, "la anchura minima no puede ser cero: hay una palabra que ocupa sitio");
+        assert!(
+            min < max,
+            "min-content ({min}) deberia ser MENOR que max-content ({max}): la palabra mas larga cabe en mucho menos que la frase entera"
+        );
+    }
+
+    /// Un item flex cuyo texto no cabe tiene que ENCOGERSE hasta su
+    /// contenedor y cortar linea, no desbordarse por la derecha.
+    ///
+    /// Es el sintoma que se veia en cualquier web moderna: en la Wikipedia
+    /// real habia cajas de 8.225 px dentro de un viewport de 1.280.
+    #[test]
+    fn un_item_flex_con_texto_largo_se_encoge_en_vez_de_desbordar() {
+        let texto = "palabra ".repeat(200);
+        let dom = HtmlParser::parse(&format!(
+            r#"<html><body><div id="c" style="display: flex; width: 400px;"><div id="t">{texto}</div></div></body></html>"#
+        ));
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let t_node = Node::find_by_id(&dom, "t").expect("t deberia existir");
+        let t_box = find_box_for_dom_node(&root, &t_node).expect("t deberia tener caja");
+
+        assert!(
+            t_box.dimensions.width <= 400.0,
+            "el item deberia caber en su contenedor de 400px, pero mide {}",
+            t_box.dimensions.width
+        );
+    }
+
+    /// Una caja `display: table` que no contiene ninguna fila sigue
+    /// teniendo contenido que colocar. Antes se devolvia 0 sin tocar nada y
+    /// ese contenido se quedaba en `Rect::default()` - o sea en (0,0), donde
+    /// ademas se PINTA, amontonado sobre todo lo demas.
+    ///
+    /// El caso es de lo mas comun: MediaWiki maqueta cada miniatura con
+    /// `figure { display: table }`, sin filas de por medio.
+    #[test]
+    fn una_tabla_sin_filas_sigue_colocando_su_contenido() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="height: 40px;">antes</div><figure style="display: table;"><div id="pie">pie de foto</div></figure></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div, figure { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let pie_node = Node::find_by_id(&dom, "pie").expect("pie deberia existir");
+        let pie_box = find_box_for_dom_node(&root, &pie_node).expect("pie deberia tener caja");
+
+        assert!(pie_box.dimensions.width > 0.0, "el contenido de la tabla deberia tener anchura real, no quedarse sin colocar");
+        assert!(
+            pie_box.dimensions.y >= 40.0,
+            "el contenido deberia caer debajo del bloque de 40px que lo precede, no en la esquina (0,0); esta en y={}",
+            pie_box.dimensions.y
+        );
+    }
+
+    /// `position: absolute` sin `left` ni `top` se coloca en su POSICION
+    /// ESTATICA - donde el flujo normal lo habria dejado - no en la esquina
+    /// de su bloque contenedor. Mandarlos todos a la esquina amontonaba en
+    /// (0,0) cada menu y cada tooltip de la pagina.
+    #[test]
+    fn un_absoluto_sin_left_ni_top_usa_su_posicion_estatica() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="height: 50px;">a</div><div style="height: 50px;">b</div><div id="abs" style="position: absolute;">c</div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let abs_node = Node::find_by_id(&dom, "abs").expect("abs deberia existir");
+        let abs_box = find_box_for_dom_node(&root, &abs_node).expect("abs deberia tener caja");
+
+        assert_eq!(
+            abs_box.dimensions.y, 100.0,
+            "deberia quedarse donde el flujo lo habria puesto (bajo dos bloques de 50px), no en y=0"
+        );
+    }
+
+    /// Las columnas de una tabla se reparten segun lo que PIDE cada una, no
+    /// a partes iguales. Repartiendo por igual, una columna con un simple
+    /// numero de orden se llevaba lo mismo que una con un titular entero.
+    #[test]
+    fn las_columnas_de_una_tabla_se_reparten_segun_su_contenido() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table><tr><td id="corta">1.</td><td id="larga">un titular considerablemente mas largo que el numero de al lado</td></tr></table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let corta = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "corta").unwrap()).expect("corta deberia tener caja");
+        let larga = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "larga").unwrap()).expect("larga deberia tener caja");
+
+        assert!(
+            larga.dimensions.width > corta.dimensions.width * 2.0,
+            "la columna del titular ({}) deberia ser bastante mas ancha que la del numero ({}), no practicamente igual",
+            larga.dimensions.width,
+            corta.dimensions.width
+        );
+        assert!(
+            corta.dimensions.width > 0.0,
+            "la columna estrecha sigue necesitando anchura suficiente para su contenido"
+        );
+    }
+
+    /// `colspan` es un atributo presentacional de HTML, no CSS: si no se
+    /// lee, la celda ocupa una sola columna y CORRE todas las siguientes de
+    /// su fila una columna a la izquierda.
+    #[test]
+    fn una_celda_con_colspan_ocupa_las_columnas_que_declara() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table><tr><td id="a">a</td><td id="b">b</td></tr><tr><td id="ancha" colspan="2">ocupa las dos</td></tr></table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        let a = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "a").unwrap()).expect("a deberia tener caja");
+        let b = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "b").unwrap()).expect("b deberia tener caja");
+        let ancha = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "ancha").unwrap()).expect("ancha deberia tener caja");
+
+        let dos_columnas = a.dimensions.width + b.dimensions.width;
+        assert!(
+            (ancha.dimensions.width - dos_columnas).abs() < 0.5,
+            "la celda con colspan=2 deberia medir lo que suman las dos columnas ({dos_columnas}), pero mide {}",
+            ancha.dimensions.width
+        );
+    }
+
+    /// `containing_width` de un item flex tiene que estar puesto ANTES de
+    /// que taffy lo MIDA, no solo al comprometer su posicion final: el item
+    /// mide su propio `padding` en porcentaje contra esa referencia, y con
+    /// el valor por defecto (0.0) de una caja recien creada, `padding: 10%`
+    /// se resolvia a CERO durante la medida - taffy comprometia un item mas
+    /// bajo de lo que deberia, y la correccion posterior de
+    /// `finalize_flex_item_children` llega demasiado tarde para el alto ya
+    /// fijado.
+    #[test]
+    fn el_padding_en_porcentaje_de_un_item_flex_se_mide_con_la_referencia_correcta() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="display: flex; width: 400px;"><div id="item"><div style="height: 50px;"></div></div></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } div { margin: 0px; } #item { padding: 10%; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let item = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "item").unwrap()).expect("caja");
+
+        // 50px de contenido + 2 x 40px de padding (10% de los 400px del
+        // contenedor) = 130px. Sin la referencia correcta durante la
+        // medida, el padding se cuenta como cero y el alto se queda en 50.
+        assert!(
+            item.dimensions.height > 100.0,
+            "el item deberia medir ~130px (contenido + padding en porcentaje), no quedarse en ~50 con el padding a cero: midio {}",
+            item.dimensions.height
+        );
     }
 
     /// El punto real de la Fase 3.2: tres items de ancho fijo en un
@@ -2623,6 +5061,278 @@ mod tests {
 
         assert_eq!(a_box.dimensions.y, b_box.dimensions.y, "ambos deberian compartir la misma linea (misma y), no apilarse");
         assert!(a_box.dimensions.width < 100.0, "deberia encogerse a su contenido ('a'), no llenar los 800px del contenedor");
+    }
+
+    /// Tarea 2.3 (caso 13 del fixture): tres cuadrados `inline-block` de
+    /// 100x30 con margen, vacios, en una misma fila. Antes medían 0x0.
+    #[test]
+    fn empty_inline_blocks_with_explicit_size_keep_their_size_and_share_a_line() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div id="fila"><span id="a"></span><span id="b"></span><span id="c"></span></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse(
+            "body { margin: 0px; } span { display: inline-block; width: 100px; height: 30px; margin-right: 10px; background: #cc0000; }",
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("existe")).expect("tiene caja");
+        let (a, b, c) = (caja("a"), caja("b"), caja("c"));
+
+        assert_eq!((a.dimensions.width, a.dimensions.height), (100.0, 30.0));
+        assert_eq!((b.dimensions.width, b.dimensions.height), (100.0, 30.0));
+        assert_eq!(b.dimensions.x, a.dimensions.x + 110.0, "100 de ancho + 10 de margen");
+        assert_eq!(c.dimensions.x, b.dimensions.x + 110.0);
+        assert_eq!(a.dimensions.y, c.dimensions.y, "los tres en la misma linea");
+    }
+
+    #[test]
+    fn a_sized_inline_block_that_does_not_fit_wraps_to_the_next_line() {
+        let dom = HtmlParser::parse(r#"<html><body><span id="a"></span><span id="b"></span><span id="c"></span></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } span { display: inline-block; width: 100px; height: 30px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 250.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("existe")).expect("tiene caja");
+        let (a, b, c) = (caja("a"), caja("b"), caja("c"));
+
+        assert_eq!(a.dimensions.y, b.dimensions.y);
+        assert!(c.dimensions.y >= a.dimensions.y + 30.0, "el tercero no cabe en 250px y baja a otra linea ({} vs {})", c.dimensions.y, a.dimensions.y);
+        assert_eq!(c.dimensions.x, 0.0, "y empieza a la izquierda");
+    }
+
+    /// El texto de un `inline-block` con ancho explicito se reparte dentro de
+    /// ese ancho, y el alto automatico lo da el contenido.
+    #[test]
+    fn a_sized_inline_block_wraps_its_text_inside_its_own_width() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><span id="s">una frase bastante larga que no cabe en cien pixeles de ancho</span></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } span { display: inline-block; width: 100px; }");
+        let font_set = FontSet::load_default_sans_serif();
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        let s = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "s").expect("existe")).expect("tiene caja");
+
+        assert_eq!(s.dimensions.width, 100.0);
+        assert!(s.dimensions.height > 40.0, "varias lineas dentro de 100px de ancho: {}", s.dimensions.height);
+    }
+
+    /// Verificacion "de paso" de la tarea 2.3: un enlace cuyo texto ocupa varias
+    /// lineas informaba ancho 0 y no se podia clicar.
+    #[test]
+    fn an_inline_link_that_wraps_over_several_lines_still_has_a_clickable_box() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><div style="width:150px"><a id="enlace" href="/x">un enlace con un texto lo bastante largo para ocupar varias lineas</a></div></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let font_set = FontSet::load_default_sans_serif();
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        let enlace = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "enlace").expect("existe")).expect("tiene caja");
+
+        assert!(enlace.dimensions.width > 0.0, "ancho 0 = imposible de clicar: {:?}", enlace.dimensions);
+        assert!(enlace.dimensions.height > 30.0, "ocupa varias lineas: {:?}", enlace.dimensions);
+    }
+
+    /// Tarea 2.7: `font-family` elige la cara con la que se MIDE el texto. La
+    /// monoespaciada ensancha una frase de 'i' (la sans-serif las hace
+    /// estrechas). Sin fuente monoespaciada en el sistema, no hay nada que
+    /// probar.
+    #[test]
+    fn a_monospace_font_family_changes_the_measured_width_of_text() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.monospace.regular.is_none() {
+            return;
+        }
+        let width_of = |css: &str| {
+            let dom = HtmlParser::parse(r#"<html><body><p id="p">iiiiiiiiiiiiiiii</p></body></html>"#);
+            let stylesheet = CssParser::parse(&format!("body {{ margin: 0px; }} p {{ margin: 0px; {css} }}"));
+            let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+            find_text_box(&root, "iiiiiiiiiiiiiiii").expect("caja de texto").dimensions.width
+        };
+        let sans = width_of("");
+        let mono = width_of("font-family: monospace;");
+        assert!(mono > sans * 1.3, "monoespaciada ({mono}) deberia ser bastante mas ancha que sans-serif ({sans})");
+        assert_eq!(width_of("font-family: Arial, sans-serif;"), sans, "una sans-serif conocida es la de siempre");
+    }
+
+    /// Tarea 2.2b (Wikipedia: "(del inglés *web browser*" y el resto del texto
+    /// en la linea de abajo): el texto que sigue a un elemento en linea se
+    /// parte por palabras y sigue en la MISMA linea, en vez de bajar entero.
+    #[test]
+    fn text_after_an_inline_element_continues_on_the_same_line_and_wraps_by_words() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let largo = "y a continuacion un texto lo bastante largo para llenar varias lineas de este parrafo estrecho";
+        let dom = HtmlParser::parse(&format!(r#"<html><body><p id="p"><b>negrita</b> {largo}</p></body></html>"#));
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; width: 200px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+
+        let bold = find_text_box(&root, "negrita").expect("texto en negrita");
+        let rest = root_text_boxes(&root).into_iter().find(|b| matches!(&b.box_type, BoxType::Text(t) if t.contains("a continuacion"))).expect("el resto del texto");
+
+        assert!(rest.first_line_indent > 0.0, "la primera linea empieza tras la negrita, no en el margen: {}", rest.first_line_indent);
+        assert!((rest.first_line_indent - (bold.dimensions.x + bold.dimensions.width)).abs() < 8.0, "justo a continuacion de la negrita ({} vs {})", rest.first_line_indent, bold.dimensions.x + bold.dimensions.width);
+        assert_eq!(rest.dimensions.y, bold.dimensions.y, "arranca en la linea de la negrita");
+        let line_height = engine_text::line_height(font_set.pick(false, false).expect("fuente"), 16.0);
+        assert!(rest.dimensions.height >= 3.0 * line_height - 0.5, "ocupa varias lineas: {} (linea {line_height})", rest.dimensions.height);
+        // El parrafo mide lo que miden sus lineas: ni una de mas ni una de menos.
+        let p = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "p").expect("p")).expect("caja del p");
+        assert!(p.dimensions.height <= rest.dimensions.height + 1.0, "{} vs {}", p.dimensions.height, rest.dimensions.height);
+    }
+
+    /// Un parrafo que se parte en varias lineas mide EXACTAMENTE esas lineas. Antes
+    /// medía una de mas (88 en vez de 70,4), y lo que venia despues del texto
+    /// arrancaba en la linea de abajo.
+    #[test]
+    fn a_wrapped_paragraph_is_exactly_as_tall_as_its_lines() {
+        let font_set = FontSet::load_default_sans_serif();
+        let Some(font) = font_set.pick(false, false) else { return };
+        let dom = HtmlParser::parse(r#"<html><body><p id="p">un texto lo bastante largo para llenar varias lineas de este parrafo estrecho de doscientos pixeles de ancho</p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; width: 200px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        let p = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "p").expect("p")).expect("caja del p");
+        let text = root_text_boxes(&root)[0];
+        let lines = engine_text::wrap_text(font, "un texto lo bastante largo para llenar varias lineas de este parrafo estrecho de doscientos pixeles de ancho", 16.0, 200.0).len();
+        assert!(lines >= 3);
+        assert_eq!(text.dimensions.height, lines as f32 * engine_text::line_height(font, 16.0));
+        assert_eq!(p.dimensions.height, text.dimensions.height, "ni una linea de mas");
+    }
+
+    /// Lo que sigue en linea a un texto largo continua tras su ultima linea, no
+    /// en la linea siguiente (Wikipedia: "...introducir una" y el enlace "URL"
+    /// aparte, con un hueco).
+    #[test]
+    fn an_inline_element_after_a_long_text_continues_on_its_last_line() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let dom = HtmlParser::parse(r#"<html><body><p>un texto lo bastante largo para llenar varias lineas de este parrafo estrecho <a id="a" href="/x">URL</a> y mas</p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; width: 200px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        let a = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "a").expect("a")).expect("caja del enlace");
+        let first = root_text_boxes(&root)[0];
+        let line_height = engine_text::line_height(font_set.pick(false, false).expect("fuente"), 16.0);
+        let last_line_y = first.dimensions.y + first.dimensions.height - line_height;
+        assert!((a.dimensions.y - last_line_y).abs() < 1.0, "el enlace va en la ultima linea del texto ({} vs {})", a.dimensions.y, last_line_y);
+        assert!(a.dimensions.x > 0.0, "y a continuacion, no al principio de la linea: {}", a.dimensions.x);
+    }
+
+    /// Un enlace que no cabe al final de la linea salta entero a la siguiente: su
+    /// caja (la que se clica) empieza donde esta su texto, no una linea mas arriba.
+    #[test]
+    fn an_inline_element_that_jumps_to_the_next_line_has_its_box_where_its_text_is() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let dom = HtmlParser::parse(r#"<html><body><p>aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll aaaaaaaaaaaaaa <a id="a" href="/x">extensiones</a> y mas.</p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; width: 200px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        let a = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "a").expect("a")).expect("caja del enlace");
+        let text = find_text_box(&root, "extensiones").expect("texto del enlace");
+        assert_eq!(a.dimensions.y, text.dimensions.y, "la caja del enlace y su texto, en la misma linea");
+        assert!(a.dimensions.height < 20.0, "una sola linea: {}", a.dimensions.height);
+    }
+
+    /// El espacio con que empezaba un texto que salta de linea desaparece: no se
+    /// pinta una linea que empiece con un hueco.
+    #[test]
+    fn a_text_that_jumps_to_a_new_line_loses_its_leading_space() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let dom = HtmlParser::parse(r#"<html><body><p>un enlace casi al final de la linea <a href="/x">este de aqui</a> y luego un texto que continua varias lineas despues</p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; width: 200px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        let boxes = root_text_boxes(&root);
+        let tail = boxes.iter().find(|b| matches!(&b.box_type, BoxType::Text(t) if t.contains("luego"))).expect("texto final");
+        if tail.first_line_indent == 0.0 && tail.dimensions.x == 0.0 {
+            let BoxType::Text(text) = &tail.box_type else { unreachable!() };
+            assert!(!text.starts_with(' '), "empieza una linea: sin espacio inicial ({text:?})");
+        }
+    }
+
+    /// La misma caja se coloca varias veces con anchos distintos (medidas de
+    /// flex, remaquetados). La sangria de la primera linea de una pasada no
+    /// puede sobrevivir a la siguiente: en Wikipedia dejaba "o complementos."
+    /// una linea mas abajo de donde el layout la habia puesto.
+    ///
+    /// Los anchos salen de MEDIR con la fuente de la maquina, no de numeros fijos:
+    /// en Windows las metricas son otras y un ancho a ojo daba otro reparto de
+    /// lineas (el trabajo `test` del CI fallo asi).
+    #[test]
+    fn the_first_line_indent_of_a_previous_pass_does_not_survive_a_wider_layout() {
+        let font_set = FontSet::load_default_sans_serif();
+        let Some(font) = font_set.pick(false, false) else { return };
+        let first = "primero ";
+        let second = "segundo texto bastante largo que se parte en varias lineas al ser estrecho";
+        let width_of = |text: &str| engine_text::wrapped_line_width(font, text, 16.0);
+        // Cabe "primero " y la primera palabra de lo siguiente, pero no todo.
+        let narrow = width_of(first) + width_of("segundo") + 4.0;
+        assert!(width_of(second) > narrow);
+
+        let mut nodes = vec![LayoutBox::new(BoxType::Text(first.to_string())), LayoutBox::new(BoxType::Text(second.to_string()))];
+        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, narrow, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
+        assert!(nodes[1].first_line_indent > 0.0, "en estrecho se parte tras 'primero'");
+
+        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, width_of(first) + width_of(second) + 50.0, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
+        assert_eq!(nodes[1].first_line_indent, 0.0, "en ancho cabe entero: sin sangria heredada");
+    }
+
+    /// Un texto que salta de linea en una pasada estrecha no pierde su espacio
+    /// inicial para siempre: en una pasada ancha, que no salta, lo conserva.
+    /// (Wikipedia: "extensiones" + "o complementos." salia "extensioneso".)
+    #[test]
+    fn a_leading_space_removed_in_a_narrow_pass_is_back_in_a_wide_one() {
+        let font_set = FontSet::load_default_sans_serif();
+        let Some(font) = font_set.pick(false, false) else { return };
+        let width_of = |text: &str| engine_text::wrapped_line_width(font, text, 16.0);
+        let tail = " o complementos y mas cosas".to_string();
+        let mut nodes = vec![
+            LayoutBox::new(BoxType::Text("antes de todo esto ".to_string())),
+            LayoutBox::new(BoxType::Text("extensiones".to_string())),
+            LayoutBox::new(BoxType::Text(tail.clone())),
+        ];
+        // Estrecho: tras "extensiones" no cabe ni la primera palabra de la cola
+        // (se mide, no se supone), asi que salta de linea y pierde su espacio.
+        let before_tail = width_of("antes de todo esto ") + width_of("extensiones");
+        let narrow = (before_tail + width_of("o") / 2.0).max(width_of("antes de todo esto ")).max(width_of("extensiones") + 1.0);
+        assert!(narrow < before_tail + width_of(" o"), "la cola no cabe");
+        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, narrow, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
+        assert!(nodes[2].trimmed_text.is_some() || nodes[2].first_line_indent > 0.0, "en estrecho se parte o se recorta");
+        // Ancho: cabe todo en una linea, y el texto conserva su espacio.
+        LayoutTreeBuilder::flow_inline_run(&mut nodes, 0.0, before_tail + width_of(&tail) + 50.0, 0.0, Some(&font_set), &ImageMap::new(), TextAlign::Left);
+        assert_eq!(nodes[2].trimmed_text, None);
+        assert!(matches!(&nodes[2].box_type, BoxType::Text(t) if *t == tail), "el texto original no se toca");
+    }
+
+    fn root_text_boxes(root: &LayoutBox) -> Vec<&LayoutBox> {
+        let mut out = Vec::new();
+        fn walk<'a>(b: &'a LayoutBox, out: &mut Vec<&'a LayoutBox>) {
+            if matches!(b.box_type, BoxType::Text(_)) {
+                out.push(b);
+            }
+            for c in &b.children {
+                walk(c, out);
+            }
+        }
+        walk(root, &mut out);
+        out
+    }
+
+    /// Un texto que ya cabe, o que empieza a principio de linea, no cambia.
+    #[test]
+    fn text_that_fits_or_starts_a_line_has_no_first_line_indent() {
+        let font_set = FontSet::load_default_sans_serif();
+        if font_set.pick(false, false).is_none() {
+            return;
+        }
+        let dom = HtmlParser::parse(r#"<html><body><p><b>a</b> corto</p><p>empieza al principio de la linea y es bastante mas largo que el ancho del parrafo</p></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } p { margin: 0px; width: 200px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, Some(&font_set), &ImageMap::new());
+        for b in root_text_boxes(&root) {
+            assert_eq!(b.first_line_indent, 0.0, "{:?}", b.box_type);
+        }
     }
 
     /// El reverso: `display:block` sobre una etiqueta naturalmente inline
@@ -3214,6 +5924,181 @@ mod tests {
         assert_eq!(find_text_box(&root_unset, "hi").unwrap().dimensions.x, 0.0, "el valor inicial real de text-align es left");
     }
 
+    /// `th` centra su contenido por defecto (hoja de agente de usuario,
+    /// `user_agent_stylesheet.rs`), igual que un navegador real - `td` no.
+    /// `text-align` ya era heredable e implementado end-to-end antes de
+    /// esta prueba; lo que faltaba era la declaracion en la hoja UA.
+    #[test]
+    fn th_centers_its_text_by_default_but_td_does_not() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table style="width:400px"><tr><th id="th" style="width:200px">hi</th><td id="td" style="width:200px">yo</td></tr></table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } table { border-spacing: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let th_cell = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "th").expect("th")).expect("caja del th");
+        let td_cell = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "td").expect("td")).expect("caja del td");
+        let th_text = find_text_box(&root, "hi").expect("deberia existir la caja de texto 'hi' del th");
+        let td_text = find_text_box(&root, "yo").expect("deberia existir la caja de texto 'yo' del td");
+        let th_offset = th_text.dimensions.x - th_cell.dimensions.x;
+        let td_offset = td_text.dimensions.x - td_cell.dimensions.x;
+        assert!(th_offset > td_offset + 10.0, "el texto del th deberia estar mucho mas desplazado dentro de su celda que el del td (centrado vs pegado a la izquierda): th_offset={th_offset}, td_offset={td_offset}");
+    }
+
+    /// `padding`/`border` de un elemento `BoxType::Inline` (span/a/b/button)
+    /// SI se resuelven ahora: el texto arranca desplazado por
+    /// `padding.left + border.left`, y la caja del propio contenedor crece
+    /// simetrica arriba/abajo (no solo a la derecha) para que un boton se
+    /// vea relleno de verdad.
+    #[test]
+    fn padding_and_border_of_an_inline_box_shift_its_text_and_grow_its_own_rect() {
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+
+        let dom = HtmlParser::parse(
+            r#"<html><body><button id="btn" style="padding: 10px; border: 2px solid black;">hi</button></body></html>"#,
+        );
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let btn_box = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "btn").expect("btn")).expect("caja del button");
+        let text_box = find_text_box(&root, "hi").expect("deberia existir la caja de texto 'hi'");
+        assert_eq!(text_box.dimensions.x - btn_box.dimensions.x, 12.0, "10px de padding + 2px de border deberian desplazar el texto 12px del borde izquierdo del boton");
+        assert_eq!(btn_box.box_dimensions.padding.top, 10.0);
+        assert_eq!(btn_box.box_dimensions.border.top, 2.0);
+
+        let dom_sin_relleno = HtmlParser::parse(r#"<html><body><button id="btn" style="padding: 0px; border: none;">hi</button></body></html>"#);
+        let root_sin_relleno = LayoutTreeBuilder::build(&dom_sin_relleno, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let btn_sin_relleno = find_box_for_dom_node(&root_sin_relleno, &Node::find_by_id(&dom_sin_relleno, "btn").expect("btn")).expect("caja del button");
+        assert_eq!(btn_box.dimensions.height - btn_sin_relleno.dimensions.height, 24.0, "10+10px de padding vertical + 2+2px de border deberian crecer la caja del boton 24px por encima de la misma sin relleno");
+    }
+
+    /// `<ul>` antepone una vineta (`•`) a cada `<li>`, colocada a la
+    /// IZQUIERDA de su contenido (en el hueco de su propio `margin-left`,
+    /// ver la hoja UA) - nunca dentro, que empujaria el texto real.
+    #[test]
+    fn ul_prepends_a_bullet_marker_positioned_to_the_left_of_each_li() {
+        let dom = HtmlParser::parse(r#"<html><body><ul><li id="a">uno</li><li id="b">dos</li></ul></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let li_a = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "a").expect("a")).expect("caja del li a");
+        let li_b = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "b").expect("b")).expect("caja del li b");
+
+        let marker_a = li_a.children.first().expect("el li deberia tener un marcador como primer hijo");
+        assert!(matches!(&marker_a.box_type, BoxType::Text(t) if t == "\u{2022}"), "una lista sin ordenar deberia usar una vineta, no un numero");
+        assert!(marker_a.dimensions.x < li_a.dimensions.x, "el marcador deberia pintarse a la izquierda del contenido del li, no dentro de el");
+
+        let marker_b = li_b.children.first().expect("el segundo li tambien deberia tener su propio marcador");
+        assert!(matches!(&marker_b.box_type, BoxType::Text(t) if t == "\u{2022}"));
+    }
+
+    /// `<ol>` numera sus marcadores 1-based y en orden de documento -
+    /// solo entre hermanos `list-item` (no cuenta nada mas).
+    #[test]
+    fn ol_numbers_its_markers_sequentially_starting_at_one() {
+        let dom = HtmlParser::parse(r#"<html><body><ol><li id="a">uno</li><li id="b">dos</li><li id="c">tres</li></ol></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let marker_text = |id: &str| {
+            let li = find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect(id)).expect("caja del li");
+            match &li.children.first().expect("deberia tener marcador").box_type {
+                BoxType::Text(t) => t.clone(),
+                other => panic!("el primer hijo deberia ser el marcador de texto, salio {other:?}"),
+            }
+        };
+        assert_eq!(marker_text("a"), "1.");
+        assert_eq!(marker_text("b"), "2.");
+        assert_eq!(marker_text("c"), "3.");
+    }
+
+    /// `list-style: none` (el shorthand, la forma MUY comun con la que una
+    /// pagina real quita las vinetas de una lista entera desde el `<ul>` -
+    /// encontrado en vivo contra la Wikipedia real, su tabla de
+    /// contenidos) suprime la vineta - heredado desde el `<ul>`, no
+    /// declarado en cada `<li>`.
+    #[test]
+    fn list_style_none_on_the_ul_suppresses_the_marker_of_every_li() {
+        let dom = HtmlParser::parse(r#"<html><body><ul style="list-style: none;"><li id="a">uno</li></ul></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let li_a = find_box_for_dom_node(&root, &Node::find_by_id(&dom, "a").expect("a")).expect("caja del li");
+        let first_child_is_marker = li_a.children.first().is_some_and(|c| matches!(&c.box_type, BoxType::Text(t) if t == "\u{2022}"));
+        assert!(!first_child_is_marker, "list-style: none deberia suprimir la vineta, no anteponerla igual que sin la propiedad");
+    }
+
+    fn marker_text_of(root: &LayoutBox, dom: &Arc<RwLock<Node>>, id: &str) -> String {
+        let li = find_box_for_dom_node(root, &Node::find_by_id(dom, id).expect(id)).expect("caja del li");
+        match &li.children.first().expect("deberia tener marcador").box_type {
+            BoxType::Text(t) => t.clone(),
+            other => panic!("el primer hijo deberia ser el marcador de texto, salio {other:?}"),
+        }
+    }
+
+    /// Cada valor de `list-style-type` que este motor reconoce, uno por
+    /// uno - `circle`/`square` (balas), `decimal-leading-zero` (cero a la
+    /// izquierda hasta dos digitos), `lower-roman`/`upper-roman`
+    /// (numeros romanos reales, no una tabla de casos sueltos - hasta
+    /// `MCMXCIX` con la formula de sustraccion), `lower-alpha`/
+    /// `upper-alpha` (letras, incluida la vuelta de "z" a "aa" en la
+    /// posicion 27 - numeracion bijective real, no base-26 ingenua).
+    #[test]
+    fn list_style_type_recognizes_every_supported_value() {
+        let dom = HtmlParser::parse(
+            r#"<html><body>
+                <ul style="list-style-type: circle;"><li id="circulo">x</li></ul>
+                <ul style="list-style-type: square;"><li id="cuadrado">x</li></ul>
+                <ol style="list-style-type: decimal-leading-zero;"><li id="cero1">x</li><li id="cero2">x</li></ol>
+                <ol style="list-style-type: lower-roman;"><li id="rom1">x</li><li id="rom4">x</li><li id="rom9">x</li></ol>
+                <ol style="list-style-type: upper-roman;"><li id="ROM1999">x</li></ol>
+                <ol style="list-style-type: lower-alpha;"><li id="alfa1">x</li><li id="alfa27">x</li></ol>
+                <ol style="list-style-type: upper-alpha;"><li id="ALFA1">x</li></ol>
+            </body></html>"#,
+        );
+        // 27 <li> en el mismo <ol> para forzar la vuelta de "z" a "aa".
+        let mut html_extra = String::from("<html><body><ol style=\"list-style-type: lower-alpha;\">");
+        for i in 1..=27 {
+            html_extra.push_str(&format!("<li id=\"a{i}\">x</li>"));
+        }
+        html_extra.push_str("</ol></body></html>");
+
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+
+        assert_eq!(marker_text_of(&root, &dom, "circulo"), "\u{25E6}");
+        assert_eq!(marker_text_of(&root, &dom, "cuadrado"), "\u{25AA}");
+        assert_eq!(marker_text_of(&root, &dom, "cero1"), "01.");
+        assert_eq!(marker_text_of(&root, &dom, "cero2"), "02.");
+        assert_eq!(marker_text_of(&root, &dom, "rom1"), "i.");
+        assert_eq!(marker_text_of(&root, &dom, "rom4"), "ii.", "el 2o <li> deberia ser el ordinal 2, no el numero 4");
+        assert_eq!(marker_text_of(&root, &dom, "rom9"), "iii.");
+        assert_eq!(marker_text_of(&root, &dom, "ROM1999"), "I.");
+        assert_eq!(marker_text_of(&root, &dom, "alfa1"), "a.");
+        assert_eq!(marker_text_of(&root, &dom, "alfa27"), "b.", "el 2o <li> deberia ser el ordinal 2 (b), no el 27");
+        assert_eq!(marker_text_of(&root, &dom, "ALFA1"), "A.");
+
+        let dom_extra = HtmlParser::parse(&html_extra);
+        let root_extra = LayoutTreeBuilder::build(&dom_extra, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        assert_eq!(marker_text_of(&root_extra, &dom_extra, "a26"), "z.");
+        assert_eq!(marker_text_of(&root_extra, &dom_extra, "a27"), "aa.", "tras z (26) sigue aa (27), numeracion bijective real");
+    }
+
+    /// Un valor explicito de `list-style-type` manda incluso llevando la
+    /// cuenta contraria a la del propio tag - `<ul>` numerando de verdad,
+    /// igual que en un navegador real.
+    #[test]
+    fn an_explicit_list_style_type_overrides_the_tags_default_marker() {
+        let dom = HtmlParser::parse(r#"<html><body><ul style="list-style-type: decimal;"><li id="a">x</li></ul></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        assert_eq!(marker_text_of(&root, &dom, "a"), "1.", "un <ul> con list-style-type: decimal deberia numerar, no usar bala");
+    }
+
+    /// Un `list-style-type` no reconocido (o `disc` explicito) cae a la
+    /// bala solida - ni inventa un simbolo ni hace panic.
+    #[test]
+    fn an_unrecognized_list_style_type_falls_back_to_the_solid_bullet() {
+        let dom = HtmlParser::parse(r#"<html><body><ul style="list-style-type: basura-inventada;"><li id="a">x</li></ul></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        assert_eq!(marker_text_of(&root, &dom, "a"), "\u{2022}");
+    }
+
     /// `justify` se PARSEA (no cae al "no reconocido") pero se pinta como
     /// `left` a proposito - ver el aviso de `resolve_text_align`.
     #[test]
@@ -3619,6 +6504,210 @@ mod tests {
 
         assert_eq!(child_box.dimensions.x, container_box.dimensions.x + 10.0, "margin-left deberia desplazar el hijo 10px a la derecha");
         assert_eq!(child_box.dimensions.y, container_box.dimensions.y + 10.0, "margin-top deberia desplazar el hijo 10px hacia abajo");
+    }
+
+    /// Caja del `<div id="...">` del documento, para los tests de margin auto.
+    fn box_of(root: &LayoutBox, dom: &Arc<RwLock<Node>>, id: &str) -> LayoutBox {
+        let node = Node::find_by_id(dom, id).unwrap_or_else(|| panic!("{id} deberia existir en el DOM"));
+        find_box_for_dom_node(root, &node).unwrap_or_else(|| panic!("{id} deberia tener caja de layout")).clone()
+    }
+
+    /// Tarea 2.1 del plan: `margin: 0 auto` con ancho propio centra la caja y
+    /// conserva el margen vertical. Es el fallo mas visible del motor:
+    /// ninguna pagina con un contenedor de ancho fijo salia centrada.
+    #[test]
+    fn margin_auto_centers_a_box_with_its_own_width_and_keeps_the_vertical_margin() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="caja" style="width: 300px; height: 40px; margin: 10px auto">x</div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let caja = box_of(&root, &dom, "caja");
+
+        assert_eq!(caja.dimensions.width, 300.0);
+        assert_eq!(caja.dimensions.x, 350.0, "(1000 - 300) / 2");
+        assert_eq!(caja.box_dimensions.margin.left, 350.0);
+        assert_eq!(caja.box_dimensions.margin.right, 350.0);
+        assert_eq!(caja.box_dimensions.margin.top, 10.0, "el margen vertical no se pierde");
+    }
+
+    /// El patron mas comun de la web real: `max-width` + `margin: 0 auto`.
+    #[test]
+    fn margin_auto_centers_a_box_limited_by_max_width() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="caja" style="max-width: 600px; margin: 0 auto">x</div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let caja = box_of(&root, &dom, "caja");
+
+        assert_eq!(caja.dimensions.width, 600.0);
+        assert_eq!(caja.dimensions.x, 200.0);
+    }
+
+    /// Un porcentaje se resuelve contra el contenedor, no contra el ancho que
+    /// queda despues de repartir los margenes (el error tipico al centrar).
+    #[test]
+    fn margin_auto_with_a_percentage_width_is_relative_to_the_container() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="caja" style="width: 50%; margin: 0 auto">x</div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let caja = box_of(&root, &dom, "caja");
+
+        assert_eq!(caja.dimensions.width, 500.0);
+        assert_eq!(caja.dimensions.x, 250.0);
+    }
+
+    /// Con un solo margen `auto`, ese absorbe el sobrante: `margin-left: auto`
+    /// empuja la caja contra el borde derecho; `margin-right: auto` la deja a
+    /// la izquierda.
+    #[test]
+    fn a_single_auto_margin_absorbs_all_the_spare_space() {
+        let dom = HtmlParser::parse(
+            r#"<html><body style="margin:0"><div id="derecha" style="width: 200px; margin-left: auto">x</div><div id="izquierda" style="width: 200px; margin-right: auto">y</div></body></html>"#,
+        );
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+
+        assert_eq!(box_of(&root, &dom, "derecha").dimensions.x, 800.0);
+        assert_eq!(box_of(&root, &dom, "izquierda").dimensions.x, 0.0);
+    }
+
+    /// Sin ancho propio el bloque ocupa todo el contenedor y los margenes
+    /// `auto` valen cero: nada cambia respecto a antes.
+    #[test]
+    fn margin_auto_without_an_own_width_leaves_the_box_full_width() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="caja" style="margin: 0 auto">x</div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let caja = box_of(&root, &dom, "caja");
+
+        assert_eq!(caja.dimensions.width, 1000.0);
+        assert_eq!(caja.dimensions.x, 0.0);
+    }
+
+    /// Una caja mas ancha que su contenedor no se centra con margenes
+    /// negativos: los `auto` valen cero (CSS 2.1 §10.3.3).
+    #[test]
+    fn margin_auto_on_a_box_wider_than_its_container_stays_at_zero() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="caja" style="width: 1500px; margin: 0 auto">x</div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let caja = box_of(&root, &dom, "caja");
+
+        assert_eq!(caja.dimensions.x, 0.0);
+        assert_eq!(caja.box_dimensions.margin.left, 0.0);
+    }
+
+    /// Tarea 2.2 del plan: el espacio entre elementos en linea se conserva.
+    /// Sin fuente la anchura de un espacio es 8 px (la aproximacion del motor),
+    /// asi que el hueco entre `<b>` e `<i>` debe ser exactamente 8.
+    #[test]
+    fn a_space_between_two_inline_elements_is_kept() {
+        let dom = HtmlParser::parse(r##"<html><body style="margin:0"><p id="p" style="margin:0">Texto <b id="b">negrita</b> <i id="i">cursiva</i> <a id="a" href="#">enlace</a> fin</p></body></html>"##);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let (b, i, a) = (box_of(&root, &dom, "b"), box_of(&root, &dom, "i"), box_of(&root, &dom, "a"));
+
+        assert_eq!(i.dimensions.x - (b.dimensions.x + b.dimensions.width), 8.0, "hueco entre <b> e <i>");
+        assert_eq!(a.dimensions.x - (i.dimensions.x + i.dimensions.width), 8.0, "hueco entre <i> y <a>");
+    }
+
+    /// Los espacios de los bordes de una racha no ocupan nada: ni al principio
+    /// ni al final del parrafo.
+    #[test]
+    fn whitespace_at_the_edges_of_an_inline_run_takes_no_room() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><p id="p" style="margin:0">   <b id="b">x</b>   </p></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let (p, b) = (box_of(&root, &dom, "p"), box_of(&root, &dom, "b"));
+
+        assert_eq!(b.dimensions.x, p.dimensions.x, "el espacio inicial no empuja el contenido");
+        let trailing = p.children.last().expect("el parrafo tiene hijos");
+        assert!(matches!(&trailing.box_type, BoxType::Text(t) if t.trim().is_empty()), "el espacio final se conserva como caja");
+        assert_eq!(trailing.dimensions.width, 0.0, "pero sin ancho");
+    }
+
+    /// El espacio en blanco entre bloques no genera cajas (el salto de linea
+    /// entre `</div>` y `<div>` es lo mas comun de cualquier HTML).
+    #[test]
+    fn whitespace_between_block_siblings_creates_no_boxes() {
+        let dom = HtmlParser::parse("<html><body id=\"cuerpo\"><div>uno</div>\n   <div>dos</div>\n</body></html>");
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let body = box_of(&root, &dom, "cuerpo");
+
+        assert_eq!(body.children.len(), 2, "solo los dos <div>, sin cajas de espacio: {:?}", body.children.iter().map(|c| &c.box_type).collect::<Vec<_>>());
+    }
+
+    /// Dentro de un contenedor flex el espacio entre hijos no es un elemento
+    /// anonimo: el contenedor tiene exactamente sus dos hijos.
+    #[test]
+    fn whitespace_inside_a_flex_container_creates_no_anonymous_item() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="f" style="display:flex"><span>a</span> <span>b</span> </div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let flex = box_of(&root, &dom, "f");
+
+        assert_eq!(flex.children.len(), 2, "{:?}", flex.children.iter().map(|c| &c.box_type).collect::<Vec<_>>());
+    }
+
+    /// Tarea 2.5 del plan: una variable con mayusculas en su nombre
+    /// (`--xhUGwc`, como las de Google) se resuelve. Antes el parser la pasaba
+    /// a minusculas y `var(--xhUGwc)` no la encontraba: la declaracion se
+    /// descartaba y la caja se quedaba sin fondo.
+    #[test]
+    fn a_var_with_an_uppercase_name_resolves() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="caja">x</div></body></html>"#);
+        let css = ":root { --xhUGwc: #ff0000; --Ancho: 120px; } #caja { background: var(--xhUGwc); width: var(--Ancho); }";
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(css), 1000.0, 600.0, None, &ImageMap::new());
+        let caja = box_of(&root, &dom, "caja");
+
+        assert_eq!(caja.computed_style.get("background-color").map(String::as_str), Some("#ff0000"));
+        assert_eq!(caja.dimensions.width, 120.0);
+    }
+
+    /// Tarea 2.4 del plan: `calc()` con un porcentaje se resuelve contra el
+    /// bloque contenedor. Antes la caja caia a "ocupar todo el contenedor".
+    #[test]
+    fn calc_with_a_percentage_resolves_against_the_container() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="a" style="width: calc(100% - 200px)">x</div><div id="b" style="width: calc(50% + 2em)">y</div><div id="c" style="width: calc(100px + 50px)">z</div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+
+        assert_eq!(box_of(&root, &dom, "a").dimensions.width, 800.0, "100% - 200px");
+        assert_eq!(box_of(&root, &dom, "b").dimensions.width, 532.0, "50% de 1000 mas 2em de 16px");
+        assert_eq!(box_of(&root, &dom, "c").dimensions.width, 150.0, "un calc solo con pixeles sigue funcionando");
+    }
+
+    #[test]
+    fn calc_with_a_percentage_works_in_a_stylesheet_and_in_margins() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div id="a">x</div></body></html>"#);
+        let css = "#a { width: calc(100% - 20px); margin-left: calc(10% + 5px); }";
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(css), 1000.0, 600.0, None, &ImageMap::new());
+        let a = box_of(&root, &dom, "a");
+
+        assert_eq!(a.box_dimensions.margin.left, 105.0, "10% de 1000 mas 5px");
+        assert_eq!(a.dimensions.x, 105.0);
+        assert_eq!(a.dimensions.width, 980.0, "el 100% es el contenedor entero (1000), no lo que queda tras el margen");
+    }
+
+    /// Tarea 2.6 del plan: `line-height` fija la altura de la linea. Sin fuente
+    /// la altura natural es 22 px (la aproximacion del motor), asi que cualquier
+    /// otro valor demuestra que se aplico.
+    #[test]
+    fn line_height_sets_the_height_of_a_line_of_text() {
+        let alto = |estilo: &str| {
+            let dom = HtmlParser::parse(&format!(r#"<html><body style="margin:0"><p id="p" style="margin:0; font-size: 20px; {estilo}">Texto</p></body></html>"#));
+            let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+            box_of(&root, &dom, "p").dimensions.height
+        };
+
+        assert_eq!(alto("line-height: 40px"), 40.0, "en pixeles");
+        assert_eq!(alto("line-height: 2"), 40.0, "multiplicador sin unidad: 2 x 20px");
+        assert_eq!(alto("line-height: 150%"), 30.0, "porcentaje del tamaño de fuente");
+        assert_eq!(alto("line-height: 1.5em"), 30.0, "em, ya convertido a pixeles por la cascada");
+        assert_eq!(alto("line-height: normal"), 22.0, "normal: la altura natural");
+        assert_eq!(alto(""), 22.0, "sin declarar: la altura natural");
+    }
+
+    /// `line-height` se hereda, y las hojas de texto quedan con el valor ya
+    /// resuelto en pixeles para que el pintado reparta las lineas igual.
+    #[test]
+    fn line_height_is_inherited_and_left_resolved_on_the_text_leaves() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><div style="line-height: 30px"><p id="p" style="margin:0">x</p></div></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 1000.0, 600.0, None, &ImageMap::new());
+        let p = box_of(&root, &dom, "p");
+
+        assert_eq!(p.dimensions.height, 30.0, "el <p> hereda el line-height del <div>");
+        let hoja = p.children.first().expect("el <p> tiene su texto");
+        assert_eq!(hoja.computed_style.get("line-height-px").map(String::as_str), Some("30px"));
+        assert_eq!(hoja.computed_style.get("line-height").map(String::as_str), Some("30px"), "el valor heredado original sigue ahi");
     }
 
     #[test]
@@ -4163,7 +7252,7 @@ mod tests {
     #[test]
     fn table_lays_out_cells_side_by_side_in_equal_columns() {
         let dom = HtmlParser::parse(r#"<html><body><table id="t" style="width: 400px;"><tr><td id="a">a</td><td id="b">b</td></tr></table></body></html>"#);
-        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; }");
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; } table { border-spacing: 0px; }");
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let a_node = Node::find_by_id(&dom, "a").expect("a deberia existir");
@@ -4177,6 +7266,56 @@ mod tests {
         assert_eq!(a_box.dimensions.y, b_box.dimensions.y, "las celdas de la misma fila deberian compartir Y");
     }
 
+    /// `border-spacing` (con un solo valor, horizontal=vertical) deja un
+    /// hueco real ANTES de la primera fila/columna, ENTRE cada par, y
+    /// DESPUES de la ultima - la misma magnitud en las tres posiciones,
+    /// no la mitad en los bordes exteriores.
+    #[test]
+    fn border_spacing_leaves_a_real_gap_around_and_between_cells() {
+        let dom = HtmlParser::parse(
+            r#"<html><body><table id="t" style="width: 220px;">
+                <tr><td id="a" style="width:100px;height:30px;">a</td><td id="b" style="width:100px;height:30px;">b</td></tr>
+                <tr><td id="c" style="height:30px;">c</td><td id="d" style="height:30px;">d</td></tr>
+            </table></body></html>"#,
+        );
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; } table { border-spacing: 10px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
+
+        assert_eq!(caja("a").dimensions.x, 10.0, "hueco de 10px antes de la primera columna");
+        assert_eq!(caja("b").dimensions.x, 10.0 + 100.0 + 10.0, "hueco de 10px entre columnas");
+        assert_eq!(caja("a").dimensions.y, 10.0, "hueco de 10px antes de la primera fila");
+        assert_eq!(caja("c").dimensions.y, 10.0 + 30.0 + 10.0, "hueco de 10px entre filas");
+    }
+
+    /// Sin `border-spacing` declarado, el valor inicial REAL del spec es
+    /// `2px` (no cero) - un `<table>` sin CSS de autor si tiene un hueco
+    /// visible entre celdas en un navegador real.
+    #[test]
+    fn border_spacing_defaults_to_2px_when_not_declared() {
+        let dom = HtmlParser::parse(r#"<html><body><table id="t"><tr><td id="a" style="width:50px;height:20px;">a</td><td id="b" style="width:50px;height:20px;">b</td></tr></table></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
+
+        assert_eq!(caja("a").dimensions.x, 2.0);
+        assert_eq!(caja("a").dimensions.y, 2.0);
+    }
+
+    /// `border-collapse: collapse` colapsa el hueco a CERO, sin importar lo
+    /// que diga `border-spacing` a la vez - simplificacion declarada (no
+    /// fusiona bordes adyacentes, solo quita el hueco).
+    #[test]
+    fn border_collapse_collapse_overrides_border_spacing_to_zero() {
+        let dom = HtmlParser::parse(r#"<html><body><table id="t" style="width:100px;"><tr><td id="a" style="width:50px;height:20px;">a</td><td id="b" style="width:50px;height:20px;">b</td></tr></table></body></html>"#);
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; } table { border-spacing: 10px; border-collapse: collapse; }");
+        let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
+        let caja = |id: &str| find_box_for_dom_node(&root, &Node::find_by_id(&dom, id).expect("nodo")).expect("caja");
+
+        assert_eq!(caja("a").dimensions.x, 0.0, "border-collapse:collapse deberia ganar sobre border-spacing:10px");
+        assert_eq!(caja("b").dimensions.x, 50.0, "sin hueco entre columnas");
+    }
+
     /// Dos filas se apilan verticalmente (segunda fila empieza donde termina
     /// la primera), cada una con su propio alto - la parte "de bloque" del
     /// algoritmo de tabla, analoga a `flow_block_children` pero fila a fila.
@@ -4188,7 +7327,7 @@ mod tests {
                 <tr id="row2"><td id="b" style="height: 50px;">b</td></tr>
             </table></body></html>"#,
         );
-        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; }");
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; } table { border-spacing: 0px; }");
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let a_node = Node::find_by_id(&dom, "a").expect("a deberia existir");
@@ -4233,7 +7372,7 @@ mod tests {
                 <tbody><tr><td id="body_cell">b</td></tr></tbody>
             </table></body></html>"#,
         );
-        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; height: 20px; }");
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; height: 20px; } table { border-spacing: 0px; }");
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let header_node = Node::find_by_id(&dom, "header").expect("header deberia existir");
@@ -4256,7 +7395,7 @@ mod tests {
                 <tr><td id="first">b</td><td id="second">c</td><td id="third">d</td></tr>
             </table></body></html>"#,
         );
-        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; }");
+        let stylesheet = CssParser::parse("body { margin: 0px; } td { padding: 0px; } table { border-spacing: 0px; }");
         let root = LayoutTreeBuilder::build(&dom, &stylesheet, 800.0, 600.0, None, &ImageMap::new());
 
         let only_node = Node::find_by_id(&dom, "only").expect("only deberia existir");

@@ -1,156 +1,112 @@
-# Navegador IA
+# Navegador
 
-Un navegador de escritorio con un **motor de renderizado propio escrito desde cero en Rust** — sin Chromium, sin WebKit, sin Gecko.
+> **Reglas del proyecto: [`AGENTS.md`](AGENTS.md).** La aplicación es 100 %
+> Rust y el motor es propio, escrito desde cero.
 
-> **Estado: en desarrollo, no apto para uso general todavía.**
-> El motor renderiza páginas reales por HTTPS, pero le faltan piezas de
-> seguridad imprescindibles (política de mismo origen, aislamiento de
-> procesos). Ver [Qué falta](#qué-falta) antes de usarlo con sitios en los
-> que no confíes.
+Un navegador de escritorio con **motor propio en Rust**: red, HTML, CSS,
+layout, pintado y JavaScript. La ventana, la barra y las pestañas también son
+Rust, y las pinta el mismo motor que pinta las páginas.
+
+> **Estado: en desarrollo.** En Windows el subproceso del motor corre aislado
+> (token restringido de integridad baja, escritorio aislado, *Job Object* y
+> perfil inaccesible para el renderizador; ver [`SECURITY.md`](SECURITY.md)). En
+> Linux y macOS todavía no hay sandbox de sistema operativo. Todavía no está
+> pensado para cuentas reales en sitios hostiles.
+>
+> **Qué funciona hoy y cómo medirlo: [`engine/ESTADO.md`](engine/ESTADO.md)**
+> (corto y verificado). Lo que falta, en
+> [`engine/huecos_sin_resolver.md`](engine/huecos_sin_resolver.md).
 
 ---
 
-## Qué hace de verdad hoy
+## Abrirlo
 
-Todo lo de esta lista está implementado y verificado ejecutando el motor, no
-solo compilándolo. Las cifras salen de correr la suite de tests el
-2026-08-20.
+Hace falta **Rust** ([rustup.rs](https://rustup.rs/)). Nada más.
+
+**Windows:** doble clic en `instalar.bat` (compila, tarda unos minutos la
+primera vez) y luego `iniciar.bat`.
+
+**Linux / macOS:** `./instalar.sh` y luego `./iniciar.sh`.
+
+**A mano:**
+
+```bash
+cd engine
+cargo run --release -p navegador                       # abre la ventana
+cargo run --release -p navegador -- es.wikipedia.org   # con una dirección
+```
+
+Atajos: Ctrl+L (barra de direcciones), Ctrl+T (pestaña nueva), Ctrl+W
+(cerrar), Ctrl+Tab (cambiar), Ctrl+Shift+RePág/AvPág (reordenar pestaña),
+Ctrl+D (marcador), Ctrl+R o F5 (recargar), Alt+← / Alt+→ (atrás / adelante),
+Ctrl+C/X/V/A (portapapeles y selección), Tab / Shift+Tab (campos), Escape (detener).
+
+También puedes generar un paquete portable con instalador nativo 100 % Rust en Windows (`NavegadorIA-windows.zip`, incluyendo `desinstalar.exe`) ejecutando `scripts/release/empaquetar_windows.ps1`.
+
+---
+
+## Qué hace hoy
 
 | | |
 |---|---|
-| **Motor** | ~23.000 líneas de Rust, 10 crates |
-| **Tests** | 683 pasando, 0 fallando |
-| **Red** | HTTP/1.1 + HTTPS real (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies RFC 6265, CORS y CSP |
-| **HTML** | Parseo con `html5ever` (el de Servo), DOM mutable, `<canvas>` 2D context |
-| **CSS** | Cascada con especificidad real, selectores con combinadores (`selectors`, el de Firefox), pseudo-clases, `@media`, `rem`, porcentajes |
-| **Layout** | Bloque, inline, `box-sizing: border-box`, flexbox con *intrinsic sizing*, CSS Grid, tablas, `float`, `position` (sticky/relative/absolute) |
-| **JavaScript** | Motor `boa`, DOM bindings, eventos con burbujeo, `fetch`, `XMLHttpRequest`, `setTimeout`, `localStorage`, Canvas 2D API |
-| **Pintado** | Rasterizado con `tiny-skia`, gráficos vectoriales SVG con `resvg`/`usvg`, fuentes con glifos reales, `border-radius`, sombras |
-| **IA Nativa** | Crate `engine-ai` con Árbol de Accesibilidad Semántico (AOM) con coordenadas espaciales optimizado para LLMs |
+| **Aplicación** | Ventana nativa HiDPI (`winit` + `softbuffer`), pestañas (reordenables y con desplazamiento `<`/`>`), historial y marcadores persistentes (`Ctrl+D`), desplegable de autocompletado, cursor dinámico, selección y portapapeles, atrás/adelante, recargar/detener, barra de direcciones (dirección o búsqueda), página de inicio y de error, instalador nativo 100 % Rust |
+| **Red** | HTTP/1.1 y HTTPS (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies, CORS y CSP. La red y las cookies van en un proceso aparte (broker) |
+| **HTML / CSS** | Parseo HTML5, cascada con especificidad, `@media`, variables, `calc()`, `em`/`rem`/`vw`, degradados, atributos HTML clásicos |
+| **Layout** | Bloque, texto en línea partido por palabras, `inline-block`, flex, grid, tablas, `float`, `position` |
+| **JavaScript** | Intérprete `boa`, DOM, eventos, `fetch`, XHR, temporizadores, `localStorage`, módulos ES |
+| **Pintado** | `tiny-skia`, SVG, fuentes del sistema (sans, serifa y monoespaciada), sombras, bordes redondeados |
+| **Accesibilidad** | `engine-ai`: árbol de accesibilidad (AOM) de la página |
 
-**Lo que se puede hacer con él ahora mismo:** cargar una página real por
-HTTPS, navegar por enlaces, usar el historial, abrir pestañas, rellenar y
-**enviar formularios** (GET y POST), **iniciar sesión** en un sitio con
-autenticación por cookies, e **interactuar con el Agente Copiloto IA**
-autónomo desde la barra lateral.
+Se puede: abrir páginas reales por HTTPS, seguir enlaces, usar el historial y
+las pestañas, escribir en los campos, enviar formularios e iniciar sesión en
+sitios con cookies. Hacker News, DuckDuckGo Lite y Wikipedia se ven bien.
 
----
-
-## Qué falta
-
-Esto es la parte importante de este README, y está aquí arriba a propósito.
-
-### Seguridad — antes de distribuirlo a nadie
-
-| Pieza | Estado |
-|---|---|
-| Validación TLS de certificados | ✅ Real (`webpki-roots`) |
-| Seguridad de memoria | ✅ Rust elimina de raíz ~70% de los CVE críticos de un navegador |
-| **Política de mismo origen** | ✅ Aislamiento en cookies/almacenamiento y esquemas seguros |
-| **CORS** | ✅ Real (`Access-Control-Allow-Origin`, preflight OPTIONS, credenciales) |
-| **CSP** | ✅ Real (`default-src`, `script-src`, `style-src`, `img-src`, `connect-src`, `font-src`, `media-src`) |
-| **Sandbox de proceso** | ❌ No existe |
-
-Sin política de mismo origen ni sandbox, una página maliciosa no tiene
-barreras. **Úsalo con sitios de confianza o en desarrollo, no como
-navegador diario.**
-
-### Plataforma
-
-Compilado y probado **solo en Windows**. `winit`/`wgpu` soportan macOS y
-Linux en teoría, pero nunca se ha verificado aquí. Sin versión móvil.
-
-### Web moderna
-
-Sin `<canvas>`, `<video>`, `<audio>`, `<iframe>`, `<svg>`. Sin WebGL,
-IndexedDB, Service Workers, WebSockets ni Web Workers. Sin HTTP/2 ni caché
-HTTP. El JavaScript es interpretado (sin JIT), así que es bastante más
-lento que un navegador comercial.
-
-### Compatibilidad
-
-La métrica honesta de un motor de navegador es cuántos tests de
-[Web Platform Tests](https://github.com/web-platform-tests/wpt) pasa. Este
-motor **no ejecuta la suite oficial todavía**: los 21 tests estilo-WPT que
-corre están escritos a mano. Hasta que ese número exista, cualquier
-afirmación sobre "compatibilidad" —incluida la de este README— es una
-impresión, no un dato.
+**Lo que no:** las webs que montan todo su contenido con JavaScript en el
+cliente suelen verse vacías (faltan APIs del DOM; el motor lo avisa). Sin
+`<video>`, `<audio>`, `<iframe>`, WebGL ni Workers. Sin HTTP/2 ni caché.
 
 ---
 
 ## Cómo está montado
 
 ```text
-navegador-ia/
-├── engine/           Motor de renderizado en Rust (9 crates)
-│   ├── crates/net/       HTTP/HTTPS, cookies, almacenamiento web
-│   ├── crates/dom/       Parseo HTML y árbol DOM
-│   ├── crates/css/       Parseo, selectores y cascada
-│   ├── crates/layout/    Cajas: bloque, inline, flex, grid, tabla, float
-│   ├── crates/text/      Medición y shaping de texto
-│   ├── crates/image/     Decodificación de imágenes
-│   ├── crates/js/        Runtime JavaScript y bindings del DOM
-│   ├── crates/gfx/       Display list, rasterizado y ventana
-│   └── crates/core/      Pipeline y servidor NDJSON (engine_server)
-├── frontend/         Interfaz en React + Vite
-├── desktop/          Envoltorio Electron
-└── backend/          Servidor Python (FastAPI) — ver nota abajo
+engine/
+├── crates/app/       La aplicación (binario `navegador`): ventana, barra, pestañas
+├── crates/core/      Pipeline, servidor NDJSON del motor y arranque de procesos
+├── crates/net/       HTTP/HTTPS, cookies, almacenamiento y broker
+├── crates/dom/       Parseo HTML y árbol DOM
+├── crates/css/       Parseo, selectores y cascada
+├── crates/layout/    Cajas: bloque, inline, flex, grid, tabla, float
+├── crates/text/      Fuentes, medida y partición de texto
+├── crates/image/     Decodificación de imágenes y SVG
+├── crates/js/        JavaScript y enlaces con el DOM
+├── crates/gfx/       Lista de pintado y rasterizado
+└── crates/ai/        Árbol de accesibilidad (AOM) del motor
 ```
 
-El motor corre como un proceso aparte (`engine_server`) que habla **NDJSON
-por stdin/stdout**. Electron se comunica con él directamente por IPC.
+`navegador` arranca tres procesos del mismo ejecutable: la ventana, el
+**motor** (`--motor`, interpreta las páginas) y el **broker** (`--broker`, red,
+cookies y almacenamiento). El motor y la ventana hablan NDJSON por
+stdin/stdout; el motor pide la red al broker con un token de un solo uso
+([ADR 0001](docs/adr/0001-broker-y-aislamiento-de-renderers.md)). Si una página
+tumba el motor, la ventana sigue viva.
 
-> **Nota sobre el backend:** Electron se comunica directamente con el
-> motor nativo de Rust (`engine_server`) vía IPC/NDJSON sin dependencias
-> intermedias obligatorias. El backend de Python queda reservado como
-> microservicio opcional para tareas avanzadas de IA.
-
-`engine/ARCHITECTURE.md` documenta el estado real de cada capacidad, con
-sus simplificaciones declaradas una por una. Es la fuente de verdad de este
-proyecto; si algo de este README lo contradice, gana `ARCHITECTURE.md`.
+`engine/ARCHITECTURE.md` es el diario histórico de cómo se llegó aquí.
 
 ---
 
-## Compilar y ejecutar
+## Pruebas
 
-### Requisitos
-* **Rust** 1.75+ (`cargo`)
-* **Node.js** 18+ y `npm`
-
-### Desarrollo
-
-```bash
-npm install
-npm run start          # frontend (Vite) + aplicación Electron
-```
-
-### Solo el motor
+Sin ningún navegador externo: se prueba con el propio motor.
 
 ```bash
 cd engine
-cargo test --workspace          # los 676 tests
-cargo run -p engine-core --bin engine_server   # servidor NDJSON por stdin/stdout
+cargo test --workspace --locked                              # todos los tests
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo run -p engine-core --bin wpt_runner --locked -- tests/wpt-style   # 60 de 60
+cargo run --release -p navegador -- --captura v.png news.ycombinator.com   # imagen de la ventana
+python3 scripts/dev/bench_all.py                             # tiempos
 ```
-
-### Instalador
-
-```bash
-npm run build:app
-```
-
-Genera `Navegador IA Setup.exe` en la raíz. **Sin firmar**: Windows
-SmartScreen mostrará un aviso a quien lo descargue. Ver
-`desktop/DISTRIBUCION.md` para las opciones de firma de código.
-
----
-
-## Sobre la IA
-
-El proyecto se llama Navegador IA porque integra un agente que navega por ti.
-**El agente autónomo está conectado a la interfaz** mediante el panel lateral
-*Copiloto IA* (accesible con el botón 🤖 en la barra de navegación), soportando
-tanto modo de simulación rápida como ejecución real impulsada por Gemini 2.0 Flash
-mediante API Key.
 
 ---
 

@@ -17,14 +17,128 @@
 
 use engine_css::{CssParser, StyleSheet};
 use engine_dom::{HtmlParser, Node, NodeType};
-use engine_js::{JsRuntime, TestResult};
+use engine_js::{BoxMetrics, JsRuntime, TestResult};
 use engine_layout::{ImageMap, LayoutBox, LayoutTreeBuilder};
-use engine_net::NetworkEngine;
+use engine_net::SharedBroker;
 use engine_text::FontSet;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::scripting;
+
+/// Separadores de las hojas externas dentro del CSS que entrega el servidor
+/// (tarea "orden de estilos"): `<inicio><href><fin de href>css<fin>`. Son
+/// caracteres de control que no pueden aparecer en CSS valido, para que
+/// `assemble_css` sepa a que `<link>` pertenece cada hoja y la coloque en su
+/// sitio del documento.
+const SHEET_START: char = '\u{1}';
+const SHEET_HREF_END: char = '\u{2}';
+const SHEET_END: char = '\u{3}';
+
+/// La hoja descargada de `href`, marcada para `assemble_css`. El texto de la
+/// hoja no puede traer los separadores (se quitan): una hoja ajena no debe
+/// poder fingir que es otra.
+pub fn wrap_sheet(href: &str, css: &str) -> String {
+    let clean = |text: &str| text.chars().filter(|c| !matches!(*c, SHEET_START | SHEET_HREF_END | SHEET_END)).collect::<String>();
+    format!("{SHEET_START}{}{SHEET_HREF_END}{}{SHEET_END}\n", clean(href), clean(css))
+}
+
+/// El CSS tal cual, sin marcas (para quien solo lo lee: descubrir imagenes de
+/// fondo, por ejemplo).
+pub fn strip_sheet_markers(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut skipping_href = false;
+    for c in css.chars() {
+        match c {
+            SHEET_START => skipping_href = true,
+            SHEET_HREF_END => skipping_href = false,
+            SHEET_END => {}
+            _ if skipping_href => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Las hojas marcadas de `css` (href, contenido) y el resto sin marcar.
+fn split_marked_sheets(css: &str) -> (Vec<(String, String)>, String) {
+    let mut sheets = Vec::new();
+    let mut unmarked = String::new();
+    let mut rest = css;
+    while let Some(start) = rest.find(SHEET_START) {
+        unmarked.push_str(&rest[..start]);
+        let after = &rest[start + SHEET_START.len_utf8()..];
+        let (Some(href_end), Some(end)) = (after.find(SHEET_HREF_END), after.find(SHEET_END)) else {
+            unmarked.push_str(after);
+            return (sheets, unmarked);
+        };
+        if href_end > end {
+            rest = &after[end + SHEET_END.len_utf8()..];
+            continue;
+        }
+        sheets.push((after[..href_end].to_string(), after[href_end + SHEET_HREF_END.len_utf8()..end].to_string()));
+        rest = &after[end + SHEET_END.len_utf8()..];
+    }
+    unmarked.push_str(rest);
+    (sheets, unmarked)
+}
+
+/// Los `<link rel=stylesheet>` y `<style>` del documento, en orden de documento.
+fn stylesheet_sources(node: &Arc<RwLock<Node>>, out: &mut Vec<Arc<RwLock<Node>>>) {
+    let guard = node.read().unwrap();
+    if let NodeType::Element { tag_name, attributes } = &guard.node_type {
+        let is_source = tag_name == "style"
+            || (tag_name == "link" && attributes.get("rel").is_some_and(|rel| rel.split_whitespace().any(|token| token.eq_ignore_ascii_case("stylesheet"))));
+        if is_source {
+            out.push(node.clone());
+        }
+    }
+    for child in &guard.children {
+        stylesheet_sources(child, out);
+    }
+}
+
+/// El CSS de la pagina en el ORDEN DEL DOCUMENTO (tarea 2 de "vistos en main"):
+/// cada `<style>` y cada hoja externa en el sitio de su etiqueta. Con
+/// especificidad igual gana lo que viene despues, asi que el orden cambia el
+/// aspecto: antes todos los `<style>` iban primero y las hojas externas
+/// despues, y un `<style>` que sobrescribe a un `<link>` anterior perdia.
+///
+/// `external_css` son las hojas marcadas con `wrap_sheet`. Lo que no lleve marca
+/// (CSS suelto que entrega quien llama, como los tests) va al final, como antes.
+pub fn assemble_css(dom_root: &Arc<RwLock<Node>>, external_css: &str, allow_inline_style: bool) -> String {
+    let (mut sheets, unmarked) = split_marked_sheets(external_css);
+    let mut sources = Vec::new();
+    stylesheet_sources(dom_root, &mut sources);
+
+    let mut combined = String::new();
+    for source in &sources {
+        let (is_style, href) = match &source.read().unwrap().node_type {
+            NodeType::Element { tag_name, attributes } => (tag_name == "style", attributes.get("href").cloned()),
+            _ => continue,
+        };
+        if is_style {
+            if allow_inline_style {
+                combined.push_str(&Node::text_content(source));
+                combined.push('\n');
+            }
+        } else if let Some(href) = href {
+            if let Some(position) = sheets.iter().position(|(sheet_href, _)| *sheet_href == href) {
+                let (_, css) = sheets.remove(position);
+                combined.push_str(&css);
+                combined.push('\n');
+            }
+        }
+    }
+    // Hojas que se descargaron pero cuya etiqueta ya no esta (un script la
+    // quito) o no se pudo emparejar: al final, que es donde estaban siempre.
+    for (_, css) in sheets {
+        combined.push_str(&css);
+        combined.push('\n');
+    }
+    combined.push_str(&unmarked);
+    combined
+}
 
 pub struct PageResult {
     /// `dom_root` y `stylesheet` los usa `pipeline.rs` en sus propios tests
@@ -83,12 +197,7 @@ pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f
     let dom_root = HtmlParser::parse(html);
     let script_results = scripting::execute_inline_scripts(&dom_root, external_scripts);
 
-    let mut combined_css = String::new();
-    for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
-        combined_css.push_str(&Node::text_content(style_tag));
-        combined_css.push('\n');
-    }
-    combined_css.push_str(css);
+    let combined_css = assemble_css(&dom_root, css, true);
 
     let stylesheet = CssParser::parse(&combined_css);
     let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
@@ -106,14 +215,9 @@ pub fn build_page(html: &str, css: &str, viewport_width: f32, viewport_height: f
 /// `test`/`assert_equals` como globales.
 pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap) -> (PageResult, Vec<TestResult>) {
     let dom_root = HtmlParser::parse(html);
-    let (script_results, test_results) = scripting::execute_inline_scripts_with_harness(&dom_root, external_scripts);
+    let (script_results, test_results) = scripting::execute_inline_scripts_with_harness(&dom_root, external_scripts, (viewport_width, viewport_height));
 
-    let mut combined_css = String::new();
-    for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
-        combined_css.push_str(&Node::text_content(style_tag));
-        combined_css.push('\n');
-    }
-    combined_css.push_str(css);
+    let combined_css = assemble_css(&dom_root, css, true);
 
     let stylesheet = CssParser::parse(&combined_css);
     let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
@@ -147,24 +251,121 @@ pub fn build_page_with_harness(html: &str, css: &str, viewport_width: f32, viewp
 /// sitio - los `<style>` se concatenaban SIEMPRE, con o sin CSP. `None`
 /// (sin `StorageContext`, ver el resto de este archivo) se permite, igual
 /// que "sin politica" en el spec real.
-pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap, network: Option<Arc<NetworkEngine>>, storage: Option<crate::scripting::StorageContext>) -> (PageResult, JsRuntime) {
+pub fn build_page_keeping_runtime(html: &str, css: &str, viewport_width: f32, viewport_height: f32, font_set: Option<&FontSet>, external_scripts: &HashMap<String, String>, images: &ImageMap, network: Option<SharedBroker>, storage: Option<crate::scripting::StorageContext>) -> (PageResult, JsRuntime) {
+    // Mismo cronometro por fases que `server::navigate_with_body`, un nivel
+    // mas abajo: sin el, las cuatro etapas caras del motor (parsear HTML,
+    // ejecutar JS, parsear CSS, maquetar) son un unico numero opaco.
+    let t = std::time::Instant::now();
     let dom_root = HtmlParser::parse(html);
-    let allow_inline_style = storage.as_ref().is_none_or(|ctx| ctx.csp.allows_inline("style-src"));
-    let (script_results, runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network, storage);
+    tracing::info!("[tiempo]   parseo HTML {:?}", t.elapsed());
 
-    let mut combined_css = String::new();
-    if allow_inline_style {
-        for style_tag in &Node::find_all_by_tag(&dom_root, "style") {
-            combined_css.push_str(&Node::text_content(style_tag));
-            combined_css.push('\n');
+    let allow_inline_style = storage.as_ref().is_none_or(|ctx| ctx.csp.allows_inline("style-src"));
+    let t = std::time::Instant::now();
+    let (script_results, mut runtime) = scripting::execute_inline_scripts_keeping_runtime(&dom_root, external_scripts, network, storage, (viewport_width, viewport_height));
+    tracing::info!("[tiempo]   JS {:?} ({} script(s))", t.elapsed(), script_results.len());
+
+    let combined_css = assemble_css(&dom_root, css, allow_inline_style);
+
+    let t = std::time::Instant::now();
+    let stylesheet = CssParser::parse(&combined_css);
+    tracing::info!("[tiempo]   parseo CSS {:?} ({} reglas de {} bytes)", t.elapsed(), stylesheet.rules.len(), combined_css.len());
+
+    let t = std::time::Instant::now();
+    let mut layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
+    tracing::info!("[tiempo]   cascada + layout {:?}", t.elapsed());
+
+    // Un script de CARGA puede asignar `scrollTop`/`scrollLeft` antes de
+    // que este primer layout exista siquiera - se aplica aqui, contra el
+    // arbol que se acaba de construir, mismo mecanismo que usa `core::
+    // server::LoadedPage::relayout` para cualquier layout posterior.
+    if let Some(offsets) = runtime.scroll_offsets() {
+        let copia = offsets.lock().unwrap().clone();
+        engine_layout::apply_scroll_offsets(&mut layout_root, &copia);
+    }
+
+    // El snapshot que lee `getComputedStyle`/`getBoundingClientRect` se
+    // publica AQUI, antes de disparar `DOMContentLoaded` - no despues, como
+    // hacia antes (`core::server` lo publicaba ya de vuelta en su propio
+    // flujo, un paso entero mas tarde). El listener mas comun de la web
+    // real es precisamente `DOMContentLoaded` leyendo geometria/estilo
+    // justo al arrancar; con el snapshot todavia vacio en ese momento,
+    // `getComputedStyle` devolvia un objeto sin ninguna propiedad util.
+    if let Some(snapshot) = runtime.layout_snapshot() {
+        if let Ok(mut data) = snapshot.write() {
+            data.boxes.clear();
+            collect_box_metrics(&layout_root, &mut data.boxes);
+            // El viewport va al mismo buzon que la geometria (Fase 45): es lo
+            // que `window.innerWidth` y `matchMedia` consultan, y aqui es
+            // donde se conoce.
+            data.viewport_width = viewport_width;
+            data.viewport_height = viewport_height;
         }
     }
-    combined_css.push_str(css);
 
-    let stylesheet = CssParser::parse(&combined_css);
-    let layout_root = LayoutTreeBuilder::build(&dom_root, &stylesheet, viewport_width, viewport_height, font_set, images);
+    // `DOMContentLoaded`: el documento ya esta parseado entero, todos sus
+    // scripts han corrido, Y el layout que acaba de calcularse arriba ya es
+    // visible para JS - las tres cosas que el spec exige que sean ciertas
+    // cuando este evento se dispara. Va aqui, despues del layout, y no
+    // justo al terminar los scripts (que era donde vivia antes, en
+    // `scripting::execute_inline_scripts_keeping_runtime`): un listener
+    // registrado en el patron mas comun de arranque de una pagina real -
+    // leer una medida nada mas cargar - necesita el snapshot YA publicado,
+    // no solo el arbol de layout construido en memoria sin que JS pueda
+    // verlo todavia.
+    if let Err(e) = runtime.dispatch_event(&dom_root, "DOMContentLoaded") {
+        tracing::warn!("[js] fallo al disparar DOMContentLoaded: {e}");
+    }
+
+    // `load` (tarea 4.2 del plan): despues de DOMContentLoaded, cuando ya estan
+    // descargados los subrecursos - aqui lo estan siempre, porque el servidor
+    // los baja ANTES de construir la pagina. Se dispara sobre `<html>` y no
+    // sobre el documento, igual que `scroll`/`resize`: `window.addEventListener`
+    // delega en `documentElement`, asi que ahi es donde escucha un
+    // `window.addEventListener('load', ...)`. Nunca se disparaba, y media web
+    // arranca desde ahi.
+    if let Some(html) = Node::document_element(&dom_root) {
+        if let Err(e) = runtime.dispatch_event(&html, "load") {
+            tracing::warn!("[js] fallo al disparar load: {e}");
+        }
+    }
+    // `window.onload = function() {...}`: la otra forma, igual de comun. Una
+    // propiedad `onload` no se invoca sola; se llama despues de los listeners,
+    // como el estandar. Una excepcion dentro de ella no debe romper la carga.
+    if let Err(e) = runtime.eval("if (typeof window !== 'undefined' && typeof window.onload === 'function') { window.onload({ type: 'load' }); }") {
+        tracing::warn!("[js] fallo en window.onload: {e}");
+    }
 
     (PageResult { dom_root, stylesheet, layout_root, script_results }, runtime)
+}
+
+/// Aplana el arbol de layout a la lista de `(nodo, metricas)` que espera el
+/// snapshot de `getComputedStyle`/`getBoundingClientRect`. Solo entran las
+/// cajas CON nodo del DOM detras: las de texto y la raiz sintetica no
+/// corresponden a ningun elemento al que JS pueda llegar (misma regla que
+/// `LayoutBox::hit_test`).
+///
+/// Vive en `core` y no en `layout` porque `BoxMetrics` es un tipo de
+/// `engine-js`, y es `core` - que depende de los dos - el unico sitio
+/// donde las dos capas pueden encontrarse sin crear una dependencia nueva
+/// entre ellas. `pub(crate)` porque `core::server` tambien la necesita
+/// (para volver a publicar el snapshot tras un relayout posterior, cuando
+/// ya no hay ningun `DOMContentLoaded` que disparar).
+pub(crate) fn collect_box_metrics(layout: &LayoutBox, out: &mut Vec<(Arc<RwLock<Node>>, BoxMetrics)>) {
+    if let Some(node) = &layout.dom_node {
+        out.push((
+            node.clone(),
+            BoxMetrics {
+                x: layout.dimensions.x,
+                y: layout.dimensions.y,
+                width: layout.dimensions.width,
+                height: layout.dimensions.height,
+                computed_style: layout.computed_style.clone(),
+            },
+        ));
+    }
+    for child in &layout.children {
+        collect_box_metrics(child, out);
+    }
 }
 
 /// Devuelve el valor CRUDO (sin resolver contra ninguna URL base) del
@@ -192,6 +393,39 @@ pub fn find_external_stylesheet_hrefs(dom_root: &Arc<RwLock<Node>>) -> Vec<Strin
                 .get("rel")
                 .is_some_and(|rel| rel.split_whitespace().any(|token| token.eq_ignore_ascii_case("stylesheet")));
             if !is_stylesheet {
+                return None;
+            }
+            attributes.get("href").cloned()
+        })
+        .collect()
+}
+
+/// Devuelve el `href` CRUDO de cada `<link rel="modulepreload">` del
+/// documento (Fase 43).
+///
+/// Por que existe: un bundle moderno no declara todos sus trozos con
+/// `<script src>`. Declara UNO (`<script type="module" src="/assets/index.js">`)
+/// y los demas con `<link rel="modulepreload" href="...">`, precisamente para
+/// que el navegador los tenga descargados antes de que el primero los importe.
+/// Sin recogerlos aqui, el `import` del modulo raiz no encontraria nada, porque
+/// este motor no va a la red durante la evaluacion (ver `engine_js::modules`).
+///
+/// `rel` se compara por tokens, no como cadena entera: `rel="modulepreload"`
+/// puede venir acompañado, igual que ya pasa con `rel="preload stylesheet"` en
+/// `find_external_stylesheet_hrefs`.
+pub fn find_module_preloads(dom_root: &Arc<RwLock<Node>>) -> Vec<String> {
+    Node::find_all_by_tag(dom_root, "link")
+        .iter()
+        .filter_map(|link_node| {
+            let node = link_node.read().unwrap();
+            let NodeType::Element { attributes, .. } = &node.node_type else {
+                return None;
+            };
+            let es_modulepreload = attributes.get("rel").is_some_and(|rel| {
+                rel.split_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("modulepreload"))
+            });
+            if !es_modulepreload {
                 return None;
             }
             attributes.get("href").cloned()
@@ -244,9 +478,163 @@ pub fn find_image_srcs(dom_root: &Arc<RwLock<Node>>) -> Vec<String> {
         .collect()
 }
 
+/// Concatena el texto de cada `<style>` del documento, en orden - mismo
+/// bucle exacto que `build_page_keeping_runtime` usa internamente para
+/// construir `combined_css` (Fase 40: se necesita ANTES de esa llamada,
+/// para descubrir `url(...)` de `background-image` que hay que descargar
+/// primero). Quien llama decide si CSP permite `<style>` en linea
+/// (`csp.allows_inline("style-src")`) - esta funcion es pura y no sabe
+/// nada de CSP, igual que `find_image_srcs`.
+pub fn find_inline_style_css(dom_root: &Arc<RwLock<Node>>) -> String {
+    let mut combined = String::new();
+    for style_tag in &Node::find_all_by_tag(dom_root, "style") {
+        combined.push_str(&Node::text_content(style_tag));
+        combined.push('\n');
+    }
+    combined
+}
+
+/// Devuelve cada `url(...)` declarado en `background`/`background-image`
+/// del CSS ya ensamblado (Fase 40) - mismo patron que `find_image_srcs`:
+/// pura, sin red, quien llama (`core::server`) la resuelve/descarga/
+/// decodifica antes de construir el `ImageMap`, reusando exactamente el
+/// mismo mapa y el mismo `img-src` de CSP que ya gobierna `<img src>` (una
+/// imagen de fondo es tan "imagen" como un `<img>` para el spec de CSP).
+/// Solo lee `background-image` - ya viene expandida ahi tanto si el autor
+/// escribio el longhand como el shorthand `background: ... url(...) ...`
+/// (ver `engine_css::parser::insert_declaration`), asi que no hace falta
+/// mirar las dos claves por separado.
+pub fn find_background_image_urls(css: &str) -> Vec<String> {
+    let sheet = CssParser::parse(css);
+    sheet
+        .rules
+        .iter()
+        .filter_map(|rule| rule.declarations.get("background-image"))
+        .filter_map(|value| extract_url(value))
+        .collect()
+}
+
+/// Extrae la URL "desnuda" (sin `url(...)`/comillas) de un valor
+/// `background-image` ya expandido, p.ej. `url("x.png")` -> `x.png`.
+/// Mismo formato sin resolver que `find_image_srcs` usa para `src` de
+/// `<img>` - asi el mismo `ImageMap` (clave = string sin resolver) sirve
+/// para las dos fuentes de imagen sin distinguir de donde vino cada una.
+fn extract_url(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let start = lower.find("url(")?;
+    let after = &value[start + 4..];
+    let end = after.find(')')?;
+    let inner = after[..end].trim();
+    let inner = inner
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(inner);
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Color del primer `<p>` de una pagina construida con esa hoja externa marcada.
+    fn paragraph_color(html: &str, external_css: &str) -> String {
+        let page = build_page(html, external_css, 800.0, 600.0, None, &HashMap::new(), &ImageMap::new());
+        let p = Node::find_all_by_tag(&page.dom_root, "p").into_iter().next().expect("un <p>");
+        engine_css::resolve_style(&p, &page.stylesheet, 800.0).get("color").cloned().unwrap_or_default()
+    }
+
+    /// Un `<style>` que viene DESPUES de un `<link>` gana a igual especificidad
+    /// (antes todos los `<style>` iban primero y la hoja externa siempre ganaba).
+    #[test]
+    fn a_style_after_a_link_overrides_the_external_sheet() {
+        let external = wrap_sheet("tema.css", "p { color: #ff0000; }");
+        let html = r#"<html><head><link rel="stylesheet" href="tema.css"><style>p { color: #0000ff; }</style></head><body><p>x</p></body></html>"#;
+        assert_eq!(paragraph_color(html, &external), "#0000ff");
+    }
+
+    /// Y al reves: un `<style>` anterior al `<link>` pierde ante el.
+    #[test]
+    fn a_style_before_a_link_loses_to_the_external_sheet() {
+        let external = wrap_sheet("tema.css", "p { color: #ff0000; }");
+        let html = r#"<html><head><style>p { color: #0000ff; }</style><link rel="stylesheet" href="tema.css"></head><body><p>x</p></body></html>"#;
+        assert_eq!(paragraph_color(html, &external), "#ff0000");
+    }
+
+    #[test]
+    fn several_links_and_styles_interleave_in_document_order() {
+        let external = format!("{}{}", wrap_sheet("a.css", "p { color: #111111; }"), wrap_sheet("b.css", "p { color: #333333; }"));
+        let html = r#"<html><head><link rel="stylesheet" href="a.css"><style>p { color: #222222; }</style><link rel="stylesheet" href="b.css"></head><body><p>x</p></body></html>"#;
+        assert_eq!(paragraph_color(html, &external), "#333333", "la ultima en el documento");
+        let html = r#"<html><head><link rel="stylesheet" href="b.css"><link rel="stylesheet" href="a.css"><style>p { color: #222222; }</style></head><body><p>x</p></body></html>"#;
+        assert_eq!(paragraph_color(html, &external), "#222222");
+    }
+
+    /// CSS sin marca (el que entregan los tests) sigue yendo al final, como antes,
+    /// y una hoja marcada sin su `<link>` tampoco se pierde.
+    #[test]
+    fn unmarked_css_and_orphan_sheets_still_apply_after_the_documents_styles() {
+        let html = "<html><head><style>p { color: #0000ff; }</style></head><body><p>x</p></body></html>";
+        assert_eq!(paragraph_color(html, "p { color: #ff0000; }"), "#ff0000");
+        assert_eq!(paragraph_color(html, &wrap_sheet("huerfana.css", "p { color: #00ff00; }")), "#00ff00");
+    }
+
+    #[test]
+    fn sheet_markers_do_not_leak_and_a_sheet_cannot_forge_them() {
+        let wrapped = wrap_sheet("a.css", "p { color: red; }\u{3}\u{1}falso\u{2}x");
+        assert_eq!(strip_sheet_markers(&wrapped).trim(), "p { color: red; }falsox");
+        let (sheets, rest) = split_marked_sheets(&wrapped);
+        assert_eq!(sheets.len(), 1, "los separadores de dentro de la hoja se quitaron");
+        assert_eq!(rest.trim(), "");
+    }
+
+    #[test]
+    fn find_inline_style_css_concatenates_every_style_tag_in_order() {
+        let dom = HtmlParser::parse("<html><head><style>a{}</style></head><body><style>b{}</style></body></html>");
+        let css = find_inline_style_css(&dom);
+        assert_eq!(css, "a{}\nb{}\n");
+    }
+
+    #[test]
+    fn find_background_image_urls_reads_the_longhand_and_the_shorthand() {
+        let urls = find_background_image_urls(
+            "div { background-image: url(a.png); }\np { background: #fff url(\"b.png\") no-repeat; }",
+        );
+        assert_eq!(urls, vec!["a.png".to_string(), "b.png".to_string()]);
+    }
+
+    #[test]
+    fn find_background_image_urls_ignores_rules_without_one() {
+        let urls = find_background_image_urls("div { color: red; background-color: blue; }");
+        assert!(urls.is_empty());
+    }
+
+    /// Tarea 4.2 del plan: `load` se dispara tras `DOMContentLoaded`, tanto a
+    /// `window.addEventListener('load', ...)` como a `window.onload = ...`, y
+    /// despues de que hayan corrido todos los scripts. Antes no se disparaba
+    /// nunca.
+    #[test]
+    fn the_load_event_and_window_onload_fire_after_dom_content_loaded() {
+        let html = r#"<html><body><script>
+            var orden = [];
+            document.addEventListener('DOMContentLoaded', function() { orden.push('dcl'); });
+            window.addEventListener('load', function() { orden.push('load'); });
+            window.onload = function() { orden.push('onload'); };
+            orden.push('script');
+        </script></body></html>"#;
+        let (_page, mut runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+
+        assert_eq!(runtime.eval("orden.join(',')").unwrap(), "\"script,dcl,load,onload\"");
+    }
+
+    /// Un `window.onload` que lanza una excepcion no rompe la carga de la pagina.
+    #[test]
+    fn an_error_inside_window_onload_does_not_break_the_page() {
+        let html = r#"<html><body><p id="x">hola</p><script>window.onload = function() { throw new Error('roto'); };</script></body></html>"#;
+        let (page, _runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
+
+        assert_eq!(Node::find_all_by_tag(&page.dom_root, "p").len(), 1, "la pagina se construyo igual");
+    }
 
     #[test]
     fn build_page_runs_the_full_pipeline_without_opening_a_window_or_blocking() {
@@ -270,6 +658,41 @@ mod tests {
         let page = build_page("<html><body><script>1 + 2</script></body></html>", "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new());
         assert_eq!(page.script_results.len(), 1);
         assert_eq!(page.script_results[0].as_deref(), Ok("3"));
+    }
+
+    /// El snapshot que lee `getComputedStyle`/`getBoundingClientRect` tiene
+    /// que estar ya publicado CUANDO `DOMContentLoaded` se dispara - el
+    /// patron mas comun de arranque de una pagina real es precisamente un
+    /// listener de `DOMContentLoaded` leyendo una medida nada mas cargar.
+    /// Publicarlo un paso mas tarde (lo que hacia antes: `core::server`
+    /// publicaba de vuelta en su propio flujo, DESPUES de que este
+    /// pipeline ya hubiera disparado el evento) dejaba ese listener viendo
+    /// un `getComputedStyle` vacio.
+    #[test]
+    fn el_snapshot_de_layout_ya_esta_publicado_cuando_dispara_dom_content_loaded() {
+        let (_page, mut runtime) = build_page_keeping_runtime(
+            r#"<html><head><style>#p { color: rgb(1, 2, 3); width: 200px; }</style></head><body><p id="p">x</p>
+            <script>
+                var resultado = 'sin correr';
+                document.addEventListener('DOMContentLoaded', function () {
+                    var cs = getComputedStyle(document.getElementById('p'));
+                    resultado = cs.getPropertyValue('color') + '|' + cs.getPropertyValue('width');
+                });
+            </script></body></html>"#,
+            "",
+            800.0,
+            600.0,
+            None,
+            &HashMap::new(),
+            &ImageMap::new(),
+            None,
+            None,
+        );
+        let resultado = runtime.eval("resultado").expect("leer 'resultado' deberia ser JS valido");
+        assert_eq!(
+            resultado, "\"rgb(1, 2, 3)|200px\"",
+            "el listener de DOMContentLoaded deberia haber leido el color/ancho REALES, no un snapshot vacio"
+        );
     }
 
     /// `dom_root` y `script_results` deben venir del MISMO documento: un
@@ -324,7 +747,7 @@ mod tests {
 
     fn storage_context_with_csp(csp: engine_net::ContentSecurityPolicy) -> crate::scripting::StorageContext {
         crate::scripting::StorageContext {
-            storage: std::sync::Arc::new(std::sync::Mutex::new(engine_net::storage::WebStorage::new())),
+            storage: engine_net::LocalBroker::in_memory().shared(),
             origin: "https://ejemplo.test".to_string(),
             csp,
             url: "https://ejemplo.test/".to_string(),

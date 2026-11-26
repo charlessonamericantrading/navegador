@@ -45,37 +45,68 @@ use std::sync::{Arc, RwLock};
 /// `resolve_style` para poder invocarse dos veces con el mismo criterio de
 /// orden interno (especificidad) pero en dos momentos distintos (UA antes,
 /// autor despues), sin duplicar la logica de matching+orden entre ambas.
-fn apply_matching_rules(computed: &mut HashMap<String, String>, stylesheet: &StyleSheet, dom_node: &Arc<RwLock<Node>>, viewport_width: f32) {
-    let mut matched: Vec<&Rule> = stylesheet
-        .rules
-        .iter()
-        // `@media` (Fase 18): una regla que venia dentro de un bloque solo
-        // participa si su condicion se cumple con el viewport ACTUAL. Se
-        // comprueba aqui, en cada resolucion de estilo, y no al parsear,
-        // precisamente para que redimensionar la ventana vuelva a
-        // evaluarla - la hoja se parsea una sola vez por pagina, pero
-        // `resolve_style` corre en cada relayout.
-        .filter(|rule| rule.media.as_ref().is_none_or(|m| m.matches(viewport_width)))
-        .filter(|rule| SelectorMatcher::matches(&rule.selector, dom_node))
-        .collect();
-    matched.sort_by_key(|rule| SelectorMatcher::calculate_specificity(&rule.selector));
+fn apply_matching_rules(
+    computed: &mut HashMap<String, String>,
+    stylesheet: &StyleSheet,
+    dom_node: &Arc<RwLock<Node>>,
+    tag_name: &str,
+    id_attr: Option<&str>,
+    classes: &[&str],
+    viewport_width: f32,
+) {
+    let mut matched = if let Some(index) = stylesheet.index_if_current() {
+        let mut candidate_indices = Vec::new();
+        index.collect_candidates(tag_name, id_attr, classes, &mut candidate_indices);
+        let candidates: Vec<&Rule> = candidate_indices
+            .iter()
+            .map(|&idx| &stylesheet.rules[idx])
+            .filter(|rule| rule.media.as_ref().is_none_or(|m| m.matches(viewport_width)))
+            .collect();
+        let mut matched = SelectorMatcher::filter_matching_rules(&candidates, dom_node);
+        matched.sort_by_key(|rule| rule.specificity);
+        matched
+    } else {
+        // Respaldo conservador para hojas construidas a mano sin `build_index()`.
+        let candidates: Vec<&Rule> = stylesheet
+            .rules
+            .iter()
+            .filter(|rule| rule.media.as_ref().is_none_or(|m| m.matches(viewport_width)))
+            .filter(|rule| rule.key.could_match(tag_name, id_attr, classes))
+            .collect();
+        let mut matched = SelectorMatcher::filter_matching_rules(&candidates, dom_node);
+        matched.sort_by_key(|rule| SelectorMatcher::calculate_specificity(&rule.selector));
+        matched
+    };
+
+    if matched.is_empty() {
+        return;
+    }
 
     // DOS pasadas (Fase 22): primero las declaraciones normales por
     // especificidad, y luego las `!important` - tambien por especificidad
     // entre ellas. Asi una declaracion importante gana a CUALQUIER normal
     // sin importar su selector, que es justo lo que `!important` significa
     // y lo unico que no se puede expresar con un solo orden.
-    for rule in &matched {
+    let mut any_important = false;
+    for rule in &mut matched {
+        if !rule.important.is_empty() {
+            any_important = true;
+        }
         for (prop, val) in &rule.declarations {
             if !rule.important.contains(prop) {
                 computed.insert(prop.clone(), val.clone());
             }
         }
     }
-    for rule in &matched {
-        for (prop, val) in &rule.declarations {
-            if rule.important.contains(prop) {
-                computed.insert(prop.clone(), val.clone());
+    if any_important {
+        for rule in &matched {
+            if rule.important.is_empty() {
+                continue;
+            }
+            for (prop, val) in &rule.declarations {
+                if rule.important.contains(prop) {
+                    computed.insert(prop.clone(), val.clone());
+                }
             }
         }
     }
@@ -86,30 +117,115 @@ fn apply_matching_rules(computed: &mut HashMap<String, String>, stylesheet: &Sty
 /// como se evalua aqui y no al parsear, redimensionar reevalua las
 /// consultas sin necesidad de volver a parsear la hoja.
 pub fn resolve_style(dom_node: &Arc<RwLock<Node>>, stylesheet: &StyleSheet, viewport_width: f32) -> HashMap<String, String> {
+    let (is_element, tag_name, id_attr, class_attr, inline_style) = {
+        let n = dom_node.read().unwrap();
+        match &n.node_type {
+            NodeType::Element { tag_name, attributes } => (
+                true,
+                if tag_name.bytes().any(|b| b.is_ascii_uppercase()) {
+                    tag_name.to_ascii_lowercase()
+                } else {
+                    tag_name.clone()
+                },
+                attributes.get("id").cloned(),
+                attributes.get("class").cloned(),
+                attributes.get("style").cloned(),
+            ),
+            _ => (false, String::new(), None, None, None),
+        }
+    };
+    if !is_element {
+        return HashMap::new();
+    }
+    let classes: Vec<&str> = class_attr.as_deref().map(|c| c.split_whitespace().collect()).unwrap_or_default();
+
     let mut computed = HashMap::new();
 
     // Origen 1: agente de usuario - SIEMPRE pierde frente a lo que venga
     // despues, sin importar especificidad (ver doc-comment del modulo).
-    apply_matching_rules(&mut computed, user_agent_stylesheet(), dom_node, viewport_width);
+    apply_matching_rules(&mut computed, user_agent_stylesheet(), dom_node, &tag_name, id_attr.as_deref(), &classes, viewport_width);
+
+    // Atributos de presentacion (`bgcolor`, `width`, `cellpadding`...): CSS de
+    // especificidad cero que cae entre el agente de usuario y el autor (tarea
+    // 2.8). Cualquier regla de la pagina los vence.
+    for (property, value) in crate::presentational::presentational_hints(dom_node) {
+        computed.insert(property, value);
+    }
 
     // Origen 2: autor de la pagina - sobrescribe cualquier declaracion de
     // agente de usuario para la misma propiedad.
-    apply_matching_rules(&mut computed, stylesheet, dom_node, viewport_width);
+    apply_matching_rules(&mut computed, stylesheet, dom_node, &tag_name, id_attr.as_deref(), &classes, viewport_width);
 
-    let inline_style = {
-        let n = dom_node.read().unwrap();
-        match &n.node_type {
-            NodeType::Element { attributes, .. } => attributes.get("style").cloned(),
-            _ => None,
-        }
-    };
     if let Some(style_attr) = inline_style {
         for (prop, val) in CssParser::parse_inline_style(&style_attr) {
             computed.insert(prop, val);
         }
     }
 
+    merge_border_longhands(&mut computed);
     computed
+}
+
+const BORDER_STYLES: &[&str] = &["none", "hidden", "solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset"];
+
+/// Si un token es un ancho de borde (`1px`, `0`, `thin`...) y no un color o un estilo.
+fn is_border_width(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    matches!(lower.as_str(), "thin" | "medium" | "thick") || lower.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// `border-width`, `border-style` y `border-color` por separado se funden en el
+/// `border` que entienden el layout y el pintado (que solo leen esa propiedad).
+/// Es lo habitual en CSS real: `border: 1px solid #a2a9b1; border-color:
+/// transparent` (los botones "silenciosos" de Wikipedia) o `border-style: none`.
+/// Sin esto el motor dibujaba el borde del shorthand y se saltaba el resto.
+///
+/// Los `border-*` por lado (`border-bottom`...) siguen sin soportarse. Un estilo
+/// distinto de `solid` (`dashed`, `dotted`) se dibuja como solido.
+fn merge_border_longhands(computed: &mut HashMap<String, String>) {
+    let (width_longhand, style_longhand, color_longhand) = (computed.get("border-width").cloned(), computed.get("border-style").cloned(), computed.get("border-color").cloned());
+    if width_longhand.is_none() && style_longhand.is_none() && color_longhand.is_none() {
+        return;
+    }
+    let (mut width, mut style, mut color): (Option<String>, Option<String>, Option<String>) = (None, None, None);
+    if let Some(shorthand) = computed.get("border") {
+        for token in crate::parser::split_css_tokens(shorthand) {
+            let lower = token.to_ascii_lowercase();
+            if BORDER_STYLES.contains(&lower.as_str()) {
+                style = Some(lower);
+            } else if is_border_width(token) {
+                width = Some(token.to_string());
+            } else {
+                color = Some(token.to_string());
+            }
+        }
+    }
+    let first = |value: &str| crate::parser::split_css_tokens(value).into_iter().next().map(str::to_string);
+    if let Some(value) = width_longhand.as_deref().and_then(first) {
+        width = Some(value);
+    }
+    if let Some(value) = style_longhand.as_deref().and_then(first) {
+        style = Some(value.to_ascii_lowercase());
+    }
+    if let Some(value) = color_longhand.as_deref().and_then(first) {
+        color = Some(value);
+    }
+    if !style.as_deref().is_some_and(|s| BORDER_STYLES.contains(&s) && s != "none" && s != "hidden") {
+        computed.remove("border");
+        return;
+    }
+    let width = match width.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("thin") => "1px".to_string(),
+        Some("medium") | None => "3px".to_string(),
+        Some("thick") => "5px".to_string(),
+        Some(_) => width.unwrap_or_default(),
+    };
+    let mut value = format!("{width} solid");
+    if let Some(color) = color {
+        value.push(' ');
+        value.push_str(&color);
+    }
+    computed.insert("border".to_string(), value);
 }
 
 #[cfg(test)]
@@ -135,6 +251,89 @@ mod tests {
 
         let computed = resolve_style(&p, &stylesheet, 1280.0);
         assert_eq!(computed.get("color").map(String::as_str), Some("#ff0000"));
+    }
+
+    fn style_of(html: &str, tag: &str, css: &str) -> HashMap<String, String> {
+        let dom = HtmlParser::parse(html);
+        let stylesheet = Parser::parse(css);
+        resolve_style(&find_first_element(&dom, tag), &stylesheet, 1280.0)
+    }
+
+    /// Tarea 2.8: los atributos HTML de presentacion cuentan como CSS.
+    #[test]
+    fn presentational_attributes_become_css() {
+        let table = style_of(
+            r##"<html><body><table width="85%" bgcolor="#f6f6ef" border="2" cellspacing="3"><tr><td>x</td></tr></table></body></html>"##,
+            "table",
+            "",
+        );
+        assert_eq!(table.get("width").map(String::as_str), Some("85%"));
+        assert_eq!(table.get("background-color").map(String::as_str), Some("#f6f6ef"));
+        assert_eq!(table.get("border").map(String::as_str), Some("2px solid #808080"));
+        assert_eq!(table.get("border-spacing").map(String::as_str), Some("3px"));
+
+        let td = style_of(r##"<html><body><table cellpadding="5" border="1"><tr><td bgcolor="ff6600" width="40">x</td></tr></table></body></html>"##, "td", "");
+        assert_eq!(td.get("background-color").map(String::as_str), Some("#ff6600"), "bgcolor sin almohadilla");
+        assert_eq!(td.get("width").map(String::as_str), Some("40px"), "un numero suelto son pixeles");
+        assert_eq!(td.get("padding-left").map(String::as_str), Some("5px"), "cellpadding de la tabla, en cada lado");
+        assert_eq!(td.get("padding-top").map(String::as_str), Some("5px"));
+        assert_eq!(td.get("border").map(String::as_str), Some("1px solid #808080"), "las celdas heredan el borde de la tabla");
+    }
+
+    /// El CSS de la pagina siempre gana a un atributo de presentacion.
+    #[test]
+    fn author_css_beats_presentational_attributes() {
+        let table = style_of(
+            r##"<html><body><table width="85%" bgcolor="#f6f6ef"><tr><td>x</td></tr></table></body></html>"##,
+            "table",
+            "table { width: 300px; background-color: #000000; }",
+        );
+        assert_eq!(table.get("width").map(String::as_str), Some("300px"));
+        assert_eq!(table.get("background-color").map(String::as_str), Some("#000000"));
+    }
+
+    #[test]
+    fn presentational_attributes_beat_the_user_agent_sheet() {
+        let td = style_of(r##"<html><body><table cellpadding="0"><tr><td>x</td></tr></table></body></html>"##, "td", "");
+        assert_eq!(td.get("padding-left").map(String::as_str), Some("0px"), "cellpadding=0 gana a la regla de padding de td del agente de usuario");
+    }
+
+    #[test]
+    fn align_and_center_and_font_attributes() {
+        let p = style_of(r##"<html><body><p align="center">x</p></body></html>"##, "p", "");
+        assert_eq!(p.get("text-align").map(String::as_str), Some("center"));
+
+        let table = style_of(r##"<html><body><center><table><tr><td>x</td></tr></table></center></body></html>"##, "table", "");
+        assert_eq!(table.get("margin-left").map(String::as_str), Some("auto"), "una tabla dentro de <center> se centra");
+        assert_eq!(table.get("margin-right").map(String::as_str), Some("auto"));
+
+        let font = style_of(r##"<html><body><font color="#828282" size="1">x</font></body></html>"##, "font", "");
+        assert_eq!(font.get("color").map(String::as_str), Some("#828282"));
+        assert_eq!(font.get("font-size").map(String::as_str), Some("10px"));
+    }
+
+    #[test]
+    fn nonsense_attribute_values_are_ignored() {
+        let table = style_of(r##"<html><body><table width="abc" bgcolor="zz!!" border="x"><tr><td>x</td></tr></table></body></html>"##, "table", "");
+        assert_eq!(table.get("width"), None);
+        assert_eq!(table.get("background-color"), None);
+        assert_eq!(table.get("border"), None);
+    }
+
+    /// `border-color: transparent` y compañia se funden con el shorthand: el
+    /// layout y el pintado solo leen `border`.
+    #[test]
+    fn border_longhands_are_merged_into_the_border_the_engine_reads() {
+        let border = |css: &str| style_of("<html><body><a>x</a></body></html>", "a", css).get("border").cloned();
+
+        assert_eq!(border("a { border: 1px solid #a2a9b1; border-color: transparent; }").as_deref(), Some("1px solid transparent"), "el color de la longhand gana");
+        assert_eq!(border("a { border: 1px solid red; border-style: none; }"), None, "border-style: none anula el borde");
+        assert_eq!(border("a { border: 1px solid red; border-width: 0; }").as_deref(), Some("0 solid red"), "ancho 0 se conserva (no ocupa nada)");
+        assert_eq!(border("a { border: 1px solid red; border-width: 4px; }").as_deref(), Some("4px solid red"));
+        assert_eq!(border("a { border-width: 2px; border-style: solid; border-color: rgba(0, 0, 0, .5); }").as_deref(), Some("2px solid rgba(0, 0, 0, .5)"), "solo con longhands");
+        assert_eq!(border("a { border-width: 2px; border-color: red; }"), None, "sin estilo no hay borde (el valor inicial es none)");
+        assert_eq!(border("a { border-style: dashed; }").as_deref(), Some("3px solid"), "ancho medium por defecto; dashed se dibuja solido");
+        assert_eq!(border("a { border: thin solid blue; }").as_deref(), Some("thin solid blue"), "sin longhands no se toca el shorthand");
     }
 
     #[test]
@@ -287,5 +486,57 @@ mod tests {
             Some("#00ff00"),
             "el longhand mas especifico deberia ganar sobre el shorthand menos especifico, aunque sean propiedades 'distintas' a nivel de string"
         );
+    }
+
+    #[test]
+    fn indexed_cascade_preserves_document_order_without_duplicates_for_selector_lists() {
+        let dom = HtmlParser::parse(r#"<html><body><a id="cta" class="btn primary" href="/go">ir</a></body></html>"#);
+        let stylesheet = Parser::parse(
+            "a, .btn, #cta { color: #111111; } \
+             a[href]:not(.disabled) { background-color: #222222; } \
+             a.primary, .btn { color: #333333; } \
+             a::before { color: #ff0000; }",
+        );
+        let a = find_first_element(&dom, "a");
+        let computed = resolve_style(&a, &stylesheet, 1280.0);
+        // `#cta` en la primera regla tiene especificidad de ID (1,0,0) > (0,2,0) de la tercera,
+        // pero si hubiese empate debe ganar la posterior en documento; aqui `#cta` gana por ID.
+        assert_eq!(computed.get("color").map(String::as_str), Some("#111111"));
+        assert_eq!(computed.get("background-color").map(String::as_str), Some("#222222"));
+
+        // Empate de especificidad entre dos reglas que entran por ramas distintas (`a` y `.btn`):
+        let empate = Parser::parse("a, #otro { color: #111111; } .btn, #ninguno { color: #444444; }");
+        let comp2 = resolve_style(&a, &empate, 1280.0);
+        assert_eq!(comp2.get("color").map(String::as_str), Some("#444444"));
+    }
+
+    #[test]
+    fn dynamic_hover_and_focus_pseudo_classes_follow_node_interaction_state() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="wrap"><a id="link" href="/x">ir</a><input id="txt" type="text"></div></body></html>"#);
+        let stylesheet = Parser::parse(
+            "a { color: #111111; } a:hover { color: #222222; } \
+             #wrap:hover { background-color: #fafafa; } \
+             input:focus { border: 2px solid #1a73e8; } \
+             #wrap:focus-within { background-color: #eef5ff; }",
+        );
+        assert!(stylesheet.has_hover_rules());
+        assert!(stylesheet.has_focus_rules());
+
+        let wrap = Node::find_by_id(&dom, "wrap").unwrap();
+        let link = Node::find_by_id(&dom, "link").unwrap();
+        let txt = Node::find_by_id(&dom, "txt").unwrap();
+
+        assert_eq!(resolve_style(&link, &stylesheet, 1280.0).get("color").map(String::as_str), Some("#111111"));
+        assert_eq!(resolve_style(&wrap, &stylesheet, 1280.0).get("background-color"), None);
+
+        for ancestor in Node::ancestors(&link) {
+            ancestor.write().unwrap().hovered = true;
+        }
+        assert_eq!(resolve_style(&link, &stylesheet, 1280.0).get("color").map(String::as_str), Some("#222222"));
+        assert_eq!(resolve_style(&wrap, &stylesheet, 1280.0).get("background-color").map(String::as_str), Some("#fafafa"));
+
+        txt.write().unwrap().focused = true;
+        assert_eq!(resolve_style(&txt, &stylesheet, 1280.0).get("border").map(String::as_str), Some("2px solid #1a73e8"));
+        assert_eq!(resolve_style(&wrap, &stylesheet, 1280.0).get("background-color").map(String::as_str), Some("#eef5ff"));
     }
 }

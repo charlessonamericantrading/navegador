@@ -1,0 +1,45 @@
+<!doctype html><html><head><meta charset="utf-8"><title>PENDIENTE</title>
+<script>
+function ok(cond, motivo) { document.title = cond ? 'OK' : 'FALLO: ' + motivo; }
+function fallo(e) { document.title = 'FALLO: ' + (e && e.message ? e.message : String(e)); }
+</script></head><body>
+<div id="app"></div>
+<script>
+// Un framework de juguete: vista como funcion del estado, diff contra el DOM
+// existente con los mismos metodos que usan Preact o Vue.
+try {
+  function h(tag, props, hijos) { return { tag: tag, props: props || {}, hijos: hijos || [] }; }
+  function crear(v) {
+    if (typeof v === 'string') return document.createTextNode(v);
+    var el = document.createElement(v.tag);
+    for (var k in v.props) el.setAttribute(k, v.props[k]);
+    v.hijos.forEach(function (h) { el.appendChild(crear(h)); });
+    return el;
+  }
+  function parchear(padre, nuevo, viejo, i) {
+    var nodo = padre.childNodes[i];
+    if (viejo === undefined) { padre.appendChild(crear(nuevo)); return; }
+    if (typeof nuevo === 'string' || typeof viejo === 'string' || nuevo.tag !== viejo.tag) {
+      if (nuevo !== viejo) padre.replaceChild(crear(nuevo), nodo);
+      return;
+    }
+    var n = Math.max(nuevo.hijos.length, viejo.hijos.length);
+    for (var j = 0; j < n; j++) parchear(nodo, nuevo.hijos[j], viejo.hijos[j], j);
+  }
+  function vista(estado) {
+    return h('div', { 'class': 'contador' }, [h('span', null, ['Cuenta: ' + estado.n]), h('button', null, ['+'])]);
+  }
+  var app = document.getElementById('app');
+  var anterior = vista({ n: 0 });
+  parchear(app, anterior, undefined, 0);
+  var boton = app.querySelector('button');
+  for (var k = 1; k <= 3; k++) {
+    var siguiente = vista({ n: k });
+    parchear(app, siguiente, anterior, 0);
+    anterior = siguiente;
+  }
+  var texto = app.querySelector('span').textContent;
+  ok(texto === 'Cuenta: 3' && app.querySelector('button') === boton, 'texto=' + texto + ', boton conservado=' + (app.querySelector('button') === boton));
+} catch (e) { fallo(e); }
+</script>
+</body></html>

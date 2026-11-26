@@ -1,0 +1,18 @@
+{
+  "descripcion": "Corpus inicial del plan (tarea 14, F25/F39). Cada entrada es una TAREA con criterio observable: la pagina pone document.title = 'OK' solo si su tarea funciono; cualquier otro titulo es un fallo y se conserva con su motivo. Sin red externa: todo se sirve en local.",
+  "version": 1,
+  "fixtures": [
+    { "id": "estatica", "ruta": "estatica.html", "categoria": "carga", "espera": "Página estática" },
+    { "id": "formulario", "ruta": "formulario.html", "categoria": "carga", "espera": "Formulario", "interactivosMinimos": 4 },
+    { "id": "construir-dom", "ruta": "construir-dom.html", "categoria": "dom", "espera": "OK" },
+    { "id": "recorrer-nodos", "ruta": "recorrer-nodos.html", "categoria": "dom", "espera": "OK" },
+    { "id": "mini-framework", "ruta": "mini-framework.html", "categoria": "framework", "espera": "OK" },
+    { "id": "modulos-es", "ruta": "modulos-es.html", "categoria": "scripts", "espera": "OK" },
+    { "id": "js-moderno", "ruta": "js-moderno.html", "categoria": "scripts", "espera": "OK" },
+    { "id": "temporizador", "ruta": "temporizador.html", "categoria": "event-loop", "espera": "OK" },
+    { "id": "fetch-json", "ruta": "fetch-json.html", "categoria": "red", "espera": "OK" },
+    { "id": "almacenamiento", "ruta": "almacenamiento.html", "categoria": "datos", "espera": "OK" },
+    { "id": "eventos", "ruta": "eventos.html", "categoria": "eventos", "espera": "OK" },
+    { "id": "observadores", "ruta": "observadores.html", "categoria": "framework", "espera": "OK" }
+  ]
+}

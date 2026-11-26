@@ -55,7 +55,7 @@
 //! (invocado como si fuera JS) en vez de reinventar un parser JSON propio.
 
 use boa_engine::{
-    job::NativeJob,
+    job::{Job, NativeAsyncJob},
     js_string,
     object::{builtins::JsPromise, ObjectInitializer},
     property::{Attribute, PropertyKey},
@@ -63,8 +63,7 @@ use boa_engine::{
 };
 use boa_gc::{Finalize, Trace};
 use engine_net::request::Method;
-use engine_net::{NetworkEngine, NetworkRequest, NetworkResponse};
-use std::sync::Arc;
+use engine_net::{NetworkRequest, NetworkResponse, SharedBroker};
 
 /// El metodo HTTP que pidio `options.method`, traducido al enum de
 /// `engine-net` - mismo criterio que `xhr::parse_method` (un metodo que
@@ -153,7 +152,7 @@ fn apply_fetch_options(request: &mut NetworkRequest, options: FetchOptions) {
     }
 }
 
-/// Envoltorio `Trace`-able sobre `Arc<NetworkEngine>` - las "captures" de
+/// Envoltorio `Trace`-able sobre `SharedBroker` - las "captures" de
 /// `NativeFunction::from_copy_closure_with_captures` deben implementar
 /// `Trace` (el recolector de basura de Boa necesita saber que recorrer),
 /// pero `NetworkEngine` no contiene NINGUN valor de Boa (`JsValue`/
@@ -161,7 +160,7 @@ fn apply_fetch_options(request: &mut NetworkRequest, options: FetchOptions) {
 /// completo al heap de Boa. `empty_trace!()` declara "nada que recorrer
 /// aqui", que es la verdad, no un atajo inseguro.
 #[derive(Clone)]
-struct NetworkCapture(Arc<NetworkEngine>, Option<String>);
+struct NetworkCapture(SharedBroker, Option<String>);
 
 impl Finalize for NetworkCapture {}
 unsafe impl Trace for NetworkCapture {
@@ -186,7 +185,7 @@ unsafe impl Trace for BodyCapture {
 /// (el mismo `NetworkEngine` que usa el resto del motor - reusa su cliente
 /// HTTP/pool de conexiones ya construido, no crea uno nuevo). Ver el
 /// doc-comment del modulo para las simplificaciones declaradas.
-pub fn register_fetch(context: &mut Context, network: Arc<NetworkEngine>, page_origin: Option<String>) -> JsResult<()> {
+pub fn register_fetch(context: &mut Context, network: SharedBroker, page_origin: Option<String>) -> JsResult<()> {
     let capture = NetworkCapture(network, page_origin);
     let fetch_fn = NativeFunction::from_copy_closure_with_captures(
         |_this, args, capture, context| {
@@ -205,7 +204,7 @@ pub fn register_fetch(context: &mut Context, network: Arc<NetworkEngine>, page_o
             // sin tocar la red en absoluto.
             if options.body.is_some() && matches!(options.method, Method::Get | Method::Head) {
                 let js_error: JsError = JsNativeError::typ().with_message("Failed to execute 'fetch': Request with GET/HEAD method cannot have body").into();
-                let opaque = js_error.to_opaque(context);
+                let opaque = js_error.into_opaque(context)?;
                 resolvers.reject.call(&JsValue::undefined(), &[opaque], context)?;
                 return Ok(promise.into());
             }
@@ -221,40 +220,38 @@ pub fn register_fetch(context: &mut Context, network: Arc<NetworkEngine>, page_o
                 Some(Ok(request)) => request,
                 _ => {
                     let js_error: JsError = JsNativeError::typ().with_message(format!("Failed to fetch '{url}': URL invalida")).into();
-                    let opaque = js_error.to_opaque(context);
+                    let opaque = js_error.into_opaque(context)?;
                     resolvers.reject.call(&JsValue::undefined(), &[opaque], context)?;
                     return Ok(promise.into());
                 }
             };
 
             let network = capture.0.clone();
-            // El future en si SOLO hace trabajo Rust puro (peticion HTTP
-            // real) - construir el objeto `Response` de verdad necesita
-            // `Context`, que no puede vivir dentro de un future generico
-            // (no es `Send`/`'static` de esa forma) - por eso se difiere a
-            // el `NativeJob` que este mismo future produce como resultado,
-            // ejecutado DESPUES con acceso real a `context` (mismo patron
-            // que usa `JsPromise::from_future` internamente, adaptado a
-            // mano porque necesitamos construir un objeto rico, no solo un
-            // valor primitivo).
-            let future = async move {
+            // Boa 0.22: la peticion es un trabajo asincrono (`NativeAsyncJob`).
+            // La parte de red es Rust puro; construir el objeto `Response`
+            // necesita el `Context`, que el ejecutor presta al trabajo por un
+            // `RefCell` una vez termina la espera. (En 0.19 esto era un
+            // future que devolvia un `NativeJob` para la cola.)
+            let job = NativeAsyncJob::new(async move |ctx: &std::cell::RefCell<&mut Context>| {
                 let result = network.fetch(&request).await;
-                NativeJob::new(move |context| match result {
+                let mut guard = ctx.borrow_mut();
+                let context: &mut Context = &mut guard;
+                match result {
                     Ok(response) => match build_response_object(&response, context) {
                         Ok(js_response) => resolvers.resolve.call(&JsValue::undefined(), &[js_response], context),
                         Err(error) => {
-                            let opaque = error.to_opaque(context);
+                            let opaque = error.into_opaque(context)?;
                             resolvers.reject.call(&JsValue::undefined(), &[opaque], context)
                         }
                     },
                     Err(error) => {
                         let js_error: JsError = JsNativeError::typ().with_message(format!("Failed to fetch '{url}': {error}")).into();
-                        let opaque = js_error.to_opaque(context);
+                        let opaque = js_error.into_opaque(context)?;
                         resolvers.reject.call(&JsValue::undefined(), &[opaque], context)
                     }
-                })
-            };
-            context.job_queue().enqueue_future_job(Box::pin(future), context);
+                }
+            });
+            context.enqueue_job(Job::AsyncJob(job));
 
             Ok(promise.into())
         },
@@ -278,10 +275,10 @@ fn build_response_object(response: &NetworkResponse, context: &mut Context) -> J
 
     let text_fn = NativeFunction::from_copy_closure_with_captures(
         |_this, _args, body, context| match &body.0 {
-            Ok(text) => Ok(JsPromise::resolve(js_string!(text.clone()), context).into()),
+            Ok(text) => Ok(JsPromise::resolve(js_string!(text.clone()), context)?.into()),
             Err(message) => {
                 let js_error: JsError = JsNativeError::typ().with_message(message.clone()).into();
-                Ok(JsPromise::reject(js_error, context).into())
+                Ok(JsPromise::reject(js_error, context)?.into())
             }
         },
         body.clone(),
@@ -293,7 +290,7 @@ fn build_response_object(response: &NetworkResponse, context: &mut Context) -> J
                 Ok(text) => text,
                 Err(message) => {
                     let js_error: JsError = JsNativeError::typ().with_message(message.clone()).into();
-                    return Ok(JsPromise::reject(js_error, context).into());
+                    return Ok(JsPromise::reject(js_error, context)?.into());
                 }
             };
             // Reusa el `JSON.parse` REAL de Boa (invocandolo como haria
@@ -306,11 +303,11 @@ fn build_response_object(response: &NetworkResponse, context: &mut Context) -> J
             let parse_fn = json_global
                 .as_object()
                 .and_then(|obj| obj.get(js_string!("parse"), context).ok())
-                .and_then(|v| v.as_callable().cloned())
+                .and_then(|v| v.as_callable())
                 .ok_or_else(|| JsNativeError::typ().with_message("JSON.parse no deberia faltar en un Context real"))?;
             match parse_fn.call(&JsValue::undefined(), &[js_string!(text.clone()).into()], context) {
-                Ok(parsed) => Ok(JsPromise::resolve(parsed, context).into()),
-                Err(error) => Ok(JsPromise::reject(error, context).into()),
+                Ok(parsed) => Ok(JsPromise::resolve(parsed, context)?.into()),
+                Err(error) => Ok(JsPromise::reject(error, context)?.into()),
             }
         },
         body,
@@ -359,10 +356,10 @@ mod tests {
 
     fn call_promise_method(context: &mut Context, response_value: &JsValue, method: &str) -> JsPromise {
         let obj = response_value.as_object().expect("response deberia ser un objeto");
-        let method_fn = obj.get(js_string!(method), context).expect("deberia existir la propiedad").as_callable().cloned().expect("deberia ser invocable");
+        let method_fn = obj.get(js_string!(method), context).expect("deberia existir la propiedad").as_callable().expect("deberia ser invocable");
         let result = method_fn.call(response_value, &[], context).expect("la llamada no deberia fallar");
         let promise = JsPromise::from_object(result.as_object().expect("deberia devolver una promise").clone()).expect("deberia ser una promise real");
-        context.run_jobs();
+        context.run_jobs().expect("los trabajos pendientes no deberian fallar");
         promise
     }
 
@@ -446,7 +443,7 @@ mod tests {
     #[test]
     fn fetch_is_registered_as_a_real_global_function() {
         let mut context = Context::default();
-        register_fetch(&mut context, Arc::new(NetworkEngine::new()), None).unwrap();
+        register_fetch(&mut context, engine_net::LocalBroker::in_memory().shared(), None).unwrap();
         let result = context.eval(Source::from_bytes("typeof fetch")).unwrap();
         assert_eq!(result.to_string(&mut context).unwrap().to_std_string_escaped(), "function");
     }
@@ -457,10 +454,10 @@ mod tests {
     #[test]
     fn fetch_with_an_invalid_url_rejects_without_touching_the_network() {
         let mut context = Context::default();
-        register_fetch(&mut context, Arc::new(NetworkEngine::new()), None).unwrap();
+        register_fetch(&mut context, engine_net::LocalBroker::in_memory().shared(), None).unwrap();
         let result = context.eval(Source::from_bytes("fetch('esto no es una url')")).unwrap();
         let promise = JsPromise::from_object(result.as_object().unwrap().clone()).unwrap();
-        context.run_jobs();
+        context.run_jobs().expect("los trabajos pendientes no deberian fallar");
         assert!(matches!(promise.state(), PromiseState::Rejected(_)));
     }
 
@@ -552,10 +549,10 @@ mod tests {
     #[test]
     fn a_get_request_with_a_body_rejects_synchronously_without_touching_the_network() {
         let mut context = Context::default();
-        register_fetch(&mut context, Arc::new(NetworkEngine::new()), None).unwrap();
+        register_fetch(&mut context, engine_net::LocalBroker::in_memory().shared(), None).unwrap();
         let result = context.eval(Source::from_bytes("fetch('https://ejemplo.test/', {method: 'GET', body: 'no deberia llevar cuerpo'})")).unwrap();
         let promise = JsPromise::from_object(result.as_object().unwrap().clone()).unwrap();
-        context.run_jobs();
+        context.run_jobs().expect("los trabajos pendientes no deberian fallar");
         assert!(matches!(promise.state(), PromiseState::Rejected(_)), "GET con body deberia rechazar de inmediato, sin llegar a encolar ninguna peticion de red");
     }
 }

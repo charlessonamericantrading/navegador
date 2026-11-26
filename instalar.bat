@@ -1,64 +1,44 @@
 @echo off
-title Instalar Navegador para Agentes de IA
-echo ===================================================
-echo   Instalador del Navegador para Agentes de IA
-echo ===================================================
-echo.
-
-:: Verificar si Node.js está instalado
-node -v >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [ERROR] Node.js no esta instalado o no se encuentra en el PATH.
-    echo Por favor, instala Node.js (se recomienda la version LTS) antes de continuar.
-    echo Abriendo la pagina de descarga de Node.js...
-    start https://nodejs.org/
-    pause
-    exit /b
+title Instalar el Navegador
+setlocal
+set "REL=%~dp0engine\target\release"
+set "FORZAR="
+if /i "%~1"=="--recompilar" (
+    set "FORZAR=1"
+    shift
 )
 
-:: Verificar si Python está instalado
-python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [ERROR] Python no esta instalado o no se encuentra en el PATH.
-    echo Por favor, instala Python 3.10 o superior (y marca la opcion "Add Python to PATH").
-    echo Abriendo la pagina de descarga de Python...
-    start https://www.python.org/downloads/
-    pause
-    exit /b
-)
+if defined FORZAR goto compilar
+if not exist "%REL%\navegador.exe" goto compilar
+if not exist "%REL%\instalador.exe" goto compilar
+goto instalar
 
-echo [1/3] Instalando dependencias de Node en la raiz...
-call npm install
-if %errorlevel% neq 0 (
-    echo [ERROR] Fallo la instalacion de dependencias raiz.
-    pause
-    exit /b
-)
-
-echo [2/3] Ejecutando instalacion completa (Frontend, Backend y Electron)...
-echo Esto puede tomar unos minutos mientras se descargan las librerias...
-call npm run install:all
-if %errorlevel% neq 0 (
-    echo [ERROR] Fallo la instalacion de las dependencias de la aplicacion.
-    pause
-    exit /b
-)
-
-echo [3/3] Creando acceso directo de ejecucion...
-(
-echo @echo off
-echo title Iniciar Navegador para Agentes de IA
-echo cd /d "%%~dp0"
-echo echo Iniciando aplicacion...
-echo call npm start
-) > iniciar.bat
-
-echo.
+:compilar
 echo ===================================================
-echo   ¡Instalacion completada con exito!
+echo   Compilar e instalar el Navegador (100%% Rust)
 echo ===================================================
 echo.
-echo Ahora puedes hacer doble clic en el archivo "iniciar.bat"
-echo en esta misma carpeta para arrancar la aplicacion.
-echo.
-pause
+cargo --version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [ERROR] Rust no esta instalado o cargo no esta en el PATH.
+    echo Instala Rust desde https://rustup.rs/ y vuelve a ejecutar este archivo.
+    start https://rustup.rs/
+    pause
+    exit /b 1
+)
+echo Compilando el navegador y el instalador (la primera vez tarda unos minutos)...
+cargo build --release --locked --manifest-path "%~dp0engine\Cargo.toml" --bin navegador --bin instalador
+if %errorlevel% neq 0 (
+    echo [ERROR] No se pudo compilar el navegador.
+    pause
+    exit /b 1
+)
+
+:instalar
+"%REL%\instalador.exe" --origen "%REL%\navegador.exe" %1 %2 %3 %4
+if %errorlevel% neq 0 (
+    echo [ERROR] Fallo al instalar el navegador.
+    pause
+    exit /b 1
+)
+exit /b 0
