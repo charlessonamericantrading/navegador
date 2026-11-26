@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+fn default_scale() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EngineRequest {
@@ -23,6 +27,8 @@ pub enum EngineRequest {
         id: Option<String>,
         width: u32,
         height: u32,
+        #[serde(default = "default_scale")]
+        scale: f32,
     },
     GetState {
         id: Option<String>,
@@ -320,10 +326,19 @@ mod tests {
                 .expect("resize request should parse");
 
         match request {
-            EngineRequest::Resize { id, width, height } => {
+            EngineRequest::Resize { id, width, height, scale } => {
                 assert_eq!(id.as_deref(), Some("r1"));
                 assert_eq!((width, height), (900, 600));
+                assert_eq!(scale, 1.0);
             }
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let with_scale: EngineRequest =
+            serde_json::from_str(r#"{"type":"resize","id":"r2","width":900,"height":600,"scale":1.5}"#)
+                .expect("resize request with scale should parse");
+        match with_scale {
+            EngineRequest::Resize { scale, .. } => assert_eq!(scale, 1.5),
             other => panic!("unexpected request: {other:?}"),
         }
     }

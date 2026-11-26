@@ -5,12 +5,13 @@
 use crate::barra::{self, Accion, BarraPintada, Pestana, VistaBarra, ALTO_BARRA};
 use crate::lienzo::{self, Lienzo};
 use crate::motor::{Elemento, Estado, MensajeMotor};
+use crate::portapapeles::Portapapeles;
 use crate::{direccion, paginas};
 use engine_layout::ImageMap;
 use engine_text::FontSet;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use tiny_skia::{Color, Pixmap, PixmapPaint, Transform};
+use tiny_skia::{Color, FilterQuality, Pixmap, PixmapPaint, Transform};
 
 /// Píxeles por línea de la rueda del ratón.
 pub const PIXELES_POR_LINEA: f32 = 48.0;
@@ -46,6 +47,13 @@ pub struct Modificadores {
     pub shift: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorTipo {
+    Normal,
+    Mano,
+    Texto,
+}
+
 #[derive(Debug, Clone)]
 pub enum Entrada {
     /// Clic izquierdo en coordenadas de la ventana.
@@ -54,6 +62,7 @@ pub enum Entrada {
     Rueda { dy: f32 },
     Tecla { tecla: Tecla, mods: Modificadores },
     Tamano { ancho: u32, alto: u32 },
+    Escala(f32),
     Motor(MensajeMotor),
 }
 
@@ -81,6 +90,7 @@ struct Campo {
 pub struct App {
     ancho: u32,
     alto: u32,
+    escala: f32,
     pestanas: Vec<Pestana>,
     activa: u32,
     pagina: Option<Pixmap>,
@@ -105,17 +115,26 @@ pub struct App {
     en_vuelo: std::collections::HashSet<String>,
     fuentes: FontSet,
     iconos: ImageMap,
-    barra: Option<(VistaBarra, u32, BarraPintada)>,
-    local: Option<(String, u32, u32, Lienzo)>,
+    barra: Option<(VistaBarra, u32, u32, BarraPintada)>,
+    local: Option<(String, u32, u32, u32, Lienzo)>,
     mostrando_local: bool,
+    portapapeles: Portapapeles,
 }
 
 impl App {
-    /// Crea la app y devuelve lo primero que hay que pedir al motor.
+    /// Crea la app a escala 1x y devuelve lo primero que hay que pedir al motor.
     pub fn nueva(ancho: u32, alto: u32, inicial: Option<String>) -> (Self, Vec<Value>) {
+        Self::nueva_con_escala(ancho, alto, 1.0, inicial)
+    }
+
+    /// Crea la app con la escala física de pantalla (`1.25`, `2.0`...) para
+    /// rasterizar textos, iconos y páginas con nitidez nativa.
+    pub fn nueva_con_escala(ancho: u32, alto: u32, escala: f32, inicial: Option<String>) -> (Self, Vec<Value>) {
+        let escala = normalizar_escala(escala);
         let mut app = Self {
             ancho: ancho.max(1),
             alto: alto.max(1),
+            escala,
             pestanas: vec![Pestana { id: 0, titulo: String::new(), url: String::new() }],
             activa: 0,
             pagina: None,
@@ -136,10 +155,11 @@ impl App {
             siguiente_id: 0,
             en_vuelo: std::collections::HashSet::new(),
             fuentes: FontSet::load_default_sans_serif(),
-            iconos: barra::iconos(),
+            iconos: barra::iconos_con_escala(escala),
             barra: None,
             local: None,
             mostrando_local: false,
+            portapapeles: Portapapeles::Sistema,
         };
         let mut salida = Salida::default();
         app.pedir_tamano(&mut salida);
@@ -202,6 +222,36 @@ impl App {
     pub fn scroll_y(&self) -> f32 {
         self.scroll_y
     }
+    pub fn escala(&self) -> f32 {
+        self.escala
+    }
+    pub fn cursor_en(&self, x: f32, y: f32) -> CursorTipo {
+        if y < ALTO_BARRA as f32 {
+            return match self.barra.as_ref().and_then(|(_, _, _, b)| b.accion_en(x, y)) {
+                Some(Accion::Direccion) => CursorTipo::Texto,
+                Some(Accion::Atras) => if self.puede_atras { CursorTipo::Mano } else { CursorTipo::Normal },
+                Some(Accion::Adelante) => if self.puede_adelante { CursorTipo::Mano } else { CursorTipo::Normal },
+                Some(_) => CursorTipo::Mano,
+                None => CursorTipo::Normal,
+            };
+        }
+        let (cx, cy) = (x, y - ALTO_BARRA as f32);
+        if self.mostrando_local {
+            return if self.local.as_ref().and_then(|(_, _, _, _, l)| lienzo::accion_en(&l.regiones, cx, cy)).is_some() {
+                CursorTipo::Mano
+            } else {
+                CursorTipo::Normal
+            };
+        }
+        if self.carga.is_some() || !self.tiene_pagina() {
+            return CursorTipo::Normal;
+        }
+        match self.elementos.iter().rev().find(|e| e.contiene(cx, cy + self.scroll_y)) {
+            Some(el) if el.es_campo_de_texto() => CursorTipo::Texto,
+            Some(_) => CursorTipo::Mano,
+            None => CursorTipo::Normal,
+        }
+    }
     pub fn titulo_ventana(&self) -> String {
         if self.titulo.trim().is_empty() {
             "Navegador".to_string()
@@ -239,6 +289,17 @@ impl App {
                     salida.redibujar = true;
                 }
             }
+            Entrada::Escala(nueva) => {
+                let nueva = normalizar_escala(nueva);
+                if (nueva - self.escala).abs() > 0.001 {
+                    self.escala = nueva;
+                    self.iconos = barra::iconos_con_escala(self.escala);
+                    self.barra = None;
+                    self.local = None;
+                    self.pedir_tamano(&mut salida);
+                    salida.redibujar = true;
+                }
+            }
             Entrada::Motor(mensaje) => {
                 if let Some(id) = mensaje.id() {
                     self.en_vuelo.remove(id);
@@ -256,10 +317,10 @@ impl App {
     fn clic(&mut self, x: f32, y: f32, salida: &mut Salida) {
         salida.redibujar = true;
         if y < ALTO_BARRA as f32 {
-            let accion = self.barra.as_ref().and_then(|(_, _, b)| b.accion_en(x, y));
+            let accion = self.barra.as_ref().and_then(|(_, _, _, b)| b.accion_en(x, y));
             match accion {
                 Some(Accion::Direccion) => {
-                    let pintado = self.barra.as_ref().and_then(|(_, _, b)| b.campo.clone());
+                    let pintado = self.barra.as_ref().and_then(|(_, _, _, b)| b.campo.clone());
                     match (&mut self.campo, pintado) {
                         (Some(campo), Some(pintado)) => {
                             campo.cursor = barra::cursor_en_x(&pintado, x, &self.fuentes).min(campo.texto.chars().count());
@@ -280,7 +341,7 @@ impl App {
         self.campo = None;
         let (cx, cy) = (x, y - ALTO_BARRA as f32);
         if self.mostrando_local {
-            let accion = self.local.as_ref().and_then(|(_, _, _, l)| lienzo::accion_en(&l.regiones, cx, cy)).map(str::to_string);
+            let accion = self.local.as_ref().and_then(|(_, _, _, _, l)| lienzo::accion_en(&l.regiones, cx, cy)).map(str::to_string);
             match accion.as_deref() {
                 Some("reintentar") => self.ejecutar(Accion::Recargar, salida),
                 Some(destino) if destino.starts_with("ir:") => self.navegar(destino[3..].to_string(), salida),
@@ -360,6 +421,20 @@ impl App {
         if tecla == Tecla::Escape && self.carga.is_some() {
             return self.ejecutar(Accion::Detener, salida);
         }
+        if self.escribiendo && mods.ctrl && !mods.alt && letra("v") {
+            if let Some(texto) = self.portapapeles.leer() {
+                for ch in texto.replace("\r\n", "\n").replace('\r', "\n").chars().take(2000) {
+                    if ch == '\n' {
+                        let id = self.nuevo_id("app");
+                        salida.peticiones.push(json!({ "type": "press_key", "id": id, "key": "Enter" }));
+                    } else if !ch.is_control() {
+                        let id = self.nuevo_id("app");
+                        salida.peticiones.push(json!({ "type": "press_key", "id": id, "key": ch.to_string() }));
+                    }
+                }
+            }
+            return;
+        }
         if mods.ctrl || mods.alt || !self.tiene_pagina() || self.mostrando_local {
             return;
         }
@@ -421,6 +496,30 @@ impl App {
             Tecla::Caracter(c) if mods.ctrl && c.eq_ignore_ascii_case("a") => {
                 campo.todo = true;
                 campo.cursor = largo;
+            }
+            Tecla::Caracter(c) if mods.ctrl && c.eq_ignore_ascii_case("c") => {
+                if campo.todo && !campo.texto.is_empty() {
+                    self.portapapeles.escribir(&campo.texto);
+                }
+            }
+            Tecla::Caracter(c) if mods.ctrl && c.eq_ignore_ascii_case("x") => {
+                if campo.todo && !campo.texto.is_empty() {
+                    self.portapapeles.escribir(&campo.texto);
+                    quitar_todo(campo);
+                }
+            }
+            Tecla::Caracter(c) if mods.ctrl && c.eq_ignore_ascii_case("v") => {
+                if let Some(pegado) = self.portapapeles.leer() {
+                    let limpio: String = pegado.chars().map(|ch| if ch == '\r' || ch == '\n' { ' ' } else { ch }).filter(|ch| !ch.is_control()).collect();
+                    if !limpio.is_empty() {
+                        if campo.todo {
+                            quitar_todo(campo);
+                        }
+                        let posicion = byte_de(&campo.texto, campo.cursor);
+                        campo.texto.insert_str(posicion, &limpio);
+                        campo.cursor += limpio.chars().count();
+                    }
+                }
             }
             Tecla::Caracter(c) if !mods.ctrl && !mods.alt => {
                 if campo.todo {
@@ -544,7 +643,7 @@ impl App {
         let id = self.nuevo_id("tam");
         self.tamano_en_vuelo = Some(id.clone());
         self.tamano_pendiente = false;
-        salida.peticiones.push(json!({ "type": "resize", "id": id, "width": self.ancho, "height": self.alto_contenido() }));
+        salida.peticiones.push(json!({ "type": "resize", "id": id, "width": self.ancho, "height": self.alto_contenido(), "scale": self.escala }));
     }
 
     fn empezar_a_editar(&mut self, texto: String) {
@@ -674,25 +773,30 @@ impl App {
         }
     }
 
-    /// La imagen entera de la ventana: la barra arriba y debajo la página
-    /// (o la página de inicio o de error).
+    /// La imagen entera de la ventana en píxeles físicos: la barra arriba y
+    /// debajo la página (o la página de inicio o de error).
     pub fn componer(&mut self) -> Pixmap {
-        let mut marco = Pixmap::new(self.ancho, self.alto).unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1"));
+        let escala_cent = (self.escala * 100.0).round() as u32;
+        let alto_contenido = self.alto_contenido();
+        let ancho_fis = fisico(self.ancho, self.escala);
+        let alto_barra_fis = fisico(ALTO_BARRA, self.escala);
+        let alto_contenido_fis = fisico(alto_contenido, self.escala);
+        let alto_fis = alto_barra_fis + alto_contenido_fis;
+        let mut marco = Pixmap::new(ancho_fis, alto_fis).unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1"));
         marco.fill(Color::WHITE);
 
         let vista = self.vista();
-        let repintar_barra = !matches!(&self.barra, Some((v, ancho, _)) if *v == vista && *ancho == self.ancho);
+        let repintar_barra = !matches!(&self.barra, Some((v, ancho, esc, _)) if *v == vista && *ancho == self.ancho && *esc == escala_cent);
         if repintar_barra {
-            match barra::pintar(&vista, self.ancho, &self.fuentes, &self.iconos) {
-                Ok(pintada) => self.barra = Some((vista, self.ancho, pintada)),
+            match barra::pintar_con_escala(&vista, self.ancho, self.escala, &self.fuentes, &self.iconos) {
+                Ok(pintada) => self.barra = Some((vista, self.ancho, escala_cent, pintada)),
                 Err(error) => eprintln!("[navegador] no se pudo pintar la barra: {error}"),
             }
         }
-        if let Some((_, _, pintada)) = &self.barra {
+        if let Some((_, _, _, pintada)) = &self.barra {
             marco.draw_pixmap(0, 0, pintada.lienzo.pixmap.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
         }
 
-        let alto_contenido = self.alto_contenido();
         let html_local = match self.errores.get(&self.activa) {
             Some((url, mensaje)) => Some(paginas::error(url, mensaje)),
             None if !self.tiene_pagina() => Some(paginas::inicio()),
@@ -701,25 +805,53 @@ impl App {
         self.mostrando_local = html_local.is_some();
         match html_local {
             Some(html) => {
-                let repintar = !matches!(&self.local, Some((h, a, b, _)) if *h == html && *a == self.ancho && *b == alto_contenido);
+                let repintar = !matches!(&self.local, Some((h, a, b, esc, _)) if *h == html && *a == self.ancho && *b == alto_contenido && *esc == escala_cent);
                 if repintar {
-                    match lienzo::pintar_html(&html, self.ancho, alto_contenido, &self.fuentes, &ImageMap::new(), |_| Vec::new()) {
-                        Ok(pintado) => self.local = Some((html, self.ancho, alto_contenido, pintado)),
+                    match lienzo::pintar_html_escalado(&html, self.ancho, alto_contenido, self.escala, &self.fuentes, &ImageMap::new(), |_| Vec::new()) {
+                        Ok(pintado) => self.local = Some((html, self.ancho, alto_contenido, escala_cent, pintado)),
                         Err(error) => eprintln!("[navegador] no se pudo pintar la página propia: {error}"),
                     }
                 }
-                if let Some((_, _, _, pintado)) = &self.local {
-                    marco.draw_pixmap(0, ALTO_BARRA as i32, pintado.pixmap.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+                if let Some((_, _, _, _, pintado)) = &self.local {
+                    marco.draw_pixmap(0, alto_barra_fis as i32, pintado.pixmap.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
                 }
             }
             None => {
                 if let Some(pagina) = &self.pagina {
-                    marco.draw_pixmap(0, ALTO_BARRA as i32, pagina.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+                    if (pagina.width(), pagina.height()) != (ancho_fis, alto_contenido_fis)
+                        && (self.escala - 1.0).abs() > 0.001
+                        && (pagina.width(), pagina.height()) == (self.ancho, alto_contenido)
+                    {
+                        let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..Default::default() };
+                        let transform = Transform::from_row(
+                            ancho_fis as f32 / pagina.width() as f32,
+                            0.0,
+                            0.0,
+                            alto_contenido_fis as f32 / pagina.height() as f32,
+                            0.0,
+                            alto_barra_fis as f32,
+                        );
+                        marco.draw_pixmap(0, 0, pagina.as_ref(), &paint, transform, None);
+                    } else {
+                        marco.draw_pixmap(0, alto_barra_fis as i32, pagina.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+                    }
                 }
             }
         }
         marco
     }
+}
+
+fn normalizar_escala(escala: f32) -> f32 {
+    if escala.is_finite() && escala > 0.0 {
+        escala.clamp(0.5, 4.0)
+    } else {
+        1.0
+    }
+}
+
+fn fisico(css: u32, escala: f32) -> u32 {
+    ((css as f32 * escala).round() as u32).max(1)
 }
 
 /// ¿Un clic aquí puede abrir otra página? (enlaces y botones de formulario)
@@ -811,7 +943,7 @@ mod tests {
     fn pulsar_la_barra_selecciona_todo_y_escribir_lo_sustituye() {
         let mut app = con_pagina();
         let barra = app.barra.as_ref().unwrap();
-        let region = barra.2.lienzo.regiones.iter().find(|r| r.accion == "direccion").unwrap().rect.clone();
+        let region = barra.3.lienzo.regiones.iter().find(|r| r.accion == "direccion").unwrap().rect.clone();
         app.manejar(Entrada::Clic { x: region.x + 40.0, y: region.y + 10.0 });
         assert_eq!(app.editando_direccion(), Some("https://e.com/"));
         escribir(&mut app, "x.org");
@@ -901,7 +1033,7 @@ mod tests {
         assert_eq!(app.error_visible().map(|(u, _)| u.as_str()), Some("https://noexiste.test"));
         app.componer();
         assert!(app.mostrando_local);
-        let boton = app.local.as_ref().unwrap().3.regiones.iter().find(|r| r.accion == "reintentar").unwrap().rect.clone();
+        let boton = app.local.as_ref().unwrap().4.regiones.iter().find(|r| r.accion == "reintentar").unwrap().rect.clone();
         let salida = app.manejar(Entrada::Clic { x: boton.x + 10.0, y: boton.y + ALTO_BARRA as f32 + 10.0 });
         assert_eq!(salida.peticiones[0]["url"], "https://noexiste.test");
         assert!(app.error_visible().is_none());
@@ -920,7 +1052,7 @@ mod tests {
     fn la_pagina_de_inicio_abre_sus_sitios() {
         let (mut app, _) = App::nueva(1000, 700, None);
         app.componer();
-        let sitio = app.local.as_ref().unwrap().3.regiones.iter().find(|r| r.accion.starts_with("ir:")).unwrap().clone();
+        let sitio = app.local.as_ref().unwrap().4.regiones.iter().find(|r| r.accion.starts_with("ir:")).unwrap().clone();
         let salida = app.manejar(Entrada::Clic { x: sitio.rect.x + 5.0, y: sitio.rect.y + ALTO_BARRA as f32 + 5.0 });
         assert_eq!(tipo(&salida.peticiones[0]), "navigate");
         assert_eq!(salida.peticiones[0]["url"], &sitio.accion[3..]);
@@ -966,5 +1098,63 @@ mod tests {
         let barra = marco.pixel(400, 2).unwrap();
         assert_ne!((barra.red(), barra.green(), barra.blue()), (200, 0, 0));
         assert_eq!(app.titulo_ventana(), "Título — Navegador");
+    }
+
+    #[test]
+    fn hidpi_compone_a_escala_fisica_y_pide_scale_al_motor() {
+        let (mut app, peticiones) = App::nueva_con_escala(800, 600, 1.5, None);
+        assert_eq!(peticiones[0]["scale"], 1.5);
+        let id = peticiones[0]["id"].as_str().unwrap().to_string();
+        app.manejar(estado(&id, ""));
+        let marco = app.componer();
+        assert_eq!((marco.width(), marco.height()), (1200, 900));
+        let salida = app.manejar(Entrada::Escala(2.0));
+        assert!(salida.redibujar);
+        let resize = salida.peticiones.iter().find(|p| tipo(p) == "resize").unwrap();
+        assert_eq!(resize["scale"], 2.0);
+        let marco_2x = app.componer();
+        assert_eq!((marco_2x.width(), marco_2x.height()), (1600, 1200));
+    }
+
+    #[test]
+    fn copiar_cortar_y_pegar_en_barra_y_pagina() {
+        let mut app = con_pagina();
+        app.portapapeles = Portapapeles::Memoria(std::sync::Mutex::new(String::new()));
+        let ctrl_c = Entrada::Tecla { tecla: Tecla::Caracter("c".into()), mods: Modificadores { ctrl: true, ..Default::default() } };
+        let ctrl_x = Entrada::Tecla { tecla: Tecla::Caracter("x".into()), mods: Modificadores { ctrl: true, ..Default::default() } };
+        let ctrl_v = Entrada::Tecla { tecla: Tecla::Caracter("v".into()), mods: Modificadores { ctrl: true, ..Default::default() } };
+        let ctrl_l = Entrada::Tecla { tecla: Tecla::Caracter("l".into()), mods: Modificadores { ctrl: true, ..Default::default() } };
+
+        app.manejar(ctrl_l);
+        assert_eq!(app.editando_direccion(), Some("https://e.com/"));
+        app.manejar(ctrl_c);
+        assert_eq!(app.portapapeles.leer().as_deref(), Some("https://e.com/"));
+        app.manejar(ctrl_x);
+        assert_eq!(app.editando_direccion(), Some(""));
+        app.portapapeles.escribir("rust-lang.org\n");
+        app.manejar(ctrl_v.clone());
+        assert_eq!(app.editando_direccion(), Some("rust-lang.org "));
+        app.manejar(tecla(Tecla::Escape));
+
+        // Pegar también llega al campo enfocado de la página.
+        app.manejar(Entrada::Clic { x: 50.0, y: ALTO_BARRA as f32 + 20.0 });
+        assert!(app.escribiendo_en_pagina());
+        app.portapapeles.escribir("ok");
+        let salida = app.manejar(ctrl_v);
+        let teclas: Vec<_> = salida.peticiones.iter().map(|p| p["key"].as_str().unwrap()).collect();
+        assert_eq!(teclas, ["o", "k"]);
+    }
+
+    #[test]
+    fn cursor_cambia_segun_elemento_y_zona() {
+        let app = con_pagina();
+        let barra = app.barra.as_ref().unwrap();
+        let dir = barra.3.lienzo.regiones.iter().find(|r| r.accion == "direccion").unwrap().rect.clone();
+        let rec = barra.3.lienzo.regiones.iter().find(|r| r.accion == "recargar").unwrap().rect.clone();
+        assert_eq!(app.cursor_en(dir.x + 10.0, dir.y + 10.0), CursorTipo::Texto);
+        assert_eq!(app.cursor_en(rec.x + 10.0, rec.y + 10.0), CursorTipo::Mano);
+        assert_eq!(app.cursor_en(50.0, ALTO_BARRA as f32 + 20.0), CursorTipo::Texto);
+        assert_eq!(app.cursor_en(30.0, ALTO_BARRA as f32 + 105.0), CursorTipo::Mano);
+        assert_eq!(app.cursor_en(500.0, ALTO_BARRA as f32 + 500.0), CursorTipo::Normal);
     }
 }

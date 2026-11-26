@@ -12,7 +12,7 @@ use crate::protocol::{
 };
 use base64::Engine as _;
 use engine_dom::{Node, NodeType};
-use engine_gfx::{focus_overlay, render_layout_to_png_with_overlay};
+use engine_gfx::{focus_overlay, render_layout_to_png_with_overlay_scaled};
 use engine_image::decode_image;
 use engine_js::JsRuntime;
 use engine_layout::{BoxType, ImageMap, LayoutBox, LayoutTreeBuilder};
@@ -202,6 +202,7 @@ impl Tab {
 struct EngineServer {
     width: u32,
     height: u32,
+    scale: f32,
     /// Todo lo que este renderer pide al exterior - red, cookies desde JS
     /// y Web Storage - pasa por aqui (ADR 0001, etapa 2; Fase 64). Hoy es un
     /// `LocalBroker` en el mismo proceso, con el mismo cliente HTTP, las
@@ -257,6 +258,7 @@ impl EngineServer {
         Self {
             width: 1280,
             height: 720,
+            scale: 1.0,
             broker,
             broker_kind,
             tabs: vec![Tab::new(0)],
@@ -338,9 +340,10 @@ impl EngineServer {
                 },
                 false,
             ),
-            EngineRequest::Resize { width, height, .. } => {
+            EngineRequest::Resize { width, height, scale, .. } => {
                 self.width = width.clamp(200, 4000);
                 self.height = height.clamp(200, 4000);
+                self.scale = if scale.is_finite() { scale.clamp(0.5, 4.0) } else { 1.0 };
                 // Solo la pestaña ACTIVA se relayouta aqui (Fase 4.5) - las
                 // demas se ponen al dia de forma perezosa en `switch_tab`
                 // cuando (si) el usuario vuelve a ellas, para no pagar el
@@ -1111,7 +1114,8 @@ impl EngineServer {
         let resolved: Vec<(String, url::Url)> = refs
             .into_iter()
             .filter_map(|raw| match page_url.join(&raw) {
-                Ok(absolute) => Some((raw, absolute)),
+                Ok(absolute) if matches!(absolute.scheme(), "http" | "https") => Some((raw, absolute)),
+                Ok(_) => None,
                 Err(_) => {
                     tracing::warn!("[server] {kind} con URL invalida, se omite: {raw}");
                     None
@@ -1217,17 +1221,41 @@ impl EngineServer {
     /// ven al recorrer las cajas (`BoxType::Image`), igual que
     /// `external_scripts`.
     async fn fetch_images(&self, srcs: Vec<String>, page_url: &url::Url, deadline: tokio::time::Instant) -> ImageMap {
+        let mut unique_urls: Vec<String> = Vec::new();
+        let mut raws_by_url: HashMap<String, Vec<String>> = HashMap::new();
+        for raw in srcs {
+            let Ok(absolute) = page_url.join(&raw) else {
+                tracing::warn!("[server] <img src> con URL invalida, se omite: {raw}");
+                continue;
+            };
+            if !matches!(absolute.scheme(), "http" | "https") {
+                continue;
+            }
+            let key = absolute.as_str().to_string();
+            raws_by_url
+                .entry(key.clone())
+                .and_modify(|list| {
+                    if !list.contains(&raw) {
+                        list.push(raw.clone());
+                    }
+                })
+                .or_insert_with(|| {
+                    unique_urls.push(key);
+                    vec![raw]
+                });
+        }
+
         let mut fetched = ImageMap::new();
-        for (src, response) in self.fetch_subresources(srcs, page_url, "<img src>", deadline).await {
-            // La DECODIFICACION sigue siendo secuencial a proposito: es
-            // trabajo de CPU, no de red, y paralelizarla necesitaria sacarla
-            // a un pool aparte. Lo que dominaba el tiempo era la espera de
-            // red, y eso es lo que se acaba de arreglar.
+        for (abs_url, response) in self.fetch_subresources(unique_urls, page_url, "<img src>", deadline).await {
             match decode_image(&response.body) {
                 Some(image) => {
-                    fetched.insert(src, image);
+                    if let Some(raws) = raws_by_url.get(&abs_url) {
+                        for raw in raws {
+                            fetched.insert(raw.clone(), std::sync::Arc::clone(&image));
+                        }
+                    }
                 }
-                None => tracing::warn!("[server] {src} no se pudo decodificar como imagen, se omite"),
+                None => tracing::warn!("[server] {abs_url} no se pudo decodificar como imagen, se omite"),
             }
         }
         fetched
@@ -1748,7 +1776,7 @@ impl EngineServer {
             .and_then(|node| page.page.layout_root.find_box_for_node(node))
             .map(|focused| focus_overlay(focused, page.font_set.as_ref()))
             .unwrap_or_default();
-        let screenshot = match render_layout_to_png_with_overlay(
+        let screenshot = match render_layout_to_png_with_overlay_scaled(
             &page.page.layout_root,
             page.font_set.as_ref(),
             &page.images,
@@ -1756,6 +1784,7 @@ impl EngineServer {
             self.height,
             tab.scroll_offset_y,
             &overlay,
+            self.scale,
         ) {
             Ok(bytes) => base64::engine::general_purpose::STANDARD.encode(bytes),
             Err(error) => return Self::error(id, format!("render_error: {error}")),
@@ -3260,6 +3289,7 @@ mod tests {
                 id: Some("resize".to_string()),
                 width: 10,
                 height: 9000,
+                scale: 1.0,
             })
             .await;
 
@@ -3766,7 +3796,7 @@ mod tests {
         let tab = server.active_tab_mut();
         tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
 
-        server.handle(EngineRequest::Resize { id: Some("r1".to_string()), width: 1000, height: 700 }).await;
+        server.handle(EngineRequest::Resize { id: Some("r1".to_string()), width: 1000, height: 700, scale: 1.0 }).await;
 
         let runtime = &mut server.active_tab_mut().current_page.as_mut().expect("deberia haber pagina").runtime;
         assert_eq!(runtime.eval("vistoResize").unwrap(), "true", "window.addEventListener('resize', ...) deberia haberse disparado con un comando Resize real");
@@ -3783,7 +3813,7 @@ mod tests {
         let tab = server.active_tab_mut();
         tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
 
-        server.handle(EngineRequest::Resize { id: Some("r1".to_string()), width: 1000, height: 700 }).await;
+        server.handle(EngineRequest::Resize { id: Some("r1".to_string()), width: 1000, height: 700, scale: 1.0 }).await;
 
         let page = &server.active_tab().current_page.as_ref().expect("deberia haber pagina").page;
         let marcador = Node::find_by_id(&page.dom_root, "marcador").expect("deberia existir el marcador");
@@ -4740,5 +4770,43 @@ mod tests {
 
         let short_shared = now + std::time::Duration::from_secs(1);
         assert_eq!(server.image_deadline(short_shared), short_shared, "si al resto casi no le queda tiempo, tampoco a las imagenes");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_image_urls_are_fetched_once_and_shared() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="#00ff00"/></svg>"##;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", svg.len());
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(svg);
+            }
+        });
+
+        let server = server_with_budget(2_000, 10_000);
+        let page_url = url::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let deadline = tokio::time::Instant::now() + server.subresource_budget;
+        let images = server
+            .fetch_images(
+                vec!["/logo.svg".to_string(), "/logo.svg".to_string(), "./logo.svg".to_string(), "data:image/svg+xml,<svg/>".to_string()],
+                &page_url,
+                deadline,
+            )
+            .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "misma URL resuelta solo debe descargarse una vez");
+        assert!(images.contains_key("/logo.svg"));
+        assert!(images.contains_key("./logo.svg"));
+        assert!(std::sync::Arc::ptr_eq(&images["/logo.svg"], &images["./logo.svg"]));
     }
 }

@@ -75,25 +75,29 @@ fn parent_of(node: &Arc<RwLock<Node>>) -> Option<Arc<RwLock<Node>>> {
     node.read().unwrap().parent.as_ref().and_then(std::sync::Weak::upgrade)
 }
 
-fn element_info(node: &Arc<RwLock<Node>>) -> Option<(String, HashMap<String, String>)> {
-    match &node.read().unwrap().node_type {
-        NodeType::Element { tag_name, attributes } => Some((tag_name.clone(), attributes.clone())),
-        _ => None,
-    }
-}
-
 /// El `<table>` mas cercano que contiene a esta celda, con sus atributos.
 fn enclosing_table(cell: &Arc<RwLock<Node>>) -> Option<HashMap<String, String>> {
     let mut current = parent_of(cell);
     while let Some(node) = current {
-        if let Some((tag, attributes)) = element_info(&node) {
-            if tag == "table" {
-                return Some(attributes);
+        let found = {
+            let guard = node.read().unwrap();
+            match &guard.node_type {
+                NodeType::Element { tag_name, attributes } if tag_name == "table" => Some(attributes.clone()),
+                _ => None,
             }
+        };
+        if found.is_some() {
+            return found;
         }
         current = parent_of(&node);
     }
     None
+}
+
+fn parent_tag_is_center(node: &Arc<RwLock<Node>>) -> bool {
+    let Some(parent) = parent_of(node) else { return false };
+    let guard = parent.read().unwrap();
+    matches!(&guard.node_type, NodeType::Element { tag_name, .. } if tag_name == "center")
 }
 
 /// Si el atributo `border` de una tabla pide borde: `border="2"` da 2px y
@@ -107,97 +111,110 @@ fn table_border_width(attributes: &HashMap<String, String>) -> Option<u32> {
 /// Las declaraciones CSS equivalentes a los atributos de presentacion del
 /// elemento, de menor prioridad que cualquier regla del autor.
 pub fn presentational_hints(dom_node: &Arc<RwLock<Node>>) -> Vec<(String, String)> {
-    let Some((tag, attributes)) = element_info(dom_node) else { return Vec::new() };
-    let attr = |name: &str| attributes.get(name).map(|v| v.trim()).filter(|v| !v.is_empty());
     let mut hints: Vec<(String, String)> = Vec::new();
-    let mut push = |property: &str, value: String| hints.push((property.to_string(), value));
+    let mut check_center_parent = false;
+    let mut check_enclosing_table = false;
 
-    let is_table_part = matches!(tag.as_str(), "table" | "tr" | "td" | "th" | "thead" | "tbody" | "tfoot");
+    {
+        let guard = dom_node.read().unwrap();
+        let NodeType::Element { tag_name, attributes } = &guard.node_type else {
+            return hints;
+        };
+        let tag = tag_name.as_str();
+        // Camino rapido: casi ningun elemento tiene atributos ni etiqueta
+        // con pistas de presentacion, asi que evitamos clonar `attributes`.
+        let needs_tag_work = matches!(tag, "table" | "tr" | "td" | "th" | "thead" | "tbody" | "tfoot" | "body" | "col" | "colgroup" | "font" | "img");
+        if !needs_tag_work && !attributes.contains_key("align") {
+            return hints;
+        }
+        let attr = |name: &str| attributes.get(name).map(|v| v.trim()).filter(|v| !v.is_empty());
+        let mut push = |property: &str, value: String| hints.push((property.to_string(), value));
 
-    if is_table_part || tag == "body" {
-        if let Some(color) = attr("bgcolor").and_then(legacy_color) {
-            push("background-color", color);
-        }
-    }
-    if tag == "body" {
-        if let Some(color) = attr("text").and_then(legacy_color) {
-            push("color", color);
-        }
-    }
-    if matches!(tag.as_str(), "table" | "td" | "th" | "col" | "colgroup") {
-        if let Some(width) = attr("width").and_then(legacy_length) {
-            push("width", width);
-        }
-    }
-    if matches!(tag.as_str(), "table" | "tr" | "td" | "th") {
-        if let Some(height) = attr("height").and_then(legacy_length) {
-            push("height", height);
-        }
-    }
+        let is_table_part = matches!(tag, "table" | "tr" | "td" | "th" | "thead" | "tbody" | "tfoot");
 
-    match tag.as_str() {
-        "table" => {
-            if let Some(width) = table_border_width(&attributes) {
-                push("border", format!("{width}px solid {TABLE_BORDER_COLOR}"));
+        if is_table_part || tag == "body" {
+            if let Some(color) = attr("bgcolor").and_then(legacy_color) {
+                push("background-color", color);
             }
-            if let Some(spacing) = attr("cellspacing").and_then(legacy_count) {
-                push("border-spacing", format!("{spacing}px"));
+        }
+        if tag == "body" {
+            if let Some(color) = attr("text").and_then(legacy_color) {
+                push("color", color);
             }
-            match attr("align").map(str::to_ascii_lowercase).as_deref() {
-                Some("center") => {
-                    push("margin-left", "auto".to_string());
-                    push("margin-right", "auto".to_string());
+        }
+        if matches!(tag, "table" | "td" | "th" | "col" | "colgroup") {
+            if let Some(width) = attr("width").and_then(legacy_length) {
+                push("width", width);
+            }
+        }
+        if matches!(tag, "table" | "tr" | "td" | "th") {
+            if let Some(height) = attr("height").and_then(legacy_length) {
+                push("height", height);
+            }
+        }
+
+        match tag {
+            "table" => {
+                if let Some(width) = table_border_width(attributes) {
+                    push("border", format!("{width}px solid {TABLE_BORDER_COLOR}"));
                 }
-                Some("right") => {
-                    push("margin-left", "auto".to_string());
-                    push("margin-right", "0px".to_string());
+                if let Some(spacing) = attr("cellspacing").and_then(legacy_count) {
+                    push("border-spacing", format!("{spacing}px"));
                 }
-                _ => {
-                    // Un navegador centra una tabla dentro de `<center>`: el
-                    // `text-align` centrado que le da su hoja de estilos
-                    // alcanza tambien a los bloques hijos. Hacker News depende
-                    // de esto.
-                    if parent_of(dom_node).and_then(|p| element_info(&p)).is_some_and(|(parent, _)| parent == "center") {
+                match attr("align").map(str::to_ascii_lowercase).as_deref() {
+                    Some("center") => {
                         push("margin-left", "auto".to_string());
                         push("margin-right", "auto".to_string());
                     }
-                }
-            }
-        }
-        "td" | "th" => {
-            if let Some(table) = enclosing_table(dom_node) {
-                if let Some(padding) = table.get("cellpadding").and_then(|v| legacy_count(v)) {
-                    for side in ["top", "right", "bottom", "left"] {
-                        push(&format!("padding-{side}"), format!("{padding}px"));
+                    Some("right") => {
+                        push("margin-left", "auto".to_string());
+                        push("margin-right", "0px".to_string());
                     }
-                }
-                if table_border_width(&table).is_some() {
-                    push("border", format!("1px solid {TABLE_BORDER_COLOR}"));
+                    _ => check_center_parent = true,
                 }
             }
+            "td" | "th" => check_enclosing_table = true,
+            "font" => {
+                if let Some(color) = attr("color").and_then(legacy_color) {
+                    push("color", color);
+                }
+                if let Some(size) = attr("size").and_then(font_size_px) {
+                    push("font-size", format!("{size}px"));
+                }
+                if let Some(face) = attr("face") {
+                    push("font-family", face.to_string());
+                }
+            }
+            _ => {}
         }
-        "font" => {
-            if let Some(color) = attr("color").and_then(legacy_color) {
-                push("color", color);
-            }
-            if let Some(size) = attr("size").and_then(font_size_px) {
-                push("font-size", format!("{size}px"));
-            }
-            if let Some(face) = attr("face") {
-                push("font-family", face.to_string());
+
+        // `align` en bloques y celdas es la alineacion del texto de dentro; en una
+        // imagen, un flotante. (En una tabla ya se resolvio arriba.)
+        if let Some(align) = attr("align").map(str::to_ascii_lowercase) {
+            let is_text_block = matches!(tag, "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "td" | "th" | "tr" | "thead" | "tbody" | "tfoot" | "center");
+            if is_text_block && matches!(align.as_str(), "left" | "center" | "right" | "justify") {
+                push("text-align", align);
+            } else if tag == "img" && matches!(align.as_str(), "left" | "right") {
+                push("float", align);
             }
         }
-        _ => {}
     }
 
-    // `align` en bloques y celdas es la alineacion del texto de dentro; en una
-    // imagen, un flotante. (En una tabla ya se resolvio arriba.)
-    if let Some(align) = attr("align").map(str::to_ascii_lowercase) {
-        let is_text_block = matches!(tag.as_str(), "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "td" | "th" | "tr" | "thead" | "tbody" | "tfoot" | "center");
-        if is_text_block && matches!(align.as_str(), "left" | "center" | "right" | "justify") {
-            push("text-align", align);
-        } else if tag == "img" && matches!(align.as_str(), "left" | "right") {
-            push("float", align);
+    // Se suelta el candado de lectura de `dom_node` antes de subir por los ancestros.
+    if check_center_parent && parent_tag_is_center(dom_node) {
+        hints.push(("margin-left".to_string(), "auto".to_string()));
+        hints.push(("margin-right".to_string(), "auto".to_string()));
+    }
+    if check_enclosing_table {
+        if let Some(table) = enclosing_table(dom_node) {
+            if let Some(padding) = table.get("cellpadding").and_then(|v| legacy_count(v)) {
+                for side in ["top", "right", "bottom", "left"] {
+                    hints.push((format!("padding-{side}"), format!("{padding}px")));
+                }
+            }
+            if table_border_width(&table).is_some() {
+                hints.push(("border".to_string(), format!("1px solid {TABLE_BORDER_COLOR}")));
+            }
         }
     }
 

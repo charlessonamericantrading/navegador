@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::element::ElementRef;
+use crate::stylesheet::{KeyPart, Rule, RuleKey};
+use selectors::parser::Component;
 
 /// Cadena de texto propia usada para varios tipos asociados de
 /// `SelectorImpl` (id, clase, nombre de etiqueta, prefijo de namespace).
@@ -307,9 +309,110 @@ fn with_parsed_selector<R>(
     })
 }
 
+pub(crate) struct SelectorAnalysis {
+    pub valid: bool,
+    pub specificity: Specificity,
+    pub index_key: RuleKey,
+}
+
+/// Extrae la clave mas selectiva del compuesto mas a la derecha del selector
+/// (hasta el primer combinador, donde `selector.iter()` se detiene).
+fn compound_key(selector: &selectors::parser::Selector<EngineSelectorImpl>) -> Option<KeyPart> {
+    let mut best_id: Option<&str> = None;
+    let mut best_class: Option<&str> = None;
+    let mut best_tag: Option<&str> = None;
+    for component in selector.iter() {
+        match component {
+            Component::ID(id) => {
+                best_id = Some(id.as_str());
+                break;
+            }
+            Component::Class(class) if best_class.is_none() => {
+                best_class = Some(class.as_str());
+            }
+            Component::LocalName(local) if best_tag.is_none() => {
+                best_tag = Some(local.lower_name.as_str());
+            }
+            _ => {}
+        }
+    }
+    if let Some(id) = best_id {
+        Some(KeyPart::Id(id.to_string()))
+    } else if let Some(class) = best_class {
+        Some(KeyPart::Class(class.to_string()))
+    } else {
+        best_tag.map(|tag| KeyPart::Tag(tag.to_string()))
+    }
+}
+
 pub struct SelectorMatcher;
 
 impl SelectorMatcher {
+    /// Parsea `selector_str` una sola vez para saber si es valido, su
+    /// especificidad y la clave de indexacion para el `RuleIndex`.
+    pub(crate) fn analyze_selector(selector_str: &str) -> SelectorAnalysis {
+        with_parsed_selector(selector_str, |list| {
+            let Some(list) = list else {
+                return SelectorAnalysis {
+                    valid: false,
+                    specificity: Specificity::default(),
+                    index_key: RuleKey::Any,
+                };
+            };
+            let specificity = list.slice().iter().map(|selector| Specificity(selector.specificity())).max().unwrap_or_default();
+            let mut parts = Vec::with_capacity(list.slice().len());
+            let mut all_keyed = !list.slice().is_empty();
+            for selector in list.slice() {
+                match compound_key(selector) {
+                    Some(part) => {
+                        if !parts.contains(&part) {
+                            parts.push(part);
+                        }
+                    }
+                    None => {
+                        all_keyed = false;
+                        break;
+                    }
+                }
+            }
+            let index_key = if all_keyed { RuleKey::OneOf(parts) } else { RuleKey::Any };
+            SelectorAnalysis { valid: true, specificity, index_key }
+        })
+    }
+
+    /// Evalua un lote de reglas candidatas contra `node` tomando el prestamo de
+    /// `PARSED_SELECTORS` y el `SelectorCaches` una sola vez para todo el nodo.
+    pub(crate) fn filter_matching_rules<'a>(rules: &[&'a Rule], node: &Arc<RwLock<Node>>) -> Vec<&'a Rule> {
+        if rules.is_empty() {
+            return Vec::new();
+        }
+        let element = ElementRef(node.clone());
+        let mut caches = SelectorCaches::default();
+        let mut context = MatchingContext::new(
+            MatchingMode::Normal,
+            None,
+            &mut caches,
+            QuirksMode::NoQuirks,
+            NeedsSelectorFlags::No,
+            MatchingForInvalidation::No,
+        );
+        PARSED_SELECTORS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let mut matched = Vec::with_capacity(rules.len().min(16));
+            for &rule in rules {
+                if !cache.contains_key(rule.selector.as_str()) {
+                    cache.insert(rule.selector.clone(), parse_selector_list(&rule.selector));
+                }
+                if let Some(list) = cache[rule.selector.as_str()].as_ref() {
+                    if matches_selector_list(list, &element, &mut context) {
+                        matched.push(rule);
+                    }
+                }
+            }
+            matched
+        })
+    }
+
     pub fn matches(selector_str: &str, node: &Arc<RwLock<Node>>) -> bool {
         with_parsed_selector(selector_str, |list| {
             let Some(list) = list else { return false };

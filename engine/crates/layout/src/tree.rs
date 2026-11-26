@@ -2153,7 +2153,8 @@ impl LayoutTreeBuilder {
         // pipeline: en uso normal no cuesta nada y con `RUST_LOG=info` dice
         // cual de las tres domina, en vez de dejarlas como un solo numero.
         let t = std::time::Instant::now();
-        Self::build_node(dom_root, &mut root_box, stylesheet, &HashMap::new(), (viewport_width, viewport_height));
+        let empty_map = Arc::new(HashMap::new());
+        Self::build_node(dom_root, &mut root_box, stylesheet, &empty_map, &empty_map, (viewport_width, viewport_height));
         tracing::info!("[tiempo]     cascada + construccion del arbol {:?}", t.elapsed());
         let t = std::time::Instant::now();
         Self::flow_block_children(&mut root_box, font_set, images);
@@ -2306,12 +2307,19 @@ impl LayoutTreeBuilder {
     /// resuelve contra la VENTANA, no contra el contenedor de cada
     /// elemento (eso serian container queries, que son otra cosa y no
     /// estan implementadas).
-    fn build_node(dom_node: &Arc<RwLock<Node>>, parent_layout_box: &mut LayoutBox, stylesheet: &StyleSheet, inherited: &HashMap<String, String>, viewport: (f32, f32)) {
+    fn build_node(
+        dom_node: &Arc<RwLock<Node>>,
+        parent_layout_box: &mut LayoutBox,
+        stylesheet: &StyleSheet,
+        inherited_props: &Arc<HashMap<String, String>>,
+        inherited_vars: &Arc<HashMap<String, String>>,
+        viewport: (f32, f32),
+    ) {
         let r = dom_node.read().unwrap();
         match &r.node_type {
             NodeType::Document => {
                 for child in &r.children {
-                    Self::build_node(child, parent_layout_box, stylesheet, inherited, viewport);
+                    Self::build_node(child, parent_layout_box, stylesheet, inherited_props, inherited_vars, viewport);
                 }
             }
             NodeType::Element { tag_name, attributes } => {
@@ -2420,53 +2428,32 @@ impl LayoutTreeBuilder {
                     apply_image_size_attributes(&mut current_box.computed_style, attributes);
                 }
 
-                // Herencia real EN LA CAJA DEL ELEMENTO (Fase 8). Hasta
-                // aqui, `computed_style` de una caja de elemento solo
-                // llevaba lo que ESE elemento declaraba; lo heredado
-                // viajaba unicamente en `inherited` y solo aterrizaba en
-                // las cajas de TEXTO (mas abajo). Bastaba para pintar -el
-                // color/tamaño de letra solo hacen falta donde hay texto-
-                // pero deja la caja del elemento diciendo una verdad a
-                // medias, y `getComputedStyle` (que por definicion
-                // devuelve el valor DESPUES de la herencia) no tenia de
-                // donde sacar el valor: un `<div>` dentro de un `<body>`
-                // con `color` reportaba "" en vez del color heredado.
-                //
-                // `or_insert_with`, nunca sobrescribir: lo que el elemento
-                // declare el mismo gana siempre sobre lo heredado, que es
-                // exactamente el orden de la cascada. Y tiene que ir ANTES
-                // del bucle de abajo para que un `font-size: 2em` propio
-                // siga sin resolver a estas alturas y lo resuelva ese
-                // bucle contra el tamaño del padre.
-                //
-                // `inherited` solo contiene propiedades de
-                // `INHERITABLE_PROPERTIES` (es quien lo construye), asi
-                // que copiarlo entero no puede colar nada no heredable.
-                for (prop, value) in inherited {
+                let has_own_vars = current_box.computed_style.keys().any(|k| is_custom_property(k));
+                let child_vars: Arc<HashMap<String, String>> = if has_own_vars {
+                    let mut next = (**inherited_vars).clone();
+                    for (prop, value) in &current_box.computed_style {
+                        if is_custom_property(prop) {
+                            next.insert(prop.clone(), value.clone());
+                        }
+                    }
+                    Arc::new(next)
+                } else {
+                    Arc::clone(inherited_vars)
+                };
+
+                let had_own_inheritable = INHERITABLE_PROPERTIES.iter().any(|prop| current_box.computed_style.contains_key(*prop));
+
+                // Herencia real EN LA CAJA DEL ELEMENTO (Fase 8): solo las
+                // propiedades heredables reales (`INHERITABLE_PROPERTIES`),
+                // nunca la tabla entera de `--*` que iria en `inherited_vars`.
+                for (prop, value) in inherited_props.iter() {
                     current_box.computed_style.entry(prop.clone()).or_insert_with(|| value.clone());
                 }
 
-                // Las propiedades personalizadas heredan siempre y se
-                // propagan tal cual (sin sustituir): su valor puede
-                // contener a su vez `var()`, que se resuelve al usarlas,
-                // no al declararlas.
-                let mut child_inherited = inherited.clone();
-                for (prop, value) in current_box.computed_style.iter() {
-                    if is_custom_property(prop) {
-                        child_inherited.insert(prop.clone(), value.clone());
-                    }
-                }
-
-                // Con todas las variables visibles (propias mas heredadas),
-                // se resuelve `var()` en el resto de propiedades. Va ANTES
-                // del bucle de herencia de abajo para que lo que se propague
-                // a los hijos sea ya el valor final, no una referencia.
-                let variables: HashMap<String, String> = child_inherited
-                    .iter()
-                    .filter(|(k, _)| is_custom_property(k))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                if !variables.is_empty() {
+                // Con todas las variables visibles (`child_vars` compartidas por
+                // `Arc` sin clonarlas), se resuelve `var()` solo si alguna
+                // propiedad del elemento realmente contiene `var(`.
+                if !child_vars.is_empty() && current_box.computed_style.iter().any(|(k, v)| !is_custom_property(k) && v.contains("var(")) {
                     let pending: Vec<(String, String)> = current_box
                         .computed_style
                         .iter()
@@ -2474,7 +2461,7 @@ impl LayoutTreeBuilder {
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
                     for (prop, value) in pending {
-                        let resolved = substitute_css_vars(&value, &variables, 0);
+                        let resolved = substitute_css_vars(&value, &child_vars, 0);
                         if resolved.trim().is_empty() {
                             current_box.computed_style.remove(&prop);
                         } else {
@@ -2483,48 +2470,56 @@ impl LayoutTreeBuilder {
                     }
                 }
 
-                for prop in INHERITABLE_PROPERTIES {
-                    let Some(value) = current_box.computed_style.get(*prop) else { continue };
-                    let resolved = if *prop == "font-size" {
-                        let parent_font_size_px = inherited
-                            .get("font-size")
-                            .and_then(|v| parse_css_font_size(v))
-                            .unwrap_or(INITIAL_FONT_SIZE);
-                        format!("{}px", resolve_font_size(value, parent_font_size_px))
-                    } else {
-                        value.clone()
-                    };
-                    current_box.computed_style.insert(prop.to_string(), resolved.clone());
-                    child_inherited.insert(prop.to_string(), resolved);
-                }
+                let child_inherited: Arc<HashMap<String, String>> = if had_own_inheritable {
+                    let mut next = HashMap::with_capacity(inherited_props.len() + 2);
+                    for prop in INHERITABLE_PROPERTIES {
+                        let Some(value) = current_box.computed_style.get(*prop) else { continue };
+                        let resolved = if *prop == "font-size" {
+                            let parent_font_size_px = inherited_props
+                                .get("font-size")
+                                .and_then(|v| parse_css_font_size(v))
+                                .unwrap_or(INITIAL_FONT_SIZE);
+                            let px = format!("{}px", resolve_font_size(value, parent_font_size_px));
+                            current_box.computed_style.insert(prop.to_string(), px.clone());
+                            px
+                        } else {
+                            value.clone()
+                        };
+                        next.insert(prop.to_string(), resolved);
+                    }
+                    Arc::new(next)
+                } else {
+                    Arc::clone(inherited_props)
+                };
 
                 // Unidades relativas -> pixeles. Va AQUI, despues del bucle
                 // de herencia, porque `em` se mide contra el `font-size` YA
                 // resuelto de esta caja, y ese bucle es quien lo deja en px.
-                //
-                // Sin esto, `width: 10em` o `calc(100px + 50px)` no parsean
-                // como longitud y la caja cae a "ocupo todo el contenedor":
-                // cualquier diseño de varias columnas se renderiza como una
-                // sola columna a ancho completo.
-                let font_px = current_box
-                    .computed_style
-                    .get("font-size")
-                    .and_then(|v| parse_css_font_size(v))
-                    .unwrap_or(INITIAL_FONT_SIZE);
-                let por_resolver: Vec<(String, String)> = current_box
+                if current_box
                     .computed_style
                     .iter()
-                    .filter(|(k, v)| !is_custom_property(k) && k.as_str() != "font-size" && necesita_resolver_unidades(v))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                for (prop, value) in por_resolver {
-                    if let Some(resuelto) = resolve_relative_units(&value, font_px, viewport) {
-                        current_box.computed_style.insert(prop, resuelto);
+                    .any(|(k, v)| !is_custom_property(k) && k.as_str() != "font-size" && necesita_resolver_unidades(v))
+                {
+                    let font_px = current_box
+                        .computed_style
+                        .get("font-size")
+                        .and_then(|v| parse_css_font_size(v))
+                        .unwrap_or(INITIAL_FONT_SIZE);
+                    let por_resolver: Vec<(String, String)> = current_box
+                        .computed_style
+                        .iter()
+                        .filter(|(k, v)| !is_custom_property(k) && k.as_str() != "font-size" && necesita_resolver_unidades(v))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (prop, value) in por_resolver {
+                        if let Some(resuelto) = resolve_relative_units(&value, font_px, viewport) {
+                            current_box.computed_style.insert(prop, resuelto);
+                        }
                     }
                 }
 
                 for child in &r.children {
-                    Self::build_node(child, &mut current_box, stylesheet, &child_inherited, viewport);
+                    Self::build_node(child, &mut current_box, stylesheet, &child_inherited, &child_vars, viewport);
                 }
                 parent_layout_box.children.push(current_box);
             }
@@ -2554,7 +2549,7 @@ impl LayoutTreeBuilder {
                 };
                 if keep {
                     let mut text_box = LayoutBox::new(BoxType::Text(collapsed));
-                    text_box.computed_style = inherited.clone();
+                    text_box.computed_style = (**inherited_props).clone();
                     // `line-height` heredado en `em` (`1.5em`) llega crudo: las
                     // hojas de texto no pasan por la conversion de unidades de
                     // arriba, asi que se resuelve aqui con SU tamaño de fuente

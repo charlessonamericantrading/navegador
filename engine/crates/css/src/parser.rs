@@ -472,8 +472,12 @@ impl<'i> QualifiedRuleParser<'i> for RuleParser {
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::QualifiedRule, ParseError<'i, Self::Error>> {
         let (declarations, important) = parse_declaration_list(input);
+        let analysis = crate::selector::SelectorMatcher::analyze_selector(&prelude);
         Ok(vec![Rule {
             key: crate::stylesheet::RuleKey::from_selector(&prelude),
+            index_key: analysis.index_key,
+            specificity: analysis.specificity,
+            selector_valid: analysis.valid,
             selector: prelude,
             declarations,
             important,
@@ -852,6 +856,7 @@ impl CssParser {
             }
         }
 
+        stylesheet.build_index();
         tracing::info!("[cssparser] {} reglas parseadas", stylesheet.rules.len());
         stylesheet
     }

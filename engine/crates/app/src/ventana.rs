@@ -1,7 +1,7 @@
 //! La ventana nativa: `winit` para la ventana y los eventos, `softbuffer` para
 //! poner en pantalla la imagen que compone `App` (barra + página).
 
-use crate::app::{App, Entrada, Modificadores, Tecla, PIXELES_POR_LINEA};
+use crate::app::{App, CursorTipo, Entrada, Modificadores, Tecla, PIXELES_POR_LINEA};
 use crate::motor::{MensajeMotor, Motor};
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -9,7 +9,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::WindowBuilder;
+use winit::window::{CursorIcon, WindowBuilder};
 
 /// Abre la ventana y no vuelve hasta que se cierra.
 pub fn ejecutar(inicial: Option<String>) -> Result<(), String> {
@@ -31,18 +31,19 @@ pub fn ejecutar(inicial: Option<String>) -> Result<(), String> {
     let contexto = softbuffer::Context::new(ventana.clone()).map_err(|e| format!("no se pudo preparar el pintado: {e}"))?;
     let mut superficie = softbuffer::Surface::new(&contexto, ventana.clone()).map_err(|e| format!("no se pudo preparar el pintado: {e}"))?;
 
-    // La app trabaja en píxeles CSS; con la pantalla escalada (125 %, 200 %...)
-    // la imagen se amplía al pintarla.
-    let mut escala = ventana.scale_factor().max(0.5);
+    // La app trabaja en píxeles CSS para el layout/eventos y rasteriza
+    // directamente a los píxeles físicos de la pantalla (`escala`).
+    let mut escala = ventana.scale_factor().clamp(0.5, 4.0);
     let tamano = ventana.inner_size();
     if let (Some(w), Some(h)) = (NonZeroU32::new(tamano.width), NonZeroU32::new(tamano.height)) {
         let _ = superficie.resize(w, h);
     }
     let (ancho, alto) = logico(tamano.width, tamano.height, escala);
-    let (mut app, peticiones) = App::nueva(ancho, alto, inicial);
+    let (mut app, peticiones) = App::nueva_con_escala(ancho, alto, escala as f32, inicial);
     enviar(&mut motor, &peticiones);
 
     let mut raton = (0.0_f32, 0.0_f32);
+    let mut cursor_actual = CursorTipo::Normal;
     let mut modificadores = ModifiersState::empty();
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop
@@ -63,13 +64,33 @@ pub fn ejecutar(inicial: Option<String>) -> Result<(), String> {
                         Some(Entrada::Tamano { ancho, alto })
                     }
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                        escala = scale_factor.max(0.5);
+                        escala = scale_factor.clamp(0.5, 4.0);
+                        let salida_escala = app.manejar(Entrada::Escala(escala as f32));
+                        enviar(&mut motor, &salida_escala.peticiones);
                         let tamano = ventana.inner_size();
+                        if let (Some(w), Some(h)) = (NonZeroU32::new(tamano.width), NonZeroU32::new(tamano.height)) {
+                            let _ = superficie.resize(w, h);
+                        }
                         let (ancho, alto) = logico(tamano.width, tamano.height, escala);
-                        Some(Entrada::Tamano { ancho, alto })
+                        let salida_tam = app.manejar(Entrada::Tamano { ancho, alto });
+                        enviar(&mut motor, &salida_tam.peticiones);
+                        if salida_escala.redibujar || salida_tam.redibujar {
+                            ventana.set_title(&app.titulo_ventana());
+                            ventana.request_redraw();
+                        }
+                        None
                     }
                     WindowEvent::CursorMoved { position, .. } => {
                         raton = ((position.x / escala) as f32, (position.y / escala) as f32);
+                        let nuevo = app.cursor_en(raton.0, raton.1);
+                        if nuevo != cursor_actual {
+                            cursor_actual = nuevo;
+                            ventana.set_cursor_icon(match nuevo {
+                                CursorTipo::Normal => CursorIcon::Default,
+                                CursorTipo::Mano => CursorIcon::Pointer,
+                                CursorTipo::Texto => CursorIcon::Text,
+                            });
+                        }
                         None
                     }
                     WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => Some(Entrada::Clic { x: raton.0, y: raton.1 }),
@@ -101,6 +122,15 @@ pub fn ejecutar(inicial: Option<String>) -> Result<(), String> {
                 let salida = app.manejar(entrada);
                 enviar(&mut motor, &salida.peticiones);
                 if salida.redibujar {
+                    let nuevo = app.cursor_en(raton.0, raton.1);
+                    if nuevo != cursor_actual {
+                        cursor_actual = nuevo;
+                        ventana.set_cursor_icon(match nuevo {
+                            CursorTipo::Normal => CursorIcon::Default,
+                            CursorTipo::Mano => CursorIcon::Pointer,
+                            CursorTipo::Texto => CursorIcon::Text,
+                        });
+                    }
                     ventana.set_title(&app.titulo_ventana());
                     ventana.request_redraw();
                 }

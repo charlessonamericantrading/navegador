@@ -1,3 +1,4 @@
+use crate::selector::Specificity;
 use std::collections::HashMap;
 
 /// La condicion de un bloque `@media` (Fase 18), ya interpretada.
@@ -168,6 +169,15 @@ pub struct Rule {
     /// aqui y no se recalcula en cada comparacion porque el punto entero
     /// es que mirarlo sea mas barato que matchear.
     pub key: RuleKey,
+    /// Clave extraida del AST real de `selectors` (para el indice de
+    /// `StyleSheet`, sin falsos negativos en `a[href]`, `:not(...)`, etc.).
+    pub(crate) index_key: RuleKey,
+    /// Especificidad precalculada al parsear para no volver a consultar
+    /// `PARSED_SELECTORS` en cada ordenacion de la cascada.
+    pub(crate) specificity: Specificity,
+    /// `false` cuando `SelectorList::parse` rechaza el selector (por ejemplo
+    /// `::before` o `:has()`): el indice lo omite por completo.
+    pub(crate) selector_valid: bool,
     /// Los valores ya SIN el sufijo `!important` - ese dato vive aparte,
     /// en `important`, para que todo lo que consume un valor CSS (parseo
     /// de color, de longitud...) reciba el valor limpio sin tener que
@@ -200,14 +210,91 @@ pub struct Rule {
     pub media: Option<MediaCondition>,
 }
 
+/// Indice de reglas por clave mas a la derecha (`id`, `class`, `tag` o `any`),
+/// para no probar todas las reglas de una hoja grande contra cada nodo del DOM.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RuleIndex {
+    by_id: HashMap<String, Vec<usize>>,
+    by_class: HashMap<String, Vec<usize>>,
+    by_tag: HashMap<String, Vec<usize>>,
+    any: Vec<usize>,
+    indexed_len: usize,
+}
+
+impl RuleIndex {
+    fn build(rules: &[Rule]) -> Self {
+        let mut index = Self {
+            by_id: HashMap::new(),
+            by_class: HashMap::new(),
+            by_tag: HashMap::new(),
+            any: Vec::new(),
+            indexed_len: rules.len(),
+        };
+        for (idx, rule) in rules.iter().enumerate() {
+            if !rule.selector_valid {
+                continue;
+            }
+            match &rule.index_key {
+                RuleKey::Any => index.any.push(idx),
+                RuleKey::OneOf(parts) => {
+                    for part in parts {
+                        match part {
+                            KeyPart::Id(id) => index.by_id.entry(id.clone()).or_default().push(idx),
+                            KeyPart::Class(class) => index.by_class.entry(class.clone()).or_default().push(idx),
+                            KeyPart::Tag(tag) => index.by_tag.entry(tag.clone()).or_default().push(idx),
+                        }
+                    }
+                }
+            }
+        }
+        index
+    }
+
+    /// Devuelve indices unicos y en orden de aparicion de las reglas que
+    /// podrian coincidir con este elemento.
+    pub(crate) fn collect_candidates(&self, tag: &str, id: Option<&str>, classes: &[&str], out: &mut Vec<usize>) {
+        out.clear();
+        out.extend_from_slice(&self.any);
+        if !tag.is_empty() {
+            if let Some(bucket) = self.by_tag.get(tag) {
+                out.extend_from_slice(bucket);
+            }
+        }
+        if let Some(id_val) = id {
+            if let Some(bucket) = self.by_id.get(id_val) {
+                out.extend_from_slice(bucket);
+            }
+        }
+        for class in classes {
+            if let Some(bucket) = self.by_class.get(*class) {
+                out.extend_from_slice(bucket);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StyleSheet {
     pub rules: Vec<Rule>,
+    index: RuleIndex,
 }
 
 impl StyleSheet {
     pub fn new() -> Self {
-        Self { rules: Vec::new() }
+        Self {
+            rules: Vec::new(),
+            index: RuleIndex::default(),
+        }
+    }
+
+    pub(crate) fn build_index(&mut self) {
+        self.index = RuleIndex::build(&self.rules);
+    }
+
+    pub(crate) fn index_if_current(&self) -> Option<&RuleIndex> {
+        (self.index.indexed_len == self.rules.len()).then_some(&self.index)
     }
 }
 

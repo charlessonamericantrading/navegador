@@ -72,19 +72,24 @@ const MAX_BACKGROUND_TILES: usize = 8192;
 /// recortado (a diferencia de `fill_rect`/`paint_image`, que nunca pintan
 /// mas alla de su propio `rect` aunque no haya mascara).
 pub fn paint_background_image(pixmap: &mut Pixmap, rect: &Rect, image: &DecodedImage, scroll_offset_y: f32, mask: Option<&Mask>) {
+    paint_background_image_scaled(pixmap, rect, image, scroll_offset_y, mask, 1.0);
+}
+
+pub fn paint_background_image_scaled(pixmap: &mut Pixmap, rect: &Rect, image: &DecodedImage, scroll_offset_y: f32, mask: Option<&Mask>, scale: f32) {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return;
     }
-    let (tile_w, tile_h) = (image.width as f32, image.height as f32);
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let (tile_w, tile_h) = (image.width as f32 * scale, image.height as f32 * scale);
     if tile_w <= 0.0 || tile_h <= 0.0 {
         return;
     }
     let Some(source) = to_premultiplied_pixmap(image) else { return };
 
-    let start_x = rect.x;
-    let start_y = rect.y - scroll_offset_y;
-    let cols = (rect.width / tile_w).ceil().max(1.0) as usize;
-    let rows = (rect.height / tile_h).ceil().max(1.0) as usize;
+    let start_x = rect.x * scale;
+    let start_y = (rect.y - scroll_offset_y) * scale;
+    let cols = ((rect.width * scale) / tile_w).ceil().max(1.0) as usize;
+    let rows = ((rect.height * scale) / tile_h).ceil().max(1.0) as usize;
 
     let mut drawn = 0usize;
     'rows: for row in 0..rows {
@@ -93,7 +98,7 @@ pub fn paint_background_image(pixmap: &mut Pixmap, rect: &Rect, image: &DecodedI
                 tracing::warn!("[image_paint] mosaico de fondo cortado en {drawn} tiles (limite {MAX_BACKGROUND_TILES})");
                 break 'rows;
             }
-            let transform = Transform::from_translate(start_x + col as f32 * tile_w, start_y + row as f32 * tile_h);
+            let transform = Transform::from_row(scale, 0.0, 0.0, scale, start_x + col as f32 * tile_w, start_y + row as f32 * tile_h);
             pixmap.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), transform, mask);
             drawn += 1;
         }

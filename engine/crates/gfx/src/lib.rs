@@ -8,4 +8,4 @@ pub mod raster;
 pub use display_list::{focus_overlay, DisplayList, DisplayItem};
 pub use window::NativeEngineWindow;
 pub use gpu_pipeline::WebGpuPipeline;
-pub use raster::{render_layout_to_pixmap, render_layout_to_png, render_layout_to_png_with_overlay};
+pub use raster::{render_layout_to_pixmap, render_layout_to_pixmap_scaled, render_layout_to_png, render_layout_to_png_with_overlay, render_layout_to_png_with_overlay_scaled};

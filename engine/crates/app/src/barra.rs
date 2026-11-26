@@ -2,7 +2,7 @@
 //! barra de direcciones. Se escribe en HTML/CSS y la pinta nuestro motor; los
 //! iconos son SVG que también decodifica el motor (`engine-image`).
 
-use crate::lienzo::{caja_con_id, escapar, pintar_html, Lienzo};
+use crate::lienzo::{caja_con_id, escapar, pintar_html_escalado, Lienzo};
 use engine_gfx::DisplayItem;
 use engine_layout::{ImageMap, Rect};
 use engine_text::{FontSet, SystemFont};
@@ -96,8 +96,17 @@ impl BarraPintada {
     }
 }
 
-/// Los iconos de la barra, decodificados por el motor.
+/// Los iconos de la barra, decodificados por el motor a escala 1x.
 pub fn iconos() -> ImageMap {
+    iconos_con_escala(1.0)
+}
+
+/// Los iconos de la barra decodificados directamente al tamaño físico que pide
+/// la pantalla (`escala`), para que se vean nítidos en pantallas HiDPI.
+pub fn iconos_con_escala(escala: f32) -> ImageMap {
+    let escala = if escala.is_finite() && escala > 0.0 { escala.clamp(0.5, 4.0) } else { 1.0 };
+    let tam_20 = ((20.0 * escala).round() as u32).max(16);
+    let tam_16 = ((16.0 * escala).round() as u32).max(12);
     const OSCURO: &str = "#3c4043";
     const APAGADO: &str = "#bdc1c6";
     let trazos = [
@@ -110,12 +119,12 @@ pub fn iconos() -> ImageMap {
     let mut mapa = ImageMap::new();
     for (nombre, trazo) in trazos {
         for (sufijo, color) in [("", OSCURO), ("-off", APAGADO)] {
-            if let Some(imagen) = engine_image::decode_svg(svg(trazo, color, 20).as_bytes()) {
+            if let Some(imagen) = engine_image::decode_svg(svg(trazo, color, tam_20).as_bytes()) {
                 mapa.insert(format!("icono:{nombre}{sufijo}"), imagen);
             }
         }
     }
-    if let Some(imagen) = engine_image::decode_svg(svg("M7 7l10 10M17 7L7 17", OSCURO, 16).as_bytes()) {
+    if let Some(imagen) = engine_image::decode_svg(svg("M7 7l10 10M17 7L7 17", OSCURO, tam_16).as_bytes()) {
         mapa.insert("icono:cerrar".to_string(), imagen);
     }
     mapa
@@ -220,12 +229,17 @@ body {{ margin: 0; font-family: sans-serif; background: #dfe3e8; }}
     (html, campo)
 }
 
-/// Pinta la barra entera con el motor.
+/// Pinta la barra entera con el motor a escala 1x.
 pub fn pintar(vista: &VistaBarra, ancho: u32, fuentes: &FontSet, iconos: &ImageMap) -> Result<BarraPintada, String> {
+    pintar_con_escala(vista, ancho, 1.0, fuentes, iconos)
+}
+
+/// Pinta la barra entera con el motor a `escala` píxeles físicos por CSS.
+pub fn pintar_con_escala(vista: &VistaBarra, ancho: u32, escala: f32, fuentes: &FontSet, iconos: &ImageMap) -> Result<BarraPintada, String> {
     let fuente = fuentes.pick(false, false);
     let (html, campo) = html(vista, ancho, fuente);
     let mut campo_pintado = None;
-    let lienzo = pintar_html(&html, ancho, ALTO_BARRA, fuentes, iconos, |layout| {
+    let lienzo = pintar_html_escalado(&html, ancho, ALTO_BARRA, escala, fuentes, iconos, |layout| {
         let (Some((inicio, visible)), Some(caja)) = (campo.as_ref(), caja_con_id(layout, "texto-direccion")) else {
             return Vec::new();
         };

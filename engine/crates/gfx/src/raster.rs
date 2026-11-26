@@ -8,7 +8,7 @@
 //! doc-comment de `paint.rs` para el bug real que costo esa duplicacion).
 
 use crate::display_list::DisplayList;
-use crate::paint::paint_display_list;
+use crate::paint::paint_display_list_scaled;
 use engine_layout::{ImageMap, LayoutBox};
 use engine_text::FontSet;
 use tiny_skia::{Color, Pixmap};
@@ -43,7 +43,22 @@ pub fn render_layout_to_png_with_overlay(
     scroll_offset_y: f32,
     overlay: &[crate::display_list::DisplayItem],
 ) -> Result<Vec<u8>, String> {
-    render_layout_to_pixmap(layout_root, font_set, images, width, height, scroll_offset_y, overlay)?
+    render_layout_to_png_with_overlay_scaled(layout_root, font_set, images, width, height, scroll_offset_y, overlay, 1.0)
+}
+
+/// Como `render_layout_to_png_with_overlay`, renderizando directamente a la
+/// escala física de pantalla `scale` (HiDPI nítido).
+pub fn render_layout_to_png_with_overlay_scaled(
+    layout_root: &LayoutBox,
+    font_set: Option<&FontSet>,
+    images: &ImageMap,
+    width: u32,
+    height: u32,
+    scroll_offset_y: f32,
+    overlay: &[crate::display_list::DisplayItem],
+    scale: f32,
+) -> Result<Vec<u8>, String> {
+    render_layout_to_pixmap_scaled(layout_root, font_set, images, width, height, scroll_offset_y, overlay, scale)?
         .encode_png()
         .map_err(|error| format!("no se pudo codificar la captura PNG: {error}"))
 }
@@ -60,11 +75,26 @@ pub fn render_layout_to_pixmap(
     scroll_offset_y: f32,
     overlay: &[crate::display_list::DisplayItem],
 ) -> Result<Pixmap, String> {
-    let mut pixmap = Pixmap::new(width, height)
-        .ok_or_else(|| format!("no se pudo crear la superficie de rasterizado {width}x{height}"))?;
-    // El fondo del elemento raiz se propaga al lienzo ENTERO (ver
-    // `engine_layout::canvas_background`). Sin esto, una pagina con tema
-    // oscuro se veia como una franja de color sobre gris claro.
+    render_layout_to_pixmap_scaled(layout_root, font_set, images, width, height, scroll_offset_y, overlay, 1.0)
+}
+
+/// Como `render_layout_to_pixmap`, pero pintando directamente a `scale` píxeles
+/// físicos por píxel CSS.
+pub fn render_layout_to_pixmap_scaled(
+    layout_root: &LayoutBox,
+    font_set: Option<&FontSet>,
+    images: &ImageMap,
+    width: u32,
+    height: u32,
+    scroll_offset_y: f32,
+    overlay: &[crate::display_list::DisplayItem],
+    scale: f32,
+) -> Result<Pixmap, String> {
+    let scale = if scale.is_finite() && scale > 0.0 { scale.clamp(0.5, 4.0) } else { 1.0 };
+    let phys_width = ((width as f32 * scale).round() as u32).max(1);
+    let phys_height = ((height as f32 * scale).round() as u32).max(1);
+    let mut pixmap = Pixmap::new(phys_width, phys_height)
+        .ok_or_else(|| format!("no se pudo crear la superficie de rasterizado {phys_width}x{phys_height}"))?;
     let canvas_color = engine_layout::canvas_background(layout_root)
         .and_then(|value| crate::display_list::parse_css_color(&value))
         .map(|[r, g, b, a]| Color::from_rgba8(r, g, b, a))
@@ -75,9 +105,9 @@ pub fn render_layout_to_pixmap(
     pixmap.fill(canvas_color);
 
     let display_list = DisplayList::build(layout_root, images);
-    paint_display_list(&mut pixmap, &display_list.items, font_set, scroll_offset_y);
+    paint_display_list_scaled(&mut pixmap, &display_list.items, font_set, scroll_offset_y, scale);
     if !overlay.is_empty() {
-        paint_display_list(&mut pixmap, overlay, font_set, scroll_offset_y);
+        paint_display_list_scaled(&mut pixmap, overlay, font_set, scroll_offset_y, scale);
     }
 
     Ok(pixmap)
@@ -290,5 +320,27 @@ mod tests {
             (0, 200, 0),
             "el mosaico no deberia derramarse fuera de su propia caja aunque el tile sea mas grande que ella"
         );
+    }
+
+    #[test]
+    fn scaled_render_draws_at_physical_dimensions_without_clipping_box() {
+        let mut root = LayoutBox::new(BoxType::Block);
+        root.dimensions.width = 100.0;
+        root.dimensions.height = 60.0;
+        let mut child = LayoutBox::new(BoxType::Block);
+        child.dimensions.x = 10.0;
+        child.dimensions.y = 10.0;
+        child.dimensions.width = 40.0;
+        child.dimensions.height = 20.0;
+        child.computed_style.insert("background-color".to_string(), "#112233".to_string());
+        root.children.push(child);
+
+        let pixmap = render_layout_to_pixmap_scaled(&root, None, &engine_layout::ImageMap::new(), 100, 60, 0.0, &[], 2.0)
+            .expect("scaled render");
+        assert_eq!((pixmap.width(), pixmap.height()), (200, 120));
+        let inside = pixmap.pixel(30, 30).expect("dentro de 20..100, 20..60");
+        assert_eq!((inside.red(), inside.green(), inside.blue()), (0x11, 0x22, 0x33));
+        let outside = pixmap.pixel(150, 90).expect("fuera");
+        assert_eq!((outside.red(), outside.green(), outside.blue()), (255, 255, 255));
     }
 }

@@ -6,7 +6,7 @@
 
 use engine_core::pipeline::build_page;
 use engine_dom::{Node, NodeType};
-use engine_gfx::{render_layout_to_pixmap, DisplayItem};
+use engine_gfx::{render_layout_to_pixmap_scaled, DisplayItem};
 use engine_layout::{ImageMap, LayoutBox, Rect};
 use engine_text::FontSet;
 use std::collections::HashMap;
@@ -38,9 +38,23 @@ pub fn pintar_html(
     imagenes: &ImageMap,
     encima: impl FnOnce(&LayoutBox) -> Vec<DisplayItem>,
 ) -> Result<Lienzo, String> {
+    pintar_html_escalado(html, ancho, alto, 1.0, fuentes, imagenes, encima)
+}
+
+/// Igual que `pintar_html`, pero rasterizando directamente a `escala` píxeles
+/// físicos por píxel CSS mientras `regiones` se mantiene en coordenadas CSS.
+pub fn pintar_html_escalado(
+    html: &str,
+    ancho: u32,
+    alto: u32,
+    escala: f32,
+    fuentes: &FontSet,
+    imagenes: &ImageMap,
+    encima: impl FnOnce(&LayoutBox) -> Vec<DisplayItem>,
+) -> Result<Lienzo, String> {
     let pagina = build_page(html, "", ancho as f32, alto as f32, Some(fuentes), &HashMap::new(), imagenes);
     let extra = encima(&pagina.layout_root);
-    let pixmap = render_layout_to_pixmap(&pagina.layout_root, Some(fuentes), imagenes, ancho.max(1), alto.max(1), 0.0, &extra)?;
+    let pixmap = render_layout_to_pixmap_scaled(&pagina.layout_root, Some(fuentes), imagenes, ancho.max(1), alto.max(1), 0.0, &extra, escala)?;
     let mut regiones = Vec::new();
     recoger_regiones(&pagina.layout_root, &mut regiones);
     Ok(Lienzo { pixmap, layout: pagina.layout_root, regiones })

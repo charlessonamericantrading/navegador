@@ -17,5 +17,6 @@ pub mod direccion;
 pub mod lienzo;
 pub mod motor;
 pub mod paginas;
+pub mod portapapeles;
 pub mod sin_ventana;
 pub mod ventana;

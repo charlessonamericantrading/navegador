@@ -45,60 +45,68 @@ use std::sync::{Arc, RwLock};
 /// `resolve_style` para poder invocarse dos veces con el mismo criterio de
 /// orden interno (especificidad) pero en dos momentos distintos (UA antes,
 /// autor despues), sin duplicar la logica de matching+orden entre ambas.
-fn apply_matching_rules(computed: &mut HashMap<String, String>, stylesheet: &StyleSheet, dom_node: &Arc<RwLock<Node>>, viewport_width: f32) {
-    // Identidad del elemento, leida UNA vez por nodo (no una por regla):
-    // es lo que hace que el prefiltro `RuleKey` salga a cuenta. Un nodo que
-    // no sea un elemento no puede matchear nada, pero se deja pasar al
-    // matcher real para no cambiar el comportamiento observable.
-    let (tag_name, id_attr, class_attr) = {
-        let node = dom_node.read().unwrap();
-        match &node.node_type {
-            engine_dom::NodeType::Element { tag_name, attributes } => (
-                tag_name.to_ascii_lowercase(),
-                attributes.get("id").cloned(),
-                attributes.get("class").cloned(),
-            ),
-            _ => (String::new(), None, None),
-        }
+fn apply_matching_rules(
+    computed: &mut HashMap<String, String>,
+    stylesheet: &StyleSheet,
+    dom_node: &Arc<RwLock<Node>>,
+    tag_name: &str,
+    id_attr: Option<&str>,
+    classes: &[&str],
+    viewport_width: f32,
+) {
+    let mut matched = if let Some(index) = stylesheet.index_if_current() {
+        let mut candidate_indices = Vec::new();
+        index.collect_candidates(tag_name, id_attr, classes, &mut candidate_indices);
+        let candidates: Vec<&Rule> = candidate_indices
+            .iter()
+            .map(|&idx| &stylesheet.rules[idx])
+            .filter(|rule| rule.media.as_ref().is_none_or(|m| m.matches(viewport_width)))
+            .collect();
+        let mut matched = SelectorMatcher::filter_matching_rules(&candidates, dom_node);
+        matched.sort_by_key(|rule| rule.specificity);
+        matched
+    } else {
+        // Respaldo conservador para hojas construidas a mano sin `build_index()`.
+        let candidates: Vec<&Rule> = stylesheet
+            .rules
+            .iter()
+            .filter(|rule| rule.media.as_ref().is_none_or(|m| m.matches(viewport_width)))
+            .filter(|rule| rule.key.could_match(tag_name, id_attr, classes))
+            .collect();
+        let mut matched = SelectorMatcher::filter_matching_rules(&candidates, dom_node);
+        matched.sort_by_key(|rule| SelectorMatcher::calculate_specificity(&rule.selector));
+        matched
     };
-    let classes: Vec<&str> = class_attr.as_deref().map(|c| c.split_whitespace().collect()).unwrap_or_default();
 
-    let mut matched: Vec<&Rule> = stylesheet
-        .rules
-        .iter()
-        // `@media` (Fase 18): una regla que venia dentro de un bloque solo
-        // participa si su condicion se cumple con el viewport ACTUAL. Se
-        // comprueba aqui, en cada resolucion de estilo, y no al parsear,
-        // precisamente para que redimensionar la ventana vuelva a
-        // evaluarla - la hoja se parsea una sola vez por pagina, pero
-        // `resolve_style` corre en cada relayout.
-        .filter(|rule| rule.media.as_ref().is_none_or(|m| m.matches(viewport_width)))
-        // Descarte BARATO antes del matcher real (Fase 39): mirar si el
-        // simple-selector clave de la regla puede siquiera corresponder a
-        // este elemento. Conservador por construccion - `RuleKey::Any`
-        // deja pasar todo, asi que esto no puede cambiar que reglas
-        // acaban aplicandose, solo cuantas se llegan a probar.
-        .filter(|rule| rule.key.could_match(&tag_name, id_attr.as_deref(), &classes))
-        .filter(|rule| SelectorMatcher::matches(&rule.selector, dom_node))
-        .collect();
-    matched.sort_by_key(|rule| SelectorMatcher::calculate_specificity(&rule.selector));
+    if matched.is_empty() {
+        return;
+    }
 
     // DOS pasadas (Fase 22): primero las declaraciones normales por
     // especificidad, y luego las `!important` - tambien por especificidad
     // entre ellas. Asi una declaracion importante gana a CUALQUIER normal
     // sin importar su selector, que es justo lo que `!important` significa
     // y lo unico que no se puede expresar con un solo orden.
-    for rule in &matched {
+    let mut any_important = false;
+    for rule in &mut matched {
+        if !rule.important.is_empty() {
+            any_important = true;
+        }
         for (prop, val) in &rule.declarations {
             if !rule.important.contains(prop) {
                 computed.insert(prop.clone(), val.clone());
             }
         }
     }
-    for rule in &matched {
-        for (prop, val) in &rule.declarations {
-            if rule.important.contains(prop) {
-                computed.insert(prop.clone(), val.clone());
+    if any_important {
+        for rule in &matched {
+            if rule.important.is_empty() {
+                continue;
+            }
+            for (prop, val) in &rule.declarations {
+                if rule.important.contains(prop) {
+                    computed.insert(prop.clone(), val.clone());
+                }
             }
         }
     }
@@ -109,11 +117,33 @@ fn apply_matching_rules(computed: &mut HashMap<String, String>, stylesheet: &Sty
 /// como se evalua aqui y no al parsear, redimensionar reevalua las
 /// consultas sin necesidad de volver a parsear la hoja.
 pub fn resolve_style(dom_node: &Arc<RwLock<Node>>, stylesheet: &StyleSheet, viewport_width: f32) -> HashMap<String, String> {
+    let (is_element, tag_name, id_attr, class_attr, inline_style) = {
+        let n = dom_node.read().unwrap();
+        match &n.node_type {
+            NodeType::Element { tag_name, attributes } => (
+                true,
+                if tag_name.bytes().any(|b| b.is_ascii_uppercase()) {
+                    tag_name.to_ascii_lowercase()
+                } else {
+                    tag_name.clone()
+                },
+                attributes.get("id").cloned(),
+                attributes.get("class").cloned(),
+                attributes.get("style").cloned(),
+            ),
+            _ => (false, String::new(), None, None, None),
+        }
+    };
+    if !is_element {
+        return HashMap::new();
+    }
+    let classes: Vec<&str> = class_attr.as_deref().map(|c| c.split_whitespace().collect()).unwrap_or_default();
+
     let mut computed = HashMap::new();
 
     // Origen 1: agente de usuario - SIEMPRE pierde frente a lo que venga
     // despues, sin importar especificidad (ver doc-comment del modulo).
-    apply_matching_rules(&mut computed, user_agent_stylesheet(), dom_node, viewport_width);
+    apply_matching_rules(&mut computed, user_agent_stylesheet(), dom_node, &tag_name, id_attr.as_deref(), &classes, viewport_width);
 
     // Atributos de presentacion (`bgcolor`, `width`, `cellpadding`...): CSS de
     // especificidad cero que cae entre el agente de usuario y el autor (tarea
@@ -124,15 +154,8 @@ pub fn resolve_style(dom_node: &Arc<RwLock<Node>>, stylesheet: &StyleSheet, view
 
     // Origen 2: autor de la pagina - sobrescribe cualquier declaracion de
     // agente de usuario para la misma propiedad.
-    apply_matching_rules(&mut computed, stylesheet, dom_node, viewport_width);
+    apply_matching_rules(&mut computed, stylesheet, dom_node, &tag_name, id_attr.as_deref(), &classes, viewport_width);
 
-    let inline_style = {
-        let n = dom_node.read().unwrap();
-        match &n.node_type {
-            NodeType::Element { attributes, .. } => attributes.get("style").cloned(),
-            _ => None,
-        }
-    };
     if let Some(style_attr) = inline_style {
         for (prop, val) in CssParser::parse_inline_style(&style_attr) {
             computed.insert(prop, val);
@@ -463,5 +486,27 @@ mod tests {
             Some("#00ff00"),
             "el longhand mas especifico deberia ganar sobre el shorthand menos especifico, aunque sean propiedades 'distintas' a nivel de string"
         );
+    }
+
+    #[test]
+    fn indexed_cascade_preserves_document_order_without_duplicates_for_selector_lists() {
+        let dom = HtmlParser::parse(r#"<html><body><a id="cta" class="btn primary" href="/go">ir</a></body></html>"#);
+        let stylesheet = Parser::parse(
+            "a, .btn, #cta { color: #111111; } \
+             a[href]:not(.disabled) { background-color: #222222; } \
+             a.primary, .btn { color: #333333; } \
+             a::before { color: #ff0000; }",
+        );
+        let a = find_first_element(&dom, "a");
+        let computed = resolve_style(&a, &stylesheet, 1280.0);
+        // `#cta` en la primera regla tiene especificidad de ID (1,0,0) > (0,2,0) de la tercera,
+        // pero si hubiese empate debe ganar la posterior en documento; aqui `#cta` gana por ID.
+        assert_eq!(computed.get("color").map(String::as_str), Some("#111111"));
+        assert_eq!(computed.get("background-color").map(String::as_str), Some("#222222"));
+
+        // Empate de especificidad entre dos reglas que entran por ramas distintas (`a` y `.btn`):
+        let empate = Parser::parse("a, #otro { color: #111111; } .btn, #ninguno { color: #444444; }");
+        let comp2 = resolve_style(&a, &empate, 1280.0);
+        assert_eq!(comp2.get("color").map(String::as_str), Some("#444444"));
     }
 }

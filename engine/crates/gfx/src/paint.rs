@@ -9,23 +9,33 @@
 //! `overflow: hidden` (Fase 3.5) se añaden aqui, una sola vez.
 
 use crate::display_list::{DisplayItem, Gradient, GradientDirection, StopPosition, TextAlign};
-use crate::image_paint::{paint_background_image, paint_image};
+use crate::image_paint::{paint_background_image_scaled, paint_image};
 use engine_layout::Rect;
 use engine_text::{baseline_offset, measure_text, shape_text, underline_metrics, wrap_text_from, FontFamily, FontSet, SystemFont};
 use tiny_skia::{FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Rect as SkiaRect, Stroke, Transform};
 
-/// Pinta cada `DisplayItem` de `items`, EN ORDEN, sobre `pixmap`.
-/// `scroll_offset_y` se resta de cada coordenada Y (transformacion
-/// content-space -> screen-space, unica aqui - `DisplayList` en si nunca se
-/// reconstruye por scroll). Se redondea a pixel entero ANTES de usarse en
-/// cualquier calculo: sin esto, un scroll a un offset fraccionario (posible
-/// con `MouseScrollDelta::PixelDelta` de un trackpad) podria reintroducir
-/// una coordenada fraccionaria en una franja de `border` YA redondeada por
-/// `border_strip_rects` (mismo bug de tiny-skia que la Fase 3.4 encontro y
-/// arreglo para columnas de tabla - ver su doc-comment) por la puerta de
-/// atras.
+fn scale_rect(rect: &Rect, scale: f32) -> Rect {
+    if (scale - 1.0).abs() < 0.001 {
+        rect.clone()
+    } else {
+        Rect {
+            x: rect.x * scale,
+            y: rect.y * scale,
+            width: rect.width * scale,
+            height: rect.height * scale,
+        }
+    }
+}
+
 pub fn paint_display_list(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: Option<&FontSet>, scroll_offset_y: f32) {
-    let scroll_offset_y = scroll_offset_y.round();
+    paint_display_list_scaled(pixmap, items, font_set, scroll_offset_y, 1.0);
+}
+
+/// Pinta cada `DisplayItem` de `items`, EN ORDEN, sobre `pixmap` multiplicando
+/// las coordenadas y tamaños por `scale` (HiDPI nítido, sin reescalar luego).
+pub fn paint_display_list_scaled(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: Option<&FontSet>, scroll_offset_y: f32, scale: f32) {
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let scroll_px = (scroll_offset_y * scale).round();
     let (width, height) = (pixmap.width(), pixmap.height());
 
     // Pila de rectangulos de recorte activos (`overflow: hidden`, Fase
@@ -37,70 +47,66 @@ pub fn paint_display_list(pixmap: &mut Pixmap, items: &[DisplayItem], font_set: 
     let mut current_mask: Option<Mask> = None;
 
     for item in items {
-        // Descarte por viewport (Fase 5): un item cuyo rectangulo cae
-        // ENTERO por encima o por debajo del pixmap no puede pintar ni un
-        // pixel visible, asi que hacerlo es trabajo tirado. No es una
-        // optimizacion cosmetica: medido sobre una pagina de 200 filas
-        // (~4800px de contenido en un viewport de 800px), pintar era el
-        // 98% del coste de cada respuesta del servidor y ~5/6 de ese
-        // trabajo era para pixeles fuera de pantalla.
-        //
-        // `PushClip`/`PopClip` NUNCA se descartan aunque su rectangulo
-        // este fuera: no pintan nada, cambian ESTADO (la pila de recorte),
-        // y saltarselos desemparejaria la pila y recortaria mal todo lo
-        // que viniera despues.
         if let Some(rect) = item_rect(item) {
-            if is_offscreen(rect, height, scroll_offset_y) {
+            let scaled = scale_rect(rect, scale);
+            if is_offscreen_scaled(&scaled, height, scroll_px, MARGEN_DESCARTE * scale) {
                 continue;
             }
         }
         match item {
             DisplayItem::PushClip { rect } => {
-                clip_stack.push(rect.clone());
-                current_mask = build_clip_mask(width, height, &clip_stack, scroll_offset_y);
+                clip_stack.push(scale_rect(rect, scale));
+                current_mask = build_clip_mask(width, height, &clip_stack, scroll_px);
             }
             DisplayItem::PopClip => {
                 clip_stack.pop();
-                current_mask = build_clip_mask(width, height, &clip_stack, scroll_offset_y);
+                current_mask = build_clip_mask(width, height, &clip_stack, scroll_px);
             }
             DisplayItem::SolidRect { rect, color, radius } => {
-                fill_shape(pixmap, rect, *radius, &paint_of(*color), scroll_offset_y, current_mask.as_ref());
+                fill_shape(pixmap, &scale_rect(rect, scale), *radius * scale, &paint_of(*color), scroll_px, current_mask.as_ref());
             }
-            // Sin blur (`0.0`, el caso mas comun de `box-shadow` sin tercer
-            // valor) es el mismo relleno directo que `SolidRect` - con blur,
-            // `paint_blurred_shadow` rellena en un lienzo aparte y lo
-            // difumina antes de componerlo encima.
             DisplayItem::Shadow { rect, color, radius, blur } => {
+                let srect = scale_rect(rect, scale);
                 if *blur > 0.0 {
-                    paint_blurred_shadow(pixmap, rect, *radius, *blur, *color, scroll_offset_y, current_mask.as_ref());
+                    paint_blurred_shadow(pixmap, &srect, *radius * scale, *blur * scale, *color, scroll_px, current_mask.as_ref());
                 } else {
-                    fill_shape(pixmap, rect, *radius, &paint_of(*color), scroll_offset_y, current_mask.as_ref());
+                    fill_shape(pixmap, &srect, *radius * scale, &paint_of(*color), scroll_px, current_mask.as_ref());
                 }
             }
             DisplayItem::Text { rect, text, color, font_size, bold, italic, underline, text_align, line_height, font_family, first_line_indent } => {
-                paint_text(pixmap, rect, text, *color, *font_size, *bold, *italic, *font_family, *underline, *text_align, *line_height, *first_line_indent, font_set, scroll_offset_y, current_mask.as_ref());
+                paint_text(
+                    pixmap,
+                    rect,
+                    text,
+                    *color,
+                    *font_size,
+                    *bold,
+                    *italic,
+                    *font_family,
+                    *underline,
+                    *text_align,
+                    *line_height,
+                    *first_line_indent,
+                    font_set,
+                    scroll_px,
+                    scale,
+                    current_mask.as_ref(),
+                );
             }
             DisplayItem::Gradient { rect, gradient, radius } => {
-                paint_gradient(pixmap, rect, gradient, *radius, scroll_offset_y, current_mask.as_ref());
+                paint_gradient(pixmap, &scale_rect(rect, scale), gradient, *radius * scale, scroll_px, scale, current_mask.as_ref());
             }
             DisplayItem::Border { rect, width: border_width, color, radius } => {
-                paint_border(pixmap, rect, *border_width, *color, *radius, scroll_offset_y, current_mask.as_ref());
+                paint_border(pixmap, &scale_rect(rect, scale), *border_width * scale, *color, *radius * scale, scroll_px, current_mask.as_ref());
             }
             DisplayItem::Image { rect, image } => {
-                paint_image(pixmap, rect, image, scroll_offset_y, current_mask.as_ref());
+                paint_image(pixmap, &scale_rect(rect, scale), image, scroll_px, current_mask.as_ref());
             }
-            // El mosaico de un `background-image` no debe salirse de SU
-            // PROPIA caja, no solo de la de un `overflow: hidden` ancestro
-            // (a diferencia del resto de items, cuyo propio dibujo nunca
-            // pinta mas alla de `rect` aunque no haya mascara activa - ver
-            // el doc-comment de `paint_background_image`). Por eso aqui se
-            // reconstruye la mascara con `rect` añadido a la pila de
-            // recorte activa, en vez de reusar `current_mask` tal cual.
             DisplayItem::BackgroundImage { rect, image } => {
                 let mut own_clip = clip_stack.clone();
-                own_clip.push(rect.clone());
-                let mask = build_clip_mask(width, height, &own_clip, scroll_offset_y);
-                paint_background_image(pixmap, rect, image, scroll_offset_y, mask.as_ref());
+                own_clip.push(scale_rect(rect, scale));
+                let mask = build_clip_mask(width, height, &own_clip, scroll_px);
+                paint_background_image_scaled(pixmap, rect, image, scroll_px / scale, mask.as_ref(), scale);
             }
         }
     }
@@ -138,10 +144,15 @@ const MARGEN_DESCARTE: f32 = 64.0;
 /// verdad (una pagina larga) y donde esta todo el ahorro. En horizontal el
 /// layout ya acota las cajas al ancho del viewport y no hay scroll lateral,
 /// asi que comprobarlo no descartaria practicamente nada.
-fn is_offscreen(rect: &Rect, viewport_height: u32, scroll_offset_y: f32) -> bool {
+fn is_offscreen_scaled(rect: &Rect, viewport_height: u32, scroll_offset_y: f32, margin: f32) -> bool {
     let top = rect.y - scroll_offset_y;
     let bottom = top + rect.height;
-    bottom < -MARGEN_DESCARTE || top > viewport_height as f32 + MARGEN_DESCARTE
+    bottom < -margin || top > viewport_height as f32 + margin
+}
+
+#[cfg(test)]
+fn is_offscreen(rect: &Rect, viewport_height: u32, scroll_offset_y: f32) -> bool {
+    is_offscreen_scaled(rect, viewport_height, scroll_offset_y, MARGEN_DESCARTE)
 }
 
 fn paint_of(color: [u8; 4]) -> Paint<'static> {
@@ -279,7 +290,7 @@ fn fill_shape(pixmap: &mut Pixmap, rect: &Rect, radius: f32, paint: &Paint<'stat
 /// La linea del degradado pasa por el centro de la caja con el angulo pedido y
 /// mide lo justo para que las esquinas de salida caigan en el 0 % y el 100 %
 /// (`|w·sen| + |h·cos|`), que es la definicion de CSS.
-fn paint_gradient(pixmap: &mut Pixmap, rect: &Rect, gradient: &Gradient, radius: f32, scroll_offset_y: f32, mask: Option<&Mask>) {
+fn paint_gradient(pixmap: &mut Pixmap, rect: &Rect, gradient: &Gradient, radius: f32, scroll_offset_y: f32, scale: f32, mask: Option<&Mask>) {
     use tiny_skia::{Color, GradientStop as SkStop, LinearGradient, Point, SpreadMode};
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return;
@@ -311,7 +322,7 @@ fn paint_gradient(pixmap: &mut Pixmap, rect: &Rect, gradient: &Gradient, radius:
         .map(|stop| {
             let fraction = match stop.position {
                 StopPosition::Fraction(f) => f,
-                StopPosition::Pixels(px) => px / length,
+                StopPosition::Pixels(px) => (px * scale) / length,
             };
             // tiny-skia exige posiciones en [0, 1] y no decrecientes.
             last = fraction.clamp(0.0, 1.0).max(last);
@@ -461,74 +472,50 @@ fn paint_text(
     line_height: Option<f32>,
     first_line_indent: f32,
     font_set: Option<&FontSet>,
-    scroll_offset_y: f32,
+    scroll_px: f32,
+    scale: f32,
     mask: Option<&Mask>,
 ) {
     let paint = paint_of(color);
-    let screen_y = rect.y - scroll_offset_y;
+    let screen_y = rect.y * scale - scroll_px;
 
     match font_set.and_then(|set| set.pick_family(font_family, bold, italic)) {
         Some(font) => {
-            // Mismo `wrap_text` que ya uso el layout para reservar el alto
-            // de esta caja (mismo font_size, mismo ancho) - el numero de
-            // lineas que se pinta aqui coincide con el que se reservo alli
-            // por construccion, no por coincidencia.
-            // Mismo corte que reservo el layout: la primera linea, si el texto
-            // empezo a mitad de linea, es `first_line_indent` mas estrecha.
+            // La partición de líneas ocurre en píxeles CSS para coincidir con el layout;
+            // los glifos se rasterizan al tamaño físico (`font_size * scale`).
             let lines = wrap_text_from(font, text, font_size, rect.width - first_line_indent, rect.width);
             let natural_height = engine_text::line_height(font, font_size);
-            // Con un `line-height` mayor (o menor) que el natural, cada linea
-            // avanza ese tanto y el texto se centra verticalmente dentro de
-            // ella: la mitad de la diferencia va arriba ("half-leading").
             let line_height = line_height.unwrap_or(natural_height);
             let half_leading = (line_height - natural_height) / 2.0;
+            let scaled_font = font_size * scale;
             for (index, line) in lines.iter().enumerate() {
-                let line_y = screen_y + index as f32 * line_height + half_leading;
-                // `text-align` (Fase 31) DENTRO de una caja que envuelve
-                // varias lineas por si sola - el unico caso que
-                // `engine-layout` deja sin resolver (ver el aviso de
-                // `resolve_text_align` mas arriba): cada linea se centra/
-                // alinea segun SU PROPIO ancho real (`measure_text` de
-                // ESA linea, no `rect.width` entero), igual que un
-                // navegador real alinea cada linea de un parrafo
-                // envuelto por separado.
+                let line_y = screen_y + (index as f32 * line_height + half_leading) * scale;
                 let line_width = measure_text(font, line, font_size).width;
-                let line_x = match text_align {
+                let line_x_css = match text_align {
                     TextAlign::Left => rect.x + if index == 0 { first_line_indent } else { 0.0 },
                     TextAlign::Center => rect.x + ((rect.width - line_width) / 2.0).max(0.0),
                     TextAlign::Right => rect.x + (rect.width - line_width).max(0.0),
                 };
-                for glyph in shape_text(font, line, font_size, line_x, line_y) {
+                let line_x = line_x_css * scale;
+                for glyph in shape_text(font, line, scaled_font, line_x, line_y) {
                     pixmap.fill_path(&glyph.path, &paint, FillRule::Winding, Transform::identity(), mask);
                 }
                 if underline && !line.trim().is_empty() {
-                    paint_underline(pixmap, font, line, font_size, line_x, line_y, &paint, mask);
+                    paint_underline(pixmap, font, line_width * scale, scaled_font, line_x, line_y, &paint, mask);
                 }
             }
         }
         None => {
             // Sin fuente de sistema disponible: bloque de relleno en vez
             // de fingir que hay glifos.
-            if let Some(sk_rect) = SkiaRect::from_xywh(rect.x, screen_y, rect.width.max(1.0), rect.height.max(1.0)) {
+            if let Some(sk_rect) = SkiaRect::from_xywh(rect.x * scale, screen_y, (rect.width * scale).max(1.0), (rect.height * scale).max(1.0)) {
                 pixmap.fill_rect(sk_rect, &paint, Transform::identity(), mask);
             }
         }
     }
 }
 
-/// La franja de `text-decoration: underline` (Fase 29) de UNA linea ya
-/// shapeada - ancho real de esa linea (`measure_text`, no `rect.width`
-/// entero: una linea mas corta que su caja, la ultima de un parrafo
-/// envuelto, no deberia subrayarse hasta el borde derecho de la caja) y
-/// posicion/grosor reales de la propia fuente (`underline_metrics`,
-/// mismas metricas que declara para el resto de sus glifos) - con
-/// respaldo a una fraccion de `font_size` (~8% bajo el baseline, ~6% de
-/// grosor, valores tipograficos tipicos) si la fuente no las declara.
-/// `line_top_y` es la MISMA coordenada de pantalla que ya recibio
-/// `shape_text` para esta linea, asi que el subrayado queda alineado con
-/// los glifos que acaba de pintar, no con un calculo aparte.
-fn paint_underline(pixmap: &mut Pixmap, font: &SystemFont, line: &str, font_size: f32, origin_x: f32, line_top_y: f32, paint: &Paint<'static>, mask: Option<&Mask>) {
-    let width = measure_text(font, line, font_size).width;
+fn paint_underline(pixmap: &mut Pixmap, font: &SystemFont, width: f32, font_size: f32, origin_x: f32, line_top_y: f32, paint: &Paint<'static>, mask: Option<&Mask>) {
     if width <= 0.0 {
         return;
     }
