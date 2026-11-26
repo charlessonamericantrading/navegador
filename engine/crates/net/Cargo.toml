@@ -15,6 +15,14 @@ bytes.workspace = true
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "webpki-roots", "tls12", "ring"] }
+# Los certificados raiz que ya llevaba hyper-rustls, ahora declarados aqui para
+# combinarlos con los del sistema (ver `tls_config` en `http_client.rs`).
+webpki-roots = "1"
+# Los certificados raiz instalados en el sistema operativo (Windows: el almacen
+# de certificados; macOS: el llavero; Linux: SSL_CERT_FILE y /etc/ssl). Un
+# antivirus que revisa las conexiones seguras o una red de empresa instalan ahi
+# su propio certificado; sin leerlo, TODA pagina https falla con `UnknownIssuer`.
+rustls-native-certs = "0.8"
 http-body-util = "0.1"
 flate2.workspace = true
 brotli.workspace = true
