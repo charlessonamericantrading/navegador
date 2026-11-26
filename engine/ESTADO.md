@@ -51,7 +51,21 @@ cargo run --release -p navegador -- --captura v.png news.ycombinator.com   # sin
   error (con «Reintentar») e instalador/desinstalador 100 % Rust (`instalador`,
   accesos `.lnk` por COM y Registro HKCU en Windows; empaquetado con
   `scripts/release/empaquetar_windows.ps1`).
-- **Pruebas:** 39 tests unitarios en `navegador`, 4 en `instalador`, 1 de extremo
+- **Si una página no abre:** la página de error enseña la causa y tiene un botón
+  «Diagnóstico» (también `Ctrl+Shift+D` o `navegador --diagnostico`). Compara la
+  red directa (nombre, conexión, HTTPS, hora) con el motor completo, escribe
+  `diagnostico.txt` con pistas en lenguaje claro y, en Windows, lo abre en el
+  Bloc de notas. Los fallos del motor quedan en `registro.txt` (misma carpeta de
+  datos; las direcciones van sin consulta). Si la ventana no puede arrancar, en
+  Windows sale un aviso con la causa.
+- **Certificados:** el motor confía en los que lleva incluidos **más** los
+  instalados en el sistema (almacén de Windows, llavero de macOS, `SSL_CERT_FILE`
+  y `/etc/ssl` en Linux). Sin esto, un antivirus que revisa las conexiones
+  seguras o un proxy de empresa hacían fallar TODA página https con
+  `UnknownIssuer`. Comprobado con el motor completo contra Google, Wikipedia y
+  Hacker News (2026-11-26, Linux, con un proxy de ese tipo); no probado en Windows.
+- **Pruebas:** 60 tests unitarios en `navegador`, 3 de extremo a extremo del
+  diagnóstico, 4 en `instalador`, 1 de extremo
   a extremo con el motor real (`engine/crates/app/tests/extremo_a_extremo.rs`) y
   prueba de aislamiento real del sandbox Windows (`tests/sandbox_isolation.rs`).
 

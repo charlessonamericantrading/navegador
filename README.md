@@ -40,6 +40,10 @@ Atajos: Ctrl+L (barra de direcciones), Ctrl+T (pestaña nueva), Ctrl+W
 Ctrl+D (marcador), Ctrl+R o F5 (recargar), Alt+← / Alt+→ (atrás / adelante),
 Ctrl+C/X/V/A (portapapeles y selección), Tab / Shift+Tab (campos), Escape (detener).
 
+**¿Una página no abre?** Pulsa «Diagnóstico» en la página de error, o `Ctrl+Shift+D`,
+o ejecuta `navegador --diagnostico`: averigua la causa (red, certificados, hora,
+motor) y deja un informe de texto.
+
 También puedes generar un paquete portable con instalador nativo 100 % Rust en Windows (`NavegadorIA-windows.zip`, incluyendo `desinstalar.exe`) ejecutando `scripts/release/empaquetar_windows.ps1`.
 
 ---
