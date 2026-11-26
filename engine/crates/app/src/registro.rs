@@ -161,9 +161,17 @@ mod tests {
 
     #[test]
     fn no_falla_si_no_se_puede_escribir() {
-        // Una ruta imposible: no debe entrar en pánico.
-        escribir_en(Path::new("/proc/no-existe/registro.txt"), "x");
-        assert!(cola(Path::new("/proc/no-existe/registro.txt"), 5).is_empty());
+        // Una ruta imposible en cualquier sistema: la "carpeta" donde iría el
+        // registro es en realidad un fichero. No debe entrar en pánico ni crear nada.
+        let dir = carpeta("imposible");
+        fs::create_dir_all(&dir).unwrap();
+        let fichero = dir.join("soy-un-fichero");
+        fs::write(&fichero, b"x").unwrap();
+        let ruta = fichero.join("registro.txt");
+        escribir_en(&ruta, "x");
+        assert!(!ruta.exists(), "no se pudo escribir, y no debe haberse escrito");
+        assert!(cola(&ruta, 5).is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
