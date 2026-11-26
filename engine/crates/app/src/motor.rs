@@ -10,7 +10,9 @@
 //! hilo de la ventana y las entrega con `al_recibir`.
 
 use base64::Engine as _;
+use engine_core::sandbox::{spawn_isolated_process, SandboxChild};
 use serde_json::Value;
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -66,6 +68,8 @@ pub struct Estado {
     pub elementos: Option<Vec<Elemento>>,
     pub puede_atras: bool,
     pub puede_adelante: bool,
+    pub enfocado_texto: Option<bool>,
+    pub seleccion: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +111,8 @@ impl MensajeMotor {
                 elementos: valor.get("elements").and_then(Value::as_array).map(|lista| lista.iter().filter_map(leer_elemento).collect()),
                 puede_atras: valor.get("can_go_back").and_then(Value::as_bool).unwrap_or(false),
                 puede_adelante: valor.get("can_go_forward").and_then(Value::as_bool).unwrap_or(false),
+                enfocado_texto: valor.get("focused_is_text").and_then(Value::as_bool),
+                seleccion: valor.get("selected_text").and_then(Value::as_str).map(str::to_string),
             })),
             Some("tabs") => Self::Pestanas {
                 id,
@@ -233,10 +239,11 @@ impl Drop for Broker {
     }
 }
 
-/// El proceso del motor (y su broker).
+/// El proceso del motor (y su broker). En Windows `--motor` corre con token
+/// restringido a integridad baja y dentro de un *Job Object* (`SandboxChild`).
 pub struct Motor {
-    hijo: Child,
-    entrada: ChildStdin,
+    hijo: SandboxChild,
+    entrada: File,
     broker: Option<Broker>,
 }
 
@@ -255,17 +262,12 @@ impl Motor {
         Ok(motor)
     }
 
-    /// Solo el motor, con las variables de entorno dadas.
+    /// Solo el motor, con las variables de entorno dadas, aislado con `SandboxChild`.
     fn lanzar_solo(ejecutable: &Path, entorno: &[(&str, String)], mut al_recibir: impl FnMut(MensajeMotor) + Send + 'static) -> std::io::Result<Self> {
-        let mut hijo = Command::new(ejecutable)
-            .arg(ARGUMENTO_MOTOR)
-            .envs(entorno.iter().map(|(k, v)| (*k, v.as_str())))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        let entrada = hijo.stdin.take().ok_or_else(|| std::io::Error::other("el motor no tiene entrada"))?;
-        let salida = hijo.stdout.take().ok_or_else(|| std::io::Error::other("el motor no tiene salida"))?;
+        let pares: Vec<(&str, &str)> = entorno.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let mut hijo = spawn_isolated_process(ejecutable, &[ARGUMENTO_MOTOR], &pares)?;
+        let entrada = hijo.take_stdin().ok_or_else(|| std::io::Error::other("el motor no tiene entrada"))?;
+        let salida = hijo.take_stdout().ok_or_else(|| std::io::Error::other("el motor no tiene salida"))?;
         std::thread::Builder::new().name("lector-motor".to_string()).spawn(move || {
             for linea in BufReader::new(salida).lines() {
                 let Ok(linea) = linea else { break };

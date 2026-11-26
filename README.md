@@ -7,8 +7,11 @@ Un navegador de escritorio con **motor propio en Rust**: red, HTML, CSS,
 layout, pintado y JavaScript. La ventana, la barra y las pestañas también son
 Rust, y las pinta el mismo motor que pinta las páginas.
 
-> **Estado: en desarrollo.** Úsalo con sitios de confianza: el motor no tiene
-> todavía sandbox del sistema operativo (ver [`SECURITY.md`](SECURITY.md)).
+> **Estado: en desarrollo.** En Windows el subproceso del motor corre aislado
+> (token restringido de integridad baja, escritorio aislado, *Job Object* y
+> perfil inaccesible para el renderizador; ver [`SECURITY.md`](SECURITY.md)). En
+> Linux y macOS todavía no hay sandbox de sistema operativo. Todavía no está
+> pensado para cuentas reales en sitios hostiles.
 >
 > **Qué funciona hoy y cómo medirlo: [`engine/ESTADO.md`](engine/ESTADO.md)**
 > (corto y verificado). Lo que falta, en
@@ -34,8 +37,11 @@ cargo run --release -p navegador -- es.wikipedia.org   # con una dirección
 ```
 
 Atajos: Ctrl+L (barra de direcciones), Ctrl+T (pestaña nueva), Ctrl+W
-(cerrar), Ctrl+Tab (cambiar), Ctrl+R o F5 (recargar), Alt+← / Alt+→ (atrás /
-adelante), Escape (detener).
+(cerrar), Ctrl+Tab (cambiar), Ctrl+Shift+RePág/AvPág (reordenar pestaña),
+Ctrl+D (marcador), Ctrl+R o F5 (recargar), Alt+← / Alt+→ (atrás / adelante),
+Ctrl+C/X/V/A (portapapeles y selección), Tab / Shift+Tab (campos), Escape (detener).
+
+También puedes generar un paquete portable con instalador nativo 100 % Rust en Windows (`NavegadorIA-windows.zip`, incluyendo `desinstalar.exe`) ejecutando `scripts/release/empaquetar_windows.ps1`.
 
 ---
 
@@ -43,7 +49,7 @@ adelante), Escape (detener).
 
 | | |
 |---|---|
-| **Aplicación** | Ventana nativa, pestañas, atrás/adelante, recargar/detener, barra de direcciones (dirección o búsqueda), página de inicio y de error |
+| **Aplicación** | Ventana nativa HiDPI (`winit` + `softbuffer`), pestañas (reordenables y con desplazamiento `<`/`>`), historial y marcadores persistentes (`Ctrl+D`), desplegable de autocompletado, cursor dinámico, selección y portapapeles, atrás/adelante, recargar/detener, barra de direcciones (dirección o búsqueda), página de inicio y de error, instalador nativo 100 % Rust |
 | **Red** | HTTP/1.1 y HTTPS (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies, CORS y CSP. La red y las cookies van en un proceso aparte (broker) |
 | **HTML / CSS** | Parseo HTML5, cascada con especificidad, `@media`, variables, `calc()`, `em`/`rem`/`vw`, degradados, atributos HTML clásicos |
 | **Layout** | Bloque, texto en línea partido por palabras, `inline-block`, flex, grid, tablas, `float`, `position` |

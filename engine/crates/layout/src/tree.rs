@@ -1444,17 +1444,14 @@ pub fn resolve_replaced_text(tag_name: &str, attributes: &HashMap<String, String
             }
         },
         "textarea" => {
-            // A diferencia de `input`, el valor inicial de un `<textarea>`
-            // es su CONTENIDO DOM (un nodo de texto hijo), no un atributo -
-            // por eso hace falta `Node::text_content` en vez de
-            // `attributes.get("value")`.
-            // Lo ESCRITO por el usuario (atributo `value`, que es donde el motor lo
-            // guarda; `collect_form_data` lo lee de ahi) manda sobre el contenido
-            // inicial: sin esto, un textarea no mostraba nada de lo que se escribia.
-            let content = attributes.get("value").cloned().unwrap_or_else(|| Node::text_content(dom_node));
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                Some(ReplacedText { text: trimmed.to_string(), is_placeholder: false, centered: false })
+            // Lo escrito por el usuario (`value`) conserva espacios/saltos exactos;
+            // el contenido inicial del DOM recorta espacios exteriores de maquetado.
+            let content = match attributes.get("value") {
+                Some(v) => v.clone(),
+                None => Node::text_content(dom_node).trim().to_string(),
+            };
+            if !content.is_empty() {
+                Some(ReplacedText { text: content, is_placeholder: false, centered: false })
             } else {
                 attributes
                     .get("placeholder")

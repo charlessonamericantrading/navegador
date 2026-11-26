@@ -10,6 +10,10 @@ description = "La aplicación del navegador, 100 % Rust: ventana, barra, pestañ
 name = "navegador"
 path = "src/main.rs"
 
+[[bin]]
+name = "instalador"
+path = "src/bin/instalador.rs"
+
 [dependencies]
 serde_json.workspace = true
 base64.workspace = true

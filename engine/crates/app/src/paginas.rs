@@ -1,6 +1,7 @@
 //! Páginas propias del navegador (inicio y error), en HTML/CSS que pinta el
 //! motor. Los enlaces llevan `data-accion="ir:<url>"` o `data-accion="reintentar"`.
 
+use crate::datos::Marcador;
 use crate::lienzo::escapar;
 
 /// Sitios de la página de inicio.
@@ -10,24 +11,51 @@ pub const SITIOS: [(&str, &str); 3] = [
     ("Google", "https://www.google.com"),
 ];
 
-/// La página de una pestaña nueva.
+/// La página de una pestaña nueva sin marcadores.
 pub fn inicio() -> String {
-    let sitios: String = SITIOS
-        .iter()
-        .map(|(nombre, url)| format!(r#"<div class="sitio" data-accion="ir:{url}">{}</div>"#, escapar(nombre)))
-        .collect();
+    inicio_con_marcadores(&[])
+}
+
+/// La página de una pestaña nueva con accesos y marcadores guardados.
+pub fn inicio_con_marcadores(marcadores: &[Marcador]) -> String {
+    let enlaces = |items: &[(&str, &str)]| -> String {
+        items
+            .iter()
+            .map(|(nombre, url)| format!(r#"<div class="sitio" data-accion="ir:{url}">{}</div>"#, escapar(nombre)))
+            .collect()
+    };
+    let sitios = enlaces(&SITIOS);
+    let seccion_marcadores = if marcadores.is_empty() {
+        String::new()
+    } else {
+        let mut pills = String::new();
+        for m in marcadores.iter().take(6) {
+            let etiqueta = if m.titulo.trim().is_empty() { m.url.as_str() } else { m.titulo.as_str() };
+            let corta: String = etiqueta.chars().take(18).collect();
+            pills.push_str(&format!(
+                r#"<div class="marcador" data-accion="ir:{}">{}</div>"#,
+                escapar(&m.url),
+                escapar(&corta)
+            ));
+        }
+        format!(r#"<h2>Marcadores</h2><div id="marcadores">{pills}</div>"#)
+    };
     format!(
         r#"<html><head><style>
 body {{ margin: 0; background: #ffffff; font-family: sans-serif; color: #202124; }}
 #centro {{ width: 560px; margin: 120px auto 0 auto; text-align: center; }}
 h1 {{ font-size: 40px; font-weight: normal; margin: 0 0 12px 0; }}
+h2 {{ font-size: 13px; font-weight: normal; color: #5f6368; margin: 36px 0 12px 0; }}
 p {{ font-size: 16px; color: #5f6368; margin: 0 0 32px 0; }}
 #sitios {{ display: flex; width: 504px; margin: 0 auto; }}
 .sitio {{ width: 144px; height: 44px; line-height: 44px; margin: 0 12px; border-radius: 22px; background: #f1f3f4; font-size: 15px; text-align: center; }}
+#marcadores {{ display: flex; width: 560px; margin: 0 auto; justify-content: center; flex-wrap: wrap; }}
+.marcador {{ height: 32px; line-height: 32px; padding: 0 14px; margin: 4px 6px; border-radius: 16px; border: 1px solid #dadce0; background: #ffffff; color: #1a73e8; font-size: 13px; }}
 </style></head><body><div id="centro">
 <h1>Navegador</h1>
 <p>Escribe una dirección o una búsqueda en la barra de arriba.</p>
 <div id="sitios">{sitios}</div>
+{seccion_marcadores}
 </div></body></html>"#
     )
 }

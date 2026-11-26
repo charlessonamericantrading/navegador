@@ -22,6 +22,9 @@ pub struct Node {
     /// append_before_sibling y reparent_children sin recorrer el arbol entero
     /// desde la raiz cada vez.
     pub parent: Option<Weak<RwLock<Node>>>,
+    /// Estado de interacción actual del puntero (`:hover`) y teclado (`:focus`).
+    pub hovered: bool,
+    pub focused: bool,
 }
 
 impl Node {
@@ -30,7 +33,21 @@ impl Node {
             node_type,
             children: Vec::new(),
             parent: None,
+            hovered: false,
+            focused: false,
         }))
+    }
+
+    /// Cadena de nodos desde `node` hacia sus ancestros (`[node, parent, ...]`).
+    pub fn ancestors(node: &Arc<RwLock<Self>>) -> Vec<Arc<RwLock<Self>>> {
+        let mut chain = Vec::new();
+        let mut current = Some(node.clone());
+        while let Some(n) = current {
+            let parent = n.read().unwrap().parent.as_ref().and_then(Weak::upgrade);
+            chain.push(n);
+            current = parent;
+        }
+        chain
     }
 
     pub fn append_child(parent: &Arc<RwLock<Self>>, child: Arc<RwLock<Self>>) {

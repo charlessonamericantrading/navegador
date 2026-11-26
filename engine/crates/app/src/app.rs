@@ -3,6 +3,7 @@
 //! la imagen de la ventana (barra + página).
 
 use crate::barra::{self, Accion, BarraPintada, Pestana, VistaBarra, ALTO_BARRA};
+use crate::datos::{DatosUsuario, Sugerencia};
 use crate::lienzo::{self, Lienzo};
 use crate::motor::{Elemento, Estado, MensajeMotor};
 use crate::portapapeles::Portapapeles;
@@ -58,6 +59,13 @@ pub enum CursorTipo {
 pub enum Entrada {
     /// Clic izquierdo en coordenadas de la ventana.
     Clic { x: f32, y: f32 },
+    /// Arrastre sobre la barra de pestañas para reordenarlas.
+    ArrastrarBarra { x: f32, y: f32 },
+    SoltarBarra,
+    /// Movimiento del puntero en coordenadas de la ventana.
+    Raton { x: f32, y: f32 },
+    /// Selección con arrastre dentro del área de página.
+    SeleccionarPagina { desde_x: f32, desde_y: f32, hasta_x: f32, hasta_y: f32 },
     /// Rueda: píxeles hacia abajo (negativo, hacia arriba).
     Rueda { dy: f32 },
     Tecla { tecla: Tecla, mods: Modificadores },
@@ -87,6 +95,14 @@ struct Campo {
     todo: bool,
 }
 
+struct Desplegable {
+    sugerencias: Vec<Sugerencia>,
+    seleccionada: Option<usize>,
+    ancho: u32,
+    escala_cent: u32,
+    lienzo: Lienzo,
+}
+
 pub struct App {
     ancho: u32,
     alto: u32,
@@ -106,6 +122,10 @@ pub struct App {
     campo: Option<Campo>,
     /// ¿Las teclas van a un campo de texto de la página?
     escribiendo: bool,
+    seleccion_pagina: Option<String>,
+    hover_en_vuelo: Option<String>,
+    hover_pendiente: Option<(f32, f32)>,
+    ultimo_hover: Option<(f32, f32)>,
     scroll_en_vuelo: Option<String>,
     scroll_pendiente: f32,
     tamano_en_vuelo: Option<String>,
@@ -119,6 +139,14 @@ pub struct App {
     local: Option<(String, u32, u32, u32, Lienzo)>,
     mostrando_local: bool,
     portapapeles: Portapapeles,
+    datos: DatosUsuario,
+    sugerencias: Vec<Sugerencia>,
+    sugerencia_seleccionada: Option<usize>,
+    mostrar_sugerencias: bool,
+    desplegable: Option<Desplegable>,
+    desplazamiento_pestanas: usize,
+    orden_pestanas: Vec<u32>,
+    arrastrando_pestana: Option<u32>,
 }
 
 impl App {
@@ -148,6 +176,10 @@ impl App {
             errores: HashMap::new(),
             campo: None,
             escribiendo: false,
+            seleccion_pagina: None,
+            hover_en_vuelo: None,
+            hover_pendiente: None,
+            ultimo_hover: None,
             scroll_en_vuelo: None,
             scroll_pendiente: 0.0,
             tamano_en_vuelo: None,
@@ -160,6 +192,17 @@ impl App {
             local: None,
             mostrando_local: false,
             portapapeles: Portapapeles::Sistema,
+            #[cfg(test)]
+            datos: DatosUsuario::en_memoria(),
+            #[cfg(not(test))]
+            datos: DatosUsuario::cargar(),
+            sugerencias: Vec::new(),
+            sugerencia_seleccionada: None,
+            mostrar_sugerencias: false,
+            desplegable: None,
+            desplazamiento_pestanas: 0,
+            orden_pestanas: vec![0],
+            arrastrando_pestana: None,
         };
         let mut salida = Salida::default();
         app.pedir_tamano(&mut salida);
@@ -225,12 +268,31 @@ impl App {
     pub fn escala(&self) -> f32 {
         self.escala
     }
+    pub fn datos(&self) -> &DatosUsuario {
+        &self.datos
+    }
+    pub fn datos_mut(&mut self) -> &mut DatosUsuario {
+        &mut self.datos
+    }
+    pub fn sugerencias(&self) -> &[Sugerencia] {
+        &self.sugerencias
+    }
     pub fn cursor_en(&self, x: f32, y: f32) -> CursorTipo {
+        if let Some((ox, oy, _, l)) = self.desplegable_en_pantalla() {
+            if x >= ox && y >= oy && x < ox + l.layout.dimensions.width && y < oy + l.layout.dimensions.height {
+                return if lienzo::accion_en(&l.regiones, x - ox, y - oy).is_some() {
+                    CursorTipo::Mano
+                } else {
+                    CursorTipo::Normal
+                };
+            }
+        }
         if y < ALTO_BARRA as f32 {
             return match self.barra.as_ref().and_then(|(_, _, _, b)| b.accion_en(x, y)) {
                 Some(Accion::Direccion) => CursorTipo::Texto,
                 Some(Accion::Atras) => if self.puede_atras { CursorTipo::Mano } else { CursorTipo::Normal },
                 Some(Accion::Adelante) => if self.puede_adelante { CursorTipo::Mano } else { CursorTipo::Normal },
+                Some(Accion::Marcador) => if !self.url.is_empty() { CursorTipo::Mano } else { CursorTipo::Normal },
                 Some(_) => CursorTipo::Mano,
                 None => CursorTipo::Normal,
             };
@@ -269,12 +331,92 @@ impl App {
         format!("{prefijo}-{}", self.siguiente_id)
     }
 
+    fn desplegable_en_pantalla(&self) -> Option<(f32, f32, u32, &Lienzo)> {
+        if self.campo.is_none() || !self.mostrar_sugerencias || self.sugerencias.is_empty() {
+            return None;
+        }
+        let d = self.desplegable.as_ref()?;
+        let (ox, oy, _) = self.caja_desplegable_css()?;
+        Some((ox, oy, 0, &d.lienzo))
+    }
+
+    fn caja_desplegable_css(&self) -> Option<(f32, f32, u32)> {
+        let dir = self
+            .barra
+            .as_ref()
+            .and_then(|(_, _, _, b)| b.lienzo.regiones.iter().find(|r| r.accion == "direccion"))
+            .map(|r| r.rect.clone());
+        let (x, ancho) = match dir {
+            Some(r) => (r.x, (r.width.round() as u32).max(200)),
+            None => (120.0, self.ancho.saturating_sub(170).max(200)),
+        };
+        Some((x, ALTO_BARRA as f32 - 2.0, ancho))
+    }
+
+    fn cerrar_campo(&mut self) {
+        self.campo = None;
+        self.sugerencias.clear();
+        self.sugerencia_seleccionada = None;
+        self.mostrar_sugerencias = false;
+        self.desplegable = None;
+    }
+
+    fn actualizar_sugerencias(&mut self, mostrar_vacio: bool) {
+        let consulta = self.campo.as_ref().map(|c| c.texto.clone()).unwrap_or_default();
+        if consulta.trim().is_empty() && !mostrar_vacio {
+            self.sugerencias.clear();
+            self.sugerencia_seleccionada = None;
+            self.mostrar_sugerencias = false;
+            return;
+        }
+        self.sugerencias = self.datos.sugerir(&consulta, 6);
+        self.sugerencia_seleccionada = None;
+        self.mostrar_sugerencias = !self.sugerencias.is_empty();
+    }
+
+    fn asegurar_pestana_visible(&mut self) {
+        let Some(pos) = self.pestanas.iter().position(|p| p.id == self.activa) else { return };
+        let (ini, fin, _, _) = barra::ventana_pestanas(self.ancho, self.pestanas.len(), self.desplazamiento_pestanas);
+        if pos < ini {
+            self.desplazamiento_pestanas = pos;
+        } else if pos >= fin {
+            let mostradas = fin.saturating_sub(ini).max(1);
+            self.desplazamiento_pestanas = pos + 1 - mostradas;
+        }
+    }
+
+    fn sincronizar_pestanas(&mut self, lista: Vec<(u32, String, String)>) {
+        self.orden_pestanas.retain(|id| lista.iter().any(|(lid, _, _)| lid == id));
+        for &(id, _, _) in &lista {
+            if !self.orden_pestanas.contains(&id) {
+                self.orden_pestanas.push(id);
+            }
+        }
+        let mut ordenadas = Vec::with_capacity(lista.len());
+        for &id in &self.orden_pestanas {
+            if let Some((_, titulo, url)) = lista.iter().find(|(lid, _, _)| *lid == id) {
+                ordenadas.push(Pestana { id, titulo: titulo.clone(), url: url.clone() });
+            }
+        }
+        if ordenadas.is_empty() {
+            ordenadas.push(Pestana { id: self.activa, titulo: String::new(), url: String::new() });
+        }
+        self.pestanas = ordenadas;
+        self.asegurar_pestana_visible();
+    }
+
     // --- Entradas ---
 
     pub fn manejar(&mut self, entrada: Entrada) -> Salida {
         let mut salida = Salida::default();
         match entrada {
             Entrada::Clic { x, y } => self.clic(x, y, &mut salida),
+            Entrada::ArrastrarBarra { x, y } => self.arrastrar_barra(x, y, &mut salida),
+            Entrada::SoltarBarra => self.arrastrando_pestana = None,
+            Entrada::Raton { x, y } => self.mover_raton(x, y, &mut salida),
+            Entrada::SeleccionarPagina { desde_x, desde_y, hasta_x, hasta_y } => {
+                self.seleccionar_pagina(desde_x, desde_y, hasta_x, hasta_y, &mut salida)
+            }
             Entrada::Rueda { dy } => self.desplazar(dy, &mut salida),
             Entrada::Tecla { tecla, mods } => self.tecla(tecla, mods, &mut salida),
             Entrada::Tamano { ancho, alto } => {
@@ -316,6 +458,19 @@ impl App {
 
     fn clic(&mut self, x: f32, y: f32, salida: &mut Salida) {
         salida.redibujar = true;
+        if let Some((ox, oy, _, l)) = self.desplegable_en_pantalla() {
+            let in_box = x >= ox && y >= oy && x < ox + l.layout.dimensions.width && y < oy + l.layout.dimensions.height;
+            if in_box {
+                if let Some(Accion::Sugerencia(idx)) = lienzo::accion_en(&l.regiones, x - ox, y - oy).and_then(Accion::desde) {
+                    if let Some(sug) = self.sugerencias.get(idx).cloned() {
+                        self.cerrar_campo();
+                        self.navegar(sug.url, salida);
+                        return;
+                    }
+                }
+                return;
+            }
+        }
         if y < ALTO_BARRA as f32 {
             let accion = self.barra.as_ref().and_then(|(_, _, _, b)| b.accion_en(x, y));
             match accion {
@@ -329,16 +484,21 @@ impl App {
                         _ => self.empezar_a_editar(self.url_mostrada()),
                     }
                 }
+                Some(Accion::Pestana(id)) => {
+                    self.cerrar_campo();
+                    self.arrastrando_pestana = Some(id);
+                    self.ejecutar(Accion::Pestana(id), salida);
+                }
                 Some(accion) => {
-                    self.campo = None;
+                    self.cerrar_campo();
                     self.ejecutar(accion, salida);
                 }
-                None => self.campo = None,
+                None => self.cerrar_campo(),
             }
             return;
         }
 
-        self.campo = None;
+        self.cerrar_campo();
         let (cx, cy) = (x, y - ALTO_BARRA as f32);
         if self.mostrando_local {
             let accion = self.local.as_ref().and_then(|(_, _, _, _, l)| lienzo::accion_en(&l.regiones, cx, cy)).map(str::to_string);
@@ -364,6 +524,65 @@ impl App {
             self.nuevo_id("app")
         };
         salida.peticiones.push(json!({ "type": "click", "id": id, "x": cx, "y": cy }));
+    }
+
+    fn arrastrar_barra(&mut self, x: f32, _y: f32, salida: &mut Salida) {
+        let Some(id_origen) = self.arrastrando_pestana else { return };
+        let Some(Accion::Pestana(id_destino)) = self.barra.as_ref().and_then(|(_, _, _, b)| b.accion_en(x, 15.0)) else {
+            return;
+        };
+        if id_origen == id_destino {
+            return;
+        }
+        let (Some(i), Some(j)) = (
+            self.pestanas.iter().position(|p| p.id == id_origen),
+            self.pestanas.iter().position(|p| p.id == id_destino),
+        ) else {
+            return;
+        };
+        let movida = self.pestanas.remove(i);
+        self.pestanas.insert(j, movida);
+        self.orden_pestanas = self.pestanas.iter().map(|p| p.id).collect();
+        self.asegurar_pestana_visible();
+        salida.redibujar = true;
+    }
+
+    fn mover_raton(&mut self, x: f32, y: f32, salida: &mut Salida) {
+        if y < ALTO_BARRA as f32 || self.mostrando_local || self.carga.is_some() || !self.tiene_pagina() {
+            return;
+        }
+        let (cx, cy) = (x, y - ALTO_BARRA as f32);
+        if self.hover_en_vuelo.is_some() {
+            self.hover_pendiente = Some((cx, cy));
+            return;
+        }
+        if let Some((lx, ly)) = self.ultimo_hover {
+            if (lx - cx).abs() < 4.0 && (ly - cy).abs() < 4.0 {
+                return;
+            }
+        }
+        self.ultimo_hover = Some((cx, cy));
+        let id = self.nuevo_id("hover");
+        self.hover_en_vuelo = Some(id.clone());
+        salida.peticiones.push(json!({ "type": "hover", "id": id, "x": cx, "y": cy }));
+    }
+
+    fn seleccionar_pagina(&mut self, desde_x: f32, desde_y: f32, hasta_x: f32, hasta_y: f32, salida: &mut Salida) {
+        if self.mostrando_local || self.carga.is_some() || !self.tiene_pagina() {
+            return;
+        }
+        self.campo = None;
+        let fy = (desde_y - ALTO_BARRA as f32).max(0.0);
+        let ty = (hasta_y - ALTO_BARRA as f32).max(0.0);
+        let id = self.nuevo_id("sel");
+        salida.peticiones.push(json!({
+            "type": "select_text",
+            "id": id,
+            "from_x": desde_x,
+            "from_y": fy,
+            "to_x": hasta_x,
+            "to_y": ty
+        }));
     }
 
     fn desplazar(&mut self, dy: f32, salida: &mut Salida) {
@@ -396,6 +615,24 @@ impl App {
         if mods.ctrl && letra("w") {
             return self.ejecutar(Accion::CerrarPestana(self.activa), salida);
         }
+        if mods.ctrl && letra("d") {
+            return self.ejecutar(Accion::Marcador, salida);
+        }
+        if mods.ctrl && mods.shift && matches!(tecla, Tecla::RePag | Tecla::AvPag) {
+            if let Some(pos) = self.pestanas.iter().position(|p| p.id == self.activa) {
+                let n = self.pestanas.len();
+                if n > 1 {
+                    let destino = if tecla == Tecla::RePag { pos.saturating_sub(1) } else { (pos + 1).min(n - 1) };
+                    if destino != pos {
+                        let movida = self.pestanas.remove(pos);
+                        self.pestanas.insert(destino, movida);
+                        self.orden_pestanas = self.pestanas.iter().map(|p| p.id).collect();
+                        self.asegurar_pestana_visible();
+                    }
+                }
+            }
+            return;
+        }
         if (mods.ctrl && letra("r")) || tecla == Tecla::F5 {
             return self.ejecutar(Accion::Recargar, salida);
         }
@@ -421,31 +658,63 @@ impl App {
         if tecla == Tecla::Escape && self.carga.is_some() {
             return self.ejecutar(Accion::Detener, salida);
         }
-        if self.escribiendo && mods.ctrl && !mods.alt && letra("v") {
-            if let Some(texto) = self.portapapeles.leer() {
-                for ch in texto.replace("\r\n", "\n").replace('\r', "\n").chars().take(2000) {
-                    if ch == '\n' {
-                        let id = self.nuevo_id("app");
-                        salida.peticiones.push(json!({ "type": "press_key", "id": id, "key": "Enter" }));
-                    } else if !ch.is_control() {
-                        let id = self.nuevo_id("app");
-                        salida.peticiones.push(json!({ "type": "press_key", "id": id, "key": ch.to_string() }));
+        if mods.ctrl && !mods.alt && self.tiene_pagina() && !self.mostrando_local {
+            if letra("c") {
+                if let Some(texto) = self.seleccion_pagina.as_deref() {
+                    self.portapapeles.escribir(texto);
+                }
+                return;
+            }
+            if self.escribiendo && letra("x") {
+                if let Some(texto) = self.seleccion_pagina.as_deref() {
+                    self.portapapeles.escribir(texto);
+                }
+                let id = self.nuevo_id("app");
+                salida.peticiones.push(json!({ "type": "press_key", "id": id, "key": "Ctrl+x" }));
+                return;
+            }
+            if self.escribiendo && letra("a") {
+                let id = self.nuevo_id("app");
+                salida.peticiones.push(json!({ "type": "press_key", "id": id, "key": "Ctrl+a" }));
+                return;
+            }
+            if self.escribiendo && letra("v") {
+                if let Some(texto) = self.portapapeles.leer() {
+                    for ch in texto.replace("\r\n", "\n").replace('\r', "\n").chars().take(2000) {
+                        if ch == '\n' {
+                            let id = self.nuevo_id("app");
+                            salida.peticiones.push(json!({ "type": "press_key", "id": id, "key": "Enter" }));
+                        } else if !ch.is_control() {
+                            let id = self.nuevo_id("app");
+                            salida.peticiones.push(json!({ "type": "press_key", "id": id, "key": ch.to_string() }));
+                        }
                     }
                 }
+                return;
             }
-            return;
         }
         if mods.ctrl || mods.alt || !self.tiene_pagina() || self.mostrando_local {
             return;
         }
 
+        if tecla == Tecla::Tab {
+            let clave = if mods.shift { "Shift+Tab" } else { "Tab" };
+            let id = self.nuevo_id("app");
+            salida.peticiones.push(json!({ "type": "press_key", "id": id, "key": clave }));
+            return;
+        }
+
         if self.escribiendo {
+            let prefijo = if mods.shift { "Shift+" } else { "" };
             let clave = match &tecla {
                 Tecla::Caracter(c) => c.clone(),
                 Tecla::Retroceso => "Backspace".to_string(),
                 Tecla::Suprimir => "Delete".to_string(),
+                Tecla::Izquierda => format!("{prefijo}ArrowLeft"),
+                Tecla::Derecha => format!("{prefijo}ArrowRight"),
+                Tecla::Inicio => format!("{prefijo}Home"),
+                Tecla::Fin => format!("{prefijo}End"),
                 Tecla::Enter => "Enter".to_string(),
-                Tecla::Tab => "Tab".to_string(),
                 Tecla::Escape => {
                     self.escribiendo = false;
                     return;
@@ -485,94 +754,127 @@ impl App {
     }
 
     fn editar(&mut self, tecla: Tecla, mods: Modificadores, salida: &mut Salida) {
-        let Some(campo) = &mut self.campo else { return };
-        let largo = campo.texto.chars().count();
-        let quitar_todo = |campo: &mut Campo| {
-            campo.texto.clear();
-            campo.cursor = 0;
-            campo.todo = false;
-        };
-        match tecla {
-            Tecla::Caracter(c) if mods.ctrl && c.eq_ignore_ascii_case("a") => {
-                campo.todo = true;
-                campo.cursor = largo;
-            }
-            Tecla::Caracter(c) if mods.ctrl && c.eq_ignore_ascii_case("c") => {
-                if campo.todo && !campo.texto.is_empty() {
-                    self.portapapeles.escribir(&campo.texto);
-                }
-            }
-            Tecla::Caracter(c) if mods.ctrl && c.eq_ignore_ascii_case("x") => {
-                if campo.todo && !campo.texto.is_empty() {
-                    self.portapapeles.escribir(&campo.texto);
-                    quitar_todo(campo);
-                }
-            }
-            Tecla::Caracter(c) if mods.ctrl && c.eq_ignore_ascii_case("v") => {
-                if let Some(pegado) = self.portapapeles.leer() {
-                    let limpio: String = pegado.chars().map(|ch| if ch == '\r' || ch == '\n' { ' ' } else { ch }).filter(|ch| !ch.is_control()).collect();
-                    if !limpio.is_empty() {
-                        if campo.todo {
-                            quitar_todo(campo);
-                        }
-                        let posicion = byte_de(&campo.texto, campo.cursor);
-                        campo.texto.insert_str(posicion, &limpio);
-                        campo.cursor += limpio.chars().count();
-                    }
-                }
-            }
-            Tecla::Caracter(c) if !mods.ctrl && !mods.alt => {
-                if campo.todo {
-                    quitar_todo(campo);
-                }
-                let posicion = byte_de(&campo.texto, campo.cursor);
-                campo.texto.insert_str(posicion, &c);
-                campo.cursor += c.chars().count();
-            }
-            Tecla::Retroceso => {
-                if campo.todo {
-                    quitar_todo(campo);
-                } else if campo.cursor > 0 {
-                    let inicio = byte_de(&campo.texto, campo.cursor - 1);
-                    let fin = byte_de(&campo.texto, campo.cursor);
-                    campo.texto.replace_range(inicio..fin, "");
-                    campo.cursor -= 1;
-                }
-            }
-            Tecla::Suprimir => {
-                if campo.todo {
-                    quitar_todo(campo);
-                } else if campo.cursor < largo {
-                    let inicio = byte_de(&campo.texto, campo.cursor);
-                    let fin = byte_de(&campo.texto, campo.cursor + 1);
-                    campo.texto.replace_range(inicio..fin, "");
-                }
-            }
-            Tecla::Izquierda => {
-                campo.cursor = if campo.todo { 0 } else { campo.cursor.saturating_sub(1) };
-                campo.todo = false;
-            }
-            Tecla::Derecha => {
-                campo.cursor = if campo.todo { largo } else { (campo.cursor + 1).min(largo) };
-                campo.todo = false;
-            }
-            Tecla::Inicio => {
+        let mut editar_sugerencias = false;
+        let mut navegar_destino: Option<String> = None;
+        let mut cerrar = false;
+        {
+            let Some(campo) = &mut self.campo else { return };
+            let largo = campo.texto.chars().count();
+            let quitar_todo = |campo: &mut Campo| {
+                campo.texto.clear();
                 campo.cursor = 0;
                 campo.todo = false;
-            }
-            Tecla::Fin => {
-                campo.cursor = largo;
-                campo.todo = false;
-            }
-            Tecla::Enter => {
-                let texto = campo.texto.clone();
-                if let Some(url) = direccion::resolver(&texto) {
-                    self.campo = None;
-                    self.navegar(url, salida);
+            };
+            match tecla {
+                Tecla::Caracter(c) if mods.ctrl && c.eq_ignore_ascii_case("a") => {
+                    campo.todo = true;
+                    campo.cursor = largo;
                 }
+                Tecla::Caracter(c) if mods.ctrl && c.eq_ignore_ascii_case("c") => {
+                    if campo.todo && !campo.texto.is_empty() {
+                        self.portapapeles.escribir(&campo.texto);
+                    }
+                }
+                Tecla::Caracter(c) if mods.ctrl && c.eq_ignore_ascii_case("x") => {
+                    if campo.todo && !campo.texto.is_empty() {
+                        self.portapapeles.escribir(&campo.texto);
+                        quitar_todo(campo);
+                        editar_sugerencias = true;
+                    }
+                }
+                Tecla::Caracter(c) if mods.ctrl && c.eq_ignore_ascii_case("v") => {
+                    if let Some(pegado) = self.portapapeles.leer() {
+                        let limpio: String = pegado.chars().map(|ch| if ch == '\r' || ch == '\n' { ' ' } else { ch }).filter(|ch| !ch.is_control()).collect();
+                        if !limpio.is_empty() {
+                            if campo.todo {
+                                quitar_todo(campo);
+                            }
+                            let posicion = byte_de(&campo.texto, campo.cursor);
+                            campo.texto.insert_str(posicion, &limpio);
+                            campo.cursor += limpio.chars().count();
+                            editar_sugerencias = true;
+                        }
+                    }
+                }
+                Tecla::Caracter(c) if !mods.ctrl && !mods.alt => {
+                    if campo.todo {
+                        quitar_todo(campo);
+                    }
+                    let posicion = byte_de(&campo.texto, campo.cursor);
+                    campo.texto.insert_str(posicion, &c);
+                    campo.cursor += c.chars().count();
+                    editar_sugerencias = true;
+                }
+                Tecla::Retroceso => {
+                    if campo.todo {
+                        quitar_todo(campo);
+                    } else if campo.cursor > 0 {
+                        let inicio = byte_de(&campo.texto, campo.cursor - 1);
+                        let fin = byte_de(&campo.texto, campo.cursor);
+                        campo.texto.replace_range(inicio..fin, "");
+                        campo.cursor -= 1;
+                    }
+                    editar_sugerencias = true;
+                }
+                Tecla::Suprimir => {
+                    if campo.todo {
+                        quitar_todo(campo);
+                    } else if campo.cursor < largo {
+                        let inicio = byte_de(&campo.texto, campo.cursor);
+                        let fin = byte_de(&campo.texto, campo.cursor + 1);
+                        campo.texto.replace_range(inicio..fin, "");
+                    }
+                    editar_sugerencias = true;
+                }
+                Tecla::Izquierda => {
+                    campo.cursor = if campo.todo { 0 } else { campo.cursor.saturating_sub(1) };
+                    campo.todo = false;
+                }
+                Tecla::Derecha => {
+                    campo.cursor = if campo.todo { largo } else { (campo.cursor + 1).min(largo) };
+                    campo.todo = false;
+                }
+                Tecla::Inicio => {
+                    campo.cursor = 0;
+                    campo.todo = false;
+                }
+                Tecla::Fin => {
+                    campo.cursor = largo;
+                    campo.todo = false;
+                }
+                Tecla::Abajo | Tecla::Arriba => {
+                    if !self.mostrar_sugerencias {
+                        self.actualizar_sugerencias(true);
+                    }
+                    if !self.sugerencias.is_empty() {
+                        let n = self.sugerencias.len();
+                        self.sugerencia_seleccionada = Some(match self.sugerencia_seleccionada {
+                            Some(i) if tecla == Tecla::Abajo => (i + 1) % n,
+                            Some(i) => (i + n - 1) % n,
+                            None if tecla == Tecla::Abajo => 0,
+                            None => n - 1,
+                        });
+                    }
+                }
+                Tecla::Enter => {
+                    if let Some(sug) = self.sugerencia_seleccionada.and_then(|i| self.sugerencias.get(i)) {
+                        navegar_destino = Some(sug.url.clone());
+                    } else if let Some(url) = direccion::resolver(&campo.texto) {
+                        navegar_destino = Some(url);
+                    }
+                }
+                Tecla::Escape | Tecla::Tab => cerrar = true,
+                _ => {}
             }
-            Tecla::Escape | Tecla::Tab => self.campo = None,
-            _ => {}
+        }
+        if editar_sugerencias {
+            self.actualizar_sugerencias(false);
+        }
+        if let Some(url) = navegar_destino {
+            self.cerrar_campo();
+            self.navegar(url, salida);
+        } else if cerrar {
+            self.cerrar_campo();
         }
     }
 
@@ -600,11 +902,29 @@ impl App {
                 }
             }
             Accion::Direccion => self.empezar_a_editar(self.url_mostrada()),
+            Accion::Marcador => {
+                let url = self.url.clone();
+                if !url.is_empty() {
+                    self.datos.alternar_marcador(&url, &self.titulo);
+                    self.local = None;
+                    salida.redibujar = true;
+                }
+            }
             Accion::NuevaPestana => {
                 let id = self.nuevo_id("app");
                 salida.peticiones.push(json!({ "type": "new_tab", "id": id, "url": null }));
                 self.escribiendo = false;
                 self.empezar_a_editar(String::new());
+            }
+            Accion::PestanasAnt => {
+                self.desplazamiento_pestanas = self.desplazamiento_pestanas.saturating_sub(1);
+                salida.redibujar = true;
+            }
+            Accion::PestanasSig => {
+                self.desplazamiento_pestanas += 1;
+                let (ini, _, _, _) = barra::ventana_pestanas(self.ancho, self.pestanas.len(), self.desplazamiento_pestanas);
+                self.desplazamiento_pestanas = ini;
+                salida.redibujar = true;
             }
             Accion::Pestana(id) => {
                 if id != self.activa {
@@ -618,9 +938,17 @@ impl App {
                     let peticion = self.nuevo_id("app");
                     salida.peticiones.push(json!({ "type": "close_tab", "id": peticion, "tab_id": id }));
                     self.pestanas.retain(|p| p.id != id);
+                    self.orden_pestanas.retain(|p| *p != id);
                     self.errores.remove(&id);
+                    self.asegurar_pestana_visible();
                     let lista = self.nuevo_id("app");
                     salida.peticiones.push(json!({ "type": "list_tabs", "id": lista }));
+                }
+            }
+            Accion::Sugerencia(idx) => {
+                if let Some(sug) = self.sugerencias.get(idx).cloned() {
+                    self.cerrar_campo();
+                    self.navegar(sug.url, salida);
                 }
             }
         }
@@ -649,6 +977,9 @@ impl App {
     fn empezar_a_editar(&mut self, texto: String) {
         let largo = texto.chars().count();
         self.campo = Some(Campo { todo: largo > 0, cursor: largo, texto });
+        self.sugerencias.clear();
+        self.sugerencia_seleccionada = None;
+        self.mostrar_sugerencias = false;
     }
 
     /// Lo que la barra enseña cuando no se edita: adónde se va mientras
@@ -684,25 +1015,36 @@ impl App {
                         self.pedir_tamano(salida);
                     }
                 }
+                if self.hover_en_vuelo.as_deref() == Some(&id) {
+                    self.hover_en_vuelo = None;
+                }
                 if mensaje.contains("no hay un control enfocado") {
                     self.escribiendo = false;
                 }
                 salida.redibujar = true;
             }
             MensajeMotor::Pestanas { lista, activa, .. } => {
-                self.pestanas = lista.into_iter().map(|(id, titulo, url)| Pestana { id, titulo, url }).collect();
-                if self.pestanas.is_empty() {
-                    self.pestanas.push(Pestana { id: activa, titulo: String::new(), url: String::new() });
-                }
                 self.activa = activa;
+                self.sincronizar_pestanas(lista);
                 salida.redibujar = true;
             }
             MensajeMotor::Terminado => {
                 self.carga = None;
+                self.hover_en_vuelo = None;
                 self.errores.insert(self.activa, (self.url.clone(), "El motor se cerró de forma inesperada. Cierra y vuelve a abrir el navegador.".to_string()));
                 salida.redibujar = true;
             }
-            MensajeMotor::Listo | MensajeMotor::Hecho { .. } | MensajeMotor::Otro => {}
+            MensajeMotor::Hecho { id } => {
+                if let Some(id) = id {
+                    if self.hover_en_vuelo.as_deref() == Some(&id) {
+                        self.hover_en_vuelo = None;
+                        if let Some((px, py)) = self.hover_pendiente.take() {
+                            self.mover_raton(px, py + ALTO_BARRA as f32, salida);
+                        }
+                    }
+                }
+            }
+            MensajeMotor::Listo | MensajeMotor::Otro => {}
         }
     }
 
@@ -725,10 +1067,25 @@ impl App {
                 self.pedir_tamano(salida);
             }
         }
+        if self.hover_en_vuelo.as_deref() == Some(&id) {
+            self.hover_en_vuelo = None;
+            if let Some((px, py)) = self.hover_pendiente.take() {
+                self.mover_raton(px, py + ALTO_BARRA as f32, salida);
+            }
+        }
         if estado.pestana != self.activa || estado.url != self.url {
             self.escribiendo = false;
         }
+        if let Some(enfocado_texto) = estado.enfocado_texto {
+            self.escribiendo = enfocado_texto;
+        }
+        self.seleccion_pagina = estado.seleccion;
+        let url_cambio = estado.url != self.url;
+        let titulo_cambio = estado.titulo != self.titulo;
         self.activa = estado.pestana;
+        if !self.orden_pestanas.contains(&estado.pestana) {
+            self.orden_pestanas.push(estado.pestana);
+        }
         match self.pestanas.iter_mut().find(|p| p.id == estado.pestana) {
             Some(p) => {
                 p.titulo = estado.titulo.clone();
@@ -736,8 +1093,12 @@ impl App {
             }
             None => self.pestanas.push(Pestana { id: estado.pestana, titulo: estado.titulo.clone(), url: estado.url.clone() }),
         }
+        self.asegurar_pestana_visible();
         self.url = estado.url;
         self.titulo = estado.titulo;
+        if !self.url.is_empty() && (url_cambio || (titulo_cambio && !self.titulo.is_empty())) {
+            self.datos.registrar_visita(&self.url, &self.titulo);
+        }
         self.scroll_y = estado.scroll_y;
         self.puede_atras = estado.puede_atras;
         self.puede_adelante = estado.puede_adelante;
@@ -763,6 +1124,7 @@ impl App {
         VistaBarra {
             pestanas: self.pestanas.clone(),
             activa: self.activa,
+            desplazamiento_pestanas: self.desplazamiento_pestanas,
             direccion,
             editando,
             cursor,
@@ -770,6 +1132,8 @@ impl App {
             cargando: self.carga.is_some(),
             puede_atras: self.puede_atras,
             puede_adelante: self.puede_adelante,
+            es_marcador: self.datos.es_marcador(&self.url),
+            marcador_habilitado: !self.url.is_empty(),
         }
     }
 
@@ -799,7 +1163,7 @@ impl App {
 
         let html_local = match self.errores.get(&self.activa) {
             Some((url, mensaje)) => Some(paginas::error(url, mensaje)),
-            None if !self.tiene_pagina() => Some(paginas::inicio()),
+            None if !self.tiene_pagina() => Some(paginas::inicio_con_marcadores(self.datos.marcadores())),
             None => None,
         };
         self.mostrando_local = html_local.is_some();
@@ -837,6 +1201,44 @@ impl App {
                     }
                 }
             }
+        }
+        if self.campo.is_some() && self.mostrar_sugerencias && !self.sugerencias.is_empty() {
+            if let Some((ox, oy, aw)) = self.caja_desplegable_css() {
+                let repintar_sug = !matches!(
+                    &self.desplegable,
+                    Some(d) if d.sugerencias == self.sugerencias && d.seleccionada == self.sugerencia_seleccionada && d.ancho == aw && d.escala_cent == escala_cent
+                );
+                if repintar_sug {
+                    if let Ok((lienzo, _)) = barra::pintar_sugerencias_con_escala(
+                        &self.sugerencias,
+                        self.sugerencia_seleccionada,
+                        aw,
+                        self.escala,
+                        &self.fuentes,
+                        &self.iconos,
+                    ) {
+                        self.desplegable = Some(Desplegable {
+                            sugerencias: self.sugerencias.clone(),
+                            seleccionada: self.sugerencia_seleccionada,
+                            ancho: aw,
+                            escala_cent,
+                            lienzo,
+                        });
+                    }
+                }
+                if let Some(d) = &self.desplegable {
+                    marco.draw_pixmap(
+                        (ox * self.escala).round() as i32,
+                        (oy * self.escala).round() as i32,
+                        d.lienzo.pixmap.as_ref(),
+                        &PixmapPaint::default(),
+                        Transform::identity(),
+                        None,
+                    );
+                }
+            }
+        } else {
+            self.desplegable = None;
         }
         marco
     }
@@ -896,6 +1298,8 @@ mod tests {
             ]),
             puede_atras: true,
             puede_adelante: false,
+            enfocado_texto: None,
+            seleccion: None,
         })))
     }
 
@@ -1156,5 +1560,81 @@ mod tests {
         assert_eq!(app.cursor_en(50.0, ALTO_BARRA as f32 + 20.0), CursorTipo::Texto);
         assert_eq!(app.cursor_en(30.0, ALTO_BARRA as f32 + 105.0), CursorTipo::Mano);
         assert_eq!(app.cursor_en(500.0, ALTO_BARRA as f32 + 500.0), CursorTipo::Normal);
+    }
+
+    #[test]
+    fn flechas_tab_hover_y_seleccion_llegan_al_motor() {
+        let mut app = con_pagina();
+        app.portapapeles = Portapapeles::Memoria(std::sync::Mutex::new(String::new()));
+
+        let hover = app.manejar(Entrada::Raton { x: 20.0, y: ALTO_BARRA as f32 + 105.0 });
+        assert_eq!(tipo(&hover.peticiones[0]), "hover");
+        let hover_id = hover.peticiones[0]["id"].as_str().unwrap().to_string();
+        app.manejar(Entrada::Motor(MensajeMotor::Hecho { id: Some(hover_id) }));
+
+        let sel = app.manejar(Entrada::SeleccionarPagina { desde_x: 10.0, desde_y: ALTO_BARRA as f32 + 10.0, hasta_x: 150.0, hasta_y: ALTO_BARRA as f32 + 20.0 });
+        assert_eq!(tipo(&sel.peticiones[0]), "select_text");
+
+        app.manejar(Entrada::Clic { x: 50.0, y: ALTO_BARRA as f32 + 20.0 });
+        let izq = app.manejar(Entrada::Tecla { tecla: Tecla::Izquierda, mods: Modificadores { shift: true, ..Default::default() } });
+        assert_eq!(izq.peticiones[0]["key"], "Shift+ArrowLeft");
+        let tab = app.manejar(Entrada::Tecla { tecla: Tecla::Tab, mods: Modificadores::default() });
+        assert_eq!(tab.peticiones[0]["key"], "Tab");
+
+        let tab_id = tab.peticiones[0]["id"].as_str().unwrap().to_string();
+        app.manejar(Entrada::Motor(MensajeMotor::Estado(Box::new(Estado {
+            id: Some(tab_id),
+            pestana: 0,
+            url: "https://e.com/".into(),
+            titulo: "Título".into(),
+            scroll_y: 0.0,
+            captura: None,
+            elementos: None,
+            puede_atras: true,
+            puede_adelante: false,
+            enfocado_texto: Some(false),
+            seleccion: Some("copiable".into()),
+        }))));
+        assert!(!app.escribiendo_en_pagina());
+        app.manejar(Entrada::Tecla { tecla: Tecla::Caracter("c".into()), mods: Modificadores { ctrl: true, ..Default::default() } });
+        assert_eq!(app.portapapeles.leer().as_deref(), Some("copiable"));
+    }
+
+    #[test]
+    fn historial_marcadores_sugerencias_y_reorden_de_pestanas() {
+        let mut app = con_pagina();
+        assert_eq!(app.datos().historial().len(), 1);
+        assert!(!app.datos().es_marcador("https://e.com/"));
+
+        // Ctrl+D guarda marcador y vuelve a quitarlo si se pulsa de nuevo.
+        let ctrl_d = Entrada::Tecla { tecla: Tecla::Caracter("d".into()), mods: Modificadores { ctrl: true, ..Default::default() } };
+        app.manejar(ctrl_d.clone());
+        assert!(app.datos().es_marcador("https://e.com/"));
+
+        // Abrir nueva pestaña, escribir parte del dominio y elegir sugerencia con flecha abajo + Enter.
+        app.manejar(Entrada::Tecla { tecla: Tecla::Caracter("t".into()), mods: Modificadores { ctrl: true, ..Default::default() } });
+        app.manejar(Entrada::Motor(MensajeMotor::Pestanas {
+            id: None,
+            lista: vec![(0, "Título".into(), "https://e.com/".into()), (1, "Docs".into(), "https://docs.rs/".into())],
+            activa: 1,
+        }));
+        escribir(&mut app, "e.com");
+        assert!(!app.sugerencias().is_empty());
+        assert_eq!(app.sugerencias()[0].url, "https://e.com/");
+        app.componer();
+        app.manejar(tecla(Tecla::Abajo));
+        let nav = app.manejar(tecla(Tecla::Enter));
+        assert_eq!(nav.peticiones[0]["url"], "https://e.com/");
+
+        // Reordenar pestañas arrastrando la primera sobre la segunda.
+        app.componer();
+        let barras = app.barra.as_ref().unwrap();
+        let p0 = barras.3.lienzo.regiones.iter().find(|r| r.accion == "pestana:0").unwrap().rect.clone();
+        let p1 = barras.3.lienzo.regiones.iter().find(|r| r.accion == "pestana:1").unwrap().rect.clone();
+        app.manejar(Entrada::Clic { x: p0.x + 15.0, y: p0.y + 10.0 });
+        app.manejar(Entrada::ArrastrarBarra { x: p1.x + 15.0, y: p1.y + 10.0 });
+        app.manejar(Entrada::SoltarBarra);
+        let ids: Vec<u32> = app.pestanas().iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![1, 0]);
     }
 }

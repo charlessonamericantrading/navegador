@@ -12,7 +12,7 @@ use crate::protocol::{
 };
 use base64::Engine as _;
 use engine_dom::{Node, NodeType};
-use engine_gfx::{focus_overlay, render_layout_to_png_with_overlay_scaled};
+use engine_gfx::{focus_overlay_with_state, render_layout_to_png_with_overlay_scaled, selection_overlay_rects};
 use engine_image::decode_image;
 use engine_js::JsRuntime;
 use engine_layout::{BoxType, ImageMap, LayoutBox, LayoutTreeBuilder};
@@ -22,6 +22,24 @@ use std::collections::HashMap;
 use std::io;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+#[derive(Debug, Clone, Default)]
+struct FieldEditState {
+    cursor: usize,
+    anchor: Option<usize>,
+}
+
+impl FieldEditState {
+    fn at(cursor: usize) -> Self {
+        Self { cursor, anchor: None }
+    }
+
+    fn selection_range(&self, len: usize) -> Option<(usize, usize)> {
+        let anchor = self.anchor?.min(len);
+        let cursor = self.cursor.min(len);
+        (anchor != cursor).then(|| (anchor.min(cursor), anchor.max(cursor)))
+    }
+}
+
 struct LoadedPage {
     url: String,
     title: String,
@@ -30,9 +48,36 @@ struct LoadedPage {
     font_set: Option<FontSet>,
     images: ImageMap,
     focused_node: Option<std::sync::Arc<std::sync::RwLock<Node>>>,
+    focus_state: Option<FieldEditState>,
+    hovered_chain: Vec<std::sync::Arc<std::sync::RwLock<Node>>>,
+    selection_rects: Vec<engine_layout::Rect>,
+    selected_text: Option<String>,
 }
 
 impl LoadedPage {
+    fn new(
+        url: String,
+        title: String,
+        page: PageResult,
+        runtime: JsRuntime,
+        font_set: Option<FontSet>,
+        images: ImageMap,
+    ) -> Self {
+        Self {
+            url,
+            title,
+            page,
+            runtime,
+            font_set,
+            images,
+            focused_node: None,
+            focus_state: None,
+            hovered_chain: Vec::new(),
+            selection_rects: Vec::new(),
+            selected_text: None,
+        }
+    }
+
     /// Rehace el arbol de layout con el tamaño de ventana dado y publica el
     /// resultado donde JS puede verlo. Es el bloque que antes estaba
     /// copiado literalmente en seis sitios (`resize`, `switch_tab`,
@@ -438,6 +483,8 @@ impl EngineServer {
                 press_enter,
             } => (self.type_text(id, x, y, text, press_enter).await, false),
             EngineRequest::PressKey { id, key } => (self.press_key(id, key).await, false),
+            EngineRequest::Hover { id, x, y } => (self.hover(id, x, y), false),
+            EngineRequest::SelectText { id, from_x, from_y, to_x, to_y } => (self.select_text(id, from_x, from_y, to_x, to_y), false),
             // Llega aqui solo cuando no hay ninguna navegacion en curso: si la
             // hubiera, `run_stdio` la abandona antes de llamar a `handle`
             // (ver `handle_interruptible`).
@@ -715,15 +762,7 @@ impl EngineServer {
         }
 
         let tab = self.active_tab_mut();
-        tab.current_page = Some(LoadedPage {
-            url: final_url,
-            title,
-            page,
-            runtime,
-            font_set: Some(font_set),
-            images,
-            focused_node: None,
-        });
+        tab.current_page = Some(LoadedPage::new(final_url, title, page, runtime, Some(font_set), images));
         tab.scroll_offset_y = 0.0;
         // Fase 8: el PRIMER snapshot del documento recien cargado.
         // `build_page_keeping_runtime` ya construyo su arbol de layout, y
@@ -1313,15 +1352,37 @@ impl EngineServer {
                 let mut may_have_changed_the_page = page.runtime.has_event_listener("click")
                     || is_text_control(&node)
                     || is_checkable_input(&node);
+                page.selection_rects.clear();
+                page.selected_text = None;
+                let prev_focus = page.focused_node.clone();
                 if is_text_control(&node) {
-                    page.focused_node = Some(node.clone());
+                    let focus_changed = !prev_focus.as_ref().is_some_and(|p| std::sync::Arc::ptr_eq(p, &node));
+                    if focus_changed && page.page.stylesheet.has_focus_rules() {
+                        may_have_changed_the_page = true;
+                    }
+                    let cursor = page
+                        .page
+                        .layout_root
+                        .find_box_for_node(&node)
+                        .map(|b| cursor_index_at_point(b, page.font_set.as_ref(), &control_value(&node), x, y + scroll_offset_y))
+                        .unwrap_or_else(|| control_value(&node).chars().count());
+                    apply_focus(page, Some(node.clone()), Some(FieldEditState::at(cursor)));
+                    if focus_changed {
+                        if let Some(prev) = &prev_focus {
+                            let _ = page.runtime.dispatch_event(prev, "blur");
+                        }
+                    }
                     if let Err(error) = page.runtime.dispatch_event(&node, "focus") {
                         return Self::error(id, format!("focus_error: {error}"));
                     }
                 } else {
-                    // Clicar fuera de un campo le quita el foco, como en un
-                    // navegador: las teclas ya no van a ningun sitio.
-                    page.focused_node = None;
+                    if prev_focus.is_some() && page.page.stylesheet.has_focus_rules() {
+                        may_have_changed_the_page = true;
+                    }
+                    apply_focus(page, None, None);
+                    if let Some(prev) = &prev_focus {
+                        let _ = page.runtime.dispatch_event(prev, "blur");
+                    }
                 }
                 // `checked` se conmuta ANTES de disparar "click" (Fase 4.1) -
                 // asi es el orden real de un navegador de verdad: la accion
@@ -1489,8 +1550,10 @@ impl EngineServer {
                 );
             }
 
-            page.focused_node = Some(node.clone());
-            append_control_value(&node, &text);
+            page.selection_rects.clear();
+            page.selected_text = None;
+            let cursor = append_control_value_at(&node, &text, None);
+            apply_focus(page, Some(node.clone()), Some(FieldEditState::at(cursor)));
             for event_type in ["focus", "input"] {
                 if let Err(error) = page.runtime.dispatch_event(&node, event_type) {
                     return Self::error(id, format!("{event_type}_error: {error}"));
@@ -1593,73 +1656,137 @@ impl EngineServer {
     /// caracteres"), `press_key` es para teclas de control sueltas.
     async fn press_key(&mut self, id: Option<String>, key: String) -> EngineResponse {
         let (width, height) = (self.width, self.height);
-        // Mismo patron que `type_text`: el envio de formulario (si Enter lo
-        // dispara) necesita `&mut self` completo, asi que el `<form>`
-        // implicado sale del prestamo de `page` como valor propio.
         let mut submit_form_target: Option<std::sync::Arc<std::sync::RwLock<Node>>> = None;
+        let mut scroll_target: Option<f32> = None;
         {
             let Some(page) = &mut self.active_tab_mut().current_page else {
                 return Self::error(id, "no hay ninguna página cargada".to_string());
             };
-            let Some(node) = &page.focused_node else {
-                return Self::error(id, format!("no hay un control enfocado para la tecla {key}"));
-            };
-            let node = node.clone();
-            // Una tecla con caracter (`a`, `ñ`, `5`, ` `) escribe en el campo
-            // enfocado (tarea 3.2): antes solo Retroceso/Supr cambiaban el valor y
-            // el resto de teclas se limitaban a disparar eventos.
-            let mut chars = key.chars();
-            let printable = matches!((chars.next(), chars.next()), (Some(c), None) if !c.is_control());
-            let is_backspace = matches!(key.as_str(), "Backspace" | "Delete");
-            // Enter en un `<textarea>` añade una linea; en un campo de una linea
-            // envia el formulario (mas abajo).
-            let is_newline = key == "Enter" && is_textarea(&node);
-            let mutates_value = (is_backspace || printable || is_newline) && is_text_control(&node);
-            if mutates_value {
-                if is_backspace {
-                    backspace_control_value(&node);
-                } else if is_newline {
-                    append_control_value(&node, "\n");
-                } else {
-                    append_control_value(&node, &key);
+            if matches!(key.as_str(), "Tab" | "Shift+Tab") {
+                let backward = key == "Shift+Tab";
+                if let Err(error) = move_focus_tab(page, backward, width as f32, height as f32, &mut scroll_target) {
+                    return Self::error(id, error);
                 }
-            }
-            let mut enter_prevented = false;
-            for event_type in ["keydown", "keyup"] {
-                match page.runtime.dispatch_keyboard_event(&node, event_type, &key) {
-                    Ok(prevented) if event_type == "keydown" => enter_prevented = prevented,
-                    Ok(_) => {}
-                    Err(error) => return Self::error(id, format!("{event_type}_error: {error}")),
+                if let Some(node) = &page.focused_node {
+                    let node = node.clone();
+                    for event_type in ["keydown", "keyup"] {
+                        if let Err(error) = page.runtime.dispatch_keyboard_event(&node, event_type, "Tab") {
+                            return Self::error(id, format!("{event_type}_error: {error}"));
+                        }
+                    }
                 }
-            }
-            if mutates_value {
-                if let Err(error) = page.runtime.dispatch_event(&node, "input") {
-                    return Self::error(id, format!("input_error: {error}"));
+            } else {
+                let Some(node) = &page.focused_node else {
+                    return Self::error(id, format!("no hay un control enfocado para la tecla {key}"));
+                };
+                let node = node.clone();
+                let is_text = is_text_control(&node);
+                let op = if is_text { parse_edit_key(&key, is_textarea(&node)) } else { None };
+                let mutates_value = matches!(
+                    op,
+                    Some(EditOp::Insert(_) | EditOp::Backspace | EditOp::Delete | EditOp::Cut)
+                );
+                if let Some(op) = op {
+                    let state = page.focus_state.get_or_insert_with(|| FieldEditState::at(control_value(&node).chars().count()));
+                    edit_control(&node, state, op);
                 }
-                // Con la pagina escuchando teclas o `input` pudo cambiar cualquier
-                // cosa: layout entero. Si nadie escucha, el valor solo cambia el
-                // texto del propio campo (su tamaño es fijo), y rehacer el layout
-                // de Wikipedia por cada letra costaba 0,4 s.
-                let page_may_react = ["input", "keydown", "keyup", "change"].iter().any(|event| page.runtime.has_event_listener(event));
-                if page_may_react {
-                    page.relayout(width as f32, height as f32);
-                } else {
-                    refresh_control_text(page, &node);
+                let mut enter_prevented = false;
+                let event_key = normalized_keyboard_key(&key);
+                for event_type in ["keydown", "keyup"] {
+                    match page.runtime.dispatch_keyboard_event(&node, event_type, event_key) {
+                        Ok(prevented) if event_type == "keydown" => enter_prevented = prevented,
+                        Ok(_) => {}
+                        Err(error) => return Self::error(id, format!("{event_type}_error: {error}")),
+                    }
                 }
-            }
-            // Enter en un input de texto de una sola linea enfocado
-            // (nunca un `<textarea>`, ver el mismo criterio en
-            // `type_text`) dispara el envio del `<form>` ancestro - este
-            // es el camino que toma un Enter mandado SIN texto nuevo en
-            // el mismo golpe (`press_key` suelto, a diferencia de
-            // `type_text` con `press_enter: true`).
-            if key == "Enter" && !enter_prevented && is_text_control(&node) && !is_textarea(&node) {
-                submit_form_target = find_form_ancestor(&node);
+                if mutates_value {
+                    if let Err(error) = page.runtime.dispatch_event(&node, "input") {
+                        return Self::error(id, format!("input_error: {error}"));
+                    }
+                    let page_may_react = ["input", "keydown", "keyup", "change"].iter().any(|event| page.runtime.has_event_listener(event));
+                    if page_may_react {
+                        page.relayout(width as f32, height as f32);
+                    } else {
+                        refresh_control_text(page, &node);
+                    }
+                }
+                if key == "Enter" && !enter_prevented && is_text && !is_textarea(&node) {
+                    submit_form_target = find_form_ancestor(&node);
+                }
             }
         }
 
+        if let Some(offset) = scroll_target {
+            if let Some(page) = &self.active_tab().current_page {
+                page.publish_scroll_offset(offset);
+            }
+            self.active_tab_mut().scroll_offset_y = offset;
+        }
         if let Some(form) = submit_form_target {
             return self.submit_form(id, form, None).await;
+        }
+        self.state_response(id)
+    }
+
+    fn hover(&mut self, id: Option<String>, x: f32, y: f32) -> EngineResponse {
+        let scroll_offset_y = self.active_tab().scroll_offset_y;
+        let (width, height) = (self.width, self.height);
+        let needs_repaint = {
+            let Some(page) = &mut self.active_tab_mut().current_page else {
+                return EngineResponse::Ok { id, message: "hover_no_page" };
+            };
+            let hit = page.page.layout_root.hit_test(x, y + scroll_offset_y);
+            let new_chain = hit.as_ref().map(Node::ancestors).unwrap_or_default();
+            let unchanged = new_chain.len() == page.hovered_chain.len()
+                && new_chain.iter().zip(page.hovered_chain.iter()).all(|(a, b)| std::sync::Arc::ptr_eq(a, b));
+            if unchanged {
+                return EngineResponse::Ok { id, message: "hover_unchanged" };
+            }
+            for old in &page.hovered_chain {
+                old.write().unwrap().hovered = false;
+            }
+            for node in &new_chain {
+                node.write().unwrap().hovered = true;
+            }
+            page.hovered_chain = new_chain;
+            if page.page.stylesheet.has_hover_rules() {
+                page.relayout(width as f32, height as f32);
+                true
+            } else {
+                false
+            }
+        };
+        if needs_repaint {
+            self.state_response(id)
+        } else {
+            EngineResponse::Ok { id, message: "hover_ok" }
+        }
+    }
+
+    fn select_text(&mut self, id: Option<String>, from_x: f32, from_y: f32, to_x: f32, to_y: f32) -> EngineResponse {
+        let scroll_offset_y = self.active_tab().scroll_offset_y;
+        {
+            let Some(page) = &mut self.active_tab_mut().current_page else {
+                return Self::error(id, "no hay ninguna página cargada".to_string());
+            };
+            let (doc_fx, doc_fy) = (from_x, from_y + scroll_offset_y);
+            let (doc_tx, doc_ty) = (to_x, to_y + scroll_offset_y);
+            if let Some(hit) = page.page.layout_root.hit_test(doc_fx, doc_fy) {
+                if is_text_control(&hit) {
+                    if let Some(box_rect) = page.page.layout_root.find_box_for_node(&hit) {
+                        let val = control_value(&hit);
+                        let anchor = cursor_index_at_point(box_rect, page.font_set.as_ref(), &val, doc_fx, doc_fy);
+                        let cursor = cursor_index_at_point(box_rect, page.font_set.as_ref(), &val, doc_tx, doc_ty);
+                        page.selection_rects.clear();
+                        page.selected_text = None;
+                        apply_focus(page, Some(hit), Some(FieldEditState { cursor, anchor: (anchor != cursor).then_some(anchor) }));
+                        return self.state_response(id);
+                    }
+                }
+            }
+            let (rects, text) = compute_text_selection(&page.page.layout_root, page.font_set.as_ref(), (doc_fx, doc_fy), (doc_tx, doc_ty));
+            page.selection_rects = rects;
+            page.selected_text = text;
         }
         self.state_response(id)
     }
@@ -1761,21 +1888,28 @@ impl EngineServer {
                 title: String::new(),
                 screenshot: String::new(),
                 elements: with_page_details.then(Vec::new),
-                // Sin pagina cargada no hay nada que diagnosticar: el
-                // frontend pinta su pagina de inicio, no un aviso.
                 requires_javascript: with_page_details.then_some(false),
                 can_go_back,
                 can_go_forward,
+                focused_is_text: None,
+                selected_text: None,
             };
         };
 
-        // Foco: anillo y cursor sobre el control que tiene el teclado (tarea 3.2).
-        let overlay = page
-            .focused_node
-            .as_ref()
-            .and_then(|node| page.page.layout_root.find_box_for_node(node))
-            .map(|focused| focus_overlay(focused, page.font_set.as_ref()))
-            .unwrap_or_default();
+        // Resaltado de selección en página + foco y cursor sobre el control activo.
+        let mut overlay = selection_overlay_rects(&page.selection_rects);
+        if let Some(node) = &page.focused_node {
+            if let Some(focused) = page.page.layout_root.find_box_for_node(node) {
+                let len = control_value(node).chars().count();
+                let (cursor, selection) = match &page.focus_state {
+                    Some(st) => (st.cursor.min(len), st.selection_range(len)),
+                    None => (len, None),
+                };
+                overlay.extend(focus_overlay_with_state(focused, page.font_set.as_ref(), cursor, selection));
+            }
+        }
+        let focused_is_text = Some(page.focused_node.as_ref().is_some_and(is_text_control));
+        let selected_text = focused_selected_text(page).or_else(|| page.selected_text.clone());
         let screenshot = match render_layout_to_png_with_overlay_scaled(
             &page.page.layout_root,
             page.font_set.as_ref(),
@@ -1802,6 +1936,8 @@ impl EngineServer {
             requires_javascript: with_page_details.then(|| page_content_requires_javascript(&page.page.dom_root, &page.page.layout_root)),
             can_go_back,
             can_go_forward,
+            focused_is_text,
+            selected_text,
         }
     }
 
@@ -1925,28 +2061,448 @@ fn refresh_control_text(page: &mut LoadedPage, node: &std::sync::Arc<std::sync::
     }
 }
 
-fn append_control_value(node: &std::sync::Arc<std::sync::RwLock<Node>>, text: &str) {
-    let mut node_guard = node.write().unwrap();
-    if let NodeType::Element { attributes, .. } = &mut node_guard.node_type {
-        attributes
-            .entry("value".to_string())
-            .or_default()
-            .push_str(text);
+enum EditOp {
+    Insert(String),
+    Backspace,
+    Delete,
+    Cut,
+    MoveLeft { select: bool },
+    MoveRight { select: bool },
+    MoveHome { select: bool },
+    MoveEnd { select: bool },
+    SelectAll,
+}
+
+fn parse_edit_key(key: &str, multiline: bool) -> Option<EditOp> {
+    match key {
+        "Backspace" => Some(EditOp::Backspace),
+        "Delete" => Some(EditOp::Delete),
+        "ArrowLeft" => Some(EditOp::MoveLeft { select: false }),
+        "ArrowRight" => Some(EditOp::MoveRight { select: false }),
+        "Home" => Some(EditOp::MoveHome { select: false }),
+        "End" => Some(EditOp::MoveEnd { select: false }),
+        "Shift+ArrowLeft" => Some(EditOp::MoveLeft { select: true }),
+        "Shift+ArrowRight" => Some(EditOp::MoveRight { select: true }),
+        "Shift+Home" => Some(EditOp::MoveHome { select: true }),
+        "Shift+End" => Some(EditOp::MoveEnd { select: true }),
+        "Ctrl+a" | "Ctrl+A" => Some(EditOp::SelectAll),
+        "Ctrl+x" | "Ctrl+X" => Some(EditOp::Cut),
+        "Enter" if multiline => Some(EditOp::Insert("\n".to_string())),
+        _ => {
+            let mut chars = key.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if !c.is_control() => Some(EditOp::Insert(key.to_string())),
+                _ => None,
+            }
+        }
     }
 }
 
-/// Quita el ULTIMO caracter de `value` (Fase 4.1, `Backspace`/`Delete` en
-/// `press_key`) - misma simplificacion ya declarada en
-/// `append_control_value`/`type_text`: sin cursor ni seleccion todavia, la
-/// edicion siempre ocurre al final del texto, nunca en medio. No-op
-/// honesto (no un panic) sobre un `value` ya vacio.
-fn backspace_control_value(node: &std::sync::Arc<std::sync::RwLock<Node>>) {
-    let mut node_guard = node.write().unwrap();
-    if let NodeType::Element { attributes, .. } = &mut node_guard.node_type {
-        if let Some(value) = attributes.get_mut("value") {
-            value.pop();
+fn normalized_keyboard_key(key: &str) -> &str {
+    key.rsplit('+').next().unwrap_or(key)
+}
+
+fn char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map_or(s.len(), |(b, _)| b)
+}
+
+fn control_value(node: &std::sync::Arc<std::sync::RwLock<Node>>) -> String {
+    let (tag_name, attr_val) = {
+        let guard = node.read().unwrap();
+        match &guard.node_type {
+            NodeType::Element { tag_name, attributes } => (tag_name.clone(), attributes.get("value").cloned()),
+            _ => return String::new(),
+        }
+    };
+    match attr_val {
+        Some(v) => v,
+        None if tag_name == "textarea" => Node::text_content(node).trim().to_string(),
+        None => String::new(),
+    }
+}
+
+fn set_control_value(node: &std::sync::Arc<std::sync::RwLock<Node>>, value: String) {
+    let mut guard = node.write().unwrap();
+    if let NodeType::Element { attributes, .. } = &mut guard.node_type {
+        attributes.insert("value".to_string(), value);
+    }
+}
+
+fn edit_control(node: &std::sync::Arc<std::sync::RwLock<Node>>, state: &mut FieldEditState, op: EditOp) {
+    let mut value = control_value(node);
+    let len = value.chars().count();
+    let mut cursor = state.cursor.min(len);
+    let sel = state.selection_range(len);
+
+    let remove_range = |v: &mut String, a: usize, b: usize| {
+        let ba = char_to_byte(v, a);
+        let bb = char_to_byte(v, b);
+        v.replace_range(ba..bb, "");
+    };
+
+    match op {
+        EditOp::Insert(text) => {
+            if let Some((a, b)) = sel {
+                remove_range(&mut value, a, b);
+                cursor = a;
+            }
+            let bpos = char_to_byte(&value, cursor);
+            value.insert_str(bpos, &text);
+            state.cursor = cursor + text.chars().count();
+            state.anchor = None;
+            set_control_value(node, value);
+        }
+        EditOp::Backspace => {
+            if let Some((a, b)) = sel {
+                remove_range(&mut value, a, b);
+                state.cursor = a;
+            } else if cursor > 0 {
+                remove_range(&mut value, cursor - 1, cursor);
+                state.cursor = cursor - 1;
+            }
+            state.anchor = None;
+            set_control_value(node, value);
+        }
+        EditOp::Delete => {
+            if let Some((a, b)) = sel {
+                remove_range(&mut value, a, b);
+                state.cursor = a;
+            } else if cursor < len {
+                remove_range(&mut value, cursor, cursor + 1);
+                state.cursor = cursor;
+            }
+            state.anchor = None;
+            set_control_value(node, value);
+        }
+        EditOp::Cut => {
+            if let Some((a, b)) = sel {
+                remove_range(&mut value, a, b);
+                state.cursor = a;
+                state.anchor = None;
+                set_control_value(node, value);
+            }
+        }
+        EditOp::MoveLeft { select } => {
+            if select && state.anchor.is_none() {
+                state.anchor = Some(cursor);
+            }
+            state.cursor = match (select, sel) {
+                (false, Some((a, _))) => a,
+                _ => cursor.saturating_sub(1),
+            };
+            if !select {
+                state.anchor = None;
+            }
+        }
+        EditOp::MoveRight { select } => {
+            if select && state.anchor.is_none() {
+                state.anchor = Some(cursor);
+            }
+            state.cursor = match (select, sel) {
+                (false, Some((_, b))) => b,
+                _ => (cursor + 1).min(len),
+            };
+            if !select {
+                state.anchor = None;
+            }
+        }
+        EditOp::MoveHome { select } => {
+            if select && state.anchor.is_none() {
+                state.anchor = Some(cursor);
+            }
+            state.cursor = 0;
+            if !select {
+                state.anchor = None;
+            }
+        }
+        EditOp::MoveEnd { select } => {
+            if select && state.anchor.is_none() {
+                state.anchor = Some(cursor);
+            }
+            state.cursor = len;
+            if !select {
+                state.anchor = None;
+            }
+        }
+        EditOp::SelectAll => {
+            state.anchor = (len > 0).then_some(0);
+            state.cursor = len;
         }
     }
+}
+
+fn focused_selected_text(page: &LoadedPage) -> Option<String> {
+    let node = page.focused_node.as_ref()?;
+    if !is_text_control(node) {
+        return None;
+    }
+    let state = page.focus_state.as_ref()?;
+    let value = control_value(node);
+    let len = value.chars().count();
+    let (a, b) = state.selection_range(len)?;
+    let ba = char_to_byte(&value, a);
+    let bb = char_to_byte(&value, b);
+    Some(value[ba..bb].to_string())
+}
+
+fn apply_focus(
+    page: &mut LoadedPage,
+    next: Option<std::sync::Arc<std::sync::RwLock<Node>>>,
+    edit_state: Option<FieldEditState>,
+) {
+    if let Some(prev) = page.focused_node.take() {
+        prev.write().unwrap().focused = false;
+    }
+    if let Some(node) = &next {
+        node.write().unwrap().focused = true;
+    }
+    page.focused_node = next;
+    page.focus_state = edit_state;
+}
+
+fn cursor_index_in_line(line: &str, rel_x: f32, font: Option<&engine_text::SystemFont>, font_size: f32) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    let mut best = (chars.len(), f32::MAX);
+    let mut acc = String::new();
+    for i in 0..=chars.len() {
+        let w = font.map_or(i as f32 * font_size * 0.55, |f| engine_text::text_width(f, &acc, font_size));
+        let d = (w - rel_x).abs();
+        if d < best.1 {
+            best = (i, d);
+        }
+        if let Some(&ch) = chars.get(i) {
+            acc.push(ch);
+        }
+    }
+    best.0
+}
+
+fn cursor_index_at_point(
+    layout_box: &LayoutBox,
+    font_set: Option<&FontSet>,
+    value: &str,
+    doc_x: f32,
+    doc_y: f32,
+) -> usize {
+    let font_size = layout_box
+        .computed_style
+        .get("font-size")
+        .and_then(|v| v.trim().strip_suffix("px"))
+        .and_then(|n| n.trim().parse::<f32>().ok())
+        .filter(|s| *s > 0.0)
+        .unwrap_or(16.0);
+    let inset = layout_box
+        .computed_style
+        .get("border")
+        .and_then(|b| b.split_whitespace().find_map(|t| t.strip_suffix("px")?.parse::<f32>().ok()))
+        .unwrap_or(0.0)
+        + 3.0;
+    let rel_x = (doc_x - (layout_box.dimensions.x + inset)).max(0.0);
+    let font = font_set.and_then(|s| s.pick(false, false));
+    let multiline = layout_box.dimensions.height > font_size * 2.5;
+    if !multiline {
+        return cursor_index_in_line(value, rel_x, font, font_size);
+    }
+    let line_height = font_size * 1.2;
+    let rel_y = (doc_y - (layout_box.dimensions.y + inset)).max(0.0);
+    let target_line = (rel_y / line_height).floor() as usize;
+    let mut offset = 0usize;
+    let lines: Vec<&str> = value.split('\n').collect();
+    let clamped_line = target_line.min(lines.len().saturating_sub(1));
+    for (idx, line) in lines.iter().enumerate() {
+        if idx == clamped_line {
+            return offset + cursor_index_in_line(line, rel_x, font, font_size);
+        }
+        offset += line.chars().count() + 1;
+    }
+    value.chars().count()
+}
+
+fn collect_focusable_nodes(layout_root: &LayoutBox) -> Vec<std::sync::Arc<std::sync::RwLock<Node>>> {
+    fn walk(
+        b: &LayoutBox,
+        seen: &mut std::collections::HashSet<usize>,
+        out: &mut Vec<(i32, usize, std::sync::Arc<std::sync::RwLock<Node>>)>,
+    ) {
+        if let Some(node) = &b.dom_node {
+            let ptr = std::sync::Arc::as_ptr(node) as usize;
+            if seen.insert(ptr) {
+                let g = node.read().unwrap();
+                if let NodeType::Element { tag_name, attributes } = &g.node_type {
+                    let hidden = tag_name == "input"
+                        && attributes.get("type").is_some_and(|t| t.eq_ignore_ascii_case("hidden"));
+                    let disabled = attributes.contains_key("disabled");
+                    let visible = b.dimensions.height > 0.0 && (b.dimensions.width > 0.0 || tag_name == "a");
+                    let tabindex = attributes.get("tabindex").and_then(|v| v.trim().parse::<i32>().ok());
+                    let focusable = visible && !disabled && !hidden && match tabindex {
+                        Some(ti) => ti >= 0,
+                        None => (tag_name == "a" && attributes.contains_key("href"))
+                            || matches!(tag_name.as_str(), "button" | "input" | "select" | "textarea"),
+                    };
+                    if focusable {
+                        let order = tabindex.filter(|&ti| ti > 0).unwrap_or(i32::MAX);
+                        let seq = out.len();
+                        out.push((order, seq, node.clone()));
+                    }
+                }
+            }
+        }
+        for child in &b.children {
+            walk(child, seen, out);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    walk(layout_root, &mut seen, &mut out);
+    out.sort_by_key(|(order, seq, _)| (*order, *seq));
+    out.into_iter().map(|(_, _, n)| n).collect()
+}
+
+fn move_focus_tab(
+    page: &mut LoadedPage,
+    backward: bool,
+    width: f32,
+    height: f32,
+    scroll_target: &mut Option<f32>,
+) -> Result<(), String> {
+    let focusable = collect_focusable_nodes(&page.page.layout_root);
+    if focusable.is_empty() {
+        return Ok(());
+    }
+    let next = match &page.focused_node {
+        Some(current) => match focusable.iter().position(|n| std::sync::Arc::ptr_eq(n, current)) {
+            Some(pos) => {
+                let len = focusable.len();
+                let next_pos = if backward { (pos + len - 1) % len } else { (pos + 1) % len };
+                focusable[next_pos].clone()
+            }
+            None => if backward { focusable.last().unwrap().clone() } else { focusable[0].clone() },
+        },
+        None => if backward { focusable.last().unwrap().clone() } else { focusable[0].clone() },
+    };
+    let prev = page.focused_node.clone();
+    let edit_state = is_text_control(&next).then(|| FieldEditState::at(control_value(&next).chars().count()));
+    apply_focus(page, Some(next.clone()), edit_state);
+    if let Some(prev_node) = prev.filter(|p| !std::sync::Arc::ptr_eq(p, &next)) {
+        page.runtime.dispatch_event(&prev_node, "blur").map_err(|e| format!("blur_error: {e}"))?;
+    }
+    page.runtime.dispatch_event(&next, "focus").map_err(|e| format!("focus_error: {e}"))?;
+    if page.page.stylesheet.has_focus_rules() || page.runtime.has_event_listener("focus") || page.runtime.has_event_listener("blur") {
+        page.relayout(width, height);
+    }
+    if let Some(target_box) = page.page.layout_root.find_box_for_node(&next) {
+        let cy = target_box.dimensions.y + target_box.dimensions.height / 2.0;
+        let extent = page.page.layout_root.content_extent();
+        let target = clamp_scroll_offset(cy - height / 2.0, extent, height);
+        *scroll_target = Some(target);
+    }
+    Ok(())
+}
+
+fn compute_text_selection(
+    layout_root: &LayoutBox,
+    font_set: Option<&FontSet>,
+    from: (f32, f32),
+    to: (f32, f32),
+) -> (Vec<engine_layout::Rect>, Option<String>) {
+    if (from.0 - to.0).abs() < 3.0 && (from.1 - to.1).abs() < 3.0 {
+        return (Vec::new(), None);
+    }
+    let ((sx, sy), (ex, ey)) = if from.1 < to.1 - 6.0 || ((from.1 - to.1).abs() <= 6.0 && from.0 <= to.0) {
+        (from, to)
+    } else {
+        (to, from)
+    };
+    let mut rects = Vec::new();
+    let mut parts = Vec::new();
+    let font = font_set.and_then(|s| s.pick(false, false));
+
+    fn collect_boxes<'a>(b: &'a LayoutBox, out: &mut Vec<&'a LayoutBox>) {
+        match &b.box_type {
+            BoxType::Text(_) => out.push(b),
+            BoxType::Replaced => {}
+            _ => {
+                for c in &b.children {
+                    collect_boxes(c, out);
+                }
+            }
+        }
+    }
+    let mut text_boxes = Vec::new();
+    collect_boxes(layout_root, &mut text_boxes);
+
+    for b in text_boxes {
+        let BoxType::Text(raw) = &b.box_type else { continue };
+        let text = b.trimmed_text.as_deref().unwrap_or(raw.as_str());
+        if text.trim().is_empty() || b.dimensions.width <= 0.0 || b.dimensions.height <= 0.0 {
+            continue;
+        }
+        let top = b.dimensions.y;
+        let bottom = b.dimensions.y + b.dimensions.height;
+        if bottom < sy || top > ey {
+            continue;
+        }
+        let font_size = b
+            .computed_style
+            .get("font-size")
+            .and_then(|v| v.trim().strip_suffix("px"))
+            .and_then(|n| n.trim().parse::<f32>().ok())
+            .filter(|s| *s > 0.0)
+            .unwrap_or(16.0);
+        let single_line_drag = (sy - ey).abs() <= b.dimensions.height.max(20.0) && sy >= top - 4.0 && ey <= bottom + 4.0;
+        let chars: Vec<char> = text.chars().collect();
+        let (a_idx, b_idx) = if single_line_drag {
+            let a = cursor_index_in_line(text, (sx - b.dimensions.x).max(0.0), font, font_size);
+            let z = cursor_index_in_line(text, (ex - b.dimensions.x).max(0.0), font, font_size);
+            (a.min(z), a.max(z))
+        } else {
+            let a = if sy >= top - 4.0 && sy <= bottom + 4.0 {
+                cursor_index_in_line(text, (sx - b.dimensions.x).max(0.0), font, font_size)
+            } else {
+                0
+            };
+            let z = if ey >= top - 4.0 && ey <= bottom + 4.0 {
+                cursor_index_in_line(text, (ex - b.dimensions.x).max(0.0), font, font_size)
+            } else {
+                chars.len()
+            };
+            (a.min(chars.len()), z.min(chars.len()))
+        };
+        if a_idx < b_idx {
+            let ba = char_to_byte(text, a_idx);
+            let bb = char_to_byte(text, b_idx);
+            let selected = text[ba..bb].trim();
+            if !selected.is_empty() {
+                parts.push(selected.to_string());
+                let x0 = b.dimensions.x + font.map_or(a_idx as f32 * font_size * 0.55, |f| engine_text::text_width(f, &text[..ba], font_size));
+                let x1 = b.dimensions.x + font.map_or(b_idx as f32 * font_size * 0.55, |f| engine_text::text_width(f, &text[..bb], font_size));
+                rects.push(engine_layout::Rect {
+                    x: x0.min(b.dimensions.x + b.dimensions.width),
+                    y: b.dimensions.y,
+                    width: (x1 - x0).max(2.0).min(b.dimensions.width),
+                    height: b.dimensions.height,
+                });
+            }
+        }
+    }
+    let joined = parts.join(" ");
+    (rects, (!joined.is_empty()).then_some(joined))
+}
+
+fn append_control_value_at(node: &std::sync::Arc<std::sync::RwLock<Node>>, text: &str, cursor: Option<usize>) -> usize {
+    let mut val = control_value(node);
+    let len = val.chars().count();
+    let idx = cursor.unwrap_or(len).min(len);
+    let bpos = char_to_byte(&val, idx);
+    val.insert_str(bpos, text);
+    set_control_value(node, val);
+    idx + text.chars().count()
+}
+
+#[cfg(test)]
+fn backspace_control_value(node: &std::sync::Arc<std::sync::RwLock<Node>>) {
+    let mut state = FieldEditState::at(control_value(node).chars().count());
+    edit_control(node, &mut state, EditOp::Backspace);
 }
 
 /// `<input type="checkbox">`/`<input type="radio">` - los DOS tipos donde
@@ -2528,11 +3084,11 @@ async fn handle_interruptible<R: AsyncBufRead + Unpin>(
 /// se deduplica.
 fn state_fingerprint(response: &EngineResponse) -> Option<u64> {
     use std::hash::{Hash, Hasher};
-    let EngineResponse::State { tab_id, scroll_offset_y, url, title, screenshot, elements, requires_javascript, can_go_back, can_go_forward, .. } = response else {
+    let EngineResponse::State { tab_id, scroll_offset_y, url, title, screenshot, elements, requires_javascript, can_go_back, can_go_forward, focused_is_text, selected_text, .. } = response else {
         return None;
     };
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (tab_id, scroll_offset_y.to_bits(), url, title, screenshot, requires_javascript, can_go_back, can_go_forward).hash(&mut hasher);
+    (tab_id, scroll_offset_y.to_bits(), url, title, screenshot, requires_javascript, can_go_back, can_go_forward, focused_is_text, selected_text).hash(&mut hasher);
     serde_json::to_string(elements).unwrap_or_default().hash(&mut hasher);
     Some(hasher.finish())
 }
@@ -3311,15 +3867,14 @@ mod tests {
         let (page, runtime) = build_page_keeping_runtime(&html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
         let mut server = EngineServer::new();
         let tab = server.active_tab_mut();
-        tab.current_page = Some(LoadedPage {
-            url: "http://ejemplo.test/".to_string(),
-            title: String::new(),
+        tab.current_page = Some(LoadedPage::new(
+            "http://ejemplo.test/".to_string(),
+            String::new(),
             page,
             runtime,
-            font_set: None,
-            images: ImageMap::new(),
-            focused_node: None,
-        });
+            None,
+            ImageMap::new(),
+        ));
         server
     }
 
@@ -3327,15 +3882,14 @@ mod tests {
         let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
         let mut server = EngineServer::new();
         let tab = server.active_tab_mut();
-        tab.current_page = Some(LoadedPage {
-            url: "http://ejemplo.test/".to_string(),
-            title: String::new(),
+        tab.current_page = Some(LoadedPage::new(
+            "http://ejemplo.test/".to_string(),
+            String::new(),
             page,
             runtime,
-            font_set: None,
-            images: ImageMap::new(),
-            focused_node: None,
-        });
+            None,
+            ImageMap::new(),
+        ));
         server
     }
 
@@ -3761,7 +4315,7 @@ mod tests {
         let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
         let mut server = EngineServer::new();
         let tab = server.active_tab_mut();
-        tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+        tab.current_page = Some(LoadedPage::new("http://ejemplo.test/".to_string(), String::new(), page, runtime, None, ImageMap::new()));
 
         server.handle(EngineRequest::Scroll { id: Some("s1".to_string()), dx: 0, dy: 200 }).await;
 
@@ -3794,7 +4348,7 @@ mod tests {
         let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
         let mut server = EngineServer::new();
         let tab = server.active_tab_mut();
-        tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+        tab.current_page = Some(LoadedPage::new("http://ejemplo.test/".to_string(), String::new(), page, runtime, None, ImageMap::new()));
 
         server.handle(EngineRequest::Resize { id: Some("r1".to_string()), width: 1000, height: 700, scale: 1.0 }).await;
 
@@ -3811,7 +4365,7 @@ mod tests {
         let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
         let mut server = EngineServer::new();
         let tab = server.active_tab_mut();
-        tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+        tab.current_page = Some(LoadedPage::new("http://ejemplo.test/".to_string(), String::new(), page, runtime, None, ImageMap::new()));
 
         server.handle(EngineRequest::Resize { id: Some("r1".to_string()), width: 1000, height: 700, scale: 1.0 }).await;
 
@@ -3830,7 +4384,7 @@ mod tests {
         let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
         let mut server = EngineServer::new();
         let tab = server.active_tab_mut();
-        tab.current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+        tab.current_page = Some(LoadedPage::new("http://ejemplo.test/".to_string(), String::new(), page, runtime, None, ImageMap::new()));
 
         let publicado = server.tick_active_tab_timers();
 
@@ -3846,7 +4400,7 @@ mod tests {
         let html = "<html><head><title>ANTES</title></head><body><script>setTimeout(function() { document.title = 'DESPUES'; }, 0);</script></body></html>";
         let (page, runtime) = build_page_keeping_runtime(html, "", 800.0, 600.0, None, &HashMap::new(), &ImageMap::new(), None, None);
         let mut server = EngineServer::new();
-        server.active_tab_mut().current_page = Some(LoadedPage { url: "http://ejemplo.test/".to_string(), title: String::new(), page, runtime, font_set: None, images: ImageMap::new(), focused_node: None });
+        server.active_tab_mut().current_page = Some(LoadedPage::new("http://ejemplo.test/".to_string(), String::new(), page, runtime, None, ImageMap::new()));
 
         let Some(EngineResponse::State { title, .. }) = server.tick_active_tab_timers() else { panic!("deberia haber estado que publicar") };
         assert_eq!(title, "DESPUES");
@@ -4410,15 +4964,7 @@ mod tests {
             None,
             None,
         );
-        LoadedPage {
-            url: url.to_string(),
-            title: String::new(),
-            page,
-            runtime,
-            font_set: None,
-            images: ImageMap::new(),
-            focused_node: None,
-        }
+        LoadedPage::new(url.to_string(), String::new(), page, runtime, None, ImageMap::new())
     }
 
     /// Un servidor con una pestaña que ya tiene documento y una entrada de
@@ -4632,15 +5178,14 @@ mod tests {
             None,
         );
         let tab = server.active_tab_mut();
-        tab.current_page = Some(LoadedPage {
-            url: "https://example.test/app".to_string(),
-            title: "Dashboard".to_string(),
+        tab.current_page = Some(LoadedPage::new(
+            "https://example.test/app".to_string(),
+            "Dashboard".to_string(),
             page,
             runtime,
-            font_set: None,
-            images: ImageMap::new(),
-            focused_node: None,
-        });
+            None,
+            ImageMap::new(),
+        ));
 
         let resp2 = server.accessibility_tree_response(Some("a3".to_string()));
         let json2 = serde_json::to_string(&resp2).expect("serialize");
@@ -4808,5 +5353,69 @@ mod tests {
         assert!(images.contains_key("/logo.svg"));
         assert!(images.contains_key("./logo.svg"));
         assert!(std::sync::Arc::ptr_eq(&images["/logo.svg"], &images["./logo.svg"]));
+    }
+
+    #[tokio::test]
+    async fn editing_with_arrows_selection_and_tab_navigation_works() {
+        let mut server = server_from_html(
+            "<html><body style=\"margin:0\">\
+             <a id=\"lnk\" href=\"/x\" style=\"display:block;width:100px;height:24px\">ir</a>\
+             <input id=\"campo\" type=\"text\" value=\"abde\" style=\"width:200px;height:30px\">\
+             <button id=\"btn\" style=\"width:80px;height:30px\">Ok</button>\
+             </body></html>",
+        );
+        // Tab desde sin foco enfoca el enlace; otro Tab pasa al input.
+        let r1 = press(&mut server, "Tab").await;
+        assert!(matches!(r1, EngineResponse::State { focused_is_text: Some(false), .. }));
+        let r2 = press(&mut server, "Tab").await;
+        assert!(matches!(r2, EngineResponse::State { focused_is_text: Some(true), .. }));
+
+        // Editar en medio del texto con flechas y seleccion.
+        press(&mut server, "ArrowLeft").await;
+        press(&mut server, "ArrowLeft").await;
+        press(&mut server, "c").await;
+        assert_eq!(field_value(&server), "abcde");
+
+        press(&mut server, "Shift+ArrowLeft").await;
+        let sel = press(&mut server, "Shift+ArrowLeft").await;
+        let EngineResponse::State { selected_text, .. } = sel else { panic!() };
+        assert_eq!(selected_text.as_deref(), Some("bc"));
+        press(&mut server, "Z").await;
+        assert_eq!(field_value(&server), "aZde");
+
+        press(&mut server, "Home").await;
+        press(&mut server, "Delete").await;
+        assert_eq!(field_value(&server), "Zde");
+
+        press(&mut server, "Ctrl+a").await;
+        press(&mut server, "Ctrl+x").await;
+        assert_eq!(field_value(&server), "");
+    }
+
+    #[tokio::test]
+    async fn hover_updates_css_hover_state_only_when_stylesheet_uses_hover() {
+        let mut server = server_from_html(
+            "<html><head><style>#btn { background: #111111; } #btn:hover { background: #ff0000; }</style></head>\
+             <body style=\"margin:0\"><a id=\"btn\" href=\"/a\" style=\"display:block;width:120px;height:40px\">Botón</a></body></html>",
+        );
+        let r = server.handle(EngineRequest::Hover { id: None, x: 20.0, y: 20.0 }).await.0;
+        assert!(matches!(r, EngineResponse::State { .. }), "con regla :hover deberia devolver State actualizado");
+        let page = &server.active_tab().current_page.as_ref().unwrap().page;
+        let btn = Node::find_by_id(&page.dom_root, "btn").unwrap();
+        let box_btn = page.layout_root.find_box_for_node(&btn).unwrap();
+        assert_eq!(box_btn.computed_style.get("background-color").map(String::as_str), Some("#ff0000"));
+    }
+
+    #[tokio::test]
+    async fn drag_select_text_highlights_and_reports_selected_text() {
+        let mut server = server_from_html(
+            "<html><body style=\"margin:0\"><p style=\"margin:0;width:300px;height:30px\">Hola mundo desde Rust</p></body></html>",
+        );
+        let r = server
+            .handle(EngineRequest::SelectText { id: None, from_x: 0.0, from_y: 10.0, to_x: 280.0, to_y: 15.0 })
+            .await
+            .0;
+        let EngineResponse::State { selected_text, .. } = r else { panic!() };
+        assert!(selected_text.as_deref().is_some_and(|t| t.contains("Hola")), "{selected_text:?}");
     }
 }

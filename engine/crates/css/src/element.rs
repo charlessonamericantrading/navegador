@@ -28,6 +28,26 @@ fn is_element(node: &Arc<RwLock<Node>>) -> bool {
     matches!(node.read().unwrap().node_type, NodeType::Element { .. })
 }
 
+fn has_focused_descendant(node: &Arc<RwLock<Node>>) -> bool {
+    let children = node.read().unwrap().children.clone();
+    for child in children {
+        let is_focused = {
+            let g = child.read().unwrap();
+            g.focused
+                || matches!(
+                    &g.node_type,
+                    NodeType::Element { tag_name, attributes }
+                        if matches!(tag_name.as_str(), "input" | "textarea" | "select" | "button" | "option" | "optgroup" | "fieldset")
+                            && (attributes.contains_key("autofocus") || attributes.contains_key("data-focused"))
+                )
+        };
+        if is_focused || has_focused_descendant(&child) {
+            return true;
+        }
+    }
+    false
+}
+
 impl Element for ElementRef {
     type Impl = EngineSelectorImpl;
 
@@ -135,43 +155,44 @@ impl Element for ElementRef {
     /// ademas exactamente lo que hace un navegador real en un dispositivo
     /// sin puntero para `:hover`.
     fn match_non_ts_pseudo_class(&self, pc: &EnginePseudoClass, _context: &mut MatchingContext<Self::Impl>) -> bool {
-        let node = self.0.read().unwrap();
-        let NodeType::Element { tag_name, attributes } = &node.node_type else { return false };
+        let (hovered, focused, tag_name, has_autofocus_attr, checked, disabled, required, read_only_attr, has_href) = {
+            let node = self.0.read().unwrap();
+            let NodeType::Element { tag_name, attributes } = &node.node_type else { return false };
+            (
+                node.hovered,
+                node.focused,
+                tag_name.clone(),
+                attributes.contains_key("autofocus") || attributes.contains_key("data-focused"),
+                attributes.contains_key("checked") || attributes.contains_key("selected"),
+                attributes.contains_key("disabled"),
+                attributes.contains_key("required"),
+                attributes.contains_key("readonly"),
+                attributes.contains_key("href"),
+            )
+        };
 
-        // Solo estos tres pueden estar deshabilitados/ser de solo lectura
-        // en el sentido del spec - un `<div disabled>` no cuenta, aunque
-        // lleve el atributo.
         let is_form_control = matches!(tag_name.as_str(), "input" | "textarea" | "select" | "button" | "option" | "optgroup" | "fieldset");
         let is_text_entry = matches!(tag_name.as_str(), "input" | "textarea");
 
         match pc {
-            // Semantica de atributo booleano HTML: PRESENCIA = marcado, sin
-            // importar su valor - el mismo criterio que ya usa
-            // `core::server::toggle_checked` al conmutarlo con un clic, asi
-            // que el "checkbox hack" funciona de punta a punta.
-            EnginePseudoClass::Checked => attributes.contains_key("checked") || attributes.contains_key("selected"),
-            EnginePseudoClass::Disabled => is_form_control && attributes.contains_key("disabled"),
-            EnginePseudoClass::Enabled => is_form_control && !attributes.contains_key("disabled"),
-            EnginePseudoClass::Required => is_form_control && attributes.contains_key("required"),
-            EnginePseudoClass::Optional => is_form_control && !attributes.contains_key("required"),
-            EnginePseudoClass::ReadOnly => !is_text_entry || attributes.contains_key("readonly") || attributes.contains_key("disabled"),
-            EnginePseudoClass::ReadWrite => is_text_entry && !attributes.contains_key("readonly") && !attributes.contains_key("disabled"),
-            // `:link` es un enlace NO visitado y `:any-link` es cualquiera
-            // con `href`. Como no hay historial de visitas consultable
-            // desde aqui, todo enlace cuenta como no visitado - que es
-            // ademas el lado seguro: `:visited` (mas abajo) nunca coincide,
-            // asi que no se puede filtrar el historial por CSS.
+            EnginePseudoClass::Checked => checked,
+            EnginePseudoClass::Disabled => is_form_control && disabled,
+            EnginePseudoClass::Enabled => is_form_control && !disabled,
+            EnginePseudoClass::Required => is_form_control && required,
+            EnginePseudoClass::Optional => is_form_control && !required,
+            EnginePseudoClass::ReadOnly => !is_text_entry || read_only_attr || disabled,
+            EnginePseudoClass::ReadWrite => is_text_entry && !read_only_attr && !disabled,
             EnginePseudoClass::Link | EnginePseudoClass::AnyLink => {
-                matches!(tag_name.as_str(), "a" | "area") && attributes.contains_key("href")
+                matches!(tag_name.as_str(), "a" | "area") && has_href
             }
-            // `:focus` y `:focus-visible` se resuelven si el control de formulario
-            // tiene foco explícito declarado (`autofocus` o `data-focused`).
-            EnginePseudoClass::Focus | EnginePseudoClass::FocusVisible | EnginePseudoClass::FocusWithin => {
-                is_form_control && (attributes.contains_key("autofocus") || attributes.contains_key("data-focused"))
+            EnginePseudoClass::Focus | EnginePseudoClass::FocusVisible => {
+                focused || (is_form_control && has_autofocus_attr)
             }
-            EnginePseudoClass::Hover
-            | EnginePseudoClass::Active
-            | EnginePseudoClass::Visited => false,
+            EnginePseudoClass::FocusWithin => {
+                focused || (is_form_control && has_autofocus_attr) || has_focused_descendant(&self.0)
+            }
+            EnginePseudoClass::Hover => hovered,
+            EnginePseudoClass::Active | EnginePseudoClass::Visited => false,
         }
     }
 

@@ -38,10 +38,126 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 #[cfg(windows)]
 mod platform {
     use super::*;
+    use core::ffi::c_void;
     use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
 
     /// `ERROR_PIPE_BUSY`: todas las instancias ocupadas; se reintenta.
     const ERROR_PIPE_BUSY: i32 = 231;
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER: u32 = 1;
+    const SDDL_REVISION_1: u32 = 1;
+
+    #[repr(C)]
+    struct SECURITY_ATTRIBUTES {
+        n_length: u32,
+        lp_security_descriptor: *mut c_void,
+        b_inherit_handle: i32,
+    }
+
+    #[repr(C)]
+    struct SID_AND_ATTRIBUTES {
+        sid: *mut c_void,
+        attributes: u32,
+    }
+
+    #[repr(C)]
+    struct TOKEN_USER_BUF {
+        user: SID_AND_ATTRIBUTES,
+    }
+
+    extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+        fn GetTokenInformation(token: *mut c_void, class: u32, info: *mut c_void, len: u32, ret_len: *mut u32) -> i32;
+        fn ConvertSidToStringSidW(sid: *const c_void, string_sid: *mut *mut u16) -> i32;
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string_sd: *const u16,
+            revision: u32,
+            sd: *mut *mut c_void,
+            sd_size: *mut u32,
+        ) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn LocalFree(hmem: *mut c_void) -> *mut c_void;
+    }
+
+    struct SecurityDescriptor(*mut c_void);
+
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { LocalFree(self.0) };
+            }
+        }
+    }
+
+    fn current_user_sid_string() -> io::Result<String> {
+        unsafe {
+            let mut token: *mut c_void = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut needed = 0u32;
+            GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut needed);
+            if needed == 0 {
+                let err = io::Error::last_os_error();
+                CloseHandle(token);
+                return Err(err);
+            }
+            let mut buf = vec![0u8; needed as usize];
+            if GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr().cast(), needed, &mut needed) == 0 {
+                let err = io::Error::last_os_error();
+                CloseHandle(token);
+                return Err(err);
+            }
+            CloseHandle(token);
+            let user = &*(buf.as_ptr().cast::<TOKEN_USER_BUF>());
+            let mut sid_ptr: *mut u16 = std::ptr::null_mut();
+            if ConvertSidToStringSidW(user.user.sid, &mut sid_ptr) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut len = 0usize;
+            while *sid_ptr.add(len) != 0 {
+                len += 1;
+            }
+            let sid_str = String::from_utf16_lossy(std::slice::from_raw_parts(sid_ptr, len));
+            LocalFree(sid_ptr.cast());
+            Ok(sid_str)
+        }
+    }
+
+    /// Descriptor de seguridad de la tubería: solo el usuario actual (y SYSTEM),
+    /// pero con etiqueta obligatoria baja (`ML;;NW;;;LW`) para que el renderer
+    /// aislado a integridad baja pueda conectarse presentando su token.
+    fn pipe_security_descriptor() -> io::Result<SecurityDescriptor> {
+        let user_sid = current_user_sid_string()?;
+        let sddl = format!("D:(A;;GA;;;{user_sid})(A;;GA;;;SY)S:(ML;;NW;;;LW)\0");
+        let wide: Vec<u16> = sddl.encode_utf16().collect();
+        let mut sd: *mut c_void = std::ptr::null_mut();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || sd.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(SecurityDescriptor(sd))
+    }
+
+    fn create_pipe_instance(name: &str, first: bool) -> io::Result<NamedPipeServer> {
+        let sd = pipe_security_descriptor()?;
+        let mut sa = SECURITY_ATTRIBUTES {
+            n_length: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lp_security_descriptor: sd.0,
+            b_inherit_handle: 0,
+        };
+        let mut opts = ServerOptions::new();
+        opts.first_pipe_instance(first).reject_remote_clients(true);
+        unsafe { opts.create_with_security_attributes_raw(name, (&mut sa as *mut SECURITY_ATTRIBUTES).cast()) }
+    }
 
     pub struct Listener {
         name: String,
@@ -51,7 +167,7 @@ mod platform {
     impl Listener {
         pub fn bind() -> io::Result<Self> {
             let name = format!(r"\\.\pipe\navegador-ia-broker-{}-{}", std::process::id(), random_hex(16)?);
-            let next = ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).create(&name)?;
+            let next = create_pipe_instance(&name, true)?;
             Ok(Self { name, next })
         }
 
@@ -64,7 +180,7 @@ mod platform {
         /// siguiente: nunca hay un momento sin instancia esperando.
         pub async fn accept(&mut self) -> io::Result<Stream> {
             self.next.connect().await?;
-            let fresh = ServerOptions::new().reject_remote_clients(true).create(&self.name)?;
+            let fresh = create_pipe_instance(&self.name, false)?;
             Ok(Box::new(std::mem::replace(&mut self.next, fresh)))
         }
     }

@@ -16,11 +16,11 @@ aquí. Los identificadores entre corchetes remiten a las tareas del plan antiguo
 se comprobó con `grep` sobre `engine/crates/*/src` en esa fecha, no se copió de
 `ARCHITECTURE.md`.
 
-**Actualización del 2026-11-25** (aplicación 100 % Rust y mejoras del motor): se
-corrigieron las entradas que ese trabajo cerró (2.3, 2.4, 2.7, 2.8, 6 y 8) y se
-añadió la sección 9, la de la aplicación. **El resto sigue como se verificó el
-2026-09-09**: no se ha vuelto a comprobar entrada por entrada. Estado de la
-suite: **1.086 tests pasando, 0 fallando**, más 60 tests estilo-WPT.
+**Actualización del 2026-11-26** (interacción web/teclado, historial/marcadores/pestañas,
+sandbox Windows de `--motor`, instalador 100 % Rust y `boa_engine` 0.22): se
+cerraron o acotaron las entradas 2.2, 4, 6 (selección de texto), 8 y 9. El resto
+de APIs JS de la sección 1 conserva la verificación contra `engine/crates/*/src`.
+Estado de la suite: **1.107 tests del workspace + 60 estilo-WPT** pasando.
 
 ---
 
@@ -198,12 +198,12 @@ Afecta a iconos de fuente, clearfix, comillas y viñetas personalizadas: mucho C
 real. `::marker`, `::placeholder`, `::selection`, `::first-line`, `::first-letter`
 tampoco.
 
-### 2.2 Pseudo-clases de interacción que nunca coinciden
+### 2.2 Pseudo-clases de interacción — parcialmente cerrado (2026-11-26)
 
-`:hover`, `:focus`, `:focus-visible`, `:focus-within`, `:active` y `:visited` se
-**parsean** (para no perder la regla entera) pero **nunca coinciden**: el motor no
-recalcula la cascada al mover el ratón ni al enfocar. Cerrarlo requiere invalidación
-de estilo por evento, no solo añadirlas al matcher.
+`:hover`, `:focus`, `:focus-visible` y `:focus-within` **ya coinciden de forma
+dinámica** al mover el ratón, tabular o hacer clic (`dom::node::Node`,
+`css::element`, `core::server` + prueba en `css::cascade::tests`). Sigue sin
+recalcularse dinámicamente `:active`.
 
 `:visited` además nunca debe coincidir, por privacidad. Eso no es un hueco.
 
@@ -278,30 +278,23 @@ re-renderizando en cada pulsación es inutilizable. Falta invalidación por sub�
 
 ## 4. Seguridad
 
-- **Sin sandbox de proceso** `[plan F2, F3]`. Es el único ❌ de la tabla del README.
-  Existe `crates/core/src/sandbox.rs` de la Fase 37, pero hay que leerlo y
-  documentar qué hace realmente antes de ampliarlo; `sandbox.rs:58` contempla
-  «plataforma sin soporte».
-- **Todas las pestañas en un proceso** (`server.rs:147`): un pánico las mata todas.
-- `tab_id` adivinable: se asigna por posición (`server.rs:222`) `[plan F5]`.
-- Sin aislamiento de sitios; sin fuzzing de los parsers propios.
-- **`boa_engine` 0.19 arrastra `fast-float` 0.2.0, con dos avisos de seguridad
-  REALES** (no de mantenimiento): `RUSTSEC-2025-0003`, un fallo de segmentación
-  por falta de comprobación de límites, y `RUSTSEC-2024-0379`, varios problemas
-  de *soundness*. Lo que los alcanza es el parser de números del motor de
-  JavaScript, es decir código de cualquier página.
-
-  Cerrarlo exige subir boa de 0.19 a 0.22: tres versiones menores de un crate
-  pre-1.0, con cambios de API en el cargador de módulos y en las firmas de
-  `NativeFunction`. Es una tarea propia `[plan F8]`, no un cambio de una línea.
-
-  El CI los tiene listados como conocidos y **bloquea cualquier aviso nuevo**;
-  no están silenciados sin más.
-- Sin mantenimiento, sin vulnerabilidad conocida: `ttf-parser`
-  (`RUSTSEC-2026-0192`), `rustybuzz` (`RUSTSEC-2026-0206`) y `paste`
-  (`RUSTSEC-2024-0436`). Las dos primeras son las piezas de tipografía del
-  motor y no hay sustituto equivalente hoy; `paste` es una macro que no llega
-  al binario.
+- **Sandbox del proceso `--motor` implementado en Windows, pendiente en Linux/macOS**
+  `[plan F2, F3]`. En Windows `spawn_isolated_process` (`crates/core/src/sandbox.rs`)
+  lanza `--motor` con token restringido (`DISABLE_MAX_PRIVILEGE`, integridad
+  baja `S-1-16-4096`), escritorio oculto dedicado (`CreateDesktopW`), *Job Object*
+  (`ActiveProcessLimit = 1`, tope de memoria y bloqueo directo de portapapeles) y
+  directorio de perfil endurecido (`S:(ML;OICI;NWNR;;;ME)`), validado por
+  `tests/sandbox_isolation.rs`. **Quedan abiertos**: bloqueo de sockets/red
+  salientes dentro del propio renderizador en Windows (*AppContainer*), sandbox
+  de procesos en Linux/macOS y aislamiento por proceso/sitio entre pestañas.
+- **Todas las pestañas en un proceso** (`server.rs`): un pánico las mata todas.
+- `tab_id` adivinable: se asigna de forma secuencial `[plan F5]`.
+- Sin fuzzing automatizado continuo ni firma digital en los binarios distribuidos.
+- **`boa_engine` migrado a 0.22.0 (`fast-float2` 0.2.4)**: los dos avisos de
+  seguridad de `fast-float` 0.2.0 (`RUSTSEC-2025-0003` y `RUSTSEC-2024-0379`)
+  quedaron cerrados. Siguen como avisos de «sin mantenimiento» (sin fallo de
+  seguridad conocido): `ttf-parser` (`RUSTSEC-2026-0192`), `rustybuzz`
+  (`RUSTSEC-2026-0206`) y `paste` (`RUSTSEC-2024-0436`).
 - `cargo deny` sigue sin estar en CI `[plan F7]`.
 
 ---
@@ -326,13 +319,16 @@ explícitamente, nunca fingir éxito.
 ## 6. Producto y protocolo
 
 - Formularios: el envío GET y POST funciona (Enter en un campo o botón de envío).
-- Selección de texto no implementada `[plan C12]`
+- Selección de texto e interacción de teclado: cerrados en barra y páginas
+  (ratón, `SelectText`, flechas, `Home`/`End`/`Delete`, `Shift+*`, `Tab`/`Shift+Tab`,
+  portapapeles `Ctrl+C/X/V/A`, `<textarea>` multilínea). Pendiente `:active` y
+  selección hacia atrás refinada palabra a palabra (`Ctrl+flecha`).
 - Sin favicon en `get_state` `[plan E4, I5]`
 - Sin evento de progreso de carga `[plan I5]`
 - Sin diálogos (`alert`/`confirm`/`prompt`) enrutados a la UI `[plan C7]`
 - Sin canal de `console` hacia la UI `[plan C5, I5]`
 - La captura se regenera entera y viaja en Base64 en cada `get_state`, incluido cada
-  scroll `[plan K4]`
+  scroll `[plan K4]` (en `get_state` de solo estado sin scroll; con escala HiDPI)
 
 ---
 
@@ -353,28 +349,20 @@ incluida la del README — es una impresión, no un dato.
 
 ## 8. Plataforma de compilación `[plan J]`
 
-Antes se compilaba y probaba solo en Windows. **Desde el 2026-11-25 se compila, se
-prueba y se abre la ventana en Linux** (nube, con un servidor gráfico virtual);
-**Windows** solo lo cubre el CI (tests, clippy y el banco), sin prueba a mano con la
-app nueva; **macOS no se ha probado nunca**. Sin versión móvil (decisión: fuera de
-alcance).
+Antes se compilaba y probaba solo en Windows. Desde el 2026-11-25 se compila,
+prueba y ejecuta también en Linux; en **Windows** ya corre y se verifica a mano
+(y por captura directa `--captura`) la aplicación nueva, su instalador nativo y
+el aislamiento de `--motor`; **macOS no se ha probado nunca**. Sin versión móvil
+(decisión: fuera de alcance).
 
 ---
 
 ## 9. La aplicación (`engine/crates/app`) `[plan 5.x]`
 
-Abierto el 2026-11-25. Lo que ya hace está en `ESTADO.md`; esto es lo que falta.
+Actualizado el 2026-11-26. Lo que ya hace está en `ESTADO.md`; esto es lo que falta:
 
-- **Agente IA** `[plan 5.4]`: no hay panel ni bucle en la app nueva.
-- **Instalador y firma** `[plan 5.5]`: solo se compila desde el código.
-- **Pantallas con escala** (125 %, 200 %): la app compone en píxeles CSS y amplía la
-  imagen, así que el texto sale algo borroso. Lo correcto es pintar a la escala real.
-- **Copiar y pegar** (barra de direcciones y campos de la página), selección con
-  ratón y Tab entre campos de la página.
-- **Barra de direcciones:** sin sugerencias, sin historial, sin marcadores.
-- **Pestañas:** no se reordenan ni se arrastran; con muchas, se estrechan hasta 60 px.
-- **Cursor del ratón** (mano sobre enlaces) y **estado al pasar por encima**
-  (`:hover` nunca coincide, ver 2.2): la app no reacciona al mover el ratón.
+- **Agente IA** `[plan 5.4]`: no hay panel ni bucle en la app nueva (pendiente de decisión).
+- **Firma de binarios y actualizador** `[plan 5.5]`: el instalador/desinstalador 100 % Rust (`instalador`) y el empaquetado portable (`NavegadorIA-windows.zip`) ya existen, pero los ejecutables no llevan firma digital ni autoactualización.
 - **Descargas, favicon, pantalla completa, imprimir:** no existen.
 - **Capturas de referencia:** las pruebas de extremo a extremo comprueban estado y
   algunos píxeles, no comparan la imagen entera contra una guardada `[plan 5.7]`.

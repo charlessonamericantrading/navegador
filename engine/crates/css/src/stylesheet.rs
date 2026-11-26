@@ -219,6 +219,8 @@ pub(crate) struct RuleIndex {
     by_tag: HashMap<String, Vec<usize>>,
     any: Vec<usize>,
     indexed_len: usize,
+    has_hover_rules: bool,
+    has_focus_rules: bool,
 }
 
 impl RuleIndex {
@@ -229,10 +231,23 @@ impl RuleIndex {
             by_tag: HashMap::new(),
             any: Vec::new(),
             indexed_len: rules.len(),
+            has_hover_rules: false,
+            has_focus_rules: false,
         };
         for (idx, rule) in rules.iter().enumerate() {
             if !rule.selector_valid {
                 continue;
+            }
+            let lower_sel = if rule.selector.as_bytes().iter().any(|b| b.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(rule.selector.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(rule.selector.as_str())
+            };
+            if lower_sel.contains(":hover") {
+                index.has_hover_rules = true;
+            }
+            if lower_sel.contains(":focus") {
+                index.has_focus_rules = true;
             }
             match &rule.index_key {
                 RuleKey::Any => index.any.push(idx),
@@ -295,6 +310,20 @@ impl StyleSheet {
 
     pub(crate) fn index_if_current(&self) -> Option<&RuleIndex> {
         (self.index.indexed_len == self.rules.len()).then_some(&self.index)
+    }
+
+    pub fn has_hover_rules(&self) -> bool {
+        if let Some(index) = self.index_if_current() {
+            return index.has_hover_rules;
+        }
+        self.rules.iter().any(|r| r.selector.to_ascii_lowercase().contains(":hover"))
+    }
+
+    pub fn has_focus_rules(&self) -> bool {
+        if let Some(index) = self.index_if_current() {
+            return index.has_focus_rules;
+        }
+        self.rules.iter().any(|r| r.selector.to_ascii_lowercase().contains(":focus"))
     }
 }
 

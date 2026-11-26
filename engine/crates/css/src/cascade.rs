@@ -509,4 +509,34 @@ mod tests {
         let comp2 = resolve_style(&a, &empate, 1280.0);
         assert_eq!(comp2.get("color").map(String::as_str), Some("#444444"));
     }
+
+    #[test]
+    fn dynamic_hover_and_focus_pseudo_classes_follow_node_interaction_state() {
+        let dom = HtmlParser::parse(r#"<html><body><div id="wrap"><a id="link" href="/x">ir</a><input id="txt" type="text"></div></body></html>"#);
+        let stylesheet = Parser::parse(
+            "a { color: #111111; } a:hover { color: #222222; } \
+             #wrap:hover { background-color: #fafafa; } \
+             input:focus { border: 2px solid #1a73e8; } \
+             #wrap:focus-within { background-color: #eef5ff; }",
+        );
+        assert!(stylesheet.has_hover_rules());
+        assert!(stylesheet.has_focus_rules());
+
+        let wrap = Node::find_by_id(&dom, "wrap").unwrap();
+        let link = Node::find_by_id(&dom, "link").unwrap();
+        let txt = Node::find_by_id(&dom, "txt").unwrap();
+
+        assert_eq!(resolve_style(&link, &stylesheet, 1280.0).get("color").map(String::as_str), Some("#111111"));
+        assert_eq!(resolve_style(&wrap, &stylesheet, 1280.0).get("background-color"), None);
+
+        for ancestor in Node::ancestors(&link) {
+            ancestor.write().unwrap().hovered = true;
+        }
+        assert_eq!(resolve_style(&link, &stylesheet, 1280.0).get("color").map(String::as_str), Some("#222222"));
+        assert_eq!(resolve_style(&wrap, &stylesheet, 1280.0).get("background-color").map(String::as_str), Some("#fafafa"));
+
+        txt.write().unwrap().focused = true;
+        assert_eq!(resolve_style(&txt, &stylesheet, 1280.0).get("border").map(String::as_str), Some("2px solid #1a73e8"));
+        assert_eq!(resolve_style(&wrap, &stylesheet, 1280.0).get("background-color").map(String::as_str), Some("#eef5ff"));
+    }
 }

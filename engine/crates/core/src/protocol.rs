@@ -54,6 +54,20 @@ pub enum EngineRequest {
         id: Option<String>,
         key: String,
     },
+    /// Mueve el puntero por la pagina para activar `:hover`.
+    Hover {
+        id: Option<String>,
+        x: f32,
+        y: f32,
+    },
+    /// Selecciona texto arrastrando entre dos coordenadas de viewport.
+    SelectText {
+        id: Option<String>,
+        from_x: f32,
+        from_y: f32,
+        to_x: f32,
+        to_y: f32,
+    },
     /// Clic en un elemento de la lista `elements` por su `id` (tarea 3.1 del
     /// plan). Las coordenadas de `elements[].rect` son del DOCUMENTO, y
     /// `click` espera coordenadas de VIEWPORT: tras un scroll no coinciden.
@@ -147,6 +161,8 @@ impl EngineRequest {
             | Self::Scroll { id, .. }
             | Self::TypeText { id, .. }
             | Self::PressKey { id, .. }
+            | Self::Hover { id, .. }
+            | Self::SelectText { id, .. }
             | Self::Stop { id }
             | Self::ClickElement { id, .. }
             | Self::TypeIntoElement { id, .. }
@@ -229,6 +245,10 @@ pub enum EngineResponse {
         /// llevar su propia copia paralela del historial.
         can_go_back: bool,
         can_go_forward: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        focused_is_text: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selected_text: Option<String>,
     },
     /// Lista de pestañas abiertas (Fase 4.5, respuesta a `list_tabs`) - cada
     /// `TabInfo` lleva su propio titulo/URL (vacios si esa pestaña todavia

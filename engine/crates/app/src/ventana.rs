@@ -43,6 +43,8 @@ pub fn ejecutar(inicial: Option<String>) -> Result<(), String> {
     enviar(&mut motor, &peticiones);
 
     let mut raton = (0.0_f32, 0.0_f32);
+    let mut inicio_arrastre: Option<(f32, f32)> = None;
+    let mut arrastrando_barra = false;
     let mut cursor_actual = CursorTipo::Normal;
     let mut modificadores = ModifiersState::empty();
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -91,9 +93,39 @@ pub fn ejecutar(inicial: Option<String>) -> Result<(), String> {
                                 CursorTipo::Texto => CursorIcon::Text,
                             });
                         }
-                        None
+                        if arrastrando_barra {
+                            Some(Entrada::ArrastrarBarra { x: raton.0, y: raton.1 })
+                        } else if inicio_arrastre.is_none() {
+                            Some(Entrada::Raton { x: raton.0, y: raton.1 })
+                        } else {
+                            None
+                        }
                     }
-                    WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => Some(Entrada::Clic { x: raton.0, y: raton.1 }),
+                    WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                        if raton.1 >= crate::barra::ALTO_BARRA as f32 {
+                            inicio_arrastre = Some(raton);
+                            None
+                        } else {
+                            if raton.1 < crate::barra::ALTO_PESTANAS as f32 {
+                                arrastrando_barra = true;
+                            }
+                            Some(Entrada::Clic { x: raton.0, y: raton.1 })
+                        }
+                    }
+                    WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                        if arrastrando_barra {
+                            arrastrando_barra = false;
+                            Some(Entrada::SoltarBarra)
+                        } else if let Some((x0, y0)) = inicio_arrastre.take() {
+                            if (raton.0 - x0).hypot(raton.1 - y0) >= 5.0 {
+                                Some(Entrada::SeleccionarPagina { desde_x: x0, desde_y: y0, hasta_x: raton.0, hasta_y: raton.1 })
+                            } else {
+                                Some(Entrada::Clic { x: raton.0, y: raton.1 })
+                            }
+                        } else {
+                            None
+                        }
+                    }
                     WindowEvent::MouseWheel { delta, .. } => {
                         let dy = match delta {
                             MouseScrollDelta::LineDelta(_, y) => -y * PIXELES_POR_LINEA,

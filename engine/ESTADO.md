@@ -4,21 +4,17 @@ Resumen corto y verificado de lo que el motor hace y no hace. Cada afirmación
 sale de ejecutarlo, no de leer el código. `ARCHITECTURE.md` queda como
 histórico: cuenta cómo se llegó aquí, no cómo está hoy.
 
-Última comprobación: 2026-11-25, Linux (nube), motor en release, ventana de
-1280×800 (la ventana real, con ratón y teclado virtuales). **Windows y macOS no
-se han probado a mano con la aplicación nueva**; en Windows solo corre lo que
-cubre el CI (tests y clippy).
+Última comprobación: 2026-11-26, Windows 11 (local, compilación en `--release` con
+`--locked`), más suites de test y clippy del workspace en Windows y Linux.
 
 ## Cómo medirlo (todo en un comando cada uno)
 
 ```bash
-cd engine && cargo test --workspace --locked          # 1.086 tests
+cd engine && cargo test --workspace --locked          # 1.107 tests en total
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run -p engine-core --bin wpt_runner --locked -- tests/wpt-style   # 60 de 60
-cargo build --release -p engine-core --bin engine_server --bin engine_broker
-python3 scripts/dev/bench_all.py                      # tiempos; --strict = objetivos de la Fase 1
-python3 scripts/dev/bench_all.py --mirror             # sin internet directo (nube)
-python3 scripts/dev/engine_driver.py --fixture css-basics-fixture.html --out css.png
+cargo build --release --locked -p navegador --bin navegador --bin instalador -p engine-core --bin engine_server --bin engine_broker
+python scripts/dev/bench_all.py --strict
 ```
 
 Los fixtures (`engine/tests/css-basics-fixture.html` y `js-basics-fixture.html`)
@@ -32,39 +28,52 @@ cargo run --release -p navegador -- es.wikipedia.org          # con una direcci�
 cargo run --release -p navegador -- --captura v.png news.ycombinator.com   # sin ventana: guarda la imagen
 ```
 
-- **Ventana** nativa (`winit` + `softbuffer`). El motor corre en otro proceso
-  (`navegador --motor`): si una página lo tumba, la ventana sigue. La red, las
-  cookies y el almacenamiento van en un tercero (`navegador --broker`), al que
-  el motor se presenta con un token de un solo uso.
-- **La barra la pinta nuestro motor:** pestañas, atrás/adelante, recargar/detener
-  y la barra de direcciones son HTML/CSS que pasa por el mismo motor que las
-  páginas (`engine/crates/app/src/barra.rs`). Los iconos son SVG.
-- **Barra de direcciones:** al pulsar selecciona todo; flechas, Inicio/Fin,
-  Retroceso/Supr, Ctrl+A, Enter y Escape. Lo que no es una dirección se busca.
-- **Atajos:** Ctrl+L (barra), Ctrl+T, Ctrl+W, Ctrl+Tab, Ctrl+R/F5, Alt+←/→,
-  Escape (detener). Rueda, Av Pág/Re Pág, espacio y flechas desplazan.
-- **Páginas propias:** inicio (con accesos) y error (con «Reintentar»),
-  también pintadas por el motor.
-- **Pruebas:** 32 de la lógica y una de extremo a extremo con el motor real
-  (`engine/crates/app/tests/extremo_a_extremo.rs`): escribe una dirección,
-  pulsa un enlace, vuelve atrás, rellena un formulario, abre y cierra una
-  pestaña y comprueba la página de error. Sin ningún navegador externo.
+- **Ventana** nativa con soporte **HiDPI** (`winit` + `softbuffer`). El motor
+  corre en otro proceso (`navegador --motor`): en Windows se lanza aislado con
+  token restringido de integridad baja, escritorio dedicado oculto, *Job Object*
+  y perfil protegido frente a lectura/escritura desde integridad baja. La red,
+  las cookies y el almacenamiento van en un tercero (`navegador --broker`), al
+  que el motor se presenta por pipe autenticado con token de un solo uso.
+- **La barra la pinta nuestro motor:** pestañas reordenables (arrastrar o
+  `Ctrl+Shift+RePág/AvPág`) con desplazamiento `<` / `>` si superan el ancho,
+  atrás/adelante, recargar/detener, estrella de marcador (`Ctrl+D`), barra de
+  direcciones y desplegable de sugerencias (marcadores + historial persistente +
+  accesos iniciales) en HTML/CSS pintado por el motor (`app/src/barra.rs`).
+- **Edición, foco y selección:** cursor nativo en barra y campos web (`ArrowLeft`,
+  `ArrowRight`, `Home`, `End`, `Delete`, `Backspace`, `Shift+*`), portapapeles
+  del sistema (`Ctrl+C`/`X`/`V`/`A`), `Tab`/`Shift+Tab` entre campos, selección
+  con ratón en páginas y campos, cursor del ratón dinámico (`Pointer`, `Text`,
+  `Wait`) y estados CSS dinámicos (`:hover`, `:focus`, `:focus-visible`,
+  `:focus-within`).
+- **Atajos:** `Ctrl+L`, `Ctrl+T`, `Ctrl+W`, `Ctrl+Tab`, `Ctrl+Shift+RePág/AvPág`,
+  `Ctrl+D`, `Ctrl+R`/`F5`, `Alt+←`/`Alt+→`, `Escape`. Rueda, `Av Pág`/`Re Pág`,
+  espacio y flechas desplazan cuando no hay campo de texto activo.
+- **Páginas propias e instalador:** inicio (con accesos y marcadores guardados),
+  error (con «Reintentar») e instalador/desinstalador 100 % Rust (`instalador`,
+  accesos `.lnk` por COM y Registro HKCU en Windows; empaquetado con
+  `scripts/release/empaquetar_windows.ps1`).
+- **Pruebas:** 39 tests unitarios en `navegador`, 3 en `instalador`, 1 de extremo
+  a extremo con el motor real (`engine/crates/app/tests/extremo_a_extremo.rs`) y
+  prueba de aislamiento real del sandbox Windows (`tests/sandbox_isolation.rs`).
 
-Falta: el panel del agente (5.4), el instalador (5.5), copiar/pegar, y en
-pantallas con escala (125 %, 200 %) la imagen se amplía (se ve algo borrosa).
+Falta: el panel del agente IA (`5.4`), firma de binarios y sandbox de red / por
+pestaña (AppContainer en Windows; sandbox de procesos en Linux y macOS).
 
 ## Números
 
-| Qué | Resultado |
+| Qué | Resultado (Windows 11, release `--strict`) |
 |---|---|
-| Fixture CSS | 17 de 17 casos se ven (el degradado del 7 incluido) |
-| Fixture JS | 12 de 12 en OK |
-| Hacker News | carga 1,0–1,3 s; scroll y clic 0,05 s; 229 elementos interactivos |
-| Google | carga 1,3–1,9 s; 13 elementos |
-| Wikipedia (artículo largo) | motor propio ~0,55 s; clic 0,04 s; scroll 0,03–0,05 s; redimensionar 0,4–0,6 s |
-| Wikipedia, carga completa | **no medible en la nube**: las imágenes de otros dominios no salen a internet y agotan su tope de 4 s. Medir en un PC con internet; el objetivo es < 3 s |
-| Página con `while(true){}` | responde en 0,18 s (antes: se colgaba) |
-| Página con recursos que nunca contestan | termina en 10 s con lo que llegó (antes: > 45 s) |
+| `wpt_runner` (`tests/wpt-style`) | 60 de 60 en OK |
+| `fixture-css` | carga 0,26 s; scroll 0,03 s; clic 0,02 s; resize 0,02 s (`ok`) |
+| `fixture-js` | 12 de 12 en OK; carga 0,20 s; scroll 0,02 s; clic 0,01 s; resize 0,01 s (`ok`) |
+| Hacker News | carga 4,78 s (`> 3 s`); scroll 0,14 s; clic 0,18 s; resize 0,13 s |
+| Google | carga 4,21 s (`> 3 s`); scroll 0,03 s; clic 0,03 s; resize 0,02 s |
+| Wikipedia (artículo largo) | carga 7,73 s (`> 3 s`); scroll 0,09 s; clic 0,08 s; resize 0,24 s |
+| DuckDuckGo HTML | carga 9,32 s (`> 3 s`); scroll 0,08 s; clic 0,08 s; resize 0,10 s |
+| Página con `while(true){}` | responde en ~0,18 s (límite de vueltas de script; no se cuelga) |
+| Página con recursos que nunca contestan | termina con tope de subrecursos (8 s recurso / 10 s total; imágenes 4 s) |
+
+*Nota sobre `bench_all.py --strict`: la interacción local (scroll ≤ 0,2 s, clic ≤ 0,3 s, resize ≤ 1 s) cumple en todas las páginas; la carga en vivo (`cargar`) supera el objetivo de 3 s en páginas externas al descargar subrecursos sin caché ni HTTP/2.*
 
 ## Qué funciona
 
@@ -81,29 +90,30 @@ pantallas con escala (125 %, 200 %) la imagen se amplía (se ve algo borrosa).
 - **Layout:** bloque, texto en línea con partición por palabras entre elementos
   (un enlace en mitad de un párrafo no rompe la línea), `inline-block` con
   tamaño, flex, grid, tablas, `float`, `position`.
-- **Pintado:** lienzo blanco, imágenes (PNG, JPEG, GIF, WebP, SVG), anillo de
-  foco y cursor en el campo con el teclado.
-- **JavaScript (Boa):** `getElementsByTagName/ClassName`, eventos `DOMContentLoaded`
-  y `load`, `fetch`, XHR, `localStorage`. Límite de 10 millones de vueltas por
-  llamada y 5 s de scripts por página.
-- **Interacción:** clic, scroll, escritura con teclas (letras, Retroceso, Enter),
-  `click_element` y `type_into_element` por id (llevan el elemento a la vista),
-  envío de formularios GET y POST, historial, pestañas.
-- **Protocolo (NDJSON):** `navigate`, `stop`, `get_state`, `click`, `scroll`,
-  `type_text`, `press_key`, `click_element`, `type_into_element`, `resize`,
-  `get_accessibility_tree`, `get_page_text`, pestañas, `ping`. Una navegación en
-  curso se abandona con `stop` o con un `navigate` nuevo.
-- **Respuestas ligeras:** `scroll` no reenvía `elements`; `elements` solo trae
-  lo interactivo y visible (tope 500, texto de 120 caracteres).
+- **Pintado:** lienzo blanco, escalado HiDPI nativo, imágenes (PNG, JPEG, GIF,
+  WebP, SVG), `<textarea>` multilínea, resaltado de selección, anillo de foco y
+  cursor en campos con el teclado.
+- **JavaScript (Boa 0.22):** `getElementsByTagName/ClassName`, eventos
+  `DOMContentLoaded` y `load`, `fetch`, XHR, `localStorage`. Límite de 10
+  millones de vueltas por llamada y 5 s de scripts por página.
+- **Interacción:** clic, hover dinámico, selección de texto por arrastre,
+  scroll, edición completa con teclas (flechas, Inicio/Fin, Supr, Retroceso,
+  `Tab`/`Shift+Tab`, `Ctrl+A/C/X/V`), `click_element` y `type_into_element` por
+  id, envío de formularios GET y POST, historial, pestañas.
+- **Protocolo (NDJSON):** `navigate`, `stop`, `get_state` (`focused_is_text`,
+  `selected_text`), `click`, `hover`, `select_text`, `scroll`, `type_text`,
+  `press_key`, `click_element`, `type_into_element`, `resize`,
+  `get_accessibility_tree`, `get_page_text`, pestañas, `ping`, `shutdown`.
 
 ## Qué no funciona (conocido y medido)
 
 - **JavaScript de aplicaciones modernas:** una web que construye su contenido
   en el cliente suele verse vacía (el motor lo avisa). La sonda de APIs
   (`engine/tests/probes/api-probe.html`) mide lo que falta.
-- **Texto:** no hay selección, mover el cursor con flechas ni Tab entre campos;
-  el cursor va siempre al final; un `<textarea>` guarda los saltos de línea pero
-  los pinta en una sola línea; no hay copiar/pegar con el teclado.
+- **Estilos dinámicos parciales:** `:hover`, `:focus`, `:focus-visible` y
+  `:focus-within` ya se recalculan en tiempo real; sigue faltando `:active` en
+  cascada dinámica. En `<textarea>` sigue sin editarse salto de línea con Enter
+  (Enter envía formulario o queda como envío de campo estándar).
 - **Inline:** `inline-block` se alinea por arriba, no por la línea de base;
   `box-sizing` se trata como `content-box` ahí; `text-align` con un texto
   partido en varias líneas solo es exacto alineado a la izquierda.
@@ -111,10 +121,13 @@ pantallas con escala (125 %, 200 %) la imagen se amplía (se ve algo borrosa).
   una sola capa de fondo, y sin `background-size`/`position`/`repeat`.
 - **Fuentes:** tres familias (sans, serifa, monoespaciada) con las fuentes del
   sistema; sin fuentes web. Si el sistema no tiene la familia, sale en sans.
-- **Red:** sin HTTP/2 ni caché; el `User-Agent` es `NextGenWebEngine/0.1.0` y no
-  se ha comprobado si cambiarlo mejora algo (tarea 1.2b).
+- **Red:** sin HTTP/2 ni caché; el `User-Agent` es `NextGenWebEngine/0.1.0`.
 - **Plataforma:** sin `<video>`, `<audio>`, `<iframe>`, WebGL, Workers, WebSockets.
-- **Seguridad:** no hay sandbox del sistema operativo. Úsalo con sitios de confianza.
+- **Seguridad:** en Windows el proceso `--motor` corre aislado (integridad baja,
+  escritorio dedicado, *Job Object* y perfil protegido), pero todas las pestañas
+  comparten un único proceso `--motor` y falta aislamiento de red en el propio
+  renderizador (*AppContainer*); en Linux y macOS sigue sin sandbox de sistema
+  operativo. Ver `SECURITY.md`.
 - **Cancelar una navegación** abandona la carga de red, pero un script que ya está
   corriendo no se interrumpe hasta su tope de 5 s.
 

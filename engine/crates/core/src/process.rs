@@ -53,9 +53,9 @@ pub fn run_engine_process() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Variables con las que el motor encuentra al broker (ver
-/// `engine_net::broker_remote::from_env`).
+/// Variables con las que el motor encuentra al broker y ruta del perfil.
 pub use engine_net::broker_remote::{BROKER_ENDPOINT_ENV, BROKER_TOKEN_ENV};
+pub use engine_net::profile::profile_dir;
 
 /// El proceso broker: la red, las cookies y el almacenamiento, aparte del
 /// proceso que interpreta las páginas (ADR 0001). Anuncia su canal por stdout
@@ -63,6 +63,11 @@ pub use engine_net::broker_remote::{BROKER_ENDPOINT_ENV, BROKER_TOKEN_ENV};
 /// (`register`) y termina cuando su stdin se cierra.
 pub fn run_broker_process() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
+    if let Some(dir) = profile_dir() {
+        if let Err(err) = crate::sandbox::harden_profile_dir(&dir) {
+            eprintln!("[broker] aviso al proteger el perfil {}: {err}", dir.display());
+        }
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(engine_net::broker_server::run_stdio(engine_net::LocalBroker::persistent()))?;
     Ok(())

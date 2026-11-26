@@ -13,6 +13,7 @@
 
 pub mod app;
 pub mod barra;
+pub mod datos;
 pub mod direccion;
 pub mod lienzo;
 pub mod motor;

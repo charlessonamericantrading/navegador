@@ -388,6 +388,12 @@ fn click_type_text_y_press_key_son_aceptados_sobre_la_pagina() {
 
     let r = motor.pedir(json!({"type": "press_key", "id": "k1", "key": "Tab"}));
     assert_correlacionada(&r, "k1", "state");
+
+    let r = motor.pedir(json!({"type": "hover", "id": "h1", "x": ix, "y": iy}));
+    assert!(matches!(r["type"].as_str(), Some("ok" | "state")), "{r}");
+
+    let r = motor.pedir(json!({"type": "select_text", "id": "st1", "from_x": 0.0, "from_y": 0.0, "to_x": 200.0, "to_y": 80.0}));
+    assert_correlacionada(&r, "st1", "state");
 }
 
 /// Tarea 3.1: `click_element` y `type_into_element` actuan por el `id` de la
@@ -644,6 +650,8 @@ fn todas_las_variantes_del_protocolo_estan_cubiertas() {
         "scroll",
         "type_text",
         "press_key",
+        "hover",
+        "select_text",
         "click_element",
         "type_into_element",
         "stop",

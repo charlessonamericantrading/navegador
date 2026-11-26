@@ -249,30 +249,62 @@ impl DisplayList {
                 if let Some(replaced) = &layout_box.replaced_text {
                     let font_size = layout_box.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
                     let inset = border_width + 3.0;
-                    let rect = Rect {
-                        x: layout_box.dimensions.x + inset,
-                        y: layout_box.dimensions.y + ((layout_box.dimensions.height - font_size * 1.2) / 2.0).max(0.0),
-                        width: (layout_box.dimensions.width - inset * 2.0).max(0.0),
-                        height: layout_box.dimensions.height,
-                    };
+                    let multiline = layout_box.dimensions.height > font_size * 2.5 && !replaced.centered;
+                    let inner_width = (layout_box.dimensions.width - inset * 2.0).max(0.0);
                     let color = if replaced.is_placeholder {
                         PLACEHOLDER_COLOR
                     } else {
                         layout_box.computed_style.get("color").and_then(|v| parse_css_color(v)).unwrap_or(INITIAL_COLOR)
                     };
-                    target.push(DisplayItem::Text {
-                        rect,
-                        text: replaced.text.clone(),
-                        color,
-                        font_size,
-                        bold: false,
-                        italic: false,
-                        underline: false,
-                        text_align: if replaced.centered { TextAlign::Center } else { TextAlign::Left },
-                        line_height: None,
-                        font_family: FontFamily::SansSerif,
-                        first_line_indent: 0.0,
-                    });
+                    if multiline && !replaced.is_placeholder && replaced.text.contains('\n') {
+                        let line_step = font_size * 1.2;
+                        let mut line_y = layout_box.dimensions.y + inset;
+                        for raw_line in replaced.text.split('\n') {
+                            if !raw_line.is_empty() {
+                                target.push(DisplayItem::Text {
+                                    rect: Rect { x: layout_box.dimensions.x + inset, y: line_y, width: inner_width, height: line_step },
+                                    text: raw_line.to_string(),
+                                    color,
+                                    font_size,
+                                    bold: false,
+                                    italic: false,
+                                    underline: false,
+                                    text_align: TextAlign::Left,
+                                    line_height: Some(line_step),
+                                    font_family: FontFamily::SansSerif,
+                                    first_line_indent: 0.0,
+                                });
+                            }
+                            line_y += line_step;
+                            if line_y > layout_box.dimensions.y + layout_box.dimensions.height - inset {
+                                break;
+                            }
+                        }
+                    } else {
+                        let rect = Rect {
+                            x: layout_box.dimensions.x + inset,
+                            y: if multiline {
+                                layout_box.dimensions.y + inset
+                            } else {
+                                layout_box.dimensions.y + ((layout_box.dimensions.height - font_size * 1.2) / 2.0).max(0.0)
+                            },
+                            width: inner_width,
+                            height: layout_box.dimensions.height,
+                        };
+                        target.push(DisplayItem::Text {
+                            rect,
+                            text: replaced.text.clone(),
+                            color,
+                            font_size,
+                            bold: false,
+                            italic: false,
+                            underline: false,
+                            text_align: if replaced.centered { TextAlign::Center } else { TextAlign::Left },
+                            line_height: None,
+                            font_family: FontFamily::SansSerif,
+                            first_line_indent: 0.0,
+                        });
+                    }
                 }
 
                 // A diferencia de `Block`/`Inline`, NO se recursa en los
@@ -990,39 +1022,130 @@ fn parse_css_border(computed_style: &HashMap<String, String>) -> Option<(f32, [u
 
 /// Color del anillo de foco de un control (azul de navegador).
 const FOCUS_RING_COLOR: [u8; 4] = [26, 115, 232, 255];
+const SELECTION_COLOR: [u8; 4] = [26, 115, 232, 70];
+
+/// Rectangulos de resaltado de seleccion de texto en pagina.
+pub fn selection_overlay_rects(rects: &[Rect]) -> Vec<DisplayItem> {
+    rects
+        .iter()
+        .filter(|r| r.width > 0.0 && r.height > 0.0)
+        .map(|r| DisplayItem::SolidRect { rect: r.clone(), color: SELECTION_COLOR, radius: 0.0 })
+        .collect()
+}
 
 /// Lo que se pinta ENCIMA de la pagina para el control con el foco (tarea 3.2):
-/// un anillo azul alrededor de su caja y, en un campo de texto de una linea, el
-/// cursor al final de lo escrito. No es parte de la pagina (no cambia su layout
-/// ni su DOM): se añade a la captura y se tira.
-///
-/// La geometria del cursor repite la del texto del campo (`inset = borde + 3`,
-/// centrado en vertical), que es donde `build_items_inner` lo pinta.
+/// anillo azul alrededor de su caja y, en un campo de texto, seleccion + cursor.
 pub fn focus_overlay(focused: &LayoutBox, font_set: Option<&engine_text::FontSet>) -> Vec<DisplayItem> {
-    let mut items = vec![DisplayItem::Border { rect: focused.dimensions.clone(), width: 2.0, color: FOCUS_RING_COLOR, radius: parse_css_border_radius(&focused.computed_style).unwrap_or(0.0) }];
+    focus_overlay_with_state(focused, font_set, usize::MAX, None)
+}
+
+/// Como `focus_overlay`, pero colocando el cursor en `cursor_chars` y resaltando `selection`.
+pub fn focus_overlay_with_state(
+    focused: &LayoutBox,
+    font_set: Option<&engine_text::FontSet>,
+    cursor_chars: usize,
+    selection: Option<(usize, usize)>,
+) -> Vec<DisplayItem> {
+    let mut items = vec![DisplayItem::Border {
+        rect: focused.dimensions.clone(),
+        width: 2.0,
+        color: FOCUS_RING_COLOR,
+        radius: parse_css_border_radius(&focused.computed_style).unwrap_or(0.0),
+    }];
 
     let is_text_field = matches!(focused.box_type, BoxType::Replaced) && !focused.replaced_text.as_ref().is_some_and(|r| r.centered);
-    let multiline = focused.dimensions.height > 40.0;
-    if is_text_field && !multiline {
-        let font_size = focused.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
-        let border_width = parse_css_border(&focused.computed_style).map_or(0.0, |(width, _)| width);
-        let inset = border_width + 3.0;
-        // Un campo vacio (con o sin placeholder) lleva el cursor al principio; con
-        // texto, tras la ultima letra.
-        let typed_width = match (&focused.replaced_text, font_set.and_then(|set| set.pick_family(FontFamily::SansSerif, false, false))) {
-            (Some(replaced), Some(font)) if !replaced.is_placeholder => engine_text::text_width(font, &replaced.text, font_size),
-            _ => 0.0,
-        };
-        let line = font_size * 1.2;
-        let max_x = focused.dimensions.x + (focused.dimensions.width - inset).max(0.0);
+    if !is_text_field {
+        return items;
+    }
+
+    let font_size = focused.computed_style.get("font-size").and_then(|v| parse_css_font_size(v)).unwrap_or(INITIAL_FONT_SIZE);
+    let border_width = parse_css_border(&focused.computed_style).map_or(0.0, |(width, _)| width);
+    let inset = border_width + 3.0;
+    let multiline = focused.dimensions.height > font_size * 2.5;
+    let font = font_set.and_then(|set| set.pick_family(FontFamily::SansSerif, false, false));
+    let typed: &str = match &focused.replaced_text {
+        Some(replaced) if !replaced.is_placeholder => &replaced.text,
+        _ => "",
+    };
+    let total_chars = typed.chars().count();
+    let cursor = cursor_chars.min(total_chars);
+    let caret_color = focused.computed_style.get("color").and_then(|v| parse_css_color(v)).unwrap_or(INITIAL_COLOR);
+    let line = font_size * 1.2;
+    let max_x = focused.dimensions.x + (focused.dimensions.width - inset).max(0.0);
+
+    let width_of = |s: &str| font.map_or(0.0, |f| engine_text::text_width(f, s, font_size));
+
+    if !multiline {
+        let top_y = focused.dimensions.y + ((focused.dimensions.height - line) / 2.0).max(0.0);
+        if let Some((start, end)) = selection {
+            let a = start.min(total_chars);
+            let b = end.min(total_chars);
+            if a < b {
+                let prefix_a: String = typed.chars().take(a).collect();
+                let prefix_b: String = typed.chars().take(b).collect();
+                let x0 = (focused.dimensions.x + inset + width_of(&prefix_a)).min(max_x);
+                let x1 = (focused.dimensions.x + inset + width_of(&prefix_b)).min(max_x);
+                if x1 > x0 {
+                    items.push(DisplayItem::SolidRect {
+                        rect: Rect { x: x0, y: top_y, width: x1 - x0, height: line.min(focused.dimensions.height) },
+                        color: SELECTION_COLOR,
+                        radius: 0.0,
+                    });
+                }
+            }
+        }
+        let before: String = typed.chars().take(cursor).collect();
         items.push(DisplayItem::SolidRect {
             rect: Rect {
-                x: (focused.dimensions.x + inset + typed_width).min(max_x),
-                y: focused.dimensions.y + ((focused.dimensions.height - line) / 2.0).max(0.0),
+                x: (focused.dimensions.x + inset + width_of(&before)).min(max_x),
+                y: top_y,
                 width: 1.0,
                 height: line.min(focused.dimensions.height),
             },
-            color: focused.computed_style.get("color").and_then(|v| parse_css_color(v)).unwrap_or(INITIAL_COLOR),
+            color: caret_color,
+            radius: 0.0,
+        });
+    } else {
+        // Textarea multilínea: posiciona cursor y selección por línea explícita (`\n`).
+        let mut line_start = 0usize;
+        let mut caret_pos = (0usize, 0.0f32);
+        let mut sel_rects = Vec::new();
+        for (line_idx, raw_line) in typed.split('\n').enumerate() {
+            let line_len = raw_line.chars().count();
+            let line_end = line_start + line_len;
+            let y = focused.dimensions.y + inset + line_idx as f32 * line;
+            if y >= focused.dimensions.y + focused.dimensions.height {
+                break;
+            }
+            if let Some((sa, sb)) = selection {
+                let oa = sa.max(line_start).min(line_end);
+                let ob = sb.max(line_start).min(line_end);
+                if oa < ob {
+                    let p0: String = raw_line.chars().take(oa - line_start).collect();
+                    let p1: String = raw_line.chars().take(ob - line_start).collect();
+                    let x0 = (focused.dimensions.x + inset + width_of(&p0)).min(max_x);
+                    let x1 = (focused.dimensions.x + inset + width_of(&p1)).min(max_x);
+                    if x1 > x0 {
+                        sel_rects.push(Rect { x: x0, y, width: x1 - x0, height: line });
+                    }
+                }
+            }
+            if cursor >= line_start && cursor <= line_end {
+                let before: String = raw_line.chars().take(cursor - line_start).collect();
+                caret_pos = (line_idx, width_of(&before));
+            }
+            line_start = line_end + 1;
+        }
+        items.extend(selection_overlay_rects(&sel_rects));
+        let caret_y = (focused.dimensions.y + inset + caret_pos.0 as f32 * line).min(focused.dimensions.y + focused.dimensions.height - line.min(focused.dimensions.height));
+        items.push(DisplayItem::SolidRect {
+            rect: Rect {
+                x: (focused.dimensions.x + inset + caret_pos.1).min(max_x),
+                y: caret_y.max(focused.dimensions.y),
+                width: 1.0,
+                height: line.min(focused.dimensions.height),
+            },
+            color: caret_color,
             radius: 0.0,
         });
     }
