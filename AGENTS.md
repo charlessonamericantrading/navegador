@@ -7,7 +7,7 @@ se discuten.
 ## Reglas absolutas
 
 1. **La aplicación es 100 % Rust.** El motor, la ventana, la interfaz (barra de
-   direcciones, pestañas, panel del agente), el agente de IA y el instalador.
+   direcciones, pestañas) y el instalador. (Se descartan los agentes de IA).
 2. **Prohibido usar cualquier motor de navegador ya existente** (de Google,
    Apple, Mozilla o de cualquier otro), ni para pintar páginas, ni para la
    interfaz, ni para las pruebas, ni como "modo de compatibilidad". Tampoco

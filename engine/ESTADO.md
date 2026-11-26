@@ -56,7 +56,7 @@ cargo run --release -p navegador -- --captura v.png news.ycombinator.com   # sin
   a extremo con el motor real (`engine/crates/app/tests/extremo_a_extremo.rs`) y
   prueba de aislamiento real del sandbox Windows (`tests/sandbox_isolation.rs`).
 
-Falta: el panel del agente IA (`5.4`), firma de binarios y sandbox de red / por
+Falta: firma de binarios y sandbox de red / por
 pestaña (AppContainer en Windows; sandbox de procesos en Linux y macOS).
 
 ## Números

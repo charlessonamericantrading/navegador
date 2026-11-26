@@ -359,9 +359,8 @@ el aislamiento de `--motor`; **macOS no se ha probado nunca**. Sin versión móv
 
 ## 9. La aplicación (`engine/crates/app`) `[plan 5.x]`
 
-Actualizado el 2026-11-26. Lo que ya hace está en `ESTADO.md`; esto es lo que falta:
+Actualizado el 2026-11-26. Lo que ya hace está en `ESTADO.md`; esto es lo que falta (el agente de IA quedó descartado del plan):
 
-- **Agente IA** `[plan 5.4]`: no hay panel ni bucle en la app nueva (pendiente de decisión).
 - **Firma de binarios y actualizador** `[plan 5.5]`: el instalador/desinstalador 100 % Rust (`instalador`) y el empaquetado portable (`NavegadorIA-windows.zip`) ya existen, pero los ejecutables no llevan firma digital ni autoactualización.
 - **Descargas, favicon, pantalla completa, imprimir:** no existen.
 - **Capturas de referencia:** las pruebas de extremo a extremo comprueban estado y

@@ -55,11 +55,11 @@ También puedes generar un paquete portable con instalador nativo 100 % Rust en 
 | **Layout** | Bloque, texto en línea partido por palabras, `inline-block`, flex, grid, tablas, `float`, `position` |
 | **JavaScript** | Intérprete `boa`, DOM, eventos, `fetch`, XHR, temporizadores, `localStorage`, módulos ES |
 | **Pintado** | `tiny-skia`, SVG, fuentes del sistema (sans, serifa y monoespaciada), sombras, bordes redondeados |
-| **IA** | `engine-ai`: árbol de accesibilidad de la página, pensado para un agente |
+| **Accesibilidad** | `engine-ai`: árbol de accesibilidad (AOM) de la página |
 
 Se puede: abrir páginas reales por HTTPS, seguir enlaces, usar el historial y
 las pestañas, escribir en los campos, enviar formularios e iniciar sesión en
-sitios con cookies. Hacker News, Google y Wikipedia se ven bien.
+sitios con cookies. Hacker News, DuckDuckGo Lite y Wikipedia se ven bien.
 
 **Lo que no:** las webs que montan todo su contenido con JavaScript en el
 cliente suelen verse vacías (faltan APIs del DOM; el motor lo avisa). Sin
@@ -81,7 +81,7 @@ engine/
 ├── crates/image/     Decodificación de imágenes y SVG
 ├── crates/js/        JavaScript y enlaces con el DOM
 ├── crates/gfx/       Lista de pintado y rasterizado
-└── crates/ai/        Árbol de accesibilidad para el agente
+└── crates/ai/        Árbol de accesibilidad (AOM) del motor
 ```
 
 `navegador` arranca tres procesos del mismo ejecutable: la ventana, el
