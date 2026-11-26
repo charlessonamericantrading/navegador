@@ -4,7 +4,7 @@
 Herramienta de desarrollo, no forma parte del producto. Arranca el motor,
 carga una pagina, guarda la captura y mide cuanto tarda cada operacion
 (navegar, scroll, clic en zona vacia, redimensionar). Es la forma de
-comprobar cada tarea de PLAN_SONNET.md con numeros en vez de a ojo.
+comprobar cada cambio con numeros en vez de a ojo.
 
 Uso:
   python3 scripts/dev/engine_driver.py https://es.wikipedia.org/wiki/Navegador_web

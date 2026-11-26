@@ -154,8 +154,7 @@ jobs:
           # que parece de red pero es de ruta.
           working-directory: engine
           # Avisos conocidos el 2026-09-09. Cada uno con su razon: ninguno se
-          # silencia sin explicar por que. Estan anotados como deuda en
-          # `engine/huecos_sin_resolver.md`.
+          # silencia sin explicar por que.
           #
           # RUSTSEC-2025-0003 y RUSTSEC-2024-0379 (`fast-float`) YA NO estan:
           #   llegaban por Boa 0.19 y desaparecieron con la migracion a Boa 0.22

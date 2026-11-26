@@ -2,8 +2,8 @@
 
 **Estado: prototipo. No está preparado para navegar por sitios no confiables
 con cuentas reales.** Este documento dice por qué, qué protege hoy y qué no, y
-cómo avisar de un fallo. Se revisa en cada fase que toque una frontera de
-seguridad (plan, sección 7.3).
+cómo avisar de un fallo. Se revisa cada vez que se toca una frontera de
+seguridad.
 
 Última revisión: 26-11-2026 (aislamiento en Windows del proceso `--motor`, instalador 100 % Rust sin firma).
 
@@ -72,7 +72,7 @@ interpreta la página, y por último aislamiento por sitio.
 
 ## Condiciones que bloquean una versión
 
-Tomadas del plan (sección 5.3): escape de sandbox o lectura de datos de otro
+Escape de sandbox o lectura de datos de otro
 contexto; credenciales expuestas; actualizaciones no autenticadas; dependencia
 crítica sin tratar en una ruta distribuida; un *harness* de pruebas que da éxito sin
 ejecutar. Hoy se cumplen varias de ellas, por eso no hay versión estable.

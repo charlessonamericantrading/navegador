@@ -23,3 +23,11 @@ Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 .idea/
+
+# Documentos internos de trabajo: se guardan en local, no se publican
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+PLAN_SONNET.md
+engine/ARCHITECTURE.md
+engine/huecos_sin_resolver.md

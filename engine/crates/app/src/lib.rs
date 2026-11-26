@@ -1,4 +1,4 @@
-//! La aplicación del navegador, 100 % Rust (Fase 5 de `PLAN_SONNET.md`).
+//! La aplicación del navegador, 100 % Rust.
 //!
 //! - El motor corre en un proceso aparte (`navegador --motor`) y habla NDJSON
 //!   por stdin/stdout (`motor`). Si una página lo tumba, la ventana sigue.

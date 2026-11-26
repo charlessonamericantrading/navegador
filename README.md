@@ -1,7 +1,7 @@
 # Navegador
 
-> **Reglas del proyecto: [`AGENTS.md`](AGENTS.md).** La aplicación es 100 %
-> Rust y el motor es propio, escrito desde cero.
+> La aplicación es 100 % Rust y el motor es propio, escrito desde cero: no usa
+> ningún motor de navegador ajeno.
 
 Un navegador de escritorio con **motor propio en Rust**: red, HTML, CSS,
 layout, pintado y JavaScript. La ventana, la barra y las pestañas también son
@@ -13,9 +13,8 @@ Rust, y las pinta el mismo motor que pinta las páginas.
 > Linux y macOS todavía no hay sandbox de sistema operativo. Todavía no está
 > pensado para cuentas reales en sitios hostiles.
 >
-> **Qué funciona hoy y cómo medirlo: [`engine/ESTADO.md`](engine/ESTADO.md)**
-> (corto y verificado). Lo que falta, en
-> [`engine/huecos_sin_resolver.md`](engine/huecos_sin_resolver.md).
+> **Qué funciona hoy, qué no y cómo medirlo:
+> [`engine/ESTADO.md`](engine/ESTADO.md)** (corto y verificado).
 
 ---
 
@@ -90,8 +89,6 @@ cookies y almacenamiento). El motor y la ventana hablan NDJSON por
 stdin/stdout; el motor pide la red al broker con un token de un solo uso
 ([ADR 0001](docs/adr/0001-broker-y-aislamiento-de-renderers.md)). Si una página
 tumba el motor, la ventana sigue viva.
-
-`engine/ARCHITECTURE.md` es el diario histórico de cómo se llegó aquí.
 
 ---
 

@@ -1,8 +1,7 @@
 # Estado del motor y de la aplicación
 
 Resumen corto y verificado de lo que el motor hace y no hace. Cada afirmación
-sale de ejecutarlo, no de leer el código. `ARCHITECTURE.md` queda como
-histórico: cuenta cómo se llegó aquí, no cómo está hoy.
+sale de ejecutarlo, no de leer el código.
 
 Última comprobación: 2026-11-26, Windows 11 (local, compilación en `--release` con
 `--locked`), más suites de test y clippy del workspace en Windows y Linux.
@@ -152,5 +151,5 @@ pestaña (AppContainer en Windows; sandbox de procesos en Linux y macOS).
    la fuente en el propio test.
 2. Antes de subir: `cargo test --workspace --locked`, `cargo clippy ... -D warnings`
    y el `wpt_runner`.
-3. La aplicación es 100 % Rust (reglas en `AGENTS.md`) y vive en
-   `engine/crates/app`.
+3. La aplicación es 100 % Rust y vive en `engine/crates/app`. No se usa ningún
+   motor de navegador ajeno, tampoco para las pruebas.
