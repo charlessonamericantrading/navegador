@@ -1,8 +1,10 @@
 //! Instalador y desinstalador 100 % Rust de `navegador` (Fase 5.5).
 //!
 //! Instala el binario propio en el perfil del usuario (sin exigir privilegios
-//! de administrador), crea el acceso directo en el menú de aplicaciones y
-//! registra el desinstalador nativo (`desinstalar.exe` en Windows).
+//! de administrador), crea accesos directos en el menú de aplicaciones y
+//! Escritorio, y registra el desinstalador nativo (`desinstalar.exe` en Windows).
+
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -15,18 +17,19 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const AYUDA: &str = "Instalador de Navegador (100 % Rust)
 
 Uso:
-  instalador [--origen <ruta>] [--ruta <directorio>] [--escritorio] [--silencioso]
+  instalador [--origen <ruta>] [--ruta <directorio>] [--sin-escritorio] [--silencioso]
   instalador --desinstalar [--ruta <directorio>] [--silencioso]
   instalador --ayuda
 
 Opciones:
   --origen <ruta>     Ejecutable navegador origen (si no se indica, se busca junto al instalador o en target/release)
   --ruta <dir>        Carpeta de instalación personalizada
-  --escritorio        Crea también un acceso directo en el Escritorio (Windows)
+  --escritorio        Crea acceso directo en el Escritorio (activo por defecto en Windows)
+  --sin-escritorio    No crea acceso directo en el Escritorio
   --sin-sistema       Solo copia archivos locales sin tocar registro ni menús del sistema
-  --silencioso        No espera confirmación al final";
+  --silencioso        Modo consola sin ventanas ni confirmación";
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Opciones {
     desinstalar: bool,
     origen: Option<PathBuf>,
@@ -35,6 +38,20 @@ struct Opciones {
     sin_sistema: bool,
     silencioso: bool,
     ayuda: bool,
+}
+
+impl Default for Opciones {
+    fn default() -> Self {
+        Self {
+            desinstalar: false,
+            origen: None,
+            destino: None,
+            escritorio: cfg!(windows),
+            sin_sistema: false,
+            silencioso: false,
+            ayuda: false,
+        }
+    }
 }
 
 fn parsear_args<I, S>(args: I) -> Result<Opciones, String>
@@ -49,6 +66,7 @@ where
         match s {
             "--desinstalar" => opts.desinstalar = true,
             "--escritorio" => opts.escritorio = true,
+            "--sin-escritorio" => opts.escritorio = false,
             "--sin-sistema" => opts.sin_sistema = true,
             "--silencioso" => opts.silencioso = true,
             "--ayuda" | "-h" | "--help" => opts.ayuda = true,
@@ -118,11 +136,19 @@ fn resolver_origen(explicito: Option<&Path>) -> Result<PathBuf, String> {
     }
     let bin = nombre_binario();
     if let Ok(actual) = std::env::current_exe() {
-        if let Some(dir) = actual.parent() {
-            let junto = dir.join(bin);
-            if junto.is_file() {
-                return Ok(junto);
+        let mut cursor = actual.parent();
+        for _ in 0..6 {
+            let Some(dir) = cursor else { break };
+            for candidato in [
+                dir.join(bin),
+                dir.join("engine").join("target").join("release").join(bin),
+                dir.join("target").join("release").join(bin),
+            ] {
+                if candidato.is_file() {
+                    return Ok(candidato);
+                }
             }
+            cursor = dir.parent();
         }
     }
     let en_repo = Path::new("engine").join("target").join("release").join(bin);
@@ -134,7 +160,7 @@ fn resolver_origen(explicito: Option<&Path>) -> Result<PathBuf, String> {
         return Ok(en_target);
     }
     Err(format!(
-        "no se encontró {bin}; compílalo antes o pásalo con --origen <ruta>"
+        "no se encontró {bin} junto al instalador ni en engine/target/release. Usa el paquete completo o pásalo con --origen <ruta>."
     ))
 }
 
@@ -227,8 +253,13 @@ fn desinstalar_en(destino_dir: &Path, limpiar_sistema: bool) -> Result<(), Strin
     }
     let actual = std::env::current_exe().ok();
     let desinst = destino_dir.join(nombre_desinstalador());
-    if desinst.exists() && actual.as_deref() != Some(desinst.as_path()) {
-        let _ = std::fs::remove_file(&desinst);
+    if desinst.exists() {
+        if actual.as_deref() == Some(desinst.as_path()) {
+            plataforma::programar_borrado_al_reiniciar(&desinst);
+            plataforma::programar_borrado_al_reiniciar(destino_dir);
+        } else {
+            let _ = std::fs::remove_file(&desinst);
+        }
     }
     let _ = std::fs::remove_dir(destino_dir);
     Ok(())
@@ -318,6 +349,17 @@ mod plataforma {
             riid: *const Guid,
             ppv: *mut *mut c_void,
         ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
     }
 
     #[link(name = "advapi32")]
@@ -501,6 +543,46 @@ mod plataforma {
         }
         Ok(())
     }
+
+    pub fn adjuntar_consola_padre() {
+        const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+        unsafe {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+
+    pub fn programar_borrado_al_reiniciar(ruta: &Path) {
+        const MOVEFILE_DELAY_UNTIL_REBOOT: u32 = 0x4;
+        let w = wide_path(ruta);
+        unsafe {
+            let _ = MoveFileExW(w.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT);
+        }
+    }
+
+    pub fn dialogo_si_no(titulo: &str, mensaje: &str, pregunta: bool) -> bool {
+        const MB_YESNO: u32 = 0x0000_0004;
+        const MB_ICONQUESTION: u32 = 0x0000_0020;
+        const MB_ICONINFORMATION: u32 = 0x0000_0040;
+        const MB_SETFOREGROUND: u32 = 0x0001_0000;
+        const IDYES: i32 = 6;
+        let t = wide_z(titulo);
+        let m = wide_z(mensaje);
+        let icono = if pregunta { MB_ICONQUESTION } else { MB_ICONINFORMATION };
+        unsafe { MessageBoxW(0, m.as_ptr(), t.as_ptr(), MB_YESNO | icono | MB_SETFOREGROUND) == IDYES }
+    }
+
+    pub fn dialogo_aviso(titulo: &str, mensaje: &str, error: bool) {
+        const MB_OK: u32 = 0x0000_0000;
+        const MB_ICONERROR: u32 = 0x0000_0010;
+        const MB_ICONINFORMATION: u32 = 0x0000_0040;
+        const MB_SETFOREGROUND: u32 = 0x0001_0000;
+        let t = wide_z(titulo);
+        let m = wide_z(mensaje);
+        let icono = if error { MB_ICONERROR } else { MB_ICONINFORMATION };
+        unsafe {
+            let _ = MessageBoxW(0, m.as_ptr(), t.as_ptr(), MB_OK | icono | MB_SETFOREGROUND);
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -532,13 +614,27 @@ mod plataforma {
     pub fn limpiar_sistema() -> Result<(), String> {
         Ok(())
     }
+
+    pub fn adjuntar_consola_padre() {}
+
+    pub fn programar_borrado_al_reiniciar(_ruta: &Path) {}
+
+    pub fn dialogo_si_no(_titulo: &str, _mensaje: &str, _pregunta: bool) -> bool {
+        true
+    }
+
+    pub fn dialogo_aviso(_titulo: &str, _mensaje: &str, _error: bool) {}
 }
 
 fn main() -> ExitCode {
+    plataforma::adjuntar_consola_padre();
     let mut opts = match parsear_args(std::env::args().skip(1)) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("[instalador] {e}\n{AYUDA}");
+            if cfg!(windows) {
+                plataforma::dialogo_aviso("Instalador de Navegador", &format!("{e}\n\n{AYUDA}"), true);
+            }
             return ExitCode::FAILURE;
         }
     };
@@ -548,37 +644,115 @@ fn main() -> ExitCode {
     }
     if opts.ayuda {
         println!("{AYUDA}");
+        if cfg!(windows) && !opts.silencioso {
+            plataforma::dialogo_aviso("Ayuda — Instalador de Navegador", AYUDA, false);
+        }
         return ExitCode::SUCCESS;
     }
 
+    let interactivo = cfg!(windows) && !opts.silencioso;
     let destino = match resolver_destino(opts.destino.as_deref(), opts.desinstalar, propio_exe.as_deref()) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("[instalador] {e}");
+            if interactivo {
+                plataforma::dialogo_aviso("Instalador de Navegador", &e, true);
+            }
             return ExitCode::FAILURE;
         }
     };
 
-    let res = if opts.desinstalar {
-        desinstalar_en(&destino, !opts.sin_sistema).map(|()| format!("Navegador desinstalado de {}", destino.display()))
-    } else {
-        resolver_origen(opts.origen.as_deref()).and_then(|origen| {
-            let resumen = instalar_en(&origen, propio_exe.as_deref(), &destino, opts.escritorio, !opts.sin_sistema)?;
-            Ok(format!(
+    if opts.desinstalar {
+        if interactivo {
+            let confirmado = plataforma::dialogo_si_no(
+                "Desinstalar Navegador",
+                &format!("¿Deseas desinstalar Navegador de:\n\n{}?", destino.display()),
+                true,
+            );
+            if !confirmado {
+                return ExitCode::SUCCESS;
+            }
+        }
+        return match desinstalar_en(&destino, !opts.sin_sistema) {
+            Ok(()) => {
+                let msg = format!("Navegador desinstalado de {}", destino.display());
+                println!("{msg}");
+                if interactivo {
+                    plataforma::dialogo_aviso("Desinstalador de Navegador", &msg, false);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("[instalador] {e}");
+                if interactivo {
+                    plataforma::dialogo_aviso("Error al desinstalar Navegador", &e, true);
+                }
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let origen = match resolver_origen(opts.origen.as_deref()) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[instalador] {e}");
+            if interactivo {
+                plataforma::dialogo_aviso("Error — Instalador de Navegador", &e, true);
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if interactivo {
+        let extra = if opts.sin_sistema {
+            "Sin accesos directos ni registro (--sin-sistema)."
+        } else if opts.escritorio {
+            "Se crearán accesos directos en el Menú Inicio y en el Escritorio."
+        } else {
+            "Se creará acceso directo en el Menú Inicio."
+        };
+        let confirmado = plataforma::dialogo_si_no(
+            "Instalar Navegador (100 % Rust)",
+            &format!(
+                "Se instalará Navegador v{VERSION} en:\n\n{}\n\n{extra}\n\n¿Continuar con la instalación?",
+                destino.display()
+            ),
+            true,
+        );
+        if !confirmado {
+            return ExitCode::SUCCESS;
+        }
+    }
+
+    match instalar_en(&origen, propio_exe.as_deref(), &destino, opts.escritorio, !opts.sin_sistema) {
+        Ok(resumen) => {
+            let msg = format!(
                 "Navegador instalado en {} ({} accesos creados)",
                 resumen.binario_instalado.display(),
                 resumen.accesos.len()
-            ))
-        })
-    };
-
-    match res {
-        Ok(msg) => {
+            );
             println!("{msg}");
+            if interactivo {
+                let abrir = plataforma::dialogo_si_no(
+                    "Instalación completada",
+                    &format!(
+                        "Navegador se instaló correctamente en:\n{}\n\nAccesos creados: {}\n\n¿Quieres abrir Navegador ahora?",
+                        destino.display(),
+                        resumen.accesos.len()
+                    ),
+                    false,
+                );
+                if abrir {
+                    let _ = std::process::Command::new(&resumen.binario_instalado).spawn();
+                }
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("[instalador] {e}");
+            if interactivo {
+                plataforma::dialogo_aviso("Error al instalar Navegador", &e, true);
+            }
             ExitCode::FAILURE
         }
     }
@@ -615,6 +789,8 @@ mod tests {
         let o = parsear_args(["--escritorio", "--ruta", "C:\\temp\\nav", "--silencioso"]).unwrap();
         assert!(o.escritorio && o.silencioso && !o.desinstalar);
         assert_eq!(o.destino, Some(PathBuf::from("C:\\temp\\nav")));
+        let sin = parsear_args(["--sin-escritorio"]).unwrap();
+        assert!(!sin.escritorio);
         assert!(parsear_args(["--desconocida"]).is_err());
         assert!(es_nombre_desinstalador(Path::new("C:\\App\\desinstalar.exe")));
         assert!(!es_nombre_desinstalador(Path::new("C:\\App\\instalador.exe")));

@@ -1,10 +1,23 @@
 @echo off
 title Instalar el Navegador
+setlocal
+set "REL=%~dp0engine\target\release"
+set "FORZAR="
+if /i "%~1"=="--recompilar" (
+    set "FORZAR=1"
+    shift
+)
+
+if defined FORZAR goto compilar
+if not exist "%REL%\navegador.exe" goto compilar
+if not exist "%REL%\instalador.exe" goto compilar
+goto instalar
+
+:compilar
 echo ===================================================
-echo   Instalar el Navegador (100%% Rust)
+echo   Compilar e instalar el Navegador (100%% Rust)
 echo ===================================================
 echo.
-
 cargo --version >nul 2>&1
 if %errorlevel% neq 0 (
     echo [ERROR] Rust no esta instalado o cargo no esta en el PATH.
@@ -13,8 +26,7 @@ if %errorlevel% neq 0 (
     pause
     exit /b 1
 )
-
-echo Compilando el navegador y el instalador Rust (la primera vez tarda unos minutos)...
+echo Compilando el navegador y el instalador (la primera vez tarda unos minutos)...
 cargo build --release --locked --manifest-path "%~dp0engine\Cargo.toml" --bin navegador --bin instalador
 if %errorlevel% neq 0 (
     echo [ERROR] No se pudo compilar el navegador.
@@ -22,13 +34,11 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-"%~dp0engine\target\release\instalador.exe" --origen "%~dp0engine\target\release\navegador.exe" --silencioso
+:instalar
+"%REL%\instalador.exe" --origen "%REL%\navegador.exe" %1 %2 %3 %4
 if %errorlevel% neq 0 (
-    echo [ERROR] Fallo al registrar la instalacion.
+    echo [ERROR] Fallo al instalar el navegador.
     pause
     exit /b 1
 )
-
-echo.
-echo Listo. Abre el navegador desde el Menu Inicio o con iniciar.bat
-pause
+exit /b 0

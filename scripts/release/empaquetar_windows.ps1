@@ -28,6 +28,6 @@ Copy-Item (Join-Path $Raiz "SECURITY.md") $Paquete
 $Zip = Join-Path $Salida "NavegadorIA-windows.zip"
 if (Test-Path $Zip) { Remove-Item -Force $Zip }
 Compress-Archive -Path "$Paquete\*" -DestinationPath $Zip
+Remove-Item -Recurse -Force $Paquete
 
-Write-Host "Paquete listo en: $Paquete"
-Write-Host "Archivo comprimido: $Zip"
+Write-Host "Archivo comprimido listo: $Zip"
