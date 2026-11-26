@@ -10,12 +10,13 @@
 /// los bytes por la duracion del closure, asi que un `Face<'a>` no podria
 /// sobrevivir fuera de el. Reconstruir el `Face` en cada `shape_text` es
 /// barato comparado con el propio shaping.
-/// `Clone` clona los bytes (una fuente suele ser cientos de KB, pero es una
-/// operacion ocasional - al redimensionar la ventana, no por frame - no el
-/// camino caliente del re-shaping por frame que ya existe).
+/// `Clone` COMPARTE los bytes (`Arc`): una fuente son cientos de KB, y cada
+/// pagina cargada recibe un clon de las 12 caras. Antes se copiaban enteras en
+/// cada pagina y en cada pestaña (varios MB por pestaña); ahora todas
+/// apuntan a la misma copia, que vive una vez por proceso.
 #[derive(Debug, Clone)]
 pub struct SystemFont {
-    bytes: Vec<u8>,
+    bytes: std::sync::Arc<[u8]>,
     face_index: u32,
     /// Identidad estable de esta cara, para poder cachear medidas de texto
     /// sin volver a mirar los bytes (ver `shape.rs`). No se puede usar la
@@ -73,7 +74,7 @@ impl SystemFont {
         })?;
 
         db.with_face_data(id, |data, face_index| Self {
-            bytes: data.to_vec(),
+            bytes: data.into(),
             face_index,
             id: next_font_id(),
         })
@@ -195,7 +196,7 @@ impl FontFaces {
                 ..fontdb::Query::default()
             };
             let id = db.query(&query)?;
-            db.with_face_data(id, |data, face_index| SystemFont { bytes: data.to_vec(), face_index, id: next_font_id() })
+            db.with_face_data(id, |data, face_index| SystemFont { bytes: data.into(), face_index, id: next_font_id() })
         };
         Self { regular: load(false, false), bold: load(true, false), italic: load(false, true), bold_italic: load(true, true) }
     }

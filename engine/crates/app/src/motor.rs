@@ -76,7 +76,8 @@ pub struct Estado {
 pub enum MensajeMotor {
     Listo,
     Estado(Box<Estado>),
-    Pestanas { id: Option<String>, lista: Vec<(u32, String, String)>, activa: u32 },
+    /// `lista`: id, título, dirección y si el motor la descartó por llevar tiempo sin usarse.
+    Pestanas { id: Option<String>, lista: Vec<(u32, String, String, bool)>, activa: u32 },
     Error { id: Option<String>, mensaje: String },
     Hecho { id: Option<String> },
     /// El proceso del motor terminó (o su salida se cerró).
@@ -124,7 +125,7 @@ impl MensajeMotor {
                             .iter()
                             .map(|p| {
                                 let campo = |c: &str| p.get(c).and_then(Value::as_str).unwrap_or_default().to_string();
-                                (p.get("id").and_then(Value::as_u64).unwrap_or(0) as u32, campo("title"), campo("url"))
+                                (p.get("id").and_then(Value::as_u64).unwrap_or(0) as u32, campo("title"), campo("url"), p.get("discarded").and_then(Value::as_bool).unwrap_or(false))
                             })
                             .collect()
                     })
@@ -344,11 +345,11 @@ mod tests {
     #[test]
     fn lee_pestanas_y_errores() {
         let MensajeMotor::Pestanas { lista, activa, .. } =
-            MensajeMotor::desde_linea(r#"{"type":"tabs","id":null,"tabs":[{"id":0,"title":"A","url":"u"},{"id":4,"title":"","url":""}],"active_tab_id":4}"#)
+            MensajeMotor::desde_linea(r#"{"type":"tabs","id":null,"tabs":[{"id":0,"title":"A","url":"u","discarded":true},{"id":4,"title":"","url":""}],"active_tab_id":4}"#)
         else {
             panic!("debían ser pestañas")
         };
-        assert_eq!(lista, vec![(0, "A".to_string(), "u".to_string()), (4, String::new(), String::new())]);
+        assert_eq!(lista, vec![(0, "A".to_string(), "u".to_string(), true), (4, String::new(), String::new(), false)]);
         assert_eq!(activa, 4);
         assert!(matches!(MensajeMotor::desde_linea(r#"{"type":"error","id":"x","message":"m"}"#), MensajeMotor::Error { id: Some(_), .. }));
         assert!(matches!(MensajeMotor::desde_linea("no es json"), MensajeMotor::Otro));
