@@ -1338,7 +1338,7 @@ mod tests {
         app.manejar(tecla(Tecla::Retroceso));
         let salida = app.manejar(tecla(Tecla::Enter));
         assert_eq!(tipo(&salida.peticiones[0]), "navigate");
-        assert_eq!(salida.peticiones[0]["url"], "https://www.google.com/search?q=clima+en+madri");
+        assert_eq!(salida.peticiones[0]["url"], "https://lite.duckduckgo.com/lite/?q=clima+en+madri");
         assert!(app.cargando());
         assert_eq!(app.editando_direccion(), None);
     }

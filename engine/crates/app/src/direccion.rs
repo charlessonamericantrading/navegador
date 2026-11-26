@@ -1,8 +1,8 @@
 //! Qué hacer con lo que se escribe en la barra de direcciones: una dirección
 //! ("wikipedia.org") se abre; cualquier otra cosa ("clima en madrid") se busca.
 
-/// Buscador al que van las búsquedas escritas en la barra.
-pub const BUSCADOR: &str = "https://www.google.com/search?q=";
+/// Buscador al que van las búsquedas escritas en la barra (versión HTML sin JS pesado).
+pub const BUSCADOR: &str = "https://lite.duckduckgo.com/lite/?q=";
 
 /// Convierte lo escrito en la URL a la que navegar. `None` si no hay nada.
 pub fn resolver(entrada: &str) -> Option<String> {
@@ -82,9 +82,9 @@ mod tests {
 
     #[test]
     fn el_resto_se_busca() {
-        assert_eq!(resolver("clima en madrid").as_deref(), Some("https://www.google.com/search?q=clima+en+madrid"));
-        assert_eq!(resolver("rust").as_deref(), Some("https://www.google.com/search?q=rust"));
-        assert_eq!(resolver("año.x1").as_deref(), Some("https://www.google.com/search?q=a%C3%B1o.x1"));
+        assert_eq!(resolver("clima en madrid").as_deref(), Some("https://lite.duckduckgo.com/lite/?q=clima+en+madrid"));
+        assert_eq!(resolver("rust").as_deref(), Some("https://lite.duckduckgo.com/lite/?q=rust"));
+        assert_eq!(resolver("año.x1").as_deref(), Some("https://lite.duckduckgo.com/lite/?q=a%C3%B1o.x1"));
     }
 
     #[test]

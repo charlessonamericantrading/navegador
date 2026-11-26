@@ -13,6 +13,19 @@ use hyper_rustls::HttpsConnector;
 use std::sync::Mutex;
 use std::time::Duration;
 
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut cur = err.source();
+    while let Some(src) = cur {
+        let s = src.to_string();
+        if !s.is_empty() && parts.last().is_none_or(|prev| prev != &s) {
+            parts.push(s);
+        }
+        cur = src.source();
+    }
+    parts.join(": ")
+}
+
 #[derive(Error, Debug)]
 pub enum NetworkError {
     #[error("Failed to parse URL: {0}")]
@@ -384,7 +397,7 @@ impl NetworkEngine {
             .client
             .request(hyper_req)
             .await
-            .map_err(|e| NetworkError::Http(e.to_string()))?;
+            .map_err(|e| NetworkError::Http(format_error_chain(&e)))?;
 
         let status_code = res.status().as_u16();
         let status_text = res.status().to_string();
@@ -415,7 +428,7 @@ impl NetworkEngine {
             .into_body()
             .collect()
             .await
-            .map_err(|e| NetworkError::Body(e.to_string()))?
+            .map_err(|e| NetworkError::Body(format_error_chain(&e)))?
             .to_bytes();
 
         let decompressed = decompress_body(&body_bytes, headers.get("content-encoding").map(String::as_str))?;
@@ -717,5 +730,33 @@ mod tests {
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
         assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(20));
         assert_eq!(NetworkEngine::new().request_timeout, REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn error_chain_preserves_tls_and_socket_causes() {
+        #[derive(Debug)]
+        struct Inner(&'static str);
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("client error (Connect)")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let msg = format_error_chain(&Outer(Inner("invalid peer certificate: Expired")));
+        assert_eq!(msg, "client error (Connect): invalid peer certificate: Expired");
     }
 }

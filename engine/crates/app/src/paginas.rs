@@ -8,7 +8,7 @@ use crate::lienzo::escapar;
 pub const SITIOS: [(&str, &str); 3] = [
     ("Wikipedia", "https://es.wikipedia.org"),
     ("Hacker News", "https://news.ycombinator.com"),
-    ("Google", "https://www.google.com"),
+    ("DuckDuckGo", "https://lite.duckduckgo.com/lite/"),
 ];
 
 /// La página de una pestaña nueva sin marcadores.
@@ -91,7 +91,9 @@ pub fn explicar(mensaje: &str) -> &'static str {
         "No se encuentra el sitio"
     } else if m.contains("refused") || m.contains("rechaz") {
         "El sitio rechazó la conexión"
-    } else if m.contains("certificate") || m.contains("tls") || m.contains("certificado") {
+    } else if m.contains("expired") || m.contains("caducad") || m.contains("expirad") {
+        "El certificado de seguridad del sitio ha caducado"
+    } else if m.contains("certificate") || m.contains("tls") || m.contains("certificado") || m.contains("invalid peer") || m.contains("webpki") {
         "La conexión segura con el sitio falló"
     } else if m.contains("url") && (m.contains("invalid") || m.contains("válida") || m.contains("valida")) {
         "La dirección no es válida"
@@ -108,6 +110,10 @@ mod tests {
     fn el_error_se_explica_claro() {
         assert_eq!(explicar("network_error: connection refused (os error 111)"), "El sitio rechazó la conexión");
         assert_eq!(explicar("network_error: operation timed out"), "La página tardó demasiado en responder");
+        assert_eq!(
+            explicar("network_error: HTTP request failed: client error (Connect): invalid peer certificate: Expired"),
+            "El certificado de seguridad del sitio ha caducado"
+        );
         assert_eq!(explicar("algo raro"), "No se pudo abrir la página");
     }
 
