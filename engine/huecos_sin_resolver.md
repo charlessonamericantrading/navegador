@@ -20,7 +20,7 @@ se comprobó con `grep` sobre `engine/crates/*/src` en esa fecha, no se copió d
 sandbox Windows de `--motor`, instalador 100 % Rust y `boa_engine` 0.22): se
 cerraron o acotaron las entradas 2.2, 4, 6 (selección de texto), 8 y 9. El resto
 de APIs JS de la sección 1 conserva la verificación contra `engine/crates/*/src`.
-Estado de la suite: **1.107 tests del workspace + 60 estilo-WPT** pasando.
+Estado de la suite: **1.107 tests en la pasada completa del workspace + 60 estilo-WPT** (y 44/44 en `navegador --locked` tras ampliar `instalador` a 4 tests).
 
 ---
 

@@ -10,7 +10,7 @@ histórico: cuenta cómo se llegó aquí, no cómo está hoy.
 ## Cómo medirlo (todo en un comando cada uno)
 
 ```bash
-cd engine && cargo test --workspace --locked          # 1.107 tests en total
+cd engine && cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run -p engine-core --bin wpt_runner --locked -- tests/wpt-style   # 60 de 60
 cargo build --release --locked -p navegador --bin navegador --bin instalador -p engine-core --bin engine_server --bin engine_broker
@@ -52,7 +52,7 @@ cargo run --release -p navegador -- --captura v.png news.ycombinator.com   # sin
   error (con «Reintentar») e instalador/desinstalador 100 % Rust (`instalador`,
   accesos `.lnk` por COM y Registro HKCU en Windows; empaquetado con
   `scripts/release/empaquetar_windows.ps1`).
-- **Pruebas:** 39 tests unitarios en `navegador`, 3 en `instalador`, 1 de extremo
+- **Pruebas:** 39 tests unitarios en `navegador`, 4 en `instalador`, 1 de extremo
   a extremo con el motor real (`engine/crates/app/tests/extremo_a_extremo.rs`) y
   prueba de aislamiento real del sandbox Windows (`tests/sandbox_isolation.rs`).
 
