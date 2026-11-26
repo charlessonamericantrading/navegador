@@ -3,6 +3,7 @@
 
 use crate::app::{App, CursorTipo, Entrada, Modificadores, Tecla, PIXELES_POR_LINEA};
 use crate::motor::{MensajeMotor, Motor};
+use crate::registro;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use winit::dpi::LogicalSize;
@@ -13,12 +14,20 @@ use winit::window::{CursorIcon, WindowBuilder};
 
 /// Abre la ventana y no vuelve hasta que se cierra.
 pub fn ejecutar(inicial: Option<String>) -> Result<(), String> {
+    registro::escribir(&format!(
+        "inicio: versión {}, {} {}, programa {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
+    ));
     let event_loop = EventLoopBuilder::<MensajeMotor>::with_user_event().build().map_err(|e| format!("no se pudo abrir la ventana: {e}"))?;
     let proxy = event_loop.create_proxy();
     let mut motor = Motor::lanzar_este(move |mensaje| {
         let _ = proxy.send_event(mensaje);
     })
     .map_err(|e| format!("no se pudo arrancar el motor: {e}"))?;
+    registro::escribir("el motor y el broker arrancaron");
 
     let ventana = Rc::new(
         WindowBuilder::new()
@@ -151,8 +160,14 @@ pub fn ejecutar(inicial: Option<String>) -> Result<(), String> {
                 _ => None,
             };
             if let Some(entrada) = entrada {
+                if let Entrada::Motor(mensaje) = &entrada {
+                    registro::mensaje_del_motor(mensaje, app.destino_en_curso().or(Some(app.url())).filter(|u| !u.is_empty()));
+                }
                 let salida = app.manejar(entrada);
                 enviar(&mut motor, &salida.peticiones);
+                if salida.diagnostico {
+                    lanzar_diagnostico();
+                }
                 if salida.redibujar {
                     let nuevo = app.cursor_en(raton.0, raton.1);
                     if nuevo != cursor_actual {
@@ -169,6 +184,16 @@ pub fn ejecutar(inicial: Option<String>) -> Result<(), String> {
             }
         })
         .map_err(|e| e.to_string())
+}
+
+/// Lanza `navegador --diagnostico` como otro proceso: tarda hasta un minuto y no
+/// debe congelar la ventana.
+fn lanzar_diagnostico() {
+    registro::escribir("el usuario pidió el diagnóstico");
+    match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg(crate::diagnostico::ARGUMENTO).spawn()) {
+        Ok(_) => {}
+        Err(e) => crate::aviso::mostrar_sin_esperar("Navegador", &format!("No se pudo lanzar el diagnóstico: {e}"), true),
+    }
 }
 
 fn enviar(motor: &mut Motor, peticiones: &[serde_json::Value]) {

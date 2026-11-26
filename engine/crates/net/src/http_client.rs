@@ -192,6 +192,48 @@ pub struct NetworkEngine {
 /// descubrio ejecutando el binario de verdad, no solo compilandolo.
 static CRYPTO_PROVIDER_INIT: std::sync::Once = std::sync::Once::new();
 
+/// Los certificados incluidos mas los `nativos` que sean validos. Devuelve
+/// cuantos se anadieron y cuantos se descartaron (uno ilegible del sistema no
+/// debe romper la red entera).
+fn raices_de_confianza(nativos: Vec<rustls::pki_types::CertificateDer<'static>>) -> (rustls::RootCertStore, usize, usize) {
+    let mut raices = rustls::RootCertStore::empty();
+    raices.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let (anadidos, descartados) = raices.add_parsable_certificates(nativos);
+    (raices, anadidos, descartados)
+}
+
+/// A quien se le confia: los certificados raiz que lleva el programa
+/// (`webpki-roots`) MAS los instalados en el sistema operativo, igual que hace
+/// cualquier navegador. Sin los del sistema, un antivirus que revisa las
+/// conexiones seguras, un proxy de empresa o una raiz propia instalada por el
+/// usuario hacen fallar TODA pagina https con `UnknownIssuer` (se vio en
+/// Windows y en el entorno de pruebas en la nube, que tiene uno).
+///
+/// Se calcula una vez por proceso: leer el almacen del sistema cuesta decenas
+/// de milisegundos y `NetworkEngine::new()` se llama muchas veces en los tests.
+fn tls_config() -> rustls::ClientConfig {
+    static CONFIG: std::sync::OnceLock<rustls::ClientConfig> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let nativos = rustls_native_certs::load_native_certs();
+            for error in &nativos.errors {
+                tracing::warn!("[net] no se pudo leer un certificado del sistema: {error}");
+            }
+            let (raices, anadidos, descartados) = raices_de_confianza(nativos.certs);
+            tracing::info!(
+                "[net] certificados raiz: {} incluidos + {anadidos} del sistema ({descartados} descartados por no ser validos)",
+                webpki_roots::TLS_SERVER_ROOTS.len()
+            );
+            let proveedor = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+            rustls::ClientConfig::builder_with_provider(proveedor)
+                .with_safe_default_protocol_versions()
+                .expect("versiones de TLS por defecto")
+                .with_root_certificates(raices)
+                .with_no_client_auth()
+        })
+        .clone()
+}
+
 /// Equivale a `NetworkEngine::new()`: sin persistencia de cookies a disco.
 /// Existe para que el tipo cumpla el contrato que Rust espera de cualquier
 /// tipo con un `new()` sin argumentos, no porque construirlo por defecto sea
@@ -229,7 +271,7 @@ impl NetworkEngine {
         http.enforce_http(false);
         http.set_connect_timeout(Some(CONNECT_TIMEOUT));
         let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_webpki_roots()
+            .with_tls_config(tls_config())
             .https_or_http()
             .enable_http1()
             .wrap_connector(http);
@@ -730,6 +772,25 @@ mod tests {
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
         assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(20));
         assert_eq!(NetworkEngine::new().request_timeout, REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn la_confianza_incluye_los_certificados_del_programa_y_tolera_basura_del_sistema() {
+        let solo_incluidos = raices_de_confianza(Vec::new());
+        assert_eq!(solo_incluidos.0.len(), webpki_roots::TLS_SERVER_ROOTS.len());
+        assert_eq!((solo_incluidos.1, solo_incluidos.2), (0, 0));
+        // Un certificado ilegible del sistema se descarta sin tumbar a los demas.
+        let con_basura = raices_de_confianza(vec![rustls::pki_types::CertificateDer::from(vec![1u8, 2, 3])]);
+        assert_eq!(con_basura.0.len(), webpki_roots::TLS_SERVER_ROOTS.len());
+        assert_eq!((con_basura.1, con_basura.2), (0, 1));
+    }
+
+    #[test]
+    fn la_configuracion_tls_se_construye_y_se_reutiliza() {
+        // Dos llamadas dan la misma configuracion sin volver a leer el sistema.
+        let a = tls_config();
+        let b = tls_config();
+        assert_eq!(a.alpn_protocols, b.alpn_protocols);
     }
 
     #[test]

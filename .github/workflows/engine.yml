@@ -104,6 +104,30 @@ jobs:
         working-directory: engine
         run: cargo clippy -p engine-net --all-targets --locked -- -D warnings
 
+  # El workspace entero en Linux: compila, pasa los tests y clippy sin avisos.
+  # Existe porque el job `test` corre solo en Windows y dejaba pasar fallos que
+  # solo se ven en Linux (una prueba con rutas de Windows, avisos de clippy de
+  # codigo que solo se usa en Windows...). No ejecuta nada de Windows.
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache de compilacion
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Tests
+        working-directory: engine
+        run: cargo test --workspace --locked
+      - name: Clippy
+        working-directory: engine
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   # Banco de medidas visibles (tarea 6.3 del plan): compila el motor en release,
   # lo pasa por los dos fixtures locales (CSS y JavaScript) y falla si alguna
   # operacion se cuelga (mas de 10 s) o si el fixture de JS deja de sacar sus 12
@@ -154,8 +178,7 @@ jobs:
           # que parece de red pero es de ruta.
           working-directory: engine
           # Avisos conocidos el 2026-09-09. Cada uno con su razon: ninguno se
-          # silencia sin explicar por que. Estan anotados como deuda en
-          # `engine/huecos_sin_resolver.md`.
+          # silencia sin explicar por que.
           #
           # RUSTSEC-2025-0003 y RUSTSEC-2024-0379 (`fast-float`) YA NO estan:
           #   llegaban por Boa 0.19 y desaparecieron con la migracion a Boa 0.22

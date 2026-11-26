@@ -5,7 +5,8 @@
 
 use engine_image::DecodedImage;
 use engine_layout::Rect;
-use tiny_skia::{IntSize, Mask, Pixmap, PixmapPaint, Transform};
+use crate::display_list::BackgroundPlacement;
+use tiny_skia::{FilterQuality, IntSize, Mask, Pixmap, PixmapPaint, Transform};
 
 /// `tiny_skia::Pixmap` exige RGBA8 PREMULTIPLICADO (`color * alpha / 255`
 /// por canal) - `engine_image::DecodedImage` guarda RGBA8 SIN premultiplicar
@@ -76,31 +77,128 @@ pub fn paint_background_image(pixmap: &mut Pixmap, rect: &Rect, image: &DecodedI
 }
 
 pub fn paint_background_image_scaled(pixmap: &mut Pixmap, rect: &Rect, image: &DecodedImage, scroll_offset_y: f32, mask: Option<&Mask>, scale: f32) {
+    paint_background_placed(pixmap, rect, image, &BackgroundPlacement::natural(rect, image), scroll_offset_y, mask, scale);
+}
+
+/// Pinta `image` en `rect` segun `placement`: la primera baldosa en su sitio y
+/// tamaño, repetida (o no) en cada eje hasta cubrir `rect`. `mask` recorta.
+pub fn paint_background_placed(pixmap: &mut Pixmap, rect: &Rect, image: &DecodedImage, placement: &BackgroundPlacement, scroll_offset_y: f32, mask: Option<&Mask>, scale: f32) {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return;
     }
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
-    let (tile_w, tile_h) = (image.width as f32 * scale, image.height as f32 * scale);
-    if tile_w <= 0.0 || tile_h <= 0.0 {
+    let (tile_w, tile_h) = (placement.tile.width * scale, placement.tile.height * scale);
+    if !(tile_w > 0.0 && tile_h > 0.0 && image.width > 0 && image.height > 0) {
         return;
     }
     let Some(source) = to_premultiplied_pixmap(image) else { return };
 
-    let start_x = rect.x * scale;
-    let start_y = (rect.y - scroll_offset_y) * scale;
-    let cols = ((rect.width * scale) / tile_w).ceil().max(1.0) as usize;
-    let rows = ((rect.height * scale) / tile_h).ceil().max(1.0) as usize;
+    // Origen de la primera baldosa y limites de `rect`, en pixeles del dispositivo.
+    let (tile_x, tile_y) = (placement.tile.x * scale, (placement.tile.y - scroll_offset_y) * scale);
+    let (rect_x, rect_y) = (rect.x * scale, (rect.y - scroll_offset_y) * scale);
+    let (rect_right, rect_bottom) = (rect_x + rect.width * scale, rect_y + rect.height * scale);
+
+    // Posiciones de las baldosas en un eje: solo la primera, o todas las que tocan `rect`.
+    let axis = |origin: f32, size: f32, start: f32, end: f32, repeat: bool| -> Vec<f32> {
+        if !repeat {
+            return vec![origin];
+        }
+        let first = origin + ((start - origin) / size).floor() * size;
+        let count = (((end - first) / size).ceil().max(1.0) as usize).min(MAX_BACKGROUND_TILES);
+        (0..count).map(|k| first + k as f32 * size).collect()
+    };
+    let xs = axis(tile_x, tile_w, rect_x, rect_right, placement.repeat_x);
+    let ys = axis(tile_y, tile_h, rect_y, rect_bottom, placement.repeat_y);
+
+    // Una baldosa que no coincide con el tamaño natural se reescala suavizando.
+    let sx = tile_w / image.width as f32;
+    let sy = tile_h / image.height as f32;
+    let natural = (sx - scale).abs() < 0.001 && (sy - scale).abs() < 0.001;
+    let paint = PixmapPaint { quality: if natural { FilterQuality::Nearest } else { FilterQuality::Bilinear }, ..PixmapPaint::default() };
 
     let mut drawn = 0usize;
-    'rows: for row in 0..rows {
-        for col in 0..cols {
+    'rows: for &y in &ys {
+        for &x in &xs {
             if drawn >= MAX_BACKGROUND_TILES {
                 tracing::warn!("[image_paint] mosaico de fondo cortado en {drawn} tiles (limite {MAX_BACKGROUND_TILES})");
                 break 'rows;
             }
-            let transform = Transform::from_row(scale, 0.0, 0.0, scale, start_x + col as f32 * tile_w, start_y + row as f32 * tile_h);
-            pixmap.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), transform, mask);
+            // Fuera de `rect` no se pinta nada: se salta (el recorte lo haria igual, pero mas caro).
+            if x >= rect_right || y >= rect_bottom || x + tile_w <= rect_x || y + tile_h <= rect_y {
+                continue;
+            }
+            pixmap.draw_pixmap(0, 0, source.as_ref(), &paint, Transform::from_row(sx, 0.0, 0.0, sy, x, y), mask);
             drawn += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Una imagen de 4x12 con tres franjas de 4 filas: roja, verde, azul.
+    fn sprite() -> DecodedImage {
+        let mut rgba = Vec::new();
+        for fila in 0..12 {
+            let color: [u8; 4] = match fila / 4 {
+                0 => [255, 0, 0, 255],
+                1 => [0, 255, 0, 255],
+                _ => [0, 0, 255, 255],
+            };
+            for _ in 0..4 {
+                rgba.extend_from_slice(&color);
+            }
+        }
+        DecodedImage { width: 4, height: 12, rgba }
+    }
+
+    fn pixel(pixmap: &Pixmap, x: u32, y: u32) -> (u8, u8, u8, u8) {
+        let p = pixmap.pixel(x, y).unwrap();
+        (p.red(), p.green(), p.blue(), p.alpha())
+    }
+
+    #[test]
+    fn a_sprite_shows_only_the_strip_the_position_selects_and_repeats_it_in_x() {
+        // Caja de 12x4 en (0,0); la imagen sube 4 filas (`0 -4px`): se ve la franja VERDE.
+        let mut pixmap = Pixmap::new(12, 8).unwrap();
+        let rect = Rect { x: 0.0, y: 0.0, width: 12.0, height: 4.0 };
+        let placement = BackgroundPlacement { tile: Rect { x: 0.0, y: -4.0, width: 4.0, height: 12.0 }, repeat_x: true, repeat_y: false };
+        paint_background_placed(&mut pixmap, &rect, &sprite(), &placement, 0.0, None, 1.0);
+        for x in [0, 5, 11] {
+            assert_eq!(pixel(&pixmap, x, 0), (0, 255, 0, 255), "franja verde repetida en x={x}");
+            assert_eq!(pixel(&pixmap, x, 3), (0, 255, 0, 255));
+        }
+        // El recorte a la caja lo pone el pintado completo (`paint_display_list` pasa una
+        // mascara con su `rect`); aqui solo se comprueba la colocacion.
+    }
+
+    #[test]
+    fn no_repeat_paints_a_single_tile_and_the_default_tiles_both_axes() {
+        let mut solo = Pixmap::new(12, 12).unwrap();
+        let rect = Rect { x: 0.0, y: 0.0, width: 12.0, height: 12.0 };
+        let una = BackgroundPlacement { tile: Rect { x: 4.0, y: 0.0, width: 4.0, height: 12.0 }, repeat_x: false, repeat_y: false };
+        paint_background_placed(&mut solo, &rect, &sprite(), &una, 0.0, None, 1.0);
+        assert_eq!(pixel(&solo, 5, 1), (255, 0, 0, 255));
+        assert_eq!(pixel(&solo, 1, 1).3, 0, "a la izquierda de la baldosa no hay nada");
+        assert_eq!(pixel(&solo, 9, 1).3, 0, "y a la derecha tampoco: no repite");
+
+        let mut mosaico = Pixmap::new(8, 24).unwrap();
+        let rect = Rect { x: 0.0, y: 0.0, width: 8.0, height: 24.0 };
+        paint_background_image_scaled(&mut mosaico, &rect, &sprite(), 0.0, None, 1.0);
+        assert_eq!(pixel(&mosaico, 5, 1), (255, 0, 0, 255), "comportamiento de siempre: repite en x");
+        assert_eq!(pixel(&mosaico, 1, 13), (255, 0, 0, 255), "y en y (la 2a copia empieza en la fila 12)");
+    }
+
+    #[test]
+    fn a_tile_scaled_by_background_size_fills_its_new_size() {
+        let mut pixmap = Pixmap::new(8, 24).unwrap();
+        let rect = Rect { x: 0.0, y: 0.0, width: 8.0, height: 24.0 };
+        // La imagen de 4x12 a 8x24 (doble): la franja roja pasa a ocupar 8 filas.
+        let placement = BackgroundPlacement { tile: Rect { x: 0.0, y: 0.0, width: 8.0, height: 24.0 }, repeat_x: false, repeat_y: false };
+        paint_background_placed(&mut pixmap, &rect, &sprite(), &placement, 0.0, None, 1.0);
+        assert_eq!(pixel(&pixmap, 3, 6), (255, 0, 0, 255));
+        assert_eq!(pixel(&pixmap, 3, 12), (0, 255, 0, 255));
+        assert_eq!(pixel(&pixmap, 3, 20), (0, 0, 255, 255));
     }
 }

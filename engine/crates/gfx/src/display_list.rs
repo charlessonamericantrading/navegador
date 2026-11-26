@@ -70,7 +70,13 @@ pub enum DisplayItem {
     /// de padding-box). Se pinta DESPUES de `background-color` y ANTES de
     /// `Border`, igual que el spec real (una imagen de fondo tapa el color
     /// solido que haya debajo).
-    BackgroundImage { rect: Rect, image: Arc<DecodedImage> },
+    ///
+    /// `placement` dice DONDE cae la primera baldosa y si se repite: lo resuelven
+    /// `background-position`, `background-size` y `background-repeat` (un sprite
+    /// como `url(s.png) 0 -261px repeat-x` solo ensena una franja de la imagen).
+    /// Sin esas propiedades es el comportamiento de siempre: tamaño natural,
+    /// desde la esquina y repetida en los dos ejes.
+    BackgroundImage { rect: Rect, image: Arc<DecodedImage>, placement: BackgroundPlacement },
     /// `background-image: linear-gradient(...)` (tarea 2.7 del plan, caso 7 del
     /// fixture). Se pinta donde iria el color de fondo, despues de el y antes del
     /// borde. `radius` mismo criterio que en `SolidRect`.
@@ -1185,6 +1191,158 @@ pub struct Gradient {
     pub stops: Vec<GradientStop>,
 }
 
+/// Donde cae la primera baldosa de una imagen de fondo y si se repite, ya en
+/// pixeles de documento.
+#[derive(Debug, Clone)]
+pub struct BackgroundPlacement {
+    /// La primera baldosa: su esquina y su tamaño (la imagen ya escalada por `background-size`).
+    pub tile: Rect,
+    pub repeat_x: bool,
+    pub repeat_y: bool,
+}
+
+impl BackgroundPlacement {
+    /// Tamaño natural, desde la esquina de `rect` y repetida en los dos ejes: lo que
+    /// pasa cuando la caja no dice nada de posicion, tamaño ni repeticion.
+    pub fn natural(rect: &Rect, image: &DecodedImage) -> Self {
+        Self { tile: Rect { x: rect.x, y: rect.y, width: image.width as f32, height: image.height as f32 }, repeat_x: true, repeat_y: true }
+    }
+}
+
+/// Resuelve `background-position`, `background-size` y `background-repeat` de la
+/// caja para su imagen. La posicion se mide sobre el padding-box (el origen por
+/// defecto del spec); el recorte sigue siendo el border-box entero.
+fn background_placement(layout_box: &LayoutBox, image: &DecodedImage) -> BackgroundPlacement {
+    let style = &layout_box.computed_style;
+    let rect = &layout_box.dimensions;
+    let border = &layout_box.box_dimensions.border;
+    let area = Rect {
+        x: rect.x + border.left,
+        y: rect.y + border.top,
+        width: (rect.width - border.left - border.right).max(0.0),
+        height: (rect.height - border.top - border.bottom).max(0.0),
+    };
+    let (iw, ih) = (image.width as f32, image.height as f32);
+    let (tile_w, tile_h) = resolve_background_size(style.get("background-size").map_or("auto", String::as_str), &area, iw, ih);
+    let (offset_x, offset_y) = resolve_background_position(style.get("background-position").map_or("0% 0%", String::as_str), &area, tile_w, tile_h);
+    let (repeat_x, repeat_y) = resolve_background_repeat(style.get("background-repeat").map_or("repeat", String::as_str));
+    BackgroundPlacement { tile: Rect { x: area.x + offset_x, y: area.y + offset_y, width: tile_w, height: tile_h }, repeat_x, repeat_y }
+}
+
+/// Una longitud o porcentaje de `background-*` (`px`, `%` o `0`), medido sobre
+/// `base`. `None` para `auto` y lo que no se entienda.
+fn background_length(token: &str, base: f32) -> Option<f32> {
+    let t = token.trim().to_ascii_lowercase();
+    if t == "0" {
+        return Some(0.0);
+    }
+    if let Some(px) = t.strip_suffix("px") {
+        return px.trim().parse::<f32>().ok();
+    }
+    t.strip_suffix('%').and_then(|p| p.trim().parse::<f32>().ok()).map(|p| base * p / 100.0)
+}
+
+/// `background-size`: `auto`, `cover`, `contain`, o uno o dos valores. Un `auto`
+/// conserva la proporcion de la imagen respecto al otro lado.
+fn resolve_background_size(value: &str, area: &Rect, iw: f32, ih: f32) -> (f32, f32) {
+    if iw <= 0.0 || ih <= 0.0 {
+        return (iw.max(0.0), ih.max(0.0));
+    }
+    let tokens: Vec<&str> = value.split_whitespace().collect();
+    match tokens.as_slice() {
+        ["cover"] => {
+            let s = (area.width / iw).max(area.height / ih);
+            (iw * s, ih * s)
+        }
+        ["contain"] => {
+            let s = (area.width / iw).min(area.height / ih);
+            (iw * s, ih * s)
+        }
+        [w] => match background_length(w, area.width) {
+            Some(w) => (w, ih * w / iw),
+            None => (iw, ih),
+        },
+        [w, h] => match (background_length(w, area.width), background_length(h, area.height)) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => (w, ih * w / iw),
+            (None, Some(h)) => (iw * h / ih, h),
+            (None, None) => (iw, ih),
+        },
+        _ => (iw, ih),
+    }
+}
+
+/// `background-position` -> desplazamiento de la baldosa desde la esquina del area.
+/// Admite una o dos palabras/longitudes y la forma de 3-4 valores con distancias a
+/// un borde (`right 10px bottom 5px`).
+fn resolve_background_position(value: &str, area: &Rect, tile_w: f32, tile_h: f32) -> (f32, f32) {
+    let tokens: Vec<String> = value.split_whitespace().map(str::to_ascii_lowercase).collect();
+    let is_x_word = |t: &str| matches!(t, "left" | "right");
+    let is_y_word = |t: &str| matches!(t, "top" | "bottom");
+    let free_x = area.width - tile_w;
+    let free_y = area.height - tile_h;
+    // Un valor de un eje en 1 o 2 palabras: palabra clave, porcentaje o longitud.
+    let axis = |token: &str, free: f32| -> f32 {
+        match token {
+            "left" | "top" => 0.0,
+            "center" => free / 2.0,
+            "right" | "bottom" => free,
+            other => match other.strip_suffix('%').and_then(|p| p.trim().parse::<f32>().ok()) {
+                Some(p) => free * p / 100.0,
+                None => background_length(other, free).unwrap_or(0.0),
+            },
+        }
+    };
+    match tokens.as_slice() {
+        [] => (0.0, 0.0),
+        [one] if is_y_word(one) => (free_x / 2.0, axis(one, free_y)),
+        [one] => (axis(one, free_x), free_y / 2.0),
+        [a, b] => {
+            // `top left`, `bottom 10px`...: si el primero es vertical o el segundo horizontal, van al reves.
+            if is_y_word(a) || is_x_word(b) {
+                (axis(b, free_x), axis(a, free_y))
+            } else {
+                (axis(a, free_x), axis(b, free_y))
+            }
+        }
+        many => {
+            // Forma de 3-4 valores: cada palabra de borde con su distancia opcional.
+            let (mut x, mut y) = (free_x / 2.0, free_y / 2.0);
+            let mut i = 0;
+            while i < many.len() {
+                let word = many[i].as_str();
+                let distance = many.get(i + 1).filter(|t| !matches!(t.as_str(), "left" | "right" | "top" | "bottom" | "center")).and_then(|t| background_length(t, if is_y_word(word) { free_y } else { free_x }));
+                i += if distance.is_some() { 2 } else { 1 };
+                let d = distance.unwrap_or(0.0);
+                match word {
+                    "left" => x = d,
+                    "right" => x = free_x - d,
+                    "top" => y = d,
+                    "bottom" => y = free_y - d,
+                    _ => {}
+                }
+            }
+            (x, y)
+        }
+    }
+}
+
+/// `background-repeat` -> (repite en x, repite en y).
+fn resolve_background_repeat(value: &str) -> (bool, bool) {
+    let tokens: Vec<String> = value.split_whitespace().map(str::to_ascii_lowercase).collect();
+    let repeats = |t: &str| t != "no-repeat";
+    match tokens.as_slice() {
+        [one] => match one.as_str() {
+            "repeat-x" => (true, false),
+            "repeat-y" => (false, true),
+            "no-repeat" => (false, false),
+            _ => (true, true),
+        },
+        [x, y] => (repeats(x), repeats(y)),
+        _ => (true, true),
+    }
+}
+
 /// El fondo de imagen de una caja: un degradado se pinta tal cual; un `url(...)`
 /// solo si su imagen ya esta descargada.
 fn push_background_image(layout_box: &LayoutBox, images: &ImageMap, radius: f32, target: &mut Vec<DisplayItem>) {
@@ -1193,7 +1351,8 @@ fn push_background_image(layout_box: &LayoutBox, images: &ImageMap, radius: f32,
         return;
     }
     if let Some(image) = parse_css_background_image(&layout_box.computed_style).and_then(|url| images.get(&url)) {
-        target.push(DisplayItem::BackgroundImage { rect: layout_box.dimensions.clone(), image: image.clone() });
+        let placement = background_placement(layout_box, image);
+        target.push(DisplayItem::BackgroundImage { rect: layout_box.dimensions.clone(), image: image.clone(), placement });
     }
 }
 
@@ -2346,5 +2505,111 @@ mod tests {
         node.computed_style.insert("overflow".to_string(), "visible".to_string());
         let list = DisplayList::build(&node, &ImageMap::new());
         assert!(!list.items.iter().any(|item| matches!(item, DisplayItem::PushClip { .. } | DisplayItem::PopClip)));
+    }
+
+    fn area(width: f32, height: f32) -> Rect {
+        Rect { x: 0.0, y: 0.0, width, height }
+    }
+
+    #[test]
+    fn background_size_auto_cover_contain_and_lengths() {
+        let a = area(200.0, 100.0);
+        assert_eq!(resolve_background_size("auto", &a, 50.0, 25.0), (50.0, 25.0));
+        assert_eq!(resolve_background_size("cover", &a, 50.0, 50.0), (200.0, 200.0), "cubre: la imagen cuadrada crece hasta el lado largo");
+        assert_eq!(resolve_background_size("contain", &a, 50.0, 50.0), (100.0, 100.0), "cabe: se queda en el lado corto");
+        assert_eq!(resolve_background_size("50% auto", &a, 40.0, 20.0), (100.0, 50.0), "auto conserva la proporcion");
+        assert_eq!(resolve_background_size("30px 10px", &a, 40.0, 20.0), (30.0, 10.0));
+        assert_eq!(resolve_background_size("20px", &a, 40.0, 20.0), (20.0, 10.0));
+    }
+
+    #[test]
+    fn background_position_keywords_percentages_lengths_and_edge_offsets() {
+        let a = area(200.0, 100.0);
+        let pos = |v: &str| resolve_background_position(v, &a, 50.0, 20.0);
+        assert_eq!(pos("0% 0%"), (0.0, 0.0));
+        assert_eq!(pos("0 -261px"), (0.0, -261.0), "un sprite sube la imagen 261 px");
+        assert_eq!(pos("center"), (75.0, 40.0), "una sola palabra: el otro eje al centro");
+        assert_eq!(pos("right bottom"), (150.0, 80.0));
+        assert_eq!(pos("bottom"), (75.0, 80.0), "una palabra vertical centra en horizontal");
+        assert_eq!(pos("top left"), (0.0, 0.0), "el orden vertical-horizontal tambien vale");
+        assert_eq!(pos("50% 100%"), (75.0, 80.0));
+        assert_eq!(pos("10px 5px"), (10.0, 5.0));
+        assert_eq!(pos("right 10px bottom 5px"), (140.0, 75.0), "distancias a los bordes");
+    }
+
+    #[test]
+    fn background_repeat_forms() {
+        assert_eq!(resolve_background_repeat("repeat"), (true, true));
+        assert_eq!(resolve_background_repeat("repeat-x"), (true, false));
+        assert_eq!(resolve_background_repeat("repeat-y"), (false, true));
+        assert_eq!(resolve_background_repeat("no-repeat"), (false, false));
+        assert_eq!(resolve_background_repeat("repeat no-repeat"), (true, false));
+    }
+
+    #[test]
+    fn a_sprite_background_emits_the_placement_of_its_strip() {
+        let mut images = ImageMap::new();
+        images.insert("sprite.png".to_string(), Arc::new(DecodedImage { width: 100, height: 300, rgba: vec![255; 100 * 300 * 4] }));
+        let mut caja = LayoutBox::new(BoxType::Block);
+        caja.dimensions = Rect { x: 10.0, y: 20.0, width: 80.0, height: 30.0 };
+        caja.computed_style.insert("background-image".to_string(), "url(sprite.png)".to_string());
+        caja.computed_style.insert("background-position".to_string(), "0 -261px".to_string());
+        caja.computed_style.insert("background-repeat".to_string(), "repeat-x".to_string());
+        let list = DisplayList::build(&caja, &images);
+        let item = list.items.iter().find_map(|i| match i {
+            DisplayItem::BackgroundImage { placement, .. } => Some(placement.clone()),
+            _ => None,
+        });
+        let placement = item.expect("debia emitir el fondo");
+        assert_eq!((placement.tile.x, placement.tile.y), (10.0, 20.0 - 261.0), "la baldosa empieza 261 px por encima de la caja");
+        assert_eq!((placement.tile.width, placement.tile.height), (100.0, 300.0), "tamaño natural");
+        assert!(placement.repeat_x && !placement.repeat_y);
+    }
+
+    #[test]
+    fn a_sprite_button_paints_only_its_strip_inside_its_own_box() {
+        // Como el boton de Google: una imagen de 100x300 con tres franjas de 100 filas
+        // (roja, verde, azul); `0 -100px repeat-x` en una caja de 60x30 debe verse VERDE
+        // dentro de la caja y nada fuera de ella.
+        let mut rgba = Vec::new();
+        for fila in 0..300 {
+            let color: [u8; 4] = match fila / 100 {
+                0 => [255, 0, 0, 255],
+                1 => [0, 255, 0, 255],
+                _ => [0, 0, 255, 255],
+            };
+            for _ in 0..100 {
+                rgba.extend_from_slice(&color);
+            }
+        }
+        let mut images = ImageMap::new();
+        images.insert("sprite.png".to_string(), Arc::new(DecodedImage { width: 100, height: 300, rgba }));
+        let mut caja = LayoutBox::new(BoxType::Block);
+        caja.dimensions = Rect { x: 20.0, y: 20.0, width: 60.0, height: 30.0 };
+        caja.computed_style.insert("background-image".to_string(), "url(sprite.png)".to_string());
+        caja.computed_style.insert("background-position".to_string(), "0 -100px".to_string());
+        caja.computed_style.insert("background-repeat".to_string(), "repeat-x".to_string());
+        let list = DisplayList::build(&caja, &images);
+
+        let mut pixmap = tiny_skia::Pixmap::new(120, 100).unwrap();
+        crate::paint::paint_display_list(&mut pixmap, &list.items, None, 0.0);
+        let rgba = |x: u32, y: u32| {
+            let p = pixmap.pixel(x, y).unwrap();
+            (p.red(), p.green(), p.blue(), p.alpha())
+        };
+        assert_eq!(rgba(30, 30), (0, 255, 0, 255), "dentro de la caja se ve la franja verde");
+        assert_eq!(rgba(79, 49), (0, 255, 0, 255), "hasta su esquina inferior derecha");
+        assert_eq!(rgba(30, 10).3, 0, "por encima de la caja no hay nada");
+        assert_eq!(rgba(30, 55).3, 0, "por debajo tampoco: la imagen no se sale de su caja");
+        assert_eq!(rgba(90, 30).3, 0, "ni a la derecha");
+    }
+
+    #[test]
+    fn without_background_properties_the_image_keeps_its_old_natural_tiling() {
+        let image = DecodedImage { width: 4, height: 4, rgba: vec![255; 64] };
+        let rect = Rect { x: 5.0, y: 6.0, width: 50.0, height: 40.0 };
+        let p = BackgroundPlacement::natural(&rect, &image);
+        assert_eq!((p.tile.x, p.tile.y, p.tile.width, p.tile.height), (5.0, 6.0, 4.0, 4.0));
+        assert!(p.repeat_x && p.repeat_y);
     }
 }

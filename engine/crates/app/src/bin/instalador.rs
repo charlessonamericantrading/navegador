@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+/// Solo lo usan los accesos directos de Windows.
+#[cfg(windows)]
 const NOMBRE_APP: &str = "Navegador";
 const NOMBRE_PAQUETE_WIN: &str = "NavegadorIA";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -40,6 +42,8 @@ struct Opciones {
     ayuda: bool,
 }
 
+// No se puede derivar: el acceso directo del Escritorio es opcion por defecto solo en Windows.
+#[allow(clippy::derivable_impls)]
 impl Default for Opciones {
     fn default() -> Self {
         Self {
@@ -792,8 +796,9 @@ mod tests {
         let sin = parsear_args(["--sin-escritorio"]).unwrap();
         assert!(!sin.escritorio);
         assert!(parsear_args(["--desconocida"]).is_err());
-        assert!(es_nombre_desinstalador(Path::new("C:\\App\\desinstalar.exe")));
-        assert!(!es_nombre_desinstalador(Path::new("C:\\App\\instalador.exe")));
+        // Con rutas de verdad del sistema donde corre (en Linux `\` no separa carpetas).
+        assert!(es_nombre_desinstalador(&Path::new("App").join("desinstalar.exe")));
+        assert!(!es_nombre_desinstalador(&Path::new("App").join("instalador.exe")));
     }
 
     #[test]

@@ -40,6 +40,34 @@ impl FieldEditState {
     }
 }
 
+/// Cuantos nodos tiene un arbol DOM (solo para el registro de memoria).
+fn count_dom_nodes(root: &std::sync::Arc<std::sync::RwLock<Node>>) -> usize {
+    1 + root.read().map(|node| node.children.iter().map(count_dom_nodes).sum::<usize>()).unwrap_or(0)
+}
+
+/// Cuantas propiedades de estilo hay en total, cuantos bytes de texto suman y
+/// cuantas cadenas DISTINTAS son (solo para el registro de memoria).
+fn style_stats(root: &LayoutBox) -> (usize, usize, usize) {
+    fn walk(layout_box: &LayoutBox, entries: &mut usize, bytes: &mut usize, distinct: &mut std::collections::HashSet<String>) {
+        for (key, value) in &layout_box.computed_style {
+            *entries += 1;
+            *bytes += key.len() + value.len();
+            distinct.insert(format!("{key}\u{0}{value}"));
+        }
+        for child in &layout_box.children {
+            walk(child, entries, bytes, distinct);
+        }
+    }
+    let (mut entries, mut bytes, mut distinct) = (0, 0, std::collections::HashSet::new());
+    walk(root, &mut entries, &mut bytes, &mut distinct);
+    (entries, bytes, distinct.len())
+}
+
+/// Cuantas cajas tiene un arbol de layout (solo para el registro de memoria).
+fn count_layout_boxes(root: &LayoutBox) -> usize {
+    1 + root.children.iter().map(count_layout_boxes).sum::<usize>()
+}
+
 struct LoadedPage {
     url: String,
     title: String,
@@ -52,6 +80,9 @@ struct LoadedPage {
     hovered_chain: Vec<std::sync::Arc<std::sync::RwLock<Node>>>,
     selection_rects: Vec<engine_layout::Rect>,
     selected_text: Option<String>,
+    /// El usuario escribio en esta pagina: una pestaña asi no se descarta
+    /// (se perderia lo escrito), igual que no lo haria un navegador de verdad.
+    edited: bool,
 }
 
 impl LoadedPage {
@@ -75,6 +106,7 @@ impl LoadedPage {
             hovered_chain: Vec::new(),
             selection_rects: Vec::new(),
             selected_text: None,
+            edited: false,
         }
     }
 
@@ -229,6 +261,21 @@ struct Tab {
     /// `0` antes de la primera carga (ningun documento real tiene ese id:
     /// `EngineServer::next_document_id` empieza en 1).
     document_id: u64,
+    /// Desde cuando NO es la pestaña activa (`None` si lo es). Con esto y
+    /// `EngineServer::discard_after` se decide cuando una pestaña en segundo
+    /// plano se descarta.
+    inactive_since: Option<std::time::Instant>,
+    /// `Some` si la pestaña se descarto: su pagina (DOM, JavaScript, layout,
+    /// imagenes) se libero y solo quedan estos datos, mas el historial y el
+    /// scroll. Se vuelve a cargar al activarla.
+    discarded: Option<DiscardedTab>,
+}
+
+/// Lo que sobrevive a descartar una pestaña, para seguir enseñandola en la barra.
+#[derive(Debug, Clone)]
+struct DiscardedTab {
+    url: String,
+    title: String,
 }
 
 impl Tab {
@@ -240,6 +287,8 @@ impl Tab {
             history_index: None,
             scroll_offset_y: 0.0,
             document_id: 0,
+            inactive_since: None,
+            discarded: None,
         }
     }
 }
@@ -288,6 +337,44 @@ struct EngineServer {
     /// terminan las hojas y los scripts (tarea 1.4). Por defecto
     /// `IMAGE_BUDGET`.
     image_budget: std::time::Duration,
+    /// Cuanto tiempo sin usarse antes de descartar una pestaña en segundo plano
+    /// (`None` = nunca). Por defecto `DISCARD_AFTER`; `NAVEGADOR_IA_DESCARTE_SEGUNDOS`
+    /// lo cambia (0 lo desactiva).
+    discard_after: Option<std::time::Duration>,
+    /// Se solto alguna pagina (se navego, se cerro una pestaña) y falta devolver su
+    /// memoria: recolectar los objetos de JavaScript y pedir al sistema que la recupere.
+    /// Se hace con el motor en reposo (`IDLE_CLEANUP_DELAY`), nunca a mitad de una operacion.
+    needs_cleanup: bool,
+    /// Cuando llego la ultima peticion (para saber desde cuando esta en reposo).
+    last_activity: std::time::Instant,
+}
+
+/// Cuanto reposo hace falta para limpiar la memoria de las paginas ya sueltas.
+const IDLE_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Tiempo sin usarse tras el cual una pestaña en segundo plano se descarta: libera
+/// su memoria y pasa a consumir practicamente nada.
+const DISCARD_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Variable de entorno que cambia `DISCARD_AFTER` (en segundos; 0 = nunca descartar).
+pub const DISCARD_ENV: &str = "NAVEGADOR_IA_DESCARTE_SEGUNDOS";
+
+/// Cada cuanto despierta como MAXIMO el reloj de fondo cuando hay temporizadores
+/// de JavaScript pendientes (una animacion con `setInterval(f, 16)` no debe
+/// repintar y codificar una captura 60 veces por segundo).
+const MIN_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn discard_after_from_env() -> Option<std::time::Duration> {
+    parse_discard_after(std::env::var(DISCARD_ENV).ok().as_deref())
+}
+
+/// `None` (sin variable o ilegible) = el valor por defecto; `0` = nunca descartar.
+fn parse_discard_after(value: Option<&str>) -> Option<std::time::Duration> {
+    match value.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(segundos) => Some(std::time::Duration::from_secs(segundos)),
+        None => Some(DISCARD_AFTER),
+    }
 }
 
 impl EngineServer {
@@ -313,6 +400,9 @@ impl EngineServer {
             subresource_timeout: Self::SUBRESOURCE_TIMEOUT,
             subresource_budget: Self::SUBRESOURCE_BUDGET,
             image_budget: Self::IMAGE_BUDGET,
+            discard_after: discard_after_from_env(),
+            needs_cleanup: false,
+            last_activity: std::time::Instant::now(),
         }
     }
 
@@ -322,6 +412,104 @@ impl EngineServer {
 
     fn active_tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active_tab]
+    }
+
+    /// Cambia la pestaña activa apuntando desde cuando la anterior deja de serlo
+    /// (de ahi se cuenta el tiempo para descartarla) y poniendo a cero la de la
+    /// nueva.
+    fn set_active_tab(&mut self, new_index: usize, now: std::time::Instant) {
+        if new_index != self.active_tab {
+            if let Some(old) = self.tabs.get_mut(self.active_tab) {
+                old.inactive_since = Some(now);
+            }
+        }
+        self.active_tab = new_index;
+        self.tabs[new_index].inactive_since = None;
+    }
+
+    /// ¿Se puede descartar la pestaña `index`? Una sola regla para saber cuando
+    /// despertar (`next_deadline`) y que descartar (`discard_idle_tabs`): si
+    /// difirieran, el motor despertaria en bucle para no hacer nada.
+    ///
+    /// No se descarta: la activa, una sin pagina (ya vacia o ya descartada) ni
+    /// una donde el usuario escribio (se perderia lo escrito).
+    fn discard_deadline(&self, index: usize) -> Option<std::time::Instant> {
+        let after = self.discard_after?;
+        let tab = self.tabs.get(index)?;
+        if index == self.active_tab || tab.discarded.is_some() {
+            return None;
+        }
+        let page = tab.current_page.as_ref()?;
+        if page.edited {
+            return None;
+        }
+        Some(tab.inactive_since? + after)
+    }
+
+    /// Descarta las pestañas en segundo plano que llevan `discard_after` sin
+    /// usarse: libera su pagina entera (DOM, JavaScript, layout, imagenes) y
+    /// conserva direccion, titulo, historial y scroll. Devuelve los ids de las
+    /// descartadas. Una pestaña descartada no consume CPU ni memoria
+    /// apreciable; al activarla se vuelve a cargar (`restore_active_tab`).
+    fn discard_idle_tabs(&mut self, now: std::time::Instant) -> Vec<u32> {
+        let due: Vec<usize> = (0..self.tabs.len()).filter(|&i| self.discard_deadline(i).is_some_and(|deadline| deadline <= now)).collect();
+        let mut discarded = Vec::new();
+        for index in due {
+            let tab = &mut self.tabs[index];
+            if let Some(page) = tab.current_page.take() {
+                tab.discarded = Some(DiscardedTab { url: page.url.clone(), title: page.current_title() });
+                discarded.push(tab.id);
+            }
+        }
+        if !discarded.is_empty() {
+            tracing::info!("[tabs] pestañas descartadas por inactividad: {discarded:?}");
+            // Las paginas ya se soltaron; el recolector de JavaScript no libera sus
+            // objetos hasta que corre, y despues se devuelve la memoria al sistema.
+            self.cleanup_memory();
+        }
+        discarded
+    }
+
+    /// Cuando tiene que despertar el motor: el temporizador de JavaScript mas
+    /// proximo de la pestaña activa, o el momento de descartar la primera
+    /// pestaña inactiva. `None` = no hay nada que hacer hasta que llegue una
+    /// peticion, asi que el motor puede dormir sin gastar CPU.
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        let timer = self.active_tab().current_page.as_ref().and_then(|page| page.runtime.next_timer_deadline());
+        let discard = (0..self.tabs.len()).filter_map(|i| self.discard_deadline(i)).min();
+        let cleanup = self.needs_cleanup.then(|| self.last_activity + IDLE_CLEANUP_DELAY);
+        [timer, discard, cleanup].into_iter().flatten().min()
+    }
+
+    /// Libera de verdad la memoria de las paginas ya sueltas (ver `needs_cleanup`).
+    fn cleanup_memory(&mut self) {
+        engine_js::collect_garbage();
+        crate::memoria::liberar_al_sistema();
+        self.needs_cleanup = false;
+    }
+
+    /// Lo que hay que hacer cuando el reloj de fondo despierta: avanzar los
+    /// temporizadores de la pestaña activa y descartar las inactivas que toque.
+    /// Devuelve lo que hay que publicar sin que nadie lo pida.
+    fn tick(&mut self, now: std::time::Instant) -> Vec<EngineResponse> {
+        let mut publications = Vec::new();
+        if let Some(state) = self.tick_active_tab_timers() {
+            publications.push(state);
+        }
+        if !self.discard_idle_tabs(now).is_empty() {
+            publications.push(self.list_tabs(None));
+        }
+        if self.needs_cleanup && now >= self.last_activity + IDLE_CLEANUP_DELAY {
+            self.cleanup_memory();
+        }
+        publications
+    }
+
+    /// Marca la pagina activa como "con cosas escritas" (ver `LoadedPage::edited`).
+    fn mark_active_page_edited(&mut self) {
+        if let Some(page) = self.active_tab_mut().current_page.as_mut() {
+            page.edited = true;
+        }
     }
 
     /// El reloj de fondo real (ver el aviso de `run_stdio`) - se llama
@@ -373,6 +561,7 @@ impl EngineServer {
 
     async fn handle(&mut self, request: EngineRequest) -> (EngineResponse, bool) {
         let id = request.id().map(str::to_owned);
+        self.last_activity = std::time::Instant::now();
 
         match request {
             EngineRequest::Navigate { url, .. } => (self.navigate(id, url, true).await, false),
@@ -481,8 +670,14 @@ impl EngineServer {
                 y,
                 text,
                 press_enter,
-            } => (self.type_text(id, x, y, text, press_enter).await, false),
-            EngineRequest::PressKey { id, key } => (self.press_key(id, key).await, false),
+            } => {
+                self.mark_active_page_edited();
+                (self.type_text(id, x, y, text, press_enter).await, false)
+            }
+            EngineRequest::PressKey { id, key } => {
+                self.mark_active_page_edited();
+                (self.press_key(id, key).await, false)
+            }
             EngineRequest::Hover { id, x, y } => (self.hover(id, x, y), false),
             EngineRequest::SelectText { id, from_x, from_y, to_x, to_y } => (self.select_text(id, from_x, from_y, to_x, to_y), false),
             // Llega aqui solo cuando no hay ninguna navegacion en curso: si la
@@ -496,6 +691,7 @@ impl EngineServer {
             EngineRequest::TypeIntoElement { element_id, text, replace, press_enter, .. } => {
                 match self.locate_element(element_id) {
                     Ok((x, y)) => {
+                        self.mark_active_page_edited();
                         if replace {
                             self.clear_control_value_at(x, y);
                         }
@@ -507,8 +703,15 @@ impl EngineServer {
             EngineRequest::Back { .. } => (self.back(id).await, false),
             EngineRequest::Forward { .. } => (self.forward(id).await, false),
             EngineRequest::NewTab { url, .. } => (self.open_new_tab(id, url).await, false),
-            EngineRequest::CloseTab { tab_id, .. } => (self.close_tab(id, tab_id), false),
-            EngineRequest::SwitchTab { tab_id, .. } => (self.switch_tab(id, tab_id), false),
+            EngineRequest::CloseTab { tab_id, .. } => {
+                let response = self.close_tab(id.clone(), tab_id);
+                // Si la que pasa a ser activa estaba descartada, se vuelve a cargar.
+                if !matches!(response, EngineResponse::Error { .. }) && self.active_tab().discarded.is_some() {
+                    return (self.restore_active_tab(id).await, false);
+                }
+                (response, false)
+            }
+            EngineRequest::SwitchTab { tab_id, .. } => (self.switch_tab(id, tab_id).await, false),
             EngineRequest::ListTabs { .. } => (self.list_tabs(id), false),
             EngineRequest::GetAccessibilityTree { .. } => (self.accessibility_tree_response(id), false),
             EngineRequest::GetPageText { .. } => (self.page_text_response(id), false),
@@ -730,6 +933,20 @@ impl EngineServer {
                 discarded.len()
             );
         }
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            // Para saber DONDE se va la memoria de una pagina (`RUST_LOG=engine_core=debug`).
+            let image_bytes: usize = images.values().map(|image| image.rgba.len()).sum();
+            tracing::debug!(
+                "[mem] {}: {} imagenes decodificadas = {:.1} MiB; {} nodos DOM; {} cajas de layout",
+                final_url,
+                images.len(),
+                image_bytes as f64 / 1_048_576.0,
+                count_dom_nodes(&page.dom_root),
+                count_layout_boxes(&page.layout_root)
+            );
+            let (entries, string_bytes, distinct) = style_stats(&page.layout_root);
+            tracing::debug!("[mem] estilos: {entries} propiedades en total, {:.1} MiB de texto, {distinct} valores distintos", string_bytes as f64 / 1_048_576.0);
+        }
         let title = Node::find_all_by_tag(&page.dom_root, "title")
             .first()
             .map(Node::text_content)
@@ -761,9 +978,16 @@ impl EngineServer {
             }
         }
 
+        // La pagina anterior de esta pestaña (si la habia) se suelta aqui: su memoria se
+        // devuelve con el motor en reposo, no ahora.
+        if self.active_tab().current_page.is_some() {
+            self.needs_cleanup = true;
+        }
         let tab = self.active_tab_mut();
         tab.current_page = Some(LoadedPage::new(final_url, title, page, runtime, Some(font_set), images));
+        tab.discarded = None;
         tab.scroll_offset_y = 0.0;
+
         // Fase 8: el PRIMER snapshot del documento recien cargado.
         // `build_page_keeping_runtime` ya construyo su arbol de layout, y
         // hasta que esto corra los scripts de la pagina solo han podido ver
@@ -1016,7 +1240,7 @@ impl EngineServer {
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
         self.tabs.push(Tab::new(tab_id));
-        self.active_tab = self.tabs.len() - 1;
+        self.set_active_tab(self.tabs.len() - 1, std::time::Instant::now());
         match url {
             Some(url) => self.navigate(id, url, true).await,
             None => self.state_response(id),
@@ -1037,12 +1261,15 @@ impl EngineServer {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
             return Self::error(id, format!("no existe ninguna pestaña con id {tab_id}"));
         };
-        self.tabs.remove(index);
+        if self.tabs.remove(index).current_page.is_some() {
+            self.needs_cleanup = true;
+        }
         if index == self.active_tab {
             self.active_tab = index.saturating_sub(1);
         } else if index < self.active_tab {
             self.active_tab -= 1;
         }
+        self.tabs[self.active_tab].inactive_since = None;
         self.state_response(id)
     }
 
@@ -1051,17 +1278,47 @@ impl EngineServer {
     /// (`resize`) mientras estaba en segundo plano - `resize` solo
     /// relayouta la pestaña activa EN ESE MOMENTO (ver el handler de
     /// `Resize` en `handle`), asi que hay que ponerla al dia aqui, no ahi.
-    fn switch_tab(&mut self, id: Option<String>, tab_id: u32) -> EngineResponse {
+    async fn switch_tab(&mut self, id: Option<String>, tab_id: u32) -> EngineResponse {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
             return Self::error(id, format!("no existe ninguna pestaña con id {tab_id}"));
         };
-        self.active_tab = index;
+        self.set_active_tab(index, std::time::Instant::now());
+        // Una pestaña descartada no tiene pagina: se vuelve a cargar.
+        if self.active_tab().discarded.is_some() {
+            return self.restore_active_tab(id).await;
+        }
         let (w, h) = (self.width, self.height);
         let tab = self.active_tab_mut();
         if let Some(page) = &mut tab.current_page {
             page.relayout(w as f32, h as f32);
             let content_extent = page.page.layout_root.content_extent();
             tab.scroll_offset_y = clamp_scroll_offset(tab.scroll_offset_y, content_extent, h as f32);
+        }
+        self.state_response(id)
+    }
+
+    /// Vuelve a cargar la pestaña ACTIVA, que estaba descartada: pide otra vez la
+    /// pagina de la entrada actual del historial (sin añadir otra entrada) y
+    /// recoloca el scroll donde estaba. Si la red falla, la pestaña sigue
+    /// descartada y el error llega a quien lo pidio, que puede reintentar.
+    async fn restore_active_tab(&mut self, id: Option<String>) -> EngineResponse {
+        let tab = self.active_tab();
+        let Some(discarded) = tab.discarded.clone() else {
+            return self.state_response(id);
+        };
+        let url = tab.history_index.and_then(|index| tab.history.get(index)).map_or(discarded.url, |entry| entry.url.clone());
+        let scroll = tab.scroll_offset_y;
+        let response = self.navigate(id.clone(), url, false).await;
+        if !matches!(response, EngineResponse::State { .. }) {
+            return response;
+        }
+        // `navigate` ya dejo `discarded` en `None`; falta el scroll de antes.
+        let height = self.height as f32;
+        let tab = self.active_tab_mut();
+        if let Some(page) = &mut tab.current_page {
+            let scrolled = clamp_scroll_offset(scroll, page.page.layout_root.content_extent(), height);
+            page.publish_scroll_offset(scrolled);
+            tab.scroll_offset_y = scrolled;
         }
         self.state_response(id)
     }
@@ -1077,8 +1334,9 @@ impl EngineServer {
             .iter()
             .map(|tab| TabInfo {
                 id: tab.id,
-                title: tab.current_page.as_ref().map(LoadedPage::current_title).unwrap_or_default(),
-                url: tab.current_page.as_ref().map(|page| page.url.clone()).unwrap_or_default(),
+                title: tab.current_page.as_ref().map(LoadedPage::current_title).or_else(|| tab.discarded.as_ref().map(|d| d.title.clone())).unwrap_or_default(),
+                url: tab.current_page.as_ref().map(|page| page.url.clone()).or_else(|| tab.discarded.as_ref().map(|d| d.url.clone())).unwrap_or_default(),
+                discarded: tab.discarded.is_some(),
             })
             .collect();
         EngineResponse::Tabs { id, tabs, active_tab_id }
@@ -1262,7 +1520,21 @@ impl EngineServer {
     async fn fetch_images(&self, srcs: Vec<String>, page_url: &url::Url, deadline: tokio::time::Instant) -> ImageMap {
         let mut unique_urls: Vec<String> = Vec::new();
         let mut raws_by_url: HashMap<String, Vec<String>> = HashMap::new();
+        let mut fetched = ImageMap::new();
         for raw in srcs {
+            // Imagen incrustada (`data:`): los bytes ya vienen en la propia
+            // direccion, asi que no hay red que tocar.
+            if is_data_url(&raw) {
+                if let std::collections::hash_map::Entry::Vacant(hueco) = fetched.entry(raw) {
+                    match decode_data_url(hueco.key()).and_then(|bytes| decode_image(&bytes)) {
+                        Some(image) => {
+                            hueco.insert(image);
+                        }
+                        None => tracing::warn!("[server] imagen data: no valida o demasiado grande, se omite"),
+                    }
+                }
+                continue;
+            }
             let Ok(absolute) = page_url.join(&raw) else {
                 tracing::warn!("[server] <img src> con URL invalida, se omite: {raw}");
                 continue;
@@ -1284,7 +1556,6 @@ impl EngineServer {
                 });
         }
 
-        let mut fetched = ImageMap::new();
         for (abs_url, response) in self.fetch_subresources(unique_urls, page_url, "<img src>", deadline).await {
             match decode_image(&response.body) {
                 Some(image) => {
@@ -2884,6 +3155,53 @@ fn collect_form_data(
 /// de `EngineServer::submit_form` (que SI navega de verdad) a proposito:
 /// es logica pura sobre strings/URLs, sin tocar `self` ni la red, y por
 /// tanto se puede probar sin levantar ninguna pagina.
+/// Tamano maximo de una imagen `data:` (evita que una pagina gaste memoria
+/// con una direccion enorme).
+const MAX_DATA_URL_BYTES: usize = 8 * 1024 * 1024;
+
+/// `true` si el valor es una direccion `data:`.
+fn is_data_url(raw: &str) -> bool {
+    raw.trim_start().get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:"))
+}
+
+/// Saca los bytes de una direccion `data:[<tipo>][;base64],<datos>`.
+/// `None` si esta mal formada o pasa del limite.
+fn decode_data_url(raw: &str) -> Option<Vec<u8>> {
+    let rest = raw.trim_start().get(5..)?;
+    let (meta, data) = rest.split_once(',')?;
+    if data.len() > MAX_DATA_URL_BYTES * 2 {
+        return None;
+    }
+    let es_base64 = meta.rsplit(';').next().is_some_and(|m| m.trim().eq_ignore_ascii_case("base64"));
+    let bytes = if es_base64 {
+        let limpio: String = percent_decode(data.as_bytes()).iter().filter(|b| !b.is_ascii_whitespace()).map(|&b| b as char).collect();
+        let limpio = limpio.trim_end_matches('=');
+        base64::engine::general_purpose::STANDARD_NO_PAD.decode(limpio).ok()?
+    } else {
+        percent_decode(data.as_bytes())
+    };
+    (bytes.len() <= MAX_DATA_URL_BYTES).then_some(bytes)
+}
+
+/// Deshace los `%XX` de una cadena de bytes.
+fn percent_decode(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' && i + 2 < input.len() {
+            let hex = |b: u8| (b as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(input[i + 1]), hex(input[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    out
+}
+
 fn build_get_submit_url(page_url_str: &str, action_attr: Option<&str>, data: &[(String, String)]) -> Result<url::Url, String> {
     let mut target_url = resolve_submit_action(page_url_str, action_attr)?;
     target_url
@@ -2951,7 +3269,14 @@ pub async fn run_stdio() -> io::Result<()> {
     // este MISMO bucle consigue el mismo efecto (reaccionar a "paso el
     // tiempo" sin bloquear la lectura de la siguiente linea) sin
     // necesitar compartir nada entre tareas.
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    //
+    // NO despierta a intervalos fijos: duerme hasta el proximo trabajo real
+    // (`EngineServer::next_deadline`: un temporizador de JavaScript de la
+    // pestaña activa, o el momento de descartar una pestaña inactiva). Sin
+    // nada pendiente espera solo a que llegue una peticion, asi que un
+    // navegador en reposo no gasta CPU. Entre dos despertares se deja al menos
+    // `MIN_TICK_INTERVAL` para que una animacion pesada no repinte sin parar.
+    let mut last_tick = std::time::Instant::now();
 
     // Huella del ultimo `State` escrito, sea respuesta o publicacion
     // espontanea: es lo ultimo que el consumidor tiene en pantalla. Un
@@ -2967,17 +3292,29 @@ pub async fn run_stdio() -> io::Result<()> {
         let next = match backlog.pop_front() {
             Some(queued) => queued,
             None => {
+                let wake = server.next_deadline().map(|deadline| deadline.max(last_tick + MIN_TICK_INTERVAL));
+                let sleep = async {
+                    match wake {
+                        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 tokio::select! {
                     line = lines.next_line() => match line? {
                         None => break,
                         Some(line) => line,
                     },
-                    _ = tick.tick() => {
-                        let Some(state) = server.tick_active_tab_timers() else { continue };
-                        let fingerprint = state_fingerprint(&state);
-                        if fingerprint.is_some() && fingerprint != last_state {
-                            last_state = fingerprint;
-                            write_response(&mut stdout, state).await?;
+                    () = sleep => {
+                        last_tick = std::time::Instant::now();
+                        for publication in server.tick(last_tick) {
+                            let fingerprint = state_fingerprint(&publication);
+                            // Los estados se deduplican; lo demas (la lista de pestañas) se publica siempre.
+                            if fingerprint.is_none() || fingerprint != last_state {
+                                if fingerprint.is_some() {
+                                    last_state = fingerprint;
+                                }
+                                write_response(&mut stdout, publication).await?;
+                            }
                         }
                         continue;
                     }
@@ -5123,22 +5460,231 @@ mod tests {
         assert_eq!(server.active_tab().id, 1, "cerrar una pestaña en segundo plano no deberia cambiar la activa");
     }
 
-    #[test]
-    fn switch_tab_reports_an_error_for_an_unknown_tab_id() {
+    #[tokio::test]
+    async fn switch_tab_reports_an_error_for_an_unknown_tab_id() {
         let mut server = EngineServer::new();
-        let response = server.switch_tab(Some("st1".to_string()), 99999);
+        let response = server.switch_tab(Some("st1".to_string()), 99999).await;
         let json = serde_json::to_string(&response).expect("response should serialize");
         assert!(json.contains("\"type\":\"error\""));
     }
 
-    #[test]
-    fn switch_tab_changes_the_active_tab() {
+    #[tokio::test]
+    async fn switch_tab_changes_the_active_tab() {
         let mut server = EngineServer::new();
         server.tabs.push(Tab::new(1));
-        let response = server.switch_tab(Some("st2".to_string()), 1);
+        let response = server.switch_tab(Some("st2".to_string()), 1).await;
         assert_eq!(server.active_tab().id, 1);
         let json = serde_json::to_string(&response).expect("response should serialize");
         assert!(json.contains("\"tab_id\":1"));
+    }
+
+    // ---- Pestañas dormidas: descarte por inactividad ----
+
+    use std::time::Duration;
+
+    /// Tres pestañas con pagina; la 0 y la 1 estan en segundo plano desde `now` y la 2 es la activa.
+    fn server_with_three_tabs(discard_after: Option<Duration>) -> (EngineServer, std::time::Instant) {
+        let mut server = EngineServer::new();
+        server.discard_after = discard_after;
+        let now = std::time::Instant::now();
+        server.tabs[0].current_page = Some(loaded_page("http://a.test/"));
+        for (id, url) in [(1, "http://b.test/"), (2, "http://c.test/")] {
+            let mut tab = Tab::new(id);
+            tab.current_page = Some(loaded_page(url));
+            server.tabs.push(tab);
+        }
+        server.set_active_tab(1, now);
+        server.set_active_tab(2, now);
+        (server, now)
+    }
+
+    const HALF_HOUR: Duration = Duration::from_secs(30 * 60);
+
+    #[test]
+    fn the_discard_time_comes_from_the_environment_with_a_30_minute_default() {
+        assert_eq!(parse_discard_after(None), Some(HALF_HOUR));
+        assert_eq!(parse_discard_after(Some("basura")), Some(HALF_HOUR));
+        assert_eq!(parse_discard_after(Some("90")), Some(Duration::from_secs(90)));
+        assert_eq!(parse_discard_after(Some(" 0 ")), None, "0 desactiva el descarte");
+    }
+
+    #[test]
+    fn an_idle_background_tab_is_discarded_after_the_time_and_keeps_its_address() {
+        let (mut server, now) = server_with_three_tabs(Some(HALF_HOUR));
+
+        assert!(server.discard_idle_tabs(now + HALF_HOUR - Duration::from_secs(1)).is_empty(), "antes de los 30 minutos no se toca nada");
+        assert!(server.tabs.iter().all(|t| t.current_page.is_some()));
+
+        let discarded = server.discard_idle_tabs(now + HALF_HOUR + Duration::from_secs(1));
+        assert_eq!(discarded, vec![0, 1], "las dos de fondo");
+        assert!(server.tabs[0].current_page.is_none() && server.tabs[1].current_page.is_none(), "su pagina se libero");
+        assert!(server.tabs[2].current_page.is_some(), "la activa no se toca");
+
+        let EngineResponse::Tabs { tabs, active_tab_id, .. } = server.list_tabs(None) else { panic!("debian ser pestañas") };
+        assert_eq!(active_tab_id, 2);
+        assert_eq!((tabs[0].discarded, tabs[0].url.as_str()), (true, "http://a.test/"), "sigue enseñando su direccion");
+        assert_eq!((tabs[1].discarded, tabs[1].url.as_str()), (true, "http://b.test/"));
+        assert!(!tabs[2].discarded);
+        assert!(server.discard_idle_tabs(now + HALF_HOUR * 4).is_empty(), "no se descarta dos veces");
+    }
+
+    #[test]
+    fn the_active_tab_is_never_discarded_however_long_it_stays() {
+        let (mut server, now) = server_with_three_tabs(Some(HALF_HOUR));
+        server.discard_idle_tabs(now + Duration::from_secs(10 * 3600));
+        assert!(server.tabs[2].current_page.is_some());
+        assert!(server.tabs[2].discarded.is_none());
+    }
+
+    #[test]
+    fn a_tab_where_the_user_typed_is_not_discarded() {
+        let (mut server, now) = server_with_three_tabs(Some(HALF_HOUR));
+        server.tabs[0].current_page.as_mut().unwrap().edited = true;
+        let discarded = server.discard_idle_tabs(now + HALF_HOUR * 2);
+        assert_eq!(discarded, vec![1], "la 0 tiene texto escrito y se conserva");
+        assert!(server.tabs[0].current_page.is_some());
+    }
+
+    #[test]
+    fn with_discarding_disabled_nothing_is_ever_discarded_and_the_engine_never_wakes() {
+        let (mut server, now) = server_with_three_tabs(None);
+        assert!(server.discard_idle_tabs(now + HALF_HOUR * 100).is_empty());
+        assert_eq!(server.next_deadline(), None);
+    }
+
+    #[test]
+    fn the_engine_sleeps_until_the_next_real_job_and_not_in_between() {
+        let (mut server, now) = server_with_three_tabs(Some(HALF_HOUR));
+        // Sin temporizadores de JavaScript: solo el momento de descartar la primera inactiva.
+        let deadline = server.next_deadline().expect("hay pestañas por descartar");
+        assert_eq!(deadline, now + HALF_HOUR, "dormir hasta el descarte, sin despertares intermedios");
+
+        // Un temporizador de la pestaña activa mas proximo manda.
+        server.tabs[2].current_page.as_mut().unwrap().runtime.eval("setTimeout(function () {}, 5000);").unwrap();
+        let con_timer = server.next_deadline().unwrap();
+        assert!(con_timer < now + Duration::from_secs(60), "el temporizador de 5 s va antes que el descarte: {:?}", con_timer.duration_since(now));
+
+        // Descartadas todas las de fondo y sin temporizadores: nada que hacer hasta la siguiente peticion.
+        server.tabs[2].current_page.as_mut().unwrap().runtime.run_due_timers();
+        server.discard_idle_tabs(now + HALF_HOUR + Duration::from_secs(1));
+        let queda = server.next_deadline();
+        assert!(queda.is_some_and(|d| d > now + Duration::from_secs(2)), "solo queda el temporizador pendiente de la activa");
+    }
+
+    #[test]
+    fn the_background_clock_publishes_the_tab_list_when_it_discards() {
+        let (mut server, now) = server_with_three_tabs(Some(HALF_HOUR));
+        assert!(server.tick(now + Duration::from_secs(60)).is_empty(), "sin nada que hacer, no publica nada");
+        let publicaciones = server.tick(now + HALF_HOUR + Duration::from_secs(1));
+        let Some(EngineResponse::Tabs { id, tabs, .. }) = publicaciones.into_iter().find(|p| matches!(p, EngineResponse::Tabs { .. })) else {
+            panic!("debia publicar la lista de pestañas")
+        };
+        assert_eq!(id, None, "es una publicacion espontanea, sin id");
+        assert_eq!(tabs.iter().filter(|t| t.discarded).count(), 2);
+    }
+
+    /// Un servidor HTTP local con una pagina alta en `/p1` y `/p2`.
+    fn tall_pages_server() -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let body = format!("<html><head><title>Pagina {path}</title></head><body style=\"margin:0\"><div style=\"height:3000px;background:#eeeeee\">{path}</div></body></html>");
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn going_back_to_a_discarded_tab_reloads_it_and_restores_the_scroll() {
+        let port = tall_pages_server();
+        let mut server = EngineServer::new();
+        server.discard_after = Some(HALF_HOUR);
+        let first = format!("http://127.0.0.1:{port}/p1");
+        assert!(matches!(server.navigate(None, first.clone(), true).await, EngineResponse::State { .. }));
+        server.tabs[0].scroll_offset_y = 500.0;
+        let tab0_id = server.tabs[0].id;
+        server.open_new_tab(None, Some(format!("http://127.0.0.1:{port}/p2"))).await;
+        assert_eq!(server.active_tab().id, 1);
+
+        let later = std::time::Instant::now() + HALF_HOUR + Duration::from_secs(5);
+        assert_eq!(server.discard_idle_tabs(later), vec![tab0_id]);
+        assert!(server.tabs[0].current_page.is_none() && server.tabs[0].discarded.is_some());
+
+        let response = server.switch_tab(Some("vuelta".to_string()), tab0_id).await;
+        let EngineResponse::State { tab_id, url, title, scroll_offset_y, .. } = response else { panic!("debia cargar la pagina: {response:?}") };
+        assert_eq!(tab_id, tab0_id);
+        assert_eq!(url, first, "vuelve a pedir la misma direccion");
+        assert!(title.contains("/p1"), "con su titulo: {title}");
+        assert_eq!(scroll_offset_y, 500.0, "y el scroll donde estaba");
+        assert!(server.tabs[0].discarded.is_none(), "ya no esta descartada");
+        assert_eq!(server.tabs[0].history.len(), 1, "recargar no añade otra entrada al historial");
+        assert_eq!(server.tabs[0].history_index, Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn if_the_network_fails_when_returning_the_tab_stays_discarded_and_can_be_retried() {
+        let cerrado = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut server = EngineServer::new();
+        server.discard_after = Some(HALF_HOUR);
+        let mut tab = Tab::new(1);
+        tab.history = vec![HistoryEntry { url: format!("http://127.0.0.1:{cerrado}/"), document_id: 3 }];
+        tab.history_index = Some(0);
+        tab.discarded = Some(DiscardedTab { url: format!("http://127.0.0.1:{cerrado}/"), title: "Antes".to_string() });
+        server.tabs.push(tab);
+
+        let response = server.switch_tab(Some("x".to_string()), 1).await;
+        assert!(matches!(response, EngineResponse::Error { .. }), "{response:?}");
+        assert!(server.tabs[1].discarded.is_some(), "sigue descartada: se puede reintentar");
+        let EngineResponse::Tabs { tabs, .. } = server.list_tabs(None) else { panic!() };
+        assert_eq!((tabs[1].discarded, tabs[1].title.as_str()), (true, "Antes"));
+    }
+
+    #[test]
+    fn memory_of_released_pages_is_returned_when_the_engine_is_idle_and_not_before() {
+        let (mut server, now) = server_with_three_tabs(None);
+        server.last_activity = now;
+        assert_eq!(server.next_deadline(), None, "sin paginas sueltas no hay nada que limpiar: el motor duerme");
+
+        server.needs_cleanup = true;
+        assert_eq!(server.next_deadline(), Some(now + IDLE_CLEANUP_DELAY), "despierta una vez, tras unos segundos de reposo");
+        server.tick(now + Duration::from_secs(1));
+        assert!(server.needs_cleanup, "aun no: el usuario acaba de hacer algo");
+        server.tick(now + IDLE_CLEANUP_DELAY + Duration::from_millis(1));
+        assert!(!server.needs_cleanup, "limpiado");
+        assert_eq!(server.next_deadline(), None, "y vuelve a dormir sin despertar en bucle");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn navigating_and_closing_a_tab_mark_the_released_page_for_cleanup() {
+        let port = tall_pages_server();
+        let mut server = EngineServer::new();
+        server.discard_after = None;
+        assert!(matches!(server.navigate(None, format!("http://127.0.0.1:{port}/a"), true).await, EngineResponse::State { .. }));
+        assert!(!server.needs_cleanup, "la primera carga no suelta ninguna pagina");
+        assert!(matches!(server.navigate(None, format!("http://127.0.0.1:{port}/b"), true).await, EngineResponse::State { .. }));
+        assert!(server.needs_cleanup, "navegar suelta la anterior");
+        server.needs_cleanup = false;
+        server.open_new_tab(None, Some(format!("http://127.0.0.1:{port}/c"))).await;
+        server.close_tab(None, 1);
+        assert!(server.needs_cleanup, "cerrar una pestaña con pagina la suelta");
+    }
+
+    #[test]
+    fn typing_marks_the_page_as_edited_so_it_is_kept() {
+        let mut server = server_from_html("<html><body><input id=\"a\"></body></html>");
+        assert!(!server.active_tab().current_page.as_ref().unwrap().edited);
+        server.mark_active_page_edited();
+        assert!(server.active_tab().current_page.as_ref().unwrap().edited);
     }
 
     #[test]
@@ -5353,6 +5899,37 @@ mod tests {
         assert!(images.contains_key("/logo.svg"));
         assert!(images.contains_key("./logo.svg"));
         assert!(std::sync::Arc::ptr_eq(&images["/logo.svg"], &images["./logo.svg"]));
+    }
+
+    #[test]
+    fn a_data_url_is_decoded_with_or_without_base64() {
+        assert_eq!(decode_data_url("data:text/plain,hola%20mundo").unwrap(), b"hola mundo");
+        assert_eq!(decode_data_url("data:text/plain;base64,aG9sYQ==").unwrap(), b"hola");
+        assert_eq!(decode_data_url("data:text/plain;base64,aG9sYQ").unwrap(), b"hola", "sin relleno tambien");
+        assert_eq!(decode_data_url("data:;base64,aG9s\nYQ==").unwrap(), b"hola", "con saltos de linea");
+        assert_eq!(decode_data_url("DATA:,%zz%4").unwrap(), b"%zz%4", "un % suelto se deja tal cual");
+        assert!(decode_data_url("data:image/png;base64,@@@@").is_none());
+        assert!(decode_data_url("data:sin-coma").is_none());
+        assert!(is_data_url("  Data:image/png;base64,AAAA"));
+        assert!(!is_data_url("https://x.com/data:"));
+    }
+
+    #[tokio::test]
+    async fn embedded_data_images_load_without_touching_the_network() {
+        let server = server_with_budget(2_000, 10_000);
+        // Ningun servidor escucha: si intentara la red, fallaria.
+        let page_url = url::Url::parse("http://127.0.0.1:9/").unwrap();
+        let deadline = tokio::time::Instant::now() + server.subresource_budget;
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="#00ff00"/></svg>"##;
+        let en_base64 = format!("data:image/svg+xml;base64,{}", base64::engine::general_purpose::STANDARD.encode(svg));
+        let en_texto = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E%3Crect width='4' height='4' fill='red'/%3E%3C/svg%3E".to_string();
+        let roto = "data:image/png;base64,AAAA".to_string();
+        let images = server
+            .fetch_images(vec![en_base64.clone(), en_base64.clone(), en_texto.clone(), roto.clone()], &page_url, deadline)
+            .await;
+        assert_eq!(images[&en_base64].width, 8);
+        assert_eq!(images[&en_texto].width, 4);
+        assert!(!images.contains_key(&roto), "una imagen rota se omite sin romper el resto");
     }
 
     #[tokio::test]

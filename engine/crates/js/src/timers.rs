@@ -255,6 +255,15 @@ pub fn register_timers(context: &mut Context) -> JsResult<TimerQueue> {
 /// tomado, porque un callback puede llamar a `setTimeout`/`clearTimeout`
 /// (patron completamente normal: un temporizador que se reencola) y
 /// mantener el cerrojo aqui seria un interbloqueo garantizado.
+/// Cuando vence el temporizador mas proximo (`None` si no hay ninguno).
+///
+/// Es lo que permite al motor DORMIRSE hasta ese instante en vez de despertar
+/// cada pocos milisegundos a preguntar si hay algo: sin temporizadores
+/// pendientes, una pagina en reposo no gasta CPU.
+pub fn next_deadline(queue: &TimerQueue) -> Option<Instant> {
+    queue.lock().ok()?.timers.iter().map(|t| t.deadline).min()
+}
+
 fn take_due_ids(queue: &TimerQueue, now: Instant) -> Vec<u32> {
     let Ok(mut state) = queue.lock() else { return Vec::new() };
 
@@ -356,6 +365,23 @@ mod tests {
         let mut runtime = JsRuntime::new();
         runtime.register_timers().expect("los temporizadores deberian registrarse");
         runtime
+    }
+
+    #[test]
+    fn next_deadline_is_none_without_timers_and_tracks_the_nearest_one() {
+        let mut runtime = runtime_with_timers();
+        assert_eq!(runtime.next_timer_deadline(), None, "sin temporizadores, el motor no tiene por que despertar");
+        let antes = std::time::Instant::now();
+        runtime.eval("setTimeout(function () {}, 60000); setTimeout(function () {}, 5000);").expect("no deberia lanzar");
+        let deadline = runtime.next_timer_deadline().expect("hay dos temporizadores");
+        let espera = deadline.duration_since(antes);
+        assert!(espera >= std::time::Duration::from_millis(4_000) && espera < std::time::Duration::from_millis(6_000), "el mas proximo es el de 5 s: {espera:?}");
+        // Un temporizador ya vencido hace que el motor despierte ya.
+        runtime.eval("setTimeout(function () {}, 0);").expect("no deberia lanzar");
+        assert!(runtime.next_timer_deadline().unwrap() <= std::time::Instant::now());
+        // Vaciados los vencidos, vuelve a quedar solo el de 5 s.
+        runtime.run_due_timers();
+        assert!(runtime.next_timer_deadline().unwrap() > std::time::Instant::now());
     }
 
     #[test]

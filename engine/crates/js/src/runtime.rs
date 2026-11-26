@@ -312,6 +312,13 @@ impl JsRuntime {
         Ok(())
     }
 
+    /// Cuando vence el temporizador mas proximo (`None` si no hay ninguno o
+    /// si `register_timers` nunca corrio). Quien aloja el runtime lo usa para
+    /// dormirse hasta entonces en vez de despertar periodicamente.
+    pub fn next_timer_deadline(&self) -> Option<std::time::Instant> {
+        crate::timers::next_deadline(self.timers.as_ref()?)
+    }
+
     /// Ejecuta los temporizadores YA vencidos y devuelve cuantos callbacks
     /// se invocaron - cero si no hay ninguno vencido o si
     /// `register_timers` nunca corrio.

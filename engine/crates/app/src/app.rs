@@ -79,6 +79,8 @@ pub enum Entrada {
 pub struct Salida {
     pub peticiones: Vec<Value>,
     pub redibujar: bool,
+    /// El usuario pidió el diagnóstico (botón de la página de error o Ctrl+Mayús+D).
+    pub diagnostico: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -163,7 +165,7 @@ impl App {
             ancho: ancho.max(1),
             alto: alto.max(1),
             escala,
-            pestanas: vec![Pestana { id: 0, titulo: String::new(), url: String::new() }],
+            pestanas: vec![Pestana { id: 0, titulo: String::new(), url: String::new(), dormida: false }],
             activa: 0,
             pagina: None,
             url: String::new(),
@@ -237,6 +239,10 @@ impl App {
     }
     pub fn titulo(&self) -> &str {
         &self.titulo
+    }
+    /// Adónde va la carga en curso (vacío si no se sabe: atrás, adelante, un enlace).
+    pub fn destino_en_curso(&self) -> Option<&str> {
+        self.carga.as_ref().map(|c| c.url.as_str()).filter(|u| !u.is_empty())
     }
     pub fn cargando(&self) -> bool {
         self.carga.is_some()
@@ -385,21 +391,21 @@ impl App {
         }
     }
 
-    fn sincronizar_pestanas(&mut self, lista: Vec<(u32, String, String)>) {
-        self.orden_pestanas.retain(|id| lista.iter().any(|(lid, _, _)| lid == id));
-        for &(id, _, _) in &lista {
+    fn sincronizar_pestanas(&mut self, lista: Vec<(u32, String, String, bool)>) {
+        self.orden_pestanas.retain(|id| lista.iter().any(|(lid, _, _, _)| lid == id));
+        for &(id, _, _, _) in &lista {
             if !self.orden_pestanas.contains(&id) {
                 self.orden_pestanas.push(id);
             }
         }
         let mut ordenadas = Vec::with_capacity(lista.len());
         for &id in &self.orden_pestanas {
-            if let Some((_, titulo, url)) = lista.iter().find(|(lid, _, _)| *lid == id) {
-                ordenadas.push(Pestana { id, titulo: titulo.clone(), url: url.clone() });
+            if let Some((_, titulo, url, dormida)) = lista.iter().find(|(lid, _, _, _)| *lid == id) {
+                ordenadas.push(Pestana { id, titulo: titulo.clone(), url: url.clone(), dormida: *dormida });
             }
         }
         if ordenadas.is_empty() {
-            ordenadas.push(Pestana { id: self.activa, titulo: String::new(), url: String::new() });
+            ordenadas.push(Pestana { id: self.activa, titulo: String::new(), url: String::new(), dormida: false });
         }
         self.pestanas = ordenadas;
         self.asegurar_pestana_visible();
@@ -504,6 +510,7 @@ impl App {
             let accion = self.local.as_ref().and_then(|(_, _, _, _, l)| lienzo::accion_en(&l.regiones, cx, cy)).map(str::to_string);
             match accion.as_deref() {
                 Some("reintentar") => self.ejecutar(Accion::Recargar, salida),
+                Some("diagnostico") => salida.diagnostico = true,
                 Some(destino) if destino.starts_with("ir:") => self.navegar(destino[3..].to_string(), salida),
                 _ => {}
             }
@@ -605,6 +612,10 @@ impl App {
         let letra = |c: &str| matches!(&tecla, Tecla::Caracter(t) if t.eq_ignore_ascii_case(c));
 
         // Atajos que valen siempre.
+        if mods.ctrl && mods.shift && letra("d") {
+            salida.diagnostico = true;
+            return;
+        }
         if (mods.ctrl && letra("l")) || tecla == Tecla::F6 || (mods.alt && letra("d")) {
             self.empezar_a_editar(self.url_mostrada());
             return;
@@ -931,6 +942,13 @@ impl App {
                     let peticion = self.nuevo_id("app");
                     salida.peticiones.push(json!({ "type": "switch_tab", "id": peticion, "tab_id": id }));
                     self.escribiendo = false;
+                    // Una pestaña dormida se vuelve a cargar al activarla: es una carga de
+                    // verdad (tarda, puede fallar y se puede detener), no un cambio instantáneo.
+                    if let Some(dormida) = self.pestanas.iter().find(|p| p.id == id && p.dormida).cloned() {
+                        self.activa = id;
+                        self.errores.remove(&id);
+                        self.carga = Some(Carga { id: peticion, url: dormida.url });
+                    }
                 }
             }
             Accion::CerrarPestana(id) => {
@@ -1090,8 +1108,10 @@ impl App {
             Some(p) => {
                 p.titulo = estado.titulo.clone();
                 p.url = estado.url.clone();
+                // Si llega su estado, la pestaña tiene página: ya no está dormida.
+                p.dormida = false;
             }
-            None => self.pestanas.push(Pestana { id: estado.pestana, titulo: estado.titulo.clone(), url: estado.url.clone() }),
+            None => self.pestanas.push(Pestana { id: estado.pestana, titulo: estado.titulo.clone(), url: estado.url.clone(), dormida: false }),
         }
         self.asegurar_pestana_visible();
         self.url = estado.url;
@@ -1444,6 +1464,79 @@ mod tests {
     }
 
     #[test]
+    fn el_diagnostico_se_pide_con_el_boton_de_error_y_con_el_atajo() {
+        let (mut app, inicio) = App::nueva(800, 600, Some("noexiste.test".to_string()));
+        let id = inicio.iter().find(|p| tipo(p) == "navigate").unwrap()["id"].as_str().unwrap().to_string();
+        app.manejar(Entrada::Motor(MensajeMotor::Error { id: Some(id), mensaje: "network_error: x".into() }));
+        app.componer();
+        let boton = app.local.as_ref().unwrap().4.regiones.iter().find(|r| r.accion == "diagnostico").unwrap().rect.clone();
+        let salida = app.manejar(Entrada::Clic { x: boton.x + 10.0, y: boton.y + ALTO_BARRA as f32 + 10.0 });
+        assert!(salida.diagnostico && salida.peticiones.is_empty(), "el botón no manda nada al motor");
+        // Con Ctrl+Mayús+D, en cualquier momento.
+        let mut otra = con_pagina();
+        let mods = Modificadores { ctrl: true, shift: true, ..Default::default() };
+        assert!(otra.manejar(Entrada::Tecla { tecla: Tecla::Caracter("D".into()), mods }).diagnostico);
+        // Sin Mayús no es el diagnóstico.
+        let solo_ctrl = Modificadores { ctrl: true, ..Default::default() };
+        assert!(!otra.manejar(Entrada::Tecla { tecla: Tecla::Caracter("d".into()), mods: solo_ctrl }).diagnostico);
+    }
+
+    #[test]
+    fn una_pestana_dormida_se_atenua_y_al_pulsarla_se_carga_como_cualquier_pagina() {
+        let mut app = con_pagina();
+        app.manejar(Entrada::Motor(MensajeMotor::Pestanas {
+            id: None,
+            lista: vec![(0, "Título".into(), "https://e.com/".into(), false), (1, "Vieja".into(), "https://vieja.com/".into(), true), (2, "Activa".into(), "https://a.com/".into(), false)],
+            activa: 2,
+        }));
+        assert_eq!(app.pestanas().iter().map(|p| p.dormida).collect::<Vec<_>>(), [false, true, false]);
+        // En la barra se ve con su propia clase (atenuada).
+        let (html, _) = barra::html(&app.vista(), 900, None);
+        assert!(html.contains("pestana dormida"), "la pestaña dormida se pinta atenuada");
+
+        let salida = app.manejar(Entrada::Clic { x: 0.0, y: 0.0 });
+        assert!(salida.peticiones.is_empty() || tipo(&salida.peticiones[0]) != "switch_tab");
+        let salida = {
+            let mut s = Salida::default();
+            app.ejecutar(Accion::Pestana(1), &mut s);
+            s
+        };
+        assert_eq!(tipo(&salida.peticiones[0]), "switch_tab");
+        assert_eq!(salida.peticiones[0]["tab_id"], 1);
+        assert!(app.cargando(), "recargar una pestaña dormida es una carga: se ve el indicador y se puede detener");
+        assert_eq!(app.destino_en_curso(), Some("https://vieja.com/"));
+        assert_eq!(app.pestana_activa(), 1);
+
+        // Si la red falla, se ve la página de error de ESA pestaña y se puede reintentar.
+        let id = salida.peticiones[0]["id"].as_str().unwrap().to_string();
+        app.manejar(Entrada::Motor(MensajeMotor::Error { id: Some(id), mensaje: "network_error: connection refused".into() }));
+        assert_eq!(app.error_visible().map(|(u, _)| u.as_str()), Some("https://vieja.com/"));
+        assert!(!app.cargando());
+    }
+
+    #[test]
+    fn una_pestana_activa_o_despierta_no_inicia_ninguna_carga_al_pulsarla() {
+        let mut app = con_pagina();
+        app.manejar(Entrada::Motor(MensajeMotor::Pestanas {
+            id: None,
+            lista: vec![(0, "Título".into(), "https://e.com/".into(), false), (1, "Otra".into(), "https://otra.com/".into(), false)],
+            activa: 0,
+        }));
+        let mut s = Salida::default();
+        app.ejecutar(Accion::Pestana(1), &mut s);
+        assert_eq!(tipo(&s.peticiones[0]), "switch_tab");
+        assert!(!app.cargando(), "una pestaña despierta cambia al instante: no es una carga");
+    }
+
+    #[test]
+    fn la_app_sabe_adonde_va_la_carga_en_curso() {
+        let (mut app, _) = App::nueva(800, 600, Some("e.com".to_string()));
+        assert_eq!(app.destino_en_curso(), Some("https://e.com"));
+        app.manejar(tecla(Tecla::Escape));
+        assert_eq!(app.destino_en_curso(), None);
+    }
+
+    #[test]
     fn una_navegacion_cancelada_no_es_un_error() {
         let (mut app, inicio) = App::nueva(800, 600, Some("e.com".to_string()));
         let id = inicio.iter().find(|p| tipo(p) == "navigate").unwrap()["id"].as_str().unwrap().to_string();
@@ -1469,7 +1562,7 @@ mod tests {
         let salida = app.manejar(atajo("t"));
         assert_eq!(tipo(&salida.peticiones[0]), "new_tab");
         assert_eq!(app.editando_direccion(), Some(""));
-        app.manejar(Entrada::Motor(MensajeMotor::Pestanas { id: None, lista: vec![(0, "A".into(), "https://e.com/".into()), (1, String::new(), String::new())], activa: 1 }));
+        app.manejar(Entrada::Motor(MensajeMotor::Pestanas { id: None, lista: vec![(0, "A".into(), "https://e.com/".into(), false), (1, String::new(), String::new(), false)], activa: 1 }));
         assert_eq!(app.pestanas().len(), 2);
         let salida = app.manejar(Entrada::Tecla { tecla: Tecla::Tab, mods: Modificadores { ctrl: true, ..Default::default() } });
         assert_eq!(salida.peticiones[0]["type"], "switch_tab");
@@ -1615,7 +1708,7 @@ mod tests {
         app.manejar(Entrada::Tecla { tecla: Tecla::Caracter("t".into()), mods: Modificadores { ctrl: true, ..Default::default() } });
         app.manejar(Entrada::Motor(MensajeMotor::Pestanas {
             id: None,
-            lista: vec![(0, "Título".into(), "https://e.com/".into()), (1, "Docs".into(), "https://docs.rs/".into())],
+            lista: vec![(0, "Título".into(), "https://e.com/".into(), false), (1, "Docs".into(), "https://docs.rs/".into(), false)],
             activa: 1,
         }));
         escribir(&mut app, "e.com");

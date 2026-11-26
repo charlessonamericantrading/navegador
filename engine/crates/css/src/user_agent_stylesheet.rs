@@ -85,6 +85,10 @@ table { display: table; }
 tr { display: table-row; }
 td { display: table-cell; padding: 1px; }
 th { display: table-cell; padding: 1px; font-weight: bold; text-align: center; }
+center { text-align: center; }
+/* El centrado de <center> alcanza a su texto y a sus bloques, pero NO al contenido de las tablas
+   (Hacker News envuelve toda la pagina en <center><table>: sus celdas siguen a la izquierda). */
+center table { text-align: left; }
 input { width: 170px; height: 21px; border: 1px solid #767676; background-color: #ffffff; }
 input[type="checkbox"], input[type="radio"] { width: 13px; height: 13px; border: 1px solid #767676; background-color: #ffffff; }
 input[type="radio"] { border-radius: 7px; }

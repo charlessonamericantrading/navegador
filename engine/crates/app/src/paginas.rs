@@ -70,11 +70,15 @@ h1 {{ font-size: 26px; font-weight: normal; margin: 0 0 16px 0; }}
 p {{ font-size: 15px; color: #3c4043; margin: 0 0 12px 0; }}
 .detalle {{ font-size: 13px; color: #80868b; margin-bottom: 28px; }}
 #reintentar {{ width: 140px; height: 40px; line-height: 40px; border-radius: 20px; background: #1a73e8; color: #ffffff; font-size: 15px; text-align: center; }}
+#botones {{ display: flex; }}
+#diagnostico {{ width: 140px; height: 40px; line-height: 40px; margin-left: 12px; border-radius: 20px; background: #f1f3f4; color: #202124; font-size: 15px; text-align: center; }}
+.ayuda {{ font-size: 13px; color: #80868b; margin-top: 20px; }}
 </style></head><body><div id="centro">
 <h1>{titulo}</h1>
 <p>{url}</p>
 <p class="detalle">{detalle}</p>
-<div id="reintentar" data-accion="reintentar">Reintentar</div>
+<div id="botones"><div id="reintentar" data-accion="reintentar">Reintentar</div><div id="diagnostico" data-accion="diagnostico">Diagnóstico</div></div>
+<p class="ayuda">Si pasa con todas las webs, pulsa «Diagnóstico»: busca la causa y deja un informe que puedes enviar.</p>
 </div></body></html>"#,
         titulo = escapar(explicar(mensaje)),
         url = escapar(url),
@@ -85,14 +89,20 @@ p {{ font-size: 15px; color: #3c4043; margin: 0 0 12px 0; }}
 /// Una frase clara para el error del motor.
 pub fn explicar(mensaje: &str) -> &'static str {
     let m = mensaje.to_lowercase();
-    if m.contains("timed out") || m.contains("timeout") || m.contains("tiempo") {
+    if m.contains("esquema_no_soportado") {
+        "Este navegador solo abre direcciones http y https (los archivos del equipo, file://, todavía no)"
+    } else if m.contains("timed out") || m.contains("timeout") || m.contains("tiempo") {
         "La página tardó demasiado en responder"
     } else if m.contains("dns") || m.contains("resolve") || m.contains("lookup") || m.contains("no such host") {
         "No se encuentra el sitio"
     } else if m.contains("refused") || m.contains("rechaz") {
         "El sitio rechazó la conexión"
+    } else if m.contains("notvalidyet") || m.contains("not valid yet") {
+        "La fecha del equipo no es correcta: el certificado del sitio aún no es válido"
     } else if m.contains("expired") || m.contains("caducad") || m.contains("expirad") {
-        "El certificado de seguridad del sitio ha caducado"
+        "El certificado del sitio ha caducado (si pasa en todas las webs, revisa la fecha y la hora del equipo)"
+    } else if m.contains("unknownissuer") || m.contains("unknown issuer") {
+        "El certificado del sitio no es de confianza en este equipo (a veces lo causa el antivirus o una red de empresa)"
     } else if m.contains("certificate") || m.contains("tls") || m.contains("certificado") || m.contains("invalid peer") || m.contains("webpki") {
         "La conexión segura con el sitio falló"
     } else if m.contains("url") && (m.contains("invalid") || m.contains("válida") || m.contains("valida")) {
@@ -112,9 +122,31 @@ mod tests {
         assert_eq!(explicar("network_error: operation timed out"), "La página tardó demasiado en responder");
         assert_eq!(
             explicar("network_error: HTTP request failed: client error (Connect): invalid peer certificate: Expired"),
-            "El certificado de seguridad del sitio ha caducado"
+            "El certificado del sitio ha caducado (si pasa en todas las webs, revisa la fecha y la hora del equipo)"
         );
         assert_eq!(explicar("algo raro"), "No se pudo abrir la página");
+    }
+
+    #[test]
+    fn los_errores_de_certificado_se_explican_con_su_causa() {
+        let desconocido = "HTTP request failed: client error (Connect): invalid peer certificate: UnknownIssuer";
+        assert!(explicar(desconocido).contains("antivirus"), "{}", explicar(desconocido));
+        assert!(explicar("invalid peer certificate: NotValidYet").contains("fecha del equipo"));
+        assert!(explicar("invalid peer certificate: Expired").contains("caducado"));
+        assert!(explicar("received fatal alert: HandshakeFailure (tls)").contains("conexión segura"));
+    }
+
+    #[test]
+    fn un_esquema_no_soportado_se_explica_sin_culpar_a_la_red() {
+        let m = "esquema_no_soportado: solo se admiten peticiones http y https (esquema: file)";
+        assert!(explicar(m).contains("http y https"), "{}", explicar(m));
+    }
+
+    #[test]
+    fn la_pagina_de_error_ofrece_el_diagnostico() {
+        let html = error("https://x.com/", "fallo");
+        assert!(html.contains(r#"data-accion="diagnostico""#));
+        assert!(html.contains(r#"data-accion="reintentar""#));
     }
 
     #[test]

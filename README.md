@@ -1,7 +1,7 @@
 # Navegador
 
-> **Reglas del proyecto: [`AGENTS.md`](AGENTS.md).** La aplicación es 100 %
-> Rust y el motor es propio, escrito desde cero.
+> La aplicación es 100 % Rust y el motor es propio, escrito desde cero: no usa
+> ningún motor de navegador ajeno.
 
 Un navegador de escritorio con **motor propio en Rust**: red, HTML, CSS,
 layout, pintado y JavaScript. La ventana, la barra y las pestañas también son
@@ -13,9 +13,8 @@ Rust, y las pinta el mismo motor que pinta las páginas.
 > Linux y macOS todavía no hay sandbox de sistema operativo. Todavía no está
 > pensado para cuentas reales en sitios hostiles.
 >
-> **Qué funciona hoy y cómo medirlo: [`engine/ESTADO.md`](engine/ESTADO.md)**
-> (corto y verificado). Lo que falta, en
-> [`engine/huecos_sin_resolver.md`](engine/huecos_sin_resolver.md).
+> **Qué funciona hoy, qué no y cómo medirlo:
+> [`engine/ESTADO.md`](engine/ESTADO.md)** (corto y verificado).
 
 ---
 
@@ -41,6 +40,10 @@ Atajos: Ctrl+L (barra de direcciones), Ctrl+T (pestaña nueva), Ctrl+W
 Ctrl+D (marcador), Ctrl+R o F5 (recargar), Alt+← / Alt+→ (atrás / adelante),
 Ctrl+C/X/V/A (portapapeles y selección), Tab / Shift+Tab (campos), Escape (detener).
 
+**¿Una página no abre?** Pulsa «Diagnóstico» en la página de error, o `Ctrl+Shift+D`,
+o ejecuta `navegador --diagnostico`: averigua la causa (red, certificados, hora,
+motor) y deja un informe de texto.
+
 También puedes generar un paquete portable con instalador nativo 100 % Rust en Windows (`NavegadorIA-windows.zip`, incluyendo `desinstalar.exe`) ejecutando `scripts/release/empaquetar_windows.ps1`.
 
 ---
@@ -49,7 +52,7 @@ También puedes generar un paquete portable con instalador nativo 100 % Rust en 
 
 | | |
 |---|---|
-| **Aplicación** | Ventana nativa HiDPI (`winit` + `softbuffer`), pestañas (reordenables y con desplazamiento `<`/`>`), historial y marcadores persistentes (`Ctrl+D`), desplegable de autocompletado, cursor dinámico, selección y portapapeles, atrás/adelante, recargar/detener, barra de direcciones (dirección o búsqueda), página de inicio y de error, instalador nativo 100 % Rust |
+| **Aplicación** | Ventana nativa HiDPI (`winit` + `softbuffer`), pestañas (reordenables y con desplazamiento `<`/`>`), historial y marcadores persistentes (`Ctrl+D`), desplegable de autocompletado, pestañas inactivas que se duermen a los 30 min (0 % de CPU y casi sin memoria), cursor dinámico, selección y portapapeles, atrás/adelante, recargar/detener, barra de direcciones (dirección o búsqueda), página de inicio y de error, instalador nativo 100 % Rust |
 | **Red** | HTTP/1.1 y HTTPS (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies, CORS y CSP. La red y las cookies van en un proceso aparte (broker) |
 | **HTML / CSS** | Parseo HTML5, cascada con especificidad, `@media`, variables, `calc()`, `em`/`rem`/`vw`, degradados, atributos HTML clásicos |
 | **Layout** | Bloque, texto en línea partido por palabras, `inline-block`, flex, grid, tablas, `float`, `position` |
@@ -90,8 +93,6 @@ cookies y almacenamiento). El motor y la ventana hablan NDJSON por
 stdin/stdout; el motor pide la red al broker con un token de un solo uso
 ([ADR 0001](docs/adr/0001-broker-y-aislamiento-de-renderers.md)). Si una página
 tumba el motor, la ventana sigue viva.
-
-`engine/ARCHITECTURE.md` es el diario histórico de cómo se llegó aquí.
 
 ---
 

@@ -24,6 +24,9 @@ engine-gfx = { path = "../gfx" }
 engine-layout = { path = "../layout" }
 engine-text = { path = "../text" }
 engine-image = { path = "../image" }
+engine-net = { path = "../net" }
+# Para las comprobaciones de red del diagnóstico (ya está en el árbol).
+tokio.workspace = true
 # Las mismas versiones que ya usa `engine-gfx` para su ventana: no entra
 # ninguna dependencia nueva en el árbol.
 winit = "0.29"

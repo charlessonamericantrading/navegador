@@ -29,6 +29,9 @@ pub struct Pestana {
     pub id: u32,
     pub titulo: String,
     pub url: String,
+    /// El motor liberó su página por llevar tiempo sin usarse: no consume
+    /// nada y se vuelve a cargar al pulsarla. Se ve atenuada.
+    pub dormida: bool,
 }
 
 /// Lo que se puede pulsar en la barra.
@@ -194,7 +197,13 @@ pub fn html(vista: &VistaBarra, ancho: u32, fuente: Option<&SystemFont>) -> (Str
     let varias = vista.pestanas.len() > 1;
     let visibles = &vista.pestanas[inicio_tabs.min(vista.pestanas.len())..fin_tabs.min(vista.pestanas.len())];
     for p in visibles {
-        let clase = if p.id == vista.activa { "pestana activa" } else { "pestana" };
+        let clase = if p.id == vista.activa {
+            "pestana activa"
+        } else if p.dormida {
+            "pestana dormida"
+        } else {
+            "pestana"
+        };
         let titulo = if p.titulo.trim().is_empty() {
             if p.url.is_empty() { "Nueva pestaña" } else { p.url.as_str() }
         } else {
@@ -257,6 +266,7 @@ body {{ margin: 0; font-family: sans-serif; background: #dfe3e8; }}
 #pestanas {{ display: flex; height: {alto_pestanas}px; padding-left: 8px; }}
 .pestana {{ display: flex; width: {tw}px; height: 30px; margin-top: 6px; margin-right: 2px; border-radius: 8px; color: #3c4043; font-size: 12px; }}
 .activa {{ background: #ffffff; color: #202124; }}
+.dormida {{ color: #9aa0a6; }}
 .titulo {{ box-sizing: border-box; height: 30px; padding-left: 12px; line-height: 30px; white-space: nowrap; }}
 .cerrar {{ width: 16px; height: 16px; margin-top: 7px; border-radius: 8px; }}
 .desp {{ box-sizing: border-box; width: 28px; height: 28px; padding: 5px; margin-top: 4px; margin-right: 4px; border-radius: 14px; }}
@@ -426,7 +436,7 @@ mod tests {
 
     fn vista(pestanas: usize) -> VistaBarra {
         VistaBarra {
-            pestanas: (0..pestanas as u32).map(|id| Pestana { id, titulo: format!("Página {id}"), url: format!("https://e{id}.com") }).collect(),
+            pestanas: (0..pestanas as u32).map(|id| Pestana { id, titulo: format!("Página {id}"), url: format!("https://e{id}.com"), dormida: false }).collect(),
             activa: 0,
             desplazamiento_pestanas: 0,
             direccion: "https://e0.com".to_string(),

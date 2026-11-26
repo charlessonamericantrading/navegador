@@ -294,6 +294,10 @@ pub struct TabInfo {
     pub id: u32,
     pub title: String,
     pub url: String,
+    /// La pestaña lleva tiempo sin usarse y el motor liberó su página (DOM,
+    /// JavaScript, imágenes). Conserva dirección, título e historial y se
+    /// vuelve a cargar al activarla.
+    pub discarded: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

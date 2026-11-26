@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Banco de medidas del motor: una tabla con lo que de verdad tarda cada pagina.
 
-Herramienta de desarrollo (tarea 0.4 de PLAN_SONNET.md). Pasa por los dos
+Herramienta de desarrollo. Pasa por los dos
 fixtures locales y por cuatro paginas reales, mide navegar, scroll, clic en
 zona vacia y redimensionar, y sale con error si alguna operacion supera su
 limite. Sirve para comprobar con numeros que un cambio ayuda o estropea.
