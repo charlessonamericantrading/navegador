@@ -89,7 +89,9 @@ p {{ font-size: 15px; color: #3c4043; margin: 0 0 12px 0; }}
 /// Una frase clara para el error del motor.
 pub fn explicar(mensaje: &str) -> &'static str {
     let m = mensaje.to_lowercase();
-    if m.contains("timed out") || m.contains("timeout") || m.contains("tiempo") {
+    if m.contains("esquema_no_soportado") {
+        "Este navegador solo abre direcciones http y https (los archivos del equipo, file://, todavía no)"
+    } else if m.contains("timed out") || m.contains("timeout") || m.contains("tiempo") {
         "La página tardó demasiado en responder"
     } else if m.contains("dns") || m.contains("resolve") || m.contains("lookup") || m.contains("no such host") {
         "No se encuentra el sitio"
@@ -132,6 +134,12 @@ mod tests {
         assert!(explicar("invalid peer certificate: NotValidYet").contains("fecha del equipo"));
         assert!(explicar("invalid peer certificate: Expired").contains("caducado"));
         assert!(explicar("received fatal alert: HandshakeFailure (tls)").contains("conexión segura"));
+    }
+
+    #[test]
+    fn un_esquema_no_soportado_se_explica_sin_culpar_a_la_red() {
+        let m = "esquema_no_soportado: solo se admiten peticiones http y https (esquema: file)";
+        assert!(explicar(m).contains("http y https"), "{}", explicar(m));
     }
 
     #[test]

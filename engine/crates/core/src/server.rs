@@ -1520,7 +1520,21 @@ impl EngineServer {
     async fn fetch_images(&self, srcs: Vec<String>, page_url: &url::Url, deadline: tokio::time::Instant) -> ImageMap {
         let mut unique_urls: Vec<String> = Vec::new();
         let mut raws_by_url: HashMap<String, Vec<String>> = HashMap::new();
+        let mut fetched = ImageMap::new();
         for raw in srcs {
+            // Imagen incrustada (`data:`): los bytes ya vienen en la propia
+            // direccion, asi que no hay red que tocar.
+            if is_data_url(&raw) {
+                if let std::collections::hash_map::Entry::Vacant(hueco) = fetched.entry(raw) {
+                    match decode_data_url(hueco.key()).and_then(|bytes| decode_image(&bytes)) {
+                        Some(image) => {
+                            hueco.insert(image);
+                        }
+                        None => tracing::warn!("[server] imagen data: no valida o demasiado grande, se omite"),
+                    }
+                }
+                continue;
+            }
             let Ok(absolute) = page_url.join(&raw) else {
                 tracing::warn!("[server] <img src> con URL invalida, se omite: {raw}");
                 continue;
@@ -1542,7 +1556,6 @@ impl EngineServer {
                 });
         }
 
-        let mut fetched = ImageMap::new();
         for (abs_url, response) in self.fetch_subresources(unique_urls, page_url, "<img src>", deadline).await {
             match decode_image(&response.body) {
                 Some(image) => {
@@ -3142,6 +3155,53 @@ fn collect_form_data(
 /// de `EngineServer::submit_form` (que SI navega de verdad) a proposito:
 /// es logica pura sobre strings/URLs, sin tocar `self` ni la red, y por
 /// tanto se puede probar sin levantar ninguna pagina.
+/// Tamano maximo de una imagen `data:` (evita que una pagina gaste memoria
+/// con una direccion enorme).
+const MAX_DATA_URL_BYTES: usize = 8 * 1024 * 1024;
+
+/// `true` si el valor es una direccion `data:`.
+fn is_data_url(raw: &str) -> bool {
+    raw.trim_start().get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:"))
+}
+
+/// Saca los bytes de una direccion `data:[<tipo>][;base64],<datos>`.
+/// `None` si esta mal formada o pasa del limite.
+fn decode_data_url(raw: &str) -> Option<Vec<u8>> {
+    let rest = raw.trim_start().get(5..)?;
+    let (meta, data) = rest.split_once(',')?;
+    if data.len() > MAX_DATA_URL_BYTES * 2 {
+        return None;
+    }
+    let es_base64 = meta.rsplit(';').next().is_some_and(|m| m.trim().eq_ignore_ascii_case("base64"));
+    let bytes = if es_base64 {
+        let limpio: String = percent_decode(data.as_bytes()).iter().filter(|b| !b.is_ascii_whitespace()).map(|&b| b as char).collect();
+        let limpio = limpio.trim_end_matches('=');
+        base64::engine::general_purpose::STANDARD_NO_PAD.decode(limpio).ok()?
+    } else {
+        percent_decode(data.as_bytes())
+    };
+    (bytes.len() <= MAX_DATA_URL_BYTES).then_some(bytes)
+}
+
+/// Deshace los `%XX` de una cadena de bytes.
+fn percent_decode(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' && i + 2 < input.len() {
+            let hex = |b: u8| (b as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(input[i + 1]), hex(input[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    out
+}
+
 fn build_get_submit_url(page_url_str: &str, action_attr: Option<&str>, data: &[(String, String)]) -> Result<url::Url, String> {
     let mut target_url = resolve_submit_action(page_url_str, action_attr)?;
     target_url
@@ -5839,6 +5899,37 @@ mod tests {
         assert!(images.contains_key("/logo.svg"));
         assert!(images.contains_key("./logo.svg"));
         assert!(std::sync::Arc::ptr_eq(&images["/logo.svg"], &images["./logo.svg"]));
+    }
+
+    #[test]
+    fn a_data_url_is_decoded_with_or_without_base64() {
+        assert_eq!(decode_data_url("data:text/plain,hola%20mundo").unwrap(), b"hola mundo");
+        assert_eq!(decode_data_url("data:text/plain;base64,aG9sYQ==").unwrap(), b"hola");
+        assert_eq!(decode_data_url("data:text/plain;base64,aG9sYQ").unwrap(), b"hola", "sin relleno tambien");
+        assert_eq!(decode_data_url("data:;base64,aG9s\nYQ==").unwrap(), b"hola", "con saltos de linea");
+        assert_eq!(decode_data_url("DATA:,%zz%4").unwrap(), b"%zz%4", "un % suelto se deja tal cual");
+        assert!(decode_data_url("data:image/png;base64,@@@@").is_none());
+        assert!(decode_data_url("data:sin-coma").is_none());
+        assert!(is_data_url("  Data:image/png;base64,AAAA"));
+        assert!(!is_data_url("https://x.com/data:"));
+    }
+
+    #[tokio::test]
+    async fn embedded_data_images_load_without_touching_the_network() {
+        let server = server_with_budget(2_000, 10_000);
+        // Ningun servidor escucha: si intentara la red, fallaria.
+        let page_url = url::Url::parse("http://127.0.0.1:9/").unwrap();
+        let deadline = tokio::time::Instant::now() + server.subresource_budget;
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="#00ff00"/></svg>"##;
+        let en_base64 = format!("data:image/svg+xml;base64,{}", base64::engine::general_purpose::STANDARD.encode(svg));
+        let en_texto = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E%3Crect width='4' height='4' fill='red'/%3E%3C/svg%3E".to_string();
+        let roto = "data:image/png;base64,AAAA".to_string();
+        let images = server
+            .fetch_images(vec![en_base64.clone(), en_base64.clone(), en_texto.clone(), roto.clone()], &page_url, deadline)
+            .await;
+        assert_eq!(images[&en_base64].width, 8);
+        assert_eq!(images[&en_texto].width, 4);
+        assert!(!images.contains_key(&roto), "una imagen rota se omite sin romper el resto");
     }
 
     #[tokio::test]

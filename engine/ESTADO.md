@@ -58,6 +58,17 @@ cargo run --release -p navegador -- --captura v.png news.ycombinator.com   # sin
   Bloc de notas. Los fallos del motor quedan en `registro.txt` (misma carpeta de
   datos; las direcciones van sin consulta). Si la ventana no puede arrancar, en
   Windows sale un aviso con la causa.
+- **Bajo consumo (pestañas dormidas):** una pestaña que no se toca durante
+  **30 minutos** se descarta: el motor libera su página (DOM, estilos, cajas,
+  JavaScript y fuentes) y devuelve la memoria al sistema; en la barra se ve
+  en gris. Al hacer clic en ella se vuelve a cargar la misma entrada del
+  historial (sin añadir una nueva) y recupera el scroll. No se duerme la
+  pestaña activa ni una con texto escrito a medias. Cambiar el tiempo:
+  `NAVEGADOR_IA_DESCARTE_SEGUNDOS` (`0` lo desactiva). Sin nada que hacer, el
+  motor **duerme hasta el próximo plazo** (temporizador de JavaScript, descarte
+  o limpieza), así que una pestaña quieta gasta 0,00 % de CPU. Medido en Linux
+  (2026-11-26, release): 10 pestañas con páginas grandes, 628 MiB → 83 MiB con
+  9 dormidas; reabrir una dormida tarda ~1,1 s. No probado todavía en Windows.
 - **Certificados:** el motor confía en los que lleva incluidos **más** los
   instalados en el sistema (almacén de Windows, llavero de macOS, `SSL_CERT_FILE`
   y `/etc/ssl` en Linux). Sin esto, un antivirus que revisa las conexiones
@@ -102,9 +113,13 @@ pestaña (AppContainer en Windows; sandbox de procesos en Linux y macOS).
   se aplican en orden de documento.
 - **Layout:** bloque, texto en línea con partición por palabras entre elementos
   (un enlace en mitad de un párrafo no rompe la línea), `inline-block` con
-  tamaño, flex, grid, tablas, `float`, `position`.
+  tamaño (sin `width` se ajusta a su contenido y parte el texto si no cabe),
+  flex, grid, tablas, `float`, `position`, y `<center>` (centra su contenido;
+  las tablas de dentro conservan el texto a la izquierda).
 - **Pintado:** lienzo blanco, escalado HiDPI nativo, imágenes (PNG, JPEG, GIF,
-  WebP, SVG), `<textarea>` multilínea, resaltado de selección, anillo de foco y
+  WebP, SVG; también incrustadas con `data:`, hasta 8 MiB), fondos con imagen
+  y `background-position`/`-size`/`-repeat` (botones de «sprite» como los de
+  Google), `<textarea>` multilínea, resaltado de selección, anillo de foco y
   cursor en campos con el teclado.
 - **JavaScript (Boa 0.22):** `getElementsByTagName/ClassName`, eventos
   `DOMContentLoaded` y `load`, `fetch`, XHR, `localStorage`. Límite de 10
@@ -130,8 +145,9 @@ pestaña (AppContainer en Windows; sandbox de procesos en Linux y macOS).
 - **Inline:** `inline-block` se alinea por arriba, no por la línea de base;
   `box-sizing` se trata como `content-box` ahí; `text-align` con un texto
   partido en varias líneas solo es exacto alineado a la izquierda.
-- **Degradados:** solo `linear-gradient` (sin `radial`, `conic` ni `repeating`),
-  una sola capa de fondo, y sin `background-size`/`position`/`repeat`.
+- **Fondos:** degradados solo `linear-gradient` (sin `radial`, `conic` ni
+  `repeating`); una sola capa de fondo; `background-origin` siempre es el
+  relleno (`padding-box`).
 - **Fuentes:** tres familias (sans, serifa, monoespaciada) con las fuentes del
   sistema; sin fuentes web. Si el sistema no tiene la familia, sale en sans.
 - **Red:** sin HTTP/2 ni caché; el `User-Agent` es `NextGenWebEngine/0.1.0`.

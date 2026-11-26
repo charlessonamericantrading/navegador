@@ -52,7 +52,7 @@ También puedes generar un paquete portable con instalador nativo 100 % Rust en 
 
 | | |
 |---|---|
-| **Aplicación** | Ventana nativa HiDPI (`winit` + `softbuffer`), pestañas (reordenables y con desplazamiento `<`/`>`), historial y marcadores persistentes (`Ctrl+D`), desplegable de autocompletado, cursor dinámico, selección y portapapeles, atrás/adelante, recargar/detener, barra de direcciones (dirección o búsqueda), página de inicio y de error, instalador nativo 100 % Rust |
+| **Aplicación** | Ventana nativa HiDPI (`winit` + `softbuffer`), pestañas (reordenables y con desplazamiento `<`/`>`), historial y marcadores persistentes (`Ctrl+D`), desplegable de autocompletado, pestañas inactivas que se duermen a los 30 min (0 % de CPU y casi sin memoria), cursor dinámico, selección y portapapeles, atrás/adelante, recargar/detener, barra de direcciones (dirección o búsqueda), página de inicio y de error, instalador nativo 100 % Rust |
 | **Red** | HTTP/1.1 y HTTPS (`hyper` + `rustls`), redirecciones, gzip/deflate/brotli, cookies, CORS y CSP. La red y las cookies van en un proceso aparte (broker) |
 | **HTML / CSS** | Parseo HTML5, cascada con especificidad, `@media`, variables, `calc()`, `em`/`rem`/`vw`, degradados, atributos HTML clásicos |
 | **Layout** | Bloque, texto en línea partido por palabras, `inline-block`, flex, grid, tablas, `float`, `position` |
