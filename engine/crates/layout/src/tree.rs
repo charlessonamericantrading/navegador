@@ -3832,8 +3832,9 @@ impl LayoutTreeBuilder {
     /// ver `flow_inline_run` para la logica de ajuste de linea.
     /// `display: inline-block` con `width` o `height` explicitos (tarea 2.3).
     fn is_sized_inline_block(computed_style: &HashMap<String, String>) -> bool {
+        // Cualquier `inline-block` es una caja atomica en la linea, tenga tamaño o no: sin
+        // `width` se ajusta a su contenido (`place_sized_inline_block`).
         computed_style.get("display").map(String::as_str) == Some("inline-block")
-            && (computed_style.contains_key("width") || computed_style.contains_key("height"))
     }
 
     /// Coloca un `inline-block` con tamaño explicito como una caja atomica en
@@ -3854,9 +3855,15 @@ impl LayoutTreeBuilder {
         let horizontal_extras = padding.left + padding.right + border.left + border.right;
         let vertical_extras = padding.top + padding.bottom + border.top + border.bottom;
 
+        // Sin `width`, la caja se AJUSTA A SU CONTENIDO (shrink-to-fit): lo que pida su
+        // contenido, sin pasar de lo que queda de la linea. Antes un `display:inline-block`
+        // sin ancho se trataba como un inline normal y sus hijos de bloque ocupaban TODA
+        // la linea (los botones de la pagina de inicio de Google eran barras de lado a lado).
+        let max_content = explicit_width.is_none().then(|| (measure_intrinsic_width(node, IntrinsicWidth::Max, font_set, images) - horizontal_extras).max(0.0));
+
         // Salto de linea previo: solo si el ancho se conoce de antemano y no
         // cabe en lo que queda de la linea (que ya tiene algo).
-        if let Some(width) = explicit_width {
+        if let Some(width) = explicit_width.or(max_content) {
             let remaining = origin_x + inner_width - *cursor_x;
             if width + horizontal_extras + margin.left + margin.right > remaining && *cursor_x > origin_x {
                 *cursor_y += *line_extent;
@@ -3870,7 +3877,7 @@ impl LayoutTreeBuilder {
         let content_x = box_x + border.left + padding.left;
         let content_y = box_y + border.top + padding.top;
         let available = (origin_x + inner_width - content_x - padding.right - border.right - margin.right).max(0.0);
-        let content_limit = explicit_width.unwrap_or(available);
+        let content_limit = explicit_width.unwrap_or_else(|| max_content.unwrap_or(available).min(available));
 
         // Los hijos se reparten en un contexto de linea propio: su ancho es el
         // de esta caja, no el de la linea que la contiene.
@@ -6215,6 +6222,65 @@ mod tests {
 
         assert_eq!(text_box.computed_style.get("text-align").map(String::as_str), Some("center"), "text-align deberia heredarse, ahora que esta en INHERITABLE_PROPERTIES");
         assert_eq!(text_box.computed_style.get("line-height").map(String::as_str), Some("1.5"), "line-height deberia heredarse, sin resolver la unidad (se propaga el valor crudo)");
+    }
+
+    /// `<center>` no hacia nada (la hoja del navegador no lo conocia): la pagina de
+    /// inicio de Google y medio web antigua se veian pegadas a la izquierda.
+    /// El boton de la pagina de inicio de Google: un `inline-block` sin ancho con un
+    /// bloque dentro. Debe ajustarse a su contenido, no ocupar toda la linea.
+    #[test]
+    fn an_inline_block_without_width_shrinks_to_its_content_instead_of_filling_the_line() {
+        let html = r#"<html><body style="margin:0"><div style="text-align:center"><span id="ib" style="display:inline-block"><span style="display:block;height:20px;border:1px solid #333">ajusta</span></span></div></body></html>"#;
+        let dom = HtmlParser::parse(html);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 800.0, 600.0, None, &ImageMap::new());
+        let ib = find_box_with_style(&root, "display").and_then(|_| find_inline_block(&root)).expect("debia existir el inline-block");
+        assert!(ib.dimensions.width > 20.0 && ib.dimensions.width < 200.0, "se ajusta al texto 'ajusta', no a los 800 px de la linea: {}", ib.dimensions.width);
+        let left = ib.dimensions.x;
+        let right = 800.0 - (ib.dimensions.x + ib.dimensions.width);
+        assert!((left - right).abs() < 3.0, "y como la linea esta centrada, queda en medio: {left} / {right}");
+    }
+
+    fn find_inline_block(root: &LayoutBox) -> Option<&LayoutBox> {
+        if root.computed_style.get("display").map(String::as_str) == Some("inline-block") {
+            return Some(root);
+        }
+        root.children.iter().find_map(find_inline_block)
+    }
+
+    #[test]
+    fn an_inline_block_wider_than_the_line_wraps_its_text_inside_the_available_width() {
+        let texto = "palabra ".repeat(60);
+        let html = format!(r#"<html><body style="margin:0"><span style="display:inline-block">{texto}</span></body></html>"#);
+        let dom = HtmlParser::parse(&html);
+        let font_set = FontSet::load_default_sans_serif();
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 300.0, 600.0, Some(&font_set), &ImageMap::new());
+        let ib = find_inline_block(&root).expect("debia existir el inline-block");
+        assert!(ib.dimensions.width <= 300.0 + 0.5, "no se sale de la linea: {}", ib.dimensions.width);
+        assert!(ib.dimensions.height > 40.0, "el texto se reparte en varias lineas dentro de la caja: alto {}", ib.dimensions.height);
+    }
+
+    /// Hacker News (y mucha web antigua) envuelve la pagina en `<center><table>`: la tabla se
+    /// centra, pero el texto de sus celdas NO.
+    #[test]
+    fn a_table_inside_center_keeps_its_cell_text_left_aligned() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><center><table width="400"><tr><td>celda</td></tr></table><p>suelto</p></center></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 800.0, 600.0, None, &ImageMap::new());
+        let celda = find_text_box(&root, "celda").expect("texto de la celda");
+        assert_eq!(celda.computed_style.get("text-align").map(String::as_str), Some("left"), "las celdas no heredan el centrado");
+        let suelto = find_text_box(&root, "suelto").expect("texto fuera de la tabla");
+        assert_eq!(suelto.computed_style.get("text-align").map(String::as_str), Some("center"), "pero el texto suelto de <center> si se centra");
+    }
+
+    #[test]
+    fn the_center_tag_centers_the_content_of_its_descendants() {
+        let dom = HtmlParser::parse(r#"<html><body style="margin:0"><center><div><span>anidado</span></div></center></body></html>"#);
+        let root = LayoutTreeBuilder::build(&dom, &CssParser::parse(""), 800.0, 600.0, None, &ImageMap::new());
+        let text_box = find_text_box(&root, "anidado").expect("deberia existir una caja de texto 'anidado'");
+        assert_eq!(text_box.computed_style.get("text-align").map(String::as_str), Some("center"), "el centrado de <center> se hereda");
+        let left = text_box.dimensions.x;
+        let right = 800.0 - (text_box.dimensions.x + text_box.dimensions.width);
+        assert!(left > 100.0, "el texto no esta pegado a la izquierda: x = {left}");
+        assert!((left - right).abs() < 2.0, "queda centrado: {left} a la izquierda y {right} a la derecha");
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! `overflow: hidden` (Fase 3.5) se añaden aqui, una sola vez.
 
 use crate::display_list::{DisplayItem, Gradient, GradientDirection, StopPosition, TextAlign};
-use crate::image_paint::{paint_background_image_scaled, paint_image};
+use crate::image_paint::{paint_background_placed, paint_image};
 use engine_layout::Rect;
 use engine_text::{baseline_offset, measure_text, shape_text, underline_metrics, wrap_text_from, FontFamily, FontSet, SystemFont};
 use tiny_skia::{FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Rect as SkiaRect, Stroke, Transform};
@@ -102,11 +102,11 @@ pub fn paint_display_list_scaled(pixmap: &mut Pixmap, items: &[DisplayItem], fon
             DisplayItem::Image { rect, image } => {
                 paint_image(pixmap, &scale_rect(rect, scale), image, scroll_px, current_mask.as_ref());
             }
-            DisplayItem::BackgroundImage { rect, image } => {
+            DisplayItem::BackgroundImage { rect, image, placement } => {
                 let mut own_clip = clip_stack.clone();
                 own_clip.push(scale_rect(rect, scale));
                 let mask = build_clip_mask(width, height, &own_clip, scroll_px);
-                paint_background_image_scaled(pixmap, rect, image, scroll_px / scale, mask.as_ref(), scale);
+                paint_background_placed(pixmap, rect, image, placement, scroll_px / scale, mask.as_ref(), scale);
             }
         }
     }

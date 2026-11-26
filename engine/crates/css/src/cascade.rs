@@ -299,6 +299,19 @@ mod tests {
     }
 
     #[test]
+    fn the_center_tag_centers_its_text_and_what_is_inside_it() {
+        // Sin esta regla `<center>` no hacia nada: la pagina de inicio de Google (y
+        // medio web antigua) se veia pegada a la izquierda.
+        let doc = r##"<html><body><center id="c">texto<div id="d"><p id="p">dentro</p></div></center></body></html>"##;
+        let style = style_of(doc, "center", "");
+        assert_eq!(style.get("text-align").map(String::as_str), Some("center"));
+        // (Que sus hijos lo heredan lo prueba `engine-layout`, que es quien hereda.)
+        // Una regla del autor sigue ganando.
+        let style = style_of(doc, "center", "center { text-align: left }");
+        assert_eq!(style.get("text-align").map(String::as_str), Some("left"));
+    }
+
+    #[test]
     fn align_and_center_and_font_attributes() {
         let p = style_of(r##"<html><body><p align="center">x</p></body></html>"##, "p", "");
         assert_eq!(p.get("text-align").map(String::as_str), Some("center"));

@@ -599,6 +599,16 @@ fn insert_declaration(declarations: &mut HashMap<String, String>, name: String, 
         if let Some(image) = background_image_candidate(&value) {
             declarations.insert("background-image".to_string(), image);
         }
+        // Posicion, repeticion y tamaño: el shorthand los REINICIA a su valor inicial
+        // cuando no se nombran (un `background: url(b.png)` posterior a una regla con
+        // `no-repeat` vuelve a repetir), asi que se emiten siempre que haya imagen o
+        // alguno de ellos.
+        let layer = background_layer_parts(&value);
+        if value.to_ascii_lowercase().contains("url(") || layer.position.is_some() || layer.repeat.is_some() || layer.size.is_some() {
+            declarations.insert("background-position".to_string(), layer.position.unwrap_or_else(|| "0% 0%".to_string()));
+            declarations.insert("background-repeat".to_string(), layer.repeat.unwrap_or_else(|| "repeat".to_string()));
+            declarations.insert("background-size".to_string(), layer.size.unwrap_or_else(|| "auto".to_string()));
+        }
     }
     if name == "padding" || name == "margin" {
         expand_box_shorthand(declarations, &name, &value);
@@ -676,6 +686,99 @@ fn expand_flex_shorthand(declarations: &mut HashMap<String, String>, value: &str
     declarations.insert("flex-grow".to_string(), grow.to_string());
     declarations.insert("flex-shrink".to_string(), shrink.to_string());
     declarations.insert("flex-basis".to_string(), basis.to_string());
+}
+
+/// Lo que el shorthand `background` dice de posicion, repeticion y tamaño de
+/// la imagen (una sola capa).
+#[derive(Debug, Default, PartialEq)]
+struct BackgroundLayerParts {
+    position: Option<String>,
+    repeat: Option<String>,
+    size: Option<String>,
+}
+
+/// Trocea por espacios SIN romper lo que va entre parentesis (`url(a b.png)`,
+/// `rgba(0, 0, 0, .5)`) ni separar la `/` que divide posicion y tamaño.
+fn split_background_tokens(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    for c in value.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(c);
+            }
+            '/' if depth == 0 => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                tokens.push("/".to_string());
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// ¿Es un trozo valido de `background-position` (una palabra de lado o una
+/// longitud/porcentaje, que puede ser negativa)?
+fn is_background_position_token(token: &str) -> bool {
+    let t = token.to_ascii_lowercase();
+    if matches!(t.as_str(), "left" | "right" | "top" | "bottom" | "center") {
+        return true;
+    }
+    if t == "0" {
+        return true;
+    }
+    ["px", "%", "em", "rem"].iter().any(|unit| t.strip_suffix(unit).is_some_and(|n| n.parse::<f32>().is_ok()))
+}
+
+/// Posicion, repeticion y tamaño del shorthand `background`: `url(x) 0 -261px
+/// repeat-x`, `center / cover no-repeat`...
+fn background_layer_parts(value: &str) -> BackgroundLayerParts {
+    let mut parts = BackgroundLayerParts::default();
+    let (mut position, mut size): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let mut after_slash = false;
+    for token in split_background_tokens(value) {
+        if token == "/" {
+            after_slash = true;
+            continue;
+        }
+        let lower = token.to_ascii_lowercase();
+        if token.contains('(') {
+            continue; // url(...), gradientes y colores con funcion
+        }
+        if matches!(lower.as_str(), "repeat" | "repeat-x" | "repeat-y" | "no-repeat" | "space" | "round") {
+            // `center / cover no-repeat`: la repeticion puede ir despues del tamaño.
+            parts.repeat = Some(lower);
+            after_slash = false;
+        } else if after_slash && size.len() < 2 && (matches!(lower.as_str(), "auto" | "cover" | "contain") || is_background_position_token(&token)) {
+            size.push(lower);
+        } else if is_background_position_token(&token) {
+            after_slash = false;
+            position.push(lower);
+        }
+    }
+    if !position.is_empty() && position.len() <= 4 {
+        parts.position = Some(position.join(" "));
+    }
+    if !size.is_empty() && size.len() <= 2 {
+        parts.size = Some(size.join(" "));
+    }
+    parts
 }
 
 /// Palabras clave del shorthand `background` que NUNCA son un color -
@@ -1376,5 +1479,46 @@ mod shorthand_expansion_tests {
     fn values_with_parentheses_are_left_alone_instead_of_being_split() {
         let d = decls("div { padding: calc(10px + 2px) 4px; }");
         assert!(!d.contains_key("padding-top"), "no deberia inventar longhands a partir de un calc()");
+    }
+
+    #[test]
+    fn background_shorthand_extracts_position_repeat_and_size_of_a_sprite() {
+        // El boton de Google: una franja de un sprite repetida en horizontal.
+        let hoja = CssParser::parse(".lsb { background: url(/images/nav_logo229.png) 0 -261px repeat-x; color: #1f1f1f }");
+        let d = &hoja.rules[0].declarations;
+        assert_eq!(d.get("background-position").map(String::as_str), Some("0 -261px"));
+        assert_eq!(d.get("background-repeat").map(String::as_str), Some("repeat-x"));
+        assert_eq!(d.get("background-size").map(String::as_str), Some("auto"));
+        assert!(d.get("background-image").is_some_and(|v| v.contains("nav_logo229.png")));
+    }
+
+    #[test]
+    fn background_shorthand_reads_size_after_the_slash_and_ignores_colors() {
+        let d = &CssParser::parse("a { background: #fff url(a.png) center / cover no-repeat }").rules[0].declarations;
+        assert_eq!(d.get("background-position").map(String::as_str), Some("center"));
+        assert_eq!(d.get("background-size").map(String::as_str), Some("cover"));
+        assert_eq!(d.get("background-repeat").map(String::as_str), Some("no-repeat"));
+        assert_eq!(d.get("background-color").map(String::as_str), Some("#fff"));
+        let d = &CssParser::parse("a { background: rgba(0, 0, 0, .5) url(a.png) 10px 20px / 50% auto }").rules[0].declarations;
+        assert_eq!(d.get("background-position").map(String::as_str), Some("10px 20px"));
+        assert_eq!(d.get("background-size").map(String::as_str), Some("50% auto"));
+    }
+
+    #[test]
+    fn the_background_shorthand_resets_position_repeat_and_size_when_it_names_an_image() {
+        let d = &CssParser::parse("a { background: url(b.png) }").rules[0].declarations;
+        assert_eq!(d.get("background-repeat").map(String::as_str), Some("repeat"), "sin nombrarlo vuelve al valor inicial");
+        assert_eq!(d.get("background-position").map(String::as_str), Some("0% 0%"));
+        // Un color solo no toca nada de lo demas.
+        let d = &CssParser::parse("a { background: #eee }").rules[0].declarations;
+        assert!(d.get("background-repeat").is_none() && d.get("background-position").is_none());
+    }
+
+    #[test]
+    fn the_longhands_pass_through_unchanged() {
+        let d = &CssParser::parse("a { background-position: right 10px bottom 5px; background-repeat: no-repeat; background-size: contain }").rules[0].declarations;
+        assert_eq!(d.get("background-position").map(String::as_str), Some("right 10px bottom 5px"));
+        assert_eq!(d.get("background-repeat").map(String::as_str), Some("no-repeat"));
+        assert_eq!(d.get("background-size").map(String::as_str), Some("contain"));
     }
 }
