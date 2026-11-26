@@ -13,6 +13,8 @@ pub struct Sesion {
     app: App,
     motor: Motor,
     mensajes: Receiver<MensajeMotor>,
+    /// Si es verdadero, los errores del motor se apuntan en el registro.
+    registrar: bool,
 }
 
 impl Sesion {
@@ -26,7 +28,14 @@ impl Sesion {
         for peticion in &peticiones {
             motor.enviar(peticion)?;
         }
-        Ok(Self { app, motor, mensajes })
+        Ok(Self { app, motor, mensajes, registrar: false })
+    }
+
+    /// Apunta en el registro los errores del motor (las pruebas no lo piden para no ensuciar la carpeta de datos).
+    #[must_use]
+    pub fn con_registro(mut self) -> Self {
+        self.registrar = true;
+        self
     }
 
     pub fn app(&self) -> &App {
@@ -56,6 +65,9 @@ impl Sesion {
             }
             match self.mensajes.recv_timeout(resto) {
                 Ok(mensaje) => {
+                    if self.registrar {
+                        crate::registro::mensaje_del_motor(&mensaje, self.app.destino_en_curso().or(Some(self.app.url())).filter(|u| !u.is_empty()));
+                    }
                     if self.entrada(Entrada::Motor(mensaje)).is_err() {
                         return condicion(&self.app);
                     }
@@ -84,7 +96,7 @@ impl Sesion {
 pub fn capturar(ruta: &Path, url: Option<String>, ancho: u32, alto: u32, limite: Duration) -> Result<String, String> {
     let ejecutable = std::env::current_exe().map_err(|e| e.to_string())?;
     let inicio = Instant::now();
-    let mut sesion = Sesion::nueva(&ejecutable, ancho, alto, url).map_err(|e| format!("no se pudo arrancar el motor: {e}"))?;
+    let mut sesion = Sesion::nueva(&ejecutable, ancho, alto, url).map_err(|e| format!("no se pudo arrancar el motor: {e}"))?.con_registro();
     let listo = sesion.esperar_reposo(limite);
     let marco = sesion.componer();
     marco.save_png(ruta).map_err(|e| format!("no se pudo guardar {}: {e}", ruta.display()))?;

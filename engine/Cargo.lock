@@ -2282,10 +2282,12 @@ dependencies = [
  "engine-gfx",
  "engine-image",
  "engine-layout",
+ "engine-net",
  "engine-text",
  "serde_json",
  "softbuffer",
  "tiny-skia",
+ "tokio",
  "url",
  "winit",
 ]

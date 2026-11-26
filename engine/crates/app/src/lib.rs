@@ -12,12 +12,15 @@
 //!   `sin_ventana` la usa sin pantalla (capturas y pruebas de extremo a extremo).
 
 pub mod app;
+pub mod aviso;
 pub mod barra;
 pub mod datos;
+pub mod diagnostico;
 pub mod direccion;
 pub mod lienzo;
 pub mod motor;
 pub mod paginas;
+pub mod registro;
 pub mod portapapeles;
 pub mod sin_ventana;
 pub mod ventana;

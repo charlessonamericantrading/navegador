@@ -79,6 +79,8 @@ pub enum Entrada {
 pub struct Salida {
     pub peticiones: Vec<Value>,
     pub redibujar: bool,
+    /// El usuario pidió el diagnóstico (botón de la página de error o Ctrl+Mayús+D).
+    pub diagnostico: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +239,10 @@ impl App {
     }
     pub fn titulo(&self) -> &str {
         &self.titulo
+    }
+    /// Adónde va la carga en curso (vacío si no se sabe: atrás, adelante, un enlace).
+    pub fn destino_en_curso(&self) -> Option<&str> {
+        self.carga.as_ref().map(|c| c.url.as_str()).filter(|u| !u.is_empty())
     }
     pub fn cargando(&self) -> bool {
         self.carga.is_some()
@@ -504,6 +510,7 @@ impl App {
             let accion = self.local.as_ref().and_then(|(_, _, _, _, l)| lienzo::accion_en(&l.regiones, cx, cy)).map(str::to_string);
             match accion.as_deref() {
                 Some("reintentar") => self.ejecutar(Accion::Recargar, salida),
+                Some("diagnostico") => salida.diagnostico = true,
                 Some(destino) if destino.starts_with("ir:") => self.navegar(destino[3..].to_string(), salida),
                 _ => {}
             }
@@ -605,6 +612,10 @@ impl App {
         let letra = |c: &str| matches!(&tecla, Tecla::Caracter(t) if t.eq_ignore_ascii_case(c));
 
         // Atajos que valen siempre.
+        if mods.ctrl && mods.shift && letra("d") {
+            salida.diagnostico = true;
+            return;
+        }
         if (mods.ctrl && letra("l")) || tecla == Tecla::F6 || (mods.alt && letra("d")) {
             self.empezar_a_editar(self.url_mostrada());
             return;
@@ -1441,6 +1452,32 @@ mod tests {
         let salida = app.manejar(Entrada::Clic { x: boton.x + 10.0, y: boton.y + ALTO_BARRA as f32 + 10.0 });
         assert_eq!(salida.peticiones[0]["url"], "https://noexiste.test");
         assert!(app.error_visible().is_none());
+    }
+
+    #[test]
+    fn el_diagnostico_se_pide_con_el_boton_de_error_y_con_el_atajo() {
+        let (mut app, inicio) = App::nueva(800, 600, Some("noexiste.test".to_string()));
+        let id = inicio.iter().find(|p| tipo(p) == "navigate").unwrap()["id"].as_str().unwrap().to_string();
+        app.manejar(Entrada::Motor(MensajeMotor::Error { id: Some(id), mensaje: "network_error: x".into() }));
+        app.componer();
+        let boton = app.local.as_ref().unwrap().4.regiones.iter().find(|r| r.accion == "diagnostico").unwrap().rect.clone();
+        let salida = app.manejar(Entrada::Clic { x: boton.x + 10.0, y: boton.y + ALTO_BARRA as f32 + 10.0 });
+        assert!(salida.diagnostico && salida.peticiones.is_empty(), "el botón no manda nada al motor");
+        // Con Ctrl+Mayús+D, en cualquier momento.
+        let mut otra = con_pagina();
+        let mods = Modificadores { ctrl: true, shift: true, ..Default::default() };
+        assert!(otra.manejar(Entrada::Tecla { tecla: Tecla::Caracter("D".into()), mods }).diagnostico);
+        // Sin Mayús no es el diagnóstico.
+        let solo_ctrl = Modificadores { ctrl: true, ..Default::default() };
+        assert!(!otra.manejar(Entrada::Tecla { tecla: Tecla::Caracter("d".into()), mods: solo_ctrl }).diagnostico);
+    }
+
+    #[test]
+    fn la_app_sabe_adonde_va_la_carga_en_curso() {
+        let (mut app, _) = App::nueva(800, 600, Some("e.com".to_string()));
+        assert_eq!(app.destino_en_curso(), Some("https://e.com"));
+        app.manejar(tecla(Tecla::Escape));
+        assert_eq!(app.destino_en_curso(), None);
     }
 
     #[test]
