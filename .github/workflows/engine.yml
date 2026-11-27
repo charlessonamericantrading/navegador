@@ -198,3 +198,48 @@ jobs:
           # `fast-float` bloqueaban una release y se retiraron con la migracion
           # de Boa (plan F02). Esta lista se revisa en cada auditoria.
           ignore: RUSTSEC-2026-0192,RUSTSEC-2026-0206,RUSTSEC-2024-0436
+
+  # Empaquetado MSIX sin firmar para Microsoft Store (`Glowapp Browser`).
+  # La Store firma el paquete al publicarlo; aquí no se usan certificados.
+  msix:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: 0
+      # Embebe el runtime C de MSVC en `navegador.exe` para no depender de
+      # VCRUNTIME140.dll ni de paquetes framework externos dentro del MSIX.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache de compilacion
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+          shared-key: msix-crt-static
+
+      - name: Compilar navegador en release
+        working-directory: engine
+        run: cargo build --release --locked -p navegador --bin navegador
+
+      - name: Empaquetar MSIX sin firmar
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File engine\packaging\msix\empaquetar.ps1 `
+            -Exe engine\target\release\navegador.exe `
+            -Salida engine\target\msix
+          Get-Content engine\target\msix\SHA256SUMS.txt
+
+      - name: Subir artefacto MSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: glowapp-browser-msix-${{ github.run_number }}
+          path: |
+            engine/target/msix/*.msix
+            engine/target/msix/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
