@@ -2,9 +2,9 @@
 <!--
   Manifiesto del paquete MSIX de Glowapp Browser para Microsoft Store (borrador Store ID 9P251CZGDJ92).
 
-  ÚNICO SITIO DONDE CAMBIAR EL Identity Name CUANDO PARTNER CENTER LO ASIGNE:
-    Sustituye `PENDIENTE.GlowappBrowser` en el atributo `Name="..."` de `<Identity>`
-    por el valor exacto que muestre Partner Center > Product identity.
+  La identidad (Name y Publisher) es la de Partner Center > Product identity:
+  Package Family Name `Charlesson.GlowappBrowser_t5wqe1epm5p6c`. empaquetar.ps1
+  la comprueba; no se cambia salvo que Partner Center la cambie.
 -->
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
@@ -13,7 +13,7 @@
   IgnorableNamespaces="uap rescap">
 
   <Identity
-    Name="PENDIENTE.GlowappBrowser"
+    Name="Charlesson.GlowappBrowser"
     Publisher="CN=92865E93-3F3F-4EEF-9C20-8F49C41D64EC"
     Version="0.1.0.0"
     ProcessorArchitecture="x64" />

@@ -3,18 +3,19 @@
 #
 # Uso:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File engine\packaging\msix\empaquetar.ps1 `
-#       [-Exe engine\target\release\navegador.exe] [-Salida engine\target\msix] [-IdentityName <NombreStore>] [-StrictIdentity]
+#       [-Exe engine\target\release\navegador.exe] [-Salida engine\target\msix]
 [CmdletBinding()]
 param(
     [string]$Exe = '',
-    [string]$Salida = '',
-    [string]$IdentityName = '',
-    [switch]$StrictIdentity
+    [string]$Salida = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
+# Identidad de Partner Center > Product identity (Store ID 9P251CZGDJ92).
+$EsperadoIdentityName = 'Charlesson.GlowappBrowser'
+$EsperadoFamilia = 'Charlesson.GlowappBrowser_t5wqe1epm5p6c'
 $EsperadoPublisher = 'CN=92865E93-3F3F-4EEF-9C20-8F49C41D64EC'
 $EsperadoPublisherDisplay = 'Charlesson'
 $EsperadoDisplayName = 'Glowapp Browser'
@@ -59,7 +60,6 @@ $versionEsperada = "$cargoVersion.0"
 $manifiestoRuta = Join-Path $aqui 'AppxManifest.xml'
 [xml]$manifiesto = Get-Content -Raw -Encoding UTF8 $manifiestoRuta
 $id = $manifiesto.Package.Identity
-if ($IdentityName) { $id.SetAttribute('Name', $IdentityName) }
 
 $idName = $id.GetAttribute('Name')
 $idPublisher = $id.GetAttribute('Publisher')
@@ -68,14 +68,19 @@ $idArq = $id.GetAttribute('ProcessorArchitecture')
 $display = [string]$manifiesto.Package.Properties.DisplayName
 $pubDisplay = [string]$manifiesto.Package.Properties.PublisherDisplayName
 
-if ([string]::IsNullOrWhiteSpace($idName)) { Fallo 'Identity Name está vacío en AppxManifest.xml.' }
-if ($StrictIdentity -and $idName -like 'PENDIENTE*') {
-    Fallo "Identity Name sigue pendiente («$idName»). Sustitúyelo en AppxManifest.xml o pasa -IdentityName."
-}
-if ($idName -like 'PENDIENTE*') {
-    Write-Warning "Identity Name usa marcador temporal («$idName»). Actualiza AppxManifest.xml cuando Partner Center asigne el definitivo."
-}
+if ($idName -ne $EsperadoIdentityName) { Fallo "Identity Name es «$idName»; debe ser «$EsperadoIdentityName» (Partner Center)." }
 if ($idPublisher -ne $EsperadoPublisher) { Fallo "Identity Publisher es «$idPublisher»; debe ser «$EsperadoPublisher»." }
+
+# Package Family Name = Name + "_" + id del Publisher: los 8 primeros bytes del SHA-256 del Publisher
+# en UTF-16LE, en base32 de Crockford en minúsculas (13 caracteres). Si no coincide con el de Partner
+# Center, la Store rechaza el paquete aunque cada campo parezca correcto.
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try { $huellaPub = $sha.ComputeHash([System.Text.Encoding]::Unicode.GetBytes($idPublisher)) } finally { $sha.Dispose() }
+$bits = (($huellaPub[0..7] | ForEach-Object { [Convert]::ToString($_, 2).PadLeft(8, '0') }) -join '') + '0'
+$alfabeto = '0123456789abcdefghjkmnpqrstvwxyz'
+$idPub = -join (0..12 | ForEach-Object { $alfabeto[[Convert]::ToInt32($bits.Substring($_ * 5, 5), 2)] })
+$familia = "${idName}_$idPub"
+if ($familia -ne $EsperadoFamilia) { Fallo "Package Family Name calculado «$familia»; Partner Center espera «$EsperadoFamilia»." }
 if ($pubDisplay -ne $EsperadoPublisherDisplay) { Fallo "PublisherDisplayName es «$pubDisplay»; debe ser «$EsperadoPublisherDisplay»." }
 if ($display -ne $EsperadoDisplayName) { Fallo "DisplayName es «$display»; debe ser «$EsperadoDisplayName»." }
 if ($idArq -ne $EsperadoArquitectura) { Fallo "ProcessorArchitecture es «$idArq»; debe ser «$EsperadoArquitectura»." }
@@ -93,7 +98,7 @@ $ejecutable = $app.GetAttribute('Executable')
 if ($app.GetAttribute('EntryPoint') -ne 'Windows.FullTrustApplication') {
     Fallo 'Application EntryPoint debe ser Windows.FullTrustApplication.'
 }
-Write-Host "Identidad: $idName · $idPublisher · v$idVersion ($idArq) · idiomas=$($idiomas -join ',')"
+Write-Host "Identidad: $familia · $idPublisher · v$idVersion ($idArq) · idiomas=$($idiomas -join ',')"
 
 # ── 2. Validar ejecutable PE x64, DLLs y --version ────────────────────────────────────────────────────
 Paso 'Ejecutable y DLLs'
