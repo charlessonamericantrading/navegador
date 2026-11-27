@@ -22,7 +22,8 @@ use std::time::Duration;
 const AYUDA: &str = "Uso:
   navegador [dirección]
   navegador --captura salida.png [--ancho 1280] [--alto 800] [--limite 60] [dirección]
-  navegador --diagnostico";
+  navegador --diagnostico
+  navegador --version";
 
 fn main() -> ExitCode {
     let argumentos: Vec<String> = std::env::args().skip(1).collect();
@@ -79,6 +80,10 @@ fn main() -> ExitCode {
             "--limite" => limite = numero(resto.next()).unwrap_or(limite),
             "--ayuda" | "-h" | "--help" => {
                 println!("{AYUDA}");
+                return ExitCode::SUCCESS;
+            }
+            "--version" | "-V" => {
+                println!("Glowapp Browser {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
             otro if otro.starts_with("--") => {

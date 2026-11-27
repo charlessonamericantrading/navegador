@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Manifiesto del paquete MSIX de Glowapp Browser para Microsoft Store (borrador Store ID 9P251CZGDJ92).
+
+  ÚNICO SITIO DONDE CAMBIAR EL Identity Name CUANDO PARTNER CENTER LO ASIGNE:
+    Sustituye `PENDIENTE.GlowappBrowser` en el atributo `Name="..."` de `<Identity>`
+    por el valor exacto que muestre Partner Center > Product identity.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity
+    Name="PENDIENTE.GlowappBrowser"
+    Publisher="CN=92865E93-3F3F-4EEF-9C20-8F49C41D64EC"
+    Version="0.1.0.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Glowapp Browser</DisplayName>
+    <PublisherDisplayName>Charlesson</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <!-- Idiomas declarados en Store (una ficha por cada idioma listado aquí). -->
+  <Resources>
+    <Resource Language="es-ES" />
+    <Resource Language="en-US" />
+  </Resources>
+
+  <Applications>
+    <Application Id="GlowappBrowser" Executable="navegador.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Glowapp Browser"
+        Description="Navegador web ligero con motor propio escrito 100 % en Rust."
+        BackgroundColor="#FFFFFF"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <Capability Name="internetClient" />
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>
