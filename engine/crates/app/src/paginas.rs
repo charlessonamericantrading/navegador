@@ -52,7 +52,7 @@ p {{ font-size: 16px; color: #5f6368; margin: 0 0 32px 0; }}
 #marcadores {{ display: flex; width: 560px; margin: 0 auto; justify-content: center; flex-wrap: wrap; }}
 .marcador {{ height: 32px; line-height: 32px; padding: 0 14px; margin: 4px 6px; border-radius: 16px; border: 1px solid #dadce0; background: #ffffff; color: #1a73e8; font-size: 13px; }}
 </style></head><body><div id="centro">
-<h1>Navegador</h1>
+<h1>Glowapp Browser</h1>
 <p>Escribe una dirección o una búsqueda en la barra de arriba.</p>
 <div id="sitios">{sitios}</div>
 {seccion_marcadores}
@@ -115,6 +115,13 @@ pub fn explicar(mensaje: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn la_pagina_de_inicio_lleva_el_nombre_de_la_store() {
+        let html = inicio();
+        assert!(html.contains("<h1>Glowapp Browser</h1>"), "{html}");
+        assert!(!html.contains("<h1>Navegador</h1>"));
+    }
 
     #[test]
     fn el_error_se_explica_claro() {
